@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, TypedDict
 
 from .contracts import (
     Clock,
@@ -54,7 +54,7 @@ from .errors import (
     VmrunError,
     VmrunTimeout,
 )
-from .platform import decode_output, host_system, subprocess_kwargs
+from .platform import decode_output, find_vmx_processes, host_system, subprocess_kwargs
 
 MASK = "***"
 DETAIL_LIMIT_BYTES = 4096
@@ -493,8 +493,23 @@ def _check_snapshot_name(name: str) -> None:
         )
 
 
+class InstanceReport(TypedDict):
+    """What :meth:`VmrunProvider.instance_report` returns (a plain dict at run time)."""
+
+    listed: bool  # `vmrun list` names the .vmx
+    pids: list[int]  # every host hypervisor process running the .vmx, sorted
+    orphans: list[int]  # the ones VMware does not account for (see instance_report)
+
+
 class VmrunProvider:
-    """``contracts.VmProvider`` backed by a ``VmrunRunner`` (normally ``VmrunCli``)."""
+    """``contracts.VmProvider`` backed by a ``VmrunRunner`` (normally ``VmrunCli``).
+
+    Besides the protocol it offers :meth:`vm_process_ids` / :meth:`instance_report`,
+    which look at the host's process table for hypervisor processes of this .vmx
+    (``process_finder``, default :func:`platform.find_vmx_processes`), because
+    ``vmrun list`` alone missed a surviving instance (E1: the duplicate-instance
+    incident in docs/PHASE0_RESULTS.md, section "E2E 중 추가로 확인한 사실").
+    """
 
     DEFAULT_TIMEOUTS: Mapping[str, float] = {
         "list": 30.0,
@@ -518,6 +533,7 @@ class VmrunProvider:
         clock: Clock | None = None,
         vmx_reader: Callable[[str], str] | None = None,
         timeouts: Mapping[str, float] | None = None,
+        process_finder: Callable[[str], Sequence[int]] | None = None,
     ) -> None:
         self.runner = runner
         self.vmx = vmx
@@ -525,6 +541,7 @@ class VmrunProvider:
         self.clock: Clock = clock or SystemClock()
         self._vmx_reader = vmx_reader or _read_text
         self._timeouts = {**self.DEFAULT_TIMEOUTS, **(timeouts or {})}
+        self._process_finder = process_finder
 
     def __repr__(self) -> str:
         return f"VmrunProvider(vmx={self.vmx!r})"
@@ -534,15 +551,54 @@ class VmrunProvider:
                                timeout_s=self._timeouts.get(command, DEFAULT_TIMEOUT_S))
 
     # ── state ───────────────────────────────────────────────────────
-    def power_state(self) -> PowerState:
+    def _listed(self) -> bool:
+        """True when ``vmrun list`` names this .vmx among the running VMs."""
         res = self._run("list", vmx=False)
         for line in res.stdout.splitlines():
             s = line.strip()
             if not s or _RUNNING_HEADER.match(s):
                 continue
             if _same_path(s, self.vmx):
-                return PowerState.RUNNING
+                return True
+        return False
+
+    def power_state(self) -> PowerState:
+        """RUNNING when ``vmrun list`` names the VM, else SUSPENDED / OFF from the files.
+
+        Hypervisor processes that ``vmrun list`` does not show are not considered
+        here; see :meth:`instance_report`.
+        """
+        if self._listed():
+            return PowerState.RUNNING
         return PowerState.SUSPENDED if self._suspended_on_disk() else PowerState.OFF
+
+    def vm_process_ids(self) -> list[int]:
+        """PIDs of the host's hypervisor processes running this .vmx (sorted, no vmrun call).
+
+        Raises GatewayError when the host process table cannot be read.
+        """
+        finder = self._process_finder
+        pids = finder(self.vmx) if finder is not None else find_vmx_processes(self.vmx)
+        return sorted({int(p) for p in pids})
+
+    def instance_report(self) -> InstanceReport:
+        """``{'listed': bool, 'pids': [...], 'orphans': [...]}`` for this .vmx.
+
+        ``listed``: ``vmrun list`` names the VM. ``pids``: every hypervisor
+        process of this .vmx on the host (:meth:`vm_process_ids`). ``orphans``:
+        processes VMware does not account for: all ``pids`` when the VM is not
+        listed, and all of them when there is more than one (which one ``vmrun``
+        drives cannot be told from here). Callers must not call start() when
+        ``pids`` is non-empty: a VM that is not listed but still has a process
+        (E1, after a revert) would run twice with the same MAC and IP. Stop the
+        orphan first (or let the operator do it). Raises GatewayError when the
+        process table cannot be read (then the answer is unknown: do not start)
+        and the runner's errors for ``vmrun list``.
+        """
+        pids = self.vm_process_ids()
+        listed = self._listed()
+        orphans = list(pids) if pids and (not listed or len(pids) > 1) else []
+        return InstanceReport(listed=listed, pids=pids, orphans=orphans)
 
     def _suspended_on_disk(self) -> bool:
         vmx = Path(self.vmx)
@@ -610,6 +666,9 @@ class VmrunProvider:
 
     # ── power ───────────────────────────────────────────────────────
     def start(self, *, gui: bool = False) -> None:
+        """``vmrun start``. Does not check for running instances itself: callers check
+        :meth:`instance_report` first and must not start while its ``pids`` is
+        non-empty (E1: a second instance of the same .vmx)."""
         self._run("start", "gui" if gui else "nogui")
 
     def stop(self, *, hard: bool = False) -> None:
@@ -705,6 +764,13 @@ class NullProvider:
 
     def isolation_report(self) -> IsolationReport:
         return IsolationReport(None, None, ())
+
+    def vm_process_ids(self) -> list[int]:
+        return []
+
+    def instance_report(self) -> InstanceReport:
+        """No VM in endpoint mode: nothing listed, no process."""
+        return InstanceReport(listed=False, pids=[], orphans=[])
 
     def list_snapshots(self) -> list[Snapshot]:
         raise self._unavailable()

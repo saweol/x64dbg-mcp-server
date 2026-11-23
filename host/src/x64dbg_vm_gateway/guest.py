@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import re
 import string
-import subprocess
 from collections.abc import Iterable, Sequence
 from pathlib import Path, PureWindowsPath
 
@@ -40,6 +39,7 @@ __all__ = [
     "MAX_GUEST_PATH",
     "POWERSHELL_EXE",
     "VixChannel",
+    "escape_for_vmrun",
     "fold_case",
     "is_reserved_name",
     "parse_dir_list",
@@ -279,21 +279,63 @@ def parse_dir_list(text: str) -> list[str]:
     return names
 
 
+# ── program arguments ───────────────────────────────────────────────
+_UNSENDABLE = frozenset("\x00\r\n")
+
+
+def escape_for_vmrun(arg: str) -> str:
+    """Escape one program argument for vmrun's ``runProgramInGuest`` quoting.
+
+    vmrun wraps every program argument in double quotes itself and escapes
+    nothing (E3, see :class:`VixChannel`). Inside such quotes the Windows
+    argument parser (MSVCRT / ``CommandLineToArgvW``) needs every ``"`` written
+    as ``\\"`` with the backslashes right before it doubled, and trailing
+    backslashes doubled so they do not escape vmrun's closing quote. Other
+    backslashes stay as they are. No outer quotes are added. So the guest
+    program receives exactly ``arg``, including ``""`` for an empty string.
+
+    Raises TypeError for a non-str and ValueError for NUL, CR or LF (a command
+    line cannot carry them).
+    """
+    if not isinstance(arg, str):
+        raise TypeError("program arguments must be str")
+    if any(ch in _UNSENDABLE for ch in arg):
+        raise ValueError(f"program argument contains NUL, CR or LF: {_shown(arg)}")
+    out: list[str] = []
+    backslashes = 0
+    for ch in arg:
+        if ch == "\\":
+            backslashes += 1
+            continue
+        if ch == '"':
+            out.append("\\" * (2 * backslashes + 1) + '"')
+        else:
+            out.append("\\" * backslashes + ch)
+        backslashes = 0
+    out.append("\\" * (2 * backslashes))
+    return "".join(out)
+
+
 # ── VixChannel ──────────────────────────────────────────────────────
 class VixChannel:
     """``contracts.GuestChannel`` implemented with vmrun guest operations (VIX).
 
-    Program arguments are quoted with the MSVCRT rules (``subprocess.list2cmdline``)
-    before they are handed to vmrun, because vmrun joins the trailing argv
-    elements into one guest command line. This was observed on vmrun 1.17.0:
-    arguments are joined with spaces and not re-quoted (Phase 0,
-    docs/PHASE0_RESULTS.md V4: ``-NoProfile -NonInteractive -ExecutionPolicy
-    Bypass -EncodedCommand <base64>`` passed unquoted worked, an unquoted
-    ``-Command`` script containing double quotes failed because the quotes were
-    lost). quote_args=True is required for arguments containing spaces or
-    quotes; arguments without them pass through unchanged. End-to-end
-    confirmation of the quoted form is pending in the VM test suite. Pass
-    ``quote_args=False`` only to hand pre-quoted arguments through verbatim.
+    Program arguments (E3: the E2E run's correction of docs/PHASE0_RESULTS.md
+    row V4, measured on the spike VM with vmrun 1.17.0 and a PowerShell
+    ``-File`` script logging ``[Environment]::CommandLine``): vmrun
+    builds the guest command line itself and wraps every program argument in
+    double quotes without escaping anything. ``a b``, ``c"d``, ``plain``,
+    ``e\\f`` arrived as ``"a b" "c"d" "plain" "e\\f"`` and the program received
+    ``a b`` and ``cd plain e\\f``. Each argument is therefore passed through
+    :func:`escape_for_vmrun` (MSVCRT escaping for the inside of a quoted
+    argument, never outer quotes), after which the program receives exactly the
+    strings given here. The earlier pre-quoting with ``subprocess.list2cmdline``
+    was wrong: it added a second pair of quotes, which split arguments
+    containing spaces and let a trailing backslash escape vmrun's closing quote
+    (it only seemed to work for ``powershell -Command``, which re-joins its
+    remaining arguments). Pass ``quote_args=False`` only to hand arguments to
+    vmrun verbatim (the caller then owns the escaping). Arguments containing NUL,
+    CR or LF are rejected with ValueError before vmrun runs.
 
     Errors: besides the ``VmrunError`` subclasses listed in the ``GuestChannel``
     contract, every method raises ``PathNotAllowed`` for a guest path that fails
@@ -346,7 +388,7 @@ class VixChannel:
         if not all(isinstance(a, str) for a in argv):
             raise TypeError("program arguments must be str")
         if self._quote_args:
-            argv = [subprocess.list2cmdline([a]) for a in argv]
+            argv = [escape_for_vmrun(a) for a in argv]
         flags: list[str] = []
         if not wait:
             flags.append("-noWait")
