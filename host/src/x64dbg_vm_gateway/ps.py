@@ -21,11 +21,18 @@ Wrapper semantics (Windows PowerShell 5.1):
 - the exit code is the script's own ``exit N``; otherwise 1 when a terminating
   error escaped the script (its text is appended to the output) and 0 when it
   completed. Non-terminating errors and native exit codes do not change it;
+- the script runs inside the wrapper's ``try`` block, and PowerShell lets a
+  statement-terminating error (e.g. a .NET method exception) inside a ``try``
+  stop the whole block instead of only that statement: such an error ends the
+  script with exit code 1. Wrap calls that may fail harmlessly in the script's
+  own ``try``/``catch``;
 - output lines are flushed as they are produced (``AutoFlush``), so output
   written before an ``exit`` or a crash is still captured.
 
-These semantics follow PowerShell's documented behaviour; they have not been
-exercised by this module's unit tests, which emulate the guest.
+These semantics follow PowerShell's documented behaviour and have NOT been run
+on a real PowerShell: the unit tests emulate the guest and only check what is
+sent to it. Verify them on the spike VM (tests/vm) before relying on details
+such as the exit code of an escaped error.
 
 Secrets: script text is never logged. Callers must not embed secrets in scripts
 (they would sit in the guest command line / temp file); pass them in a file that

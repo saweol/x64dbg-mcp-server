@@ -900,9 +900,11 @@ function Get-ConfigState([string]$Path) {
 function Get-PluginInfo([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [ordered]@{ present = $false } }
     $item = Get-Item -LiteralPath $Path -Force
+    $version = $null
+    try { $version = $item.VersionInfo.FileVersion } catch { }
     return [ordered]@{
         present = $true; size = $item.Length; mtime = $item.LastWriteTimeUtc.ToString('s') + 'Z'
-        file_version = $item.VersionInfo.FileVersion
+        file_version = $version
     }
 }
 $out = New-Object System.Collections.Generic.List[object]
