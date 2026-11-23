@@ -143,8 +143,10 @@ def test_keyword_only_and_list_arguments_are_converted(app):
     async def go(c: Client) -> Any:
         await c.call_tool("analysis_start", {"sample_path": "/samples/a.exe", "arch": "x32", "revert": False})
         await c.call_tool("analysis_collect", {"extra_guest_paths": ["C:\\a", "C:\\b"]})
-        return await c.call_tool("ida_import_annotations", {"items": [{"address": "0x1000", "name": "f"}],
-                                                            "module": "a.exe", "ida_imagebase": 0x400000})
+        # items use ida_sync's shape: rva or ida_address (+ name / comment)
+        items = [{"ida_address": "0x401000", "name": "f"}]
+        return await c.call_tool("ida_import_annotations",
+                                 {"items": items, "module": "a.exe", "ida_imagebase": 0x400000})
 
     res = drive(mcp_server.build_server(app), go)
     assert payload(res) == {"applied": 1}
