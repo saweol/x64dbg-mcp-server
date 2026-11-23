@@ -17,6 +17,7 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 __all__ = [
     "COMIMAGE_FLAGS_32BITPREFERRED",
@@ -40,9 +41,9 @@ COMIMAGE_FLAGS_ILONLY = 0x00000001
 COMIMAGE_FLAGS_32BITREQUIRED = 0x00000002
 COMIMAGE_FLAGS_32BITPREFERRED = 0x00020000
 
-_ARCH_BY_MACHINE = {IMAGE_FILE_MACHINE_I386: "x32", IMAGE_FILE_MACHINE_AMD64: "x64"}
+_ARCH_BY_MACHINE = MappingProxyType({IMAGE_FILE_MACHINE_I386: "x32", IMAGE_FILE_MACHINE_AMD64: "x64"})
 # Offset of the data directory array inside the optional header, per magic.
-_DATA_DIR_OFFSET = {_PE32_MAGIC: 96, _PE32_PLUS_MAGIC: 112}
+_DATA_DIR_OFFSET = MappingProxyType({_PE32_MAGIC: 96, _PE32_PLUS_MAGIC: 112})
 _SECTION_HEADER_SIZE = 40
 _COR20_FLAGS_END = 20  # IMAGE_COR20_HEADER.Flags is the u32 at offset 16
 

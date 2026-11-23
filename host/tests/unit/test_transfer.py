@@ -19,6 +19,15 @@ import zipfile
 from pathlib import Path, PureWindowsPath
 
 import pytest
+
+from tests.fakes.fake_guest import FakeGuest
+from x64dbg_vm_gateway.errors import (
+    GuestOperationError,
+    IntegrityError,
+    PathNotAllowed,
+    TransferError,
+    UnsafeArchiveError,
+)
 from x64dbg_vm_gateway.transfer import (
     DEFAULT_EXTRACT_LIMITS,
     ExtractedEntry,
@@ -28,15 +37,6 @@ from x64dbg_vm_gateway.transfer import (
     encrypt_archive,
     safe_extract,
     upload_sample,
-)
-
-from tests.fakes.fake_guest import FakeGuest
-from x64dbg_vm_gateway.errors import (
-    GuestOperationError,
-    IntegrityError,
-    PathNotAllowed,
-    TransferError,
-    UnsafeArchiveError,
 )
 
 POSIX = os.name == "posix"
@@ -510,6 +510,26 @@ def test_safe_extract_corrupt_entry_is_rejected_and_removed(tmp_path):
     assert _listing(dest) == {ok.stored_name}
 
 
+def _corrupt_stored_zip(path: Path, blobs: list[bytes], n_corrupt: int) -> Path:
+    z = make_zip(path, [(f"m{i}", b) for i, b in enumerate(blobs)], compression=zipfile.ZIP_STORED)
+    raw = bytearray(z.read_bytes())
+    for blob in blobs[:n_corrupt]:
+        raw[raw.find(blob[:32]) + 300] ^= 0xFF  # CRC mismatch, detected only after the full read
+    z.write_bytes(bytes(raw))
+    return z
+
+
+def test_safe_extract_counts_bytes_of_rejected_members(tmp_path):
+    blobs = [os.urandom(600) for _ in range(3)]
+    z = _corrupt_stored_zip(tmp_path / "o.zip", blobs, n_corrupt=2)
+    statuses = [e.status for e in safe_extract(z, tmp_path / "ok", ExtractLimits(max_total_bytes=5000))]
+    assert statuses == ["rejected:corrupt", "rejected:corrupt", "ok"]
+    # Corrupt members still consumed decompression budget: 600 + 600 > 1000.
+    with pytest.raises(UnsafeArchiveError) as ei:
+        safe_extract(z, tmp_path / "tight", ExtractLimits(max_total_bytes=1000))
+    assert ei.value.details["reason"] == "total-bytes"
+
+
 def test_safe_extract_not_a_zip(tmp_path):
     p = tmp_path / "o.zip"
     p.write_bytes(b"this is not a zip")
@@ -762,3 +782,29 @@ def test_encrypt_archive_without_pyzipper_raises(tmp_path):
     with pytest.raises(TransferError) as ei:
         encrypt_archive(src, tmp_path / "enc.zip")
     assert "aeszip" in (ei.value.hint or "")
+
+
+@pytest.mark.skipif(not HAVE_PYZIPPER, reason="pyzipper not installed (extra 'aeszip')")
+def test_encrypt_archive_secret_password_and_limits(tmp_path):
+    import pyzipper
+
+    from x64dbg_vm_gateway.contracts import Secret
+
+    src = make_zip(tmp_path / "src.zip", [("a.bin", b"A" * 5000)])
+    dst = tmp_path / "enc.zip"
+    encrypt_archive(src, dst, Secret("s3cret-pw"))
+    with pyzipper.AESZipFile(dst) as enc:
+        enc.setpassword(b"s3cret-pw")
+        assert enc.read("a.bin") == b"A" * 5000
+    with pytest.raises(UnsafeArchiveError):
+        encrypt_archive(src, tmp_path / "small.zip", limits=ExtractLimits(max_total_bytes=1000))
+    assert not (tmp_path / "small.zip").exists()
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_collect_leaves_no_part_or_temp_files_after_partial_run(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"a"})
+    m = _collect(fake_guest, tmp_path, fake_clock, extra_guest_paths=[f"{JOB_DIR}\\missing.bin"])
+    art = tmp_path / "job" / "artifacts"
+    leftovers = [p for p in art.rglob("*") if p.name.endswith((".part", ".tmp", ".partial"))]
+    assert leftovers == [] and m.partial

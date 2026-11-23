@@ -41,6 +41,8 @@ __all__ = [
     "POWERSHELL_EXE",
     "VixChannel",
     "is_reserved_name",
+    "parse_dir_list",
+    "parse_process_list",
     "validate_guest_path",
 ]
 

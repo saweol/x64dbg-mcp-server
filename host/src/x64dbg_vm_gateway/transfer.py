@@ -41,6 +41,7 @@ import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import Any
 
 from .contracts import Clock, GuestChannel, Secret, SystemClock
@@ -80,7 +81,7 @@ _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 _PS_PREFIX = ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command")
 # Characters PowerShell interprets as wildcards / escapes in -Path / -FilePath arguments.
 _PS_WILDCARD_CHARS = frozenset("[]`")
-_EXT_BY_KIND = {"exe": "exe", "dotnet-exe": "exe", "dll": "dll", "dotnet-dll": "dll"}
+_EXT_BY_KIND = MappingProxyType({"exe": "exe", "dotnet-exe": "exe", "dll": "dll", "dotnet-dll": "dll"})
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _ZIP_FLAG_ENCRYPTED = 0x1
 _BASENAME_MAX = 64
@@ -391,7 +392,13 @@ def _within(path: str, root_real: str) -> bool:
 
 
 def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest: Path, dest_real: str,
-                    limits: ExtractLimits, total_before: int, archive_size: int) -> ExtractedEntry:
+                    limits: ExtractLimits, total_before: int,
+                    archive_size: int) -> tuple[ExtractedEntry, int]:
+    """Extract one member; returns the entry and the number of bytes decompressed.
+
+    Bytes decompressed for a member that is later rejected still count against
+    ``max_total_bytes`` so a stream of corrupt members cannot reset the budget.
+    """
     tmp = dest / f".{index:04d}.{secrets.token_hex(6)}.partial"
     denom = max(1, min(info.compress_size, archive_size))
     digest = hashlib.sha256()
@@ -417,6 +424,10 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
                         chunk = src.read(max(want, 1))
                     except (zipfile.BadZipFile, zlib.error, lzma.LZMAError, EOFError, OSError,
                             ValueError) as exc:
+                        # The failing read may already have decompressed (and discarded) data,
+                        # e.g. a CRC error is raised by the read that returns the last bytes.
+                        # zipfile never yields more than the declared size, so charge that.
+                        written = max(written, min(info.file_size, limits.max_file_bytes))
                         raise _EntryRejected("corrupt") from exc
                     if not chunk:
                         break
@@ -438,7 +449,7 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
             os.fsync(out.fileno())
     except _EntryRejected as rej:
         _unlink_quiet(tmp)
-        return ExtractedEntry(info.filename, None, info.file_size, None, f"rejected:{rej.reason}")
+        return ExtractedEntry(info.filename, None, info.file_size, None, f"rejected:{rej.reason}"), written
     except OSError as exc:  # host-side write failure
         _unlink_quiet(tmp)
         raise TransferError(f"host write failed while extracting: {exc.strerror or exc}", stage="extract",
@@ -453,8 +464,8 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
     os.replace(tmp, final)  # replaces a pre-existing link itself, never its target
     if not _within(str(final), dest_real):
         _unlink_quiet(final)
-        return ExtractedEntry(info.filename, None, written, None, "rejected:escape")
-    return ExtractedEntry(info.filename, stored, written, sha, "ok")
+        return ExtractedEntry(info.filename, None, written, None, "rejected:escape"), written
+    return ExtractedEntry(info.filename, stored, written, sha, "ok"), written
 
 
 def _unlink_quiet(path: Path) -> None:
@@ -507,9 +518,8 @@ def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[E
             if reason is not None:
                 out.append(ExtractedEntry(name, None, info.file_size, None, f"rejected:{reason}"))
                 continue
-            entry = _extract_member(zf, info, index, dest, dest_real, limits, total, archive_size)
-            if entry.status == "ok":
-                total += entry.size
+            entry, consumed = _extract_member(zf, info, index, dest, dest_real, limits, total, archive_size)
+            total += consumed
             out.append(entry)
 
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from x64dbg_vm_gateway.guest import VixChannel, validate_guest_path
 
 from tests.fakes.fake_vmrun import FakeVmrunRunner
 from x64dbg_vm_gateway import contracts
@@ -29,6 +28,7 @@ from x64dbg_vm_gateway.errors import (
     VmrunError,
     VmrunTimeout,
 )
+from x64dbg_vm_gateway.guest import VixChannel, validate_guest_path
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "transfer"
 
@@ -529,3 +529,44 @@ def test_every_guest_path_is_validated(tmp_path, runner, chan, call):
     with pytest.raises(PathNotAllowed):
         call(chan, tmp_path)
     assert runner.calls == []
+
+
+def test_must_be_under_does_not_apply_multichar_case_mappings():
+    # 'ß'.upper() == 'SS' and 'ß'.casefold() == 'ss', but NTFS keeps them distinct directories.
+    with pytest.raises(PathNotAllowed):
+        validate_guest_path("C:\\mass\\x", must_be_under="C:\\ma\u00df")
+    assert validate_guest_path("C:\\MA\u1e9e\\x", must_be_under="C:\\ma\u00df") == "C:\\MA\u1e9e\\x"
+
+
+def test_copy_from_guest_refuses_symlink_or_directory_destination(tmp_path, runner, chan):
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"keep")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks not available")
+    with pytest.raises(TransferError):
+        chan.copy_from_guest("C:\\a.bin", link)
+    with pytest.raises(TransferError):
+        chan.copy_from_guest("C:\\a.bin", tmp_path)
+    assert runner.calls == []
+
+
+def test_run_program_rejects_non_str_args(runner, chan):
+    with pytest.raises(TypeError):
+        chan.run_program("C:\\a.exe", ["ok", 5])  # type: ignore[list-item]
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("kw", [{"timeout_s": 0}, {"run_timeout_s": -1}, {"copy_timeout_s": 0}])
+def test_vix_channel_rejects_non_positive_timeouts(runner, kw):
+    with pytest.raises(ValueError):
+        VixChannel(runner, **kw)
+
+
+def test_parsers_are_exported():
+    from x64dbg_vm_gateway.guest import parse_dir_list, parse_process_list
+
+    assert parse_dir_list("Directory list: 1\nx\n") == ["x"]
+    assert parse_process_list("Process list: 1\npid=7, owner=a, cmd=b\n")[0].pid == 7
