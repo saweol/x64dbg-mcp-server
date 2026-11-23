@@ -11,8 +11,8 @@ Claude Code ──stdio(또는 HTTPS)──► x64dbg-vm-gateway (host)
 ```
 
 - **AI가 쓰는 툴**
-  - 게이트웨이 툴 19개: `analysis_*`, `vm_*`, `file_*`, `debugger_*`, `ida_*`, `session_status`, `gateway_doctor`
-  - x64dbg 툴 83개: 원래 이름 그대로 중계합니다.
+  - 게이트웨이 툴 21개: `analysis_*`, `vm_*`, `file_*`, `debugger_*`, `ida_*`, `jobs_*`, `session_status`, `gateway_doctor`
+  - x64dbg 툴 83개(플러그인 v1.10): 원래 이름 그대로 중계합니다. 실제 Claude Code에서 합계 104개로 보이는 것을 확인했습니다.
 - **루프:** `analysis_start` → 분석(미러 툴) → `analysis_collect` → `analysis_finish`(클린 스냅샷 복원)
 
 ## 2. 요구 사항
@@ -191,9 +191,10 @@ IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 �
   - x64·x32 전체 루프: 복원 → 업로드 → 로드 → BP/run/스택/덤프 → 수집(덤프·DB가 manifest에 기록) → IDA export → 복원. 분석 명령을 뺀 한 바퀴 약 48초
   - x64dbg 강제 종료 → `BACKEND_RESTARTED` → 재기동 → ack → 분석 재개
   - MCP stdio: 첫 툴 목록에 v1.10 툴이 들어 있음, `session_status` 호출
+  - 실제 Claude Code 클라이언트(`claude -p --mcp-config`, `uv tool install`로 설치한 실행 파일): 툴 104개 목록, `session_status`, `GetServerInfo`(v1.10) 호출. 읽기 전용 툴만 써 봤습니다.
 - **미검증**
   - Windows/macOS host
-  - 실제 Claude Code 클라이언트에서의 장시간 호출 timeout
+  - 실제 Claude Code 클라이언트에서 분석 루프 전체와 장시간 호출 timeout
   - 실제 IDA에서의 스크립트 실행
   - 원격 HTTP/TLS 모드의 실제 다른 PC 접속(단위 테스트만)
   - `run`/step 직후 과도 상태의 `GetDebugState`
