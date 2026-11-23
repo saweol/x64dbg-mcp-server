@@ -99,6 +99,16 @@
   - 자격 증명을 `env_file`에서 읽었다(셸에 export 없음).
   - 재부팅을 부팅 시각(13:37 → 16:42 UTC)으로 감지했다. `reboot_signal=boot_time`.
   - 39 s 후 준비 완료, 스냅샷까지 총 3분 14초.
+- **실제 Claude Code 클라이언트**
+  - 조건: `claude -p --mcp-config`, `uv tool install ./host`로 설치한 실행 파일, 허용 툴 제한.
+  - 툴 104개(게이트웨이 21 + 플러그인 83)가 보였다.
+  - 루프 전체가 68초에 끝났다. 순서는 다음과 같다.
+    - `analysis_start`(즉시 완료)
+    - `kernel32.Sleep` BP, `run` 2회(엔트리 → Sleep), PAUSED
+    - 스택, 덤프
+    - 수집(`.dd64`, 덤프)
+    - 복원
+  - `run`의 `timeoutMs` 120000이 호출 예산에 맞춰 70000으로 줄었다는 안내가 출력에 붙었다.
 - **install-plugin(실 VM)**
   - 25 s 걸렸다.
   - 백업은 `<arch>\plugins_backup\<plugin>.<UTC>.bak`에 만들어졌고, `plugins\`에는 플러그인만 남았다.
@@ -116,6 +126,7 @@
 ### 아직 실 VM에서 확인하지 않은 것
 
 - 수정된 `GetDebugState`가 `run`/step 직후의 과도 상태에서 무엇을 보고하는지. E2E는 `run` 반환 뒤의 정지 상태만 봤다.
+- 110초를 넘기는 호출이 실제 Claude Code에서 `in_progress`로 끊기는 경로. 실제 클라이언트로 돌린 루프는 모든 호출이 예산 안에 끝났다.
 - x64dbg 강제 종료 시 디버기 프로세스가 어떻게 되는지(V14).
 - `LogRedirect` 명령의 실제 동작(V5 일부).
 - vmrun 동시 호출(V7), Claude Code 실제 클라이언트의 장시간 호출 timeout(V8), vmtoolsd 강제 종료(V9).
