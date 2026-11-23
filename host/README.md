@@ -176,6 +176,22 @@ guard for all of them.
 Errors come back as `isError` results with
 `{code, message, stage, retryable, hint, next_tool, details}`.
 
+Further behaviour worth knowing:
+
+- `vm_power start` is allowed during an analysis (to resume a VM that host sleep suspended);
+  `stop`, `suspend` and `reset` are refused until the job is collected or discarded.
+- A v1.10 plugin that locked the gateway out after failed logins answers HTTP 429: calls fail with
+  `BACKEND_THROTTLED` (`details.retry_after_s`), the backend shows as `THROTTLED` in
+  `session_status`, and it is never restarted for that.
+- With `analysis_start(reload_on_restart=true)` a relaunched debugger gets the sample again before
+  `BACKEND_RESTARTED` is reported; `details.reloaded` says whether it is loaded.
+- `ida_rebase`, `ida_export_annotations` (writes `<job>/artifacts/ida_sync.json`) and
+  `ida_import_annotations` connect the session to IDA; see `ida/README.md`.
+- While a gateway serves a jobs root, CLI commands that need it (`discard`, `status`, `doctor`,
+  `provision`, `install-plugin`) stop with `LOCK_TIMEOUT` naming the gateway's pid. `provision` and
+  `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
+  after a plugin install.
+
 ## Remote access (M3)
 
 `serve --transport http` exposes the same tools over MCP streamable HTTP at `/mcp`. Prefer an SSH
