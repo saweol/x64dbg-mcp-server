@@ -1,0 +1,8 @@
+HTTP/1.1 401 Unauthorized
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Accept
+Access-Control-Expose-Headers: Mcp-Session-Id
+Content-Length: 24
+
+{"error":"Unauthorized"}

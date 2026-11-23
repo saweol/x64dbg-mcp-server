@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Accept
+Access-Control-Expose-Headers: Mcp-Session-Id
+Content-Type: application/json
+Content-Length: 161
+
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"isDebugging: false\nstatus: NO_TARGET\nhint: Use LoadBinary to open an executable first."}]}}
