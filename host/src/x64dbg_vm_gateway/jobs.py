@@ -17,13 +17,22 @@ A crash between 2 and 3 leaves the old ``state.json`` plus an intent whose
 sequence number is ahead of the recorded history; ``recover_scan`` reports
 that as ``flags["interrupted_transition"]``.
 
+Size bounds: a ``state.json`` larger than the read cap is refused before
+anything is written (it could not be loaded again). Consecutive self-loops
+(``ANALYZING -> ANALYZING`` per mirrored call) are coalesced into one history
+entry with a ``count``, reasons are clipped, and ``intent.log`` is rotated to
+``intent.log.1`` past ``_MAX_INTENT_BYTES``.
+
 Invariants enforced here (plan 4.1):
 
 - Only the edges in ``TRANSITIONS`` are legal; terminal states are final.
 - ``DISCARDED`` is never a ``transition()`` target. Only ``discard()`` with
   ``actor == "human-cli"`` can enter it, so no MCP tool can skip collection.
 - ``REVERTING`` is entered only from ``COLLECTED`` or ``DISCARDED``.
-- A profile has at most one non-terminal job at a time.
+- A profile has at most one non-terminal job at a time. A job directory
+  whose state cannot be read counts as live (fail closed): it blocks its
+  profile (or every profile, if the profile is unknown) in ``create()`` and
+  ``active()`` until its state is restored or a human abandons it.
 - Job ids are validated against ``JOB_ID_RE`` before they touch a path.
 
 Thread-safety: every public ``JobStore`` method takes one internal re-entrant
@@ -31,8 +40,12 @@ lock, so a store may be shared by worker threads. Separate processes are kept
 apart by an exclusive lock file ``<root>/.lock`` held from ``open()`` until
 ``close()``. Acquisition and stale-lock reclaim are themselves serialised by
 an OS advisory lock on ``<root>/.lock.guard``, so two processes cannot both
-reclaim the same stale lock. The ``Job`` objects handed out are deep copies;
-mutating them never changes the store.
+reclaim the same stale lock; where advisory locks are unavailable, stale
+locks are never reclaimed automatically. A lock written under a different
+hostname is never reclaimed either (it may belong to another machine sharing
+the directory); after renaming this machine, delete such a lock by hand.
+The ``Job`` objects handed out are deep copies; mutating them never changes
+the store.
 """
 
 from __future__ import annotations
@@ -60,6 +73,7 @@ from .contracts import TERMINAL_JOB_STATES, Clock, JobState, SampleInfo, SystemC
 from .errors import LockTimeout, PathNotAllowed, StateViolation
 
 __all__ = [
+    "CORRUPT_KINDS",
     "DISCARDABLE_STATES",
     "DISCARD_ACTOR",
     "JOB_ID_RE",
@@ -114,10 +128,20 @@ it but never resumes it), and such a job blocks its profile because
 ``create()`` refuses a second live job. Therefore every live state except
 REVERTING (already on its way to DONE) is discardable. The actor check keeps
 this out of reach of MCP tools.
+
+Exception (plan 4.1 invariant 2): a job this store instance moved into
+UPLOADING or COLLECTING has a file copy of this process in flight; it can be
+discarded only after that step leaves the state. The same state found on disk
+at ``open()`` was left by a process that no longer runs (the root lock
+guarantees it) and is discardable.
 """
+
+_BUSY_STATES: frozenset[JobState] = frozenset({_S.UPLOADING, _S.COLLECTING})
 
 _STATE_FILE = "state.json"
 _INTENT_FILE = "intent.log"
+_INTENT_ROTATED = "intent.log.1"
+_ABANDONED_FILE = "abandoned.json"
 _LOCK_FILE = ".lock"
 _GUARD_FILE = ".lock.guard"
 _SUBDIRS = ("input", "artifacts", "logs")
@@ -126,8 +150,14 @@ _UPDATABLE_FIELDS = frozenset(
 )
 _CORRUPT_RE = re.compile(r"state\.json\.corrupt-([0-9]+)")
 _TEMP_RE = re.compile(r"\.state\.json\.[0-9a-f]{12}\.tmp")  # see _atomic_write
+# Absolute drive path with backslashes; no empty components, wildcards, quotes,
+# ADS colons or control characters (the guest root ends up in guest command lines).
+_GUEST_ROOT_RE = re.compile(r'[A-Za-z]:(?:\\[^\\/:*?"<>|\x00-\x1f\x7f]+)+')
 _MAX_ID_ATTEMPTS = 8
-_MAX_STATE_BYTES = 16 * 1024 * 1024
+_MAX_STATE_BYTES = 16 * 1024 * 1024  # read cap; writes are refused above it too
+_MAX_INTENT_BYTES = 4 * 1024 * 1024  # intent.log is rotated to intent.log.1 past this
+_MAX_REASON_CHARS = 1000
+_INTENT_HEAD_BYTES = 4096
 _INTENT_TAIL_BYTES = 64 * 1024
 _LOCK_POLL_S = 0.25
 _GUARD_POLL_S = 0.05
@@ -152,6 +182,32 @@ def validate_job_id(job_id: object) -> str:
 
 def _clip(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _normalize_guest_root(raw: object) -> str:
+    """``C:/mcp/jobs/`` -> ``C:\\mcp\\jobs``; ValueError unless it is a plain absolute drive path."""
+    if not isinstance(raw, str):
+        raise ValueError("guest_job_root must be a string")
+    base = raw.replace("/", "\\").rstrip("\\")
+    if _GUEST_ROOT_RE.fullmatch(base) is None:
+        raise ValueError("guest_job_root must be an absolute Windows path such as C:\\mcp\\jobs "
+                         "(no UNC, wildcards, quotes, ':' streams or control characters)")
+    for part in base.split("\\")[1:]:
+        # Windows strips trailing dots/spaces, so "jobs." would alias "jobs".
+        if part in (".", "..") or part.endswith((".", " ")):
+            raise ValueError("guest_job_root must not contain '.', '..' or names ending in '.' or ' '")
+    return base
+
+
+def _entry_count(entry: Mapping[str, Any]) -> int:
+    """How many transitions one history entry stands for (coalesced self-loops > 1)."""
+    n = entry.get("count", 1)
+    return n if type(n) is int and n >= 1 else 1
+
+
+def _history_count(history: Iterable[Mapping[str, Any]]) -> int:
+    """Total number of transitions recorded; the intent ``seq`` is compared against it."""
+    return sum(_entry_count(h) for h in history)
 
 
 # ── job model ───────────────────────────────────────────────────────
@@ -300,18 +356,34 @@ def _sample_from_json(v: object) -> SampleInfo | None:
     return SampleInfo(**kwargs)
 
 
+CORRUPT_KINDS = ("missing", "invalid", "unreadable")
+
+
 @dataclass(frozen=True)
 class CorruptJob:
-    """A job directory whose state.json is missing or unparseable.
+    """A job directory without a usable state.json. It needs a human.
 
-    The bad file has been renamed to ``state.json.corrupt-N``; the job is not
-    loaded and needs a human. ``corrupt_files`` lists every quarantined copy.
+    ``kind``:
+
+    - ``missing``: no state.json (crash inside ``create()``, or quarantined
+      by an earlier scan).
+    - ``invalid``: state.json parsed and was rejected. ``recover_scan``
+      renames it to ``state.json.corrupt-N`` (``quarantined``).
+    - ``unreadable``: an I/O error (permissions, EMFILE, EIO, ...). That is
+      no proof of corruption, so the file is left in place.
+
+    Until resolved, the job blocks ``create()``/``active()`` for ``profile``,
+    which comes from the job's intent log; ``None`` (unknown) blocks every
+    profile. ``corrupt_files`` lists every quarantined copy.
     """
 
     job_id: str
     path: str
     reason: str
     corrupt_files: tuple[str, ...] = ()
+    profile: str | None = None
+    kind: str = "invalid"
+    quarantined: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -319,6 +391,9 @@ class CorruptJob:
             "path": self.path,
             "reason": self.reason,
             "corrupt_files": list(self.corrupt_files),
+            "profile": self.profile,
+            "kind": self.kind,
+            "quarantined": self.quarantined,
             "corrupt": True,
         }
 
@@ -463,6 +538,13 @@ def _atomic_write(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return os.stat(path, follow_symlinks=False).st_size
+    except OSError:
+        return 0
+
+
 def _read_capped(path: Path, limit: int) -> bytes:
     fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY | _O_CLOEXEC)
     try:
@@ -507,11 +589,44 @@ def _check_update_fields(updates: Mapping[str, Any]) -> None:
         raise TypeError(f"job fields cannot be updated this way: {', '.join(bad)}")
 
 
-def _apply_updates(job: Job, updates: Mapping[str, Any]) -> None:
+@dataclass(frozen=True)
+class _FlagMerge:
+    """Validated ``set_flags``/``clear_flags`` arguments (applied under the store lock)."""
+
+    set: Mapping[str, Any]
+    clear: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return bool(self.set or self.clear)
+
+
+def _check_flag_merge(updates: Mapping[str, Any], set_flags: Mapping[str, Any] | None,
+                      clear_flags: Iterable[str]) -> _FlagMerge:
+    if set_flags is None:
+        set_flags = {}
+    if not isinstance(set_flags, Mapping):
+        raise TypeError("set_flags must be a mapping of flag name to value")
+    if isinstance(clear_flags, str | bytes) or not isinstance(clear_flags, Iterable):
+        raise TypeError("clear_flags must be a collection of flag names, not a single string")
+    clear = tuple(clear_flags)
+    if not all(isinstance(k, str) for k in (*set_flags, *clear)):
+        raise TypeError("flag names must be strings")
+    merge = _FlagMerge(dict(set_flags), clear)
+    if merge and "flags" in updates:
+        raise TypeError("pass either flags= (replaces the dict) or set_flags=/clear_flags= (merge), not both")
+    return merge
+
+
+def _apply_updates(job: Job, updates: Mapping[str, Any], merge: _FlagMerge | None = None) -> None:
     for key, value in updates.items():
         if key == "sample" and isinstance(value, Mapping):
             value = SampleInfo(**value)
         setattr(job, key, copy.deepcopy(value))
+    if merge:
+        for name in merge.clear:
+            job.flags.pop(name, None)
+        for name, value in merge.set.items():
+            job.flags[name] = copy.deepcopy(value)
     Job.from_json(job.to_json())  # type/shape validation (raises ValueError)
 
 
@@ -521,8 +636,9 @@ class _GuardLock:
 
     It serialises lock-file acquisition and stale-lock reclaim. The OS drops
     an advisory lock when its holder dies, so a crash cannot leave it held.
-    On a filesystem without advisory locks it degrades to no-op; the O_EXCL
-    lock file still protects the normal case.
+    On a filesystem without advisory locks it degrades to a no-op and
+    ``locked`` is False; the O_EXCL lock file still excludes a second owner,
+    and callers must then not reclaim stale locks (see ``_try_lock_once``).
     """
 
     def __init__(self, path: Path, clock: Clock, timeout_s: float) -> None:
@@ -531,6 +647,11 @@ class _GuardLock:
         self._timeout_s = timeout_s
         self._fd: int | None = None
         self._locked = False
+
+    @property
+    def locked(self) -> bool:
+        """True if the OS advisory lock is actually held (False: unsupported here)."""
+        return self._locked
 
     def __enter__(self) -> _GuardLock:
         # Read-only is enough for flock/msvcrt.locking and survives a narrow umask.
@@ -624,6 +745,10 @@ class JobStore:
         self._host = socket.gethostname()
         self._lock = threading.RLock()
         self._jobs: dict[str, Job] = {}
+        # Job directories without a usable state.json; each blocks its profile.
+        self._corrupt: dict[str, CorruptJob] = {}
+        # Jobs this instance moved into a _BUSY_STATES state (a step of ours may be in flight).
+        self._busy_here: set[str] = set()
         self._open = False
         self._nonce: str | None = None
 
@@ -632,7 +757,8 @@ class JobStore:
         """Take the root's process lock and load all jobs. Idempotent.
 
         Raises LockTimeout if another live process holds the root for longer
-        than ``timeout_s`` seconds.
+        than ``timeout_s`` seconds. Job directories without a usable state are
+        recorded (see ``corrupt_jobs``) but not renamed; ``recover_scan`` does that.
         """
         with self._lock:
             if self._open:
@@ -640,7 +766,7 @@ class JobStore:
             self._ensure_root()
             self._acquire_process_lock(timeout_s)
             try:
-                self._jobs = self._load_valid_jobs()
+                self._jobs, self._corrupt = self._load()
             except BaseException:
                 self._release_process_lock()
                 raise
@@ -648,7 +774,12 @@ class JobStore:
             return self
 
     def close(self) -> None:
-        """Release the process lock (only if this store still owns it). Idempotent."""
+        """Release the process lock (only if this store still owns it). Idempotent.
+
+        Never raises LockTimeout: if the guard lock cannot be taken, the lock
+        file is still removed by a nonce-checked unlink, so ``with`` blocks do
+        not have their own exception replaced.
+        """
         with self._lock:
             if not self._open:
                 return
@@ -657,6 +788,8 @@ class JobStore:
             finally:
                 self._open = False
                 self._jobs = {}
+                self._corrupt = {}
+                self._busy_here = set()
 
     def __enter__(self) -> JobStore:
         return self.open()
@@ -684,22 +817,39 @@ class JobStore:
                     if profile is None or j.profile == profile]
 
     def active(self, profile: str) -> Job | None:
-        """The profile's non-terminal job (DISCARDED counts as live), or None."""
+        """The profile's non-terminal job (DISCARDED counts as live), or None.
+
+        Raises StateViolation instead of returning None while a job directory
+        that may belong to ``profile`` has no usable state (``corrupt_jobs``):
+        "no active job" would let policy allow a revert that destroys its
+        uncollected artifacts.
+        """
         with self._lock:
             self._require_open()
             job = self._active_locked(profile)
-            return copy.deepcopy(job) if job is not None else None
+            if job is not None:
+                return copy.deepcopy(job)
+            blocker = self._blocking_corrupt(profile)
+            if blocker is not None:
+                raise self._corrupt_violation(blocker, profile)
+            return None
+
+    def corrupt_jobs(self) -> list[CorruptJob]:
+        """Unresolved job directories without a usable state (oldest first)."""
+        with self._lock:
+            self._require_open()
+            return [rec for _, rec in sorted(self._corrupt.items())]
 
     # ── mutations ───────────────────────────────────────────────────
     def create(self, profile: str, guest_job_root: str) -> Job:
-        """Create a CREATED job for ``profile``; refuse if one is still live."""
+        """Create a CREATED job for ``profile``; refuse if one is (or may be) still live.
+
+        ``guest_job_root`` must be an absolute drive path (``C:\\mcp\\jobs``);
+        forward slashes are normalised and trailing separators stripped.
+        """
         if not isinstance(profile, str) or not profile.strip():
             raise ValueError("profile must be a non-empty string")
-        if not isinstance(guest_job_root, str) or not guest_job_root.strip("\\ "):
-            raise ValueError("guest_job_root must be a non-empty Windows path")
-        if any(ord(c) < 0x20 for c in guest_job_root):
-            raise ValueError("guest_job_root contains control characters")
-        guest_base = guest_job_root.rstrip("\\")
+        guest_base = _normalize_guest_root(guest_job_root)
         with self._lock:
             self._require_open()
             current = self._active_locked(profile)
@@ -710,6 +860,9 @@ class JobStore:
                     hint="finish or discard the existing job first",
                     next_tool="session_status",
                 )
+            blocker = self._blocking_corrupt(profile)
+            if blocker is not None:
+                raise self._corrupt_violation(blocker, profile)
             job_id, job_dir = self._allocate_job_dir()
             now = self._clock.now_iso()
             job = Job(id=job_id, profile=profile, state=JobState.CREATED, created_at=now, updated_at=now,
@@ -731,18 +884,25 @@ class JobStore:
         *,
         reason: str,
         expect_from: JobState | str | Iterable[JobState | str] | None = None,
+        set_flags: Mapping[str, Any] | None = None,
+        clear_flags: Iterable[str] = (),
         **updates: Any,
     ) -> Job:
         """Move a job along a legal edge, optionally updating non-state fields.
 
         ``expect_from`` guards against a concurrent change (compare-and-set).
         ``updates`` may set: sample, backend_id, epoch, restarts, manifest_path,
-        flags, error (``flags`` replaces the whole dict).
+        flags, error. ``flags=`` replaces the whole dict, dropping store-owned
+        flags such as ``needs_recovery``; prefer ``set_flags``/``clear_flags``,
+        which merge atomically under the store lock. ``reason`` is clipped to
+        ``_MAX_REASON_CHARS``. Consecutive self-loops share one history entry
+        whose ``count`` says how many transitions it stands for.
         """
         validate_job_id(job_id)
         target = _as_state(to)
         expected = _as_states(expect_from)
         _check_update_fields(updates)
+        merge = _check_flag_merge(updates, set_flags, clear_flags)
         if not isinstance(reason, str):
             raise TypeError("reason must be a string")
         with self._lock:
@@ -762,10 +922,15 @@ class JobStore:
             if target not in TRANSITIONS[cur.state]:
                 raise StateViolation(f"illegal job transition {cur.state.value} -> {target.value}",
                                      details=details, next_tool="session_status")
-            return self._commit_transition(cur, target, reason, updates, actor=None)
+            return self._commit_transition(cur, target, reason, updates, merge, actor=None)
 
     def discard(self, job_id: str, actor: str, *, reason: str = "discarded by a human via the CLI") -> Job:
-        """Mark a job DISCARDED. Only ``actor == "human-cli"`` may do this."""
+        """Mark a job DISCARDED. Only ``actor == "human-cli"`` may do this.
+
+        Refused for REVERTING/terminal jobs and, while this store's own upload
+        or collect step may be running, for UPLOADING/COLLECTING (see
+        ``DISCARDABLE_STATES``).
+        """
         validate_job_id(job_id)
         if not isinstance(actor, str) or actor != DISCARD_ACTOR:
             raise StateViolation("only a human using the CLI may discard a job",
@@ -779,52 +944,114 @@ class JobStore:
             if cur.state not in DISCARDABLE_STATES:
                 raise StateViolation(f"job {job_id} cannot be discarded while {cur.state.value}",
                                      details={"job_id": job_id, "state": cur.state.value})
-            return self._commit_transition(cur, JobState.DISCARDED, reason, {}, actor=actor)
+            if cur.state in _BUSY_STATES and job_id in self._busy_here:
+                raise StateViolation(
+                    f"job {job_id} is {cur.state.value} and this gateway may still be copying files",
+                    details={"job_id": job_id, "state": cur.state.value},
+                    hint="wait until the step finishes or fails; if it hangs, stop the gateway and "
+                         "discard the job afterwards",
+                )
+            return self._commit_transition(cur, JobState.DISCARDED, reason, {}, None, actor=actor)
 
-    def update(self, job_id: str, **fields: Any) -> Job:
-        """Change non-state fields (sample, backend_id, epoch, restarts, manifest_path, flags, error)."""
+    def update(self, job_id: str, *, set_flags: Mapping[str, Any] | None = None,
+               clear_flags: Iterable[str] = (), **fields: Any) -> Job:
+        """Change non-state fields (sample, backend_id, epoch, restarts, manifest_path, flags, error).
+
+        ``set_flags``/``clear_flags`` merge into ``flags`` atomically (see
+        ``transition``). Terminal jobs accept bookkeeping updates; the state
+        itself can never change here.
+        """
         validate_job_id(job_id)
         _check_update_fields(fields)
+        merge = _check_flag_merge(fields, set_flags, clear_flags)
         with self._lock:
             self._require_open()
             cur = self._get_locked(job_id)
-            if not fields:
+            if not fields and not merge:
                 return copy.deepcopy(cur)
             new = copy.deepcopy(cur)
-            _apply_updates(new, fields)
+            _apply_updates(new, fields, merge)
             new.updated_at = self._clock.now_iso()
-            self._persist(new, {"op": "update", "fields": sorted(fields)})
+            changed = sorted({*fields, *(("flags",) if merge else ())})
+            self._persist(new, {"op": "update", "fields": changed})
             self._jobs[job_id] = new
             return copy.deepcopy(new)
+
+    def abandon_corrupt(self, job_id: str, actor: str, *,
+                        reason: str = "abandoned by a human via the CLI") -> CorruptJob:
+        """Resolve a job directory without a usable state so it stops blocking its profile.
+
+        Human only (``actor == "human-cli"``), like ``discard``. Whatever is
+        left of state.json is kept as ``state.json.corrupt-N`` and an
+        ``abandoned.json`` marker records who did it and why. If a valid
+        state.json is restored later, it is loaded again as usual.
+        """
+        validate_job_id(job_id)
+        if not isinstance(actor, str) or actor != DISCARD_ACTOR:
+            raise StateViolation("only a human using the CLI may abandon a job",
+                                 details={"job_id": job_id, "actor": _clip(repr(actor), 40)},
+                                 hint="ask the user to inspect the job directory and abandon it from the CLI")
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string")
+        reason = _clip(reason, _MAX_REASON_CHARS)
+        with self._lock:
+            self._require_open()
+            rec = self._corrupt.get(job_id)
+            if rec is None:
+                raise StateViolation(f"job {job_id} is not an unresolved corrupt job",
+                                     details={"job_id": job_id},
+                                     hint="a job whose state loads is ended with discard, not abandon")
+            job_dir = self.job_dir(job_id)
+            now = self._clock.now_iso()
+            _append_line(job_dir / _INTENT_FILE, _dump_line(
+                {"at": now, "job_id": job_id, "op": "abandon", "actor": actor, "reason": reason}))
+            with contextlib.suppress(FileNotFoundError):
+                os.rename(job_dir / _STATE_FILE,
+                          job_dir / f"{_STATE_FILE}.corrupt-{self._next_corrupt_index(job_dir)}")
+            marker = {"at": now, "job_id": job_id, "actor": actor, "reason": reason,
+                      "profile": rec.profile, "previous_reason": rec.reason}
+            _atomic_write(job_dir / _ABANDONED_FILE, _dump_state(marker))
+            del self._corrupt[job_id]
+            return dataclasses.replace(rec, corrupt_files=self._corrupt_files(job_dir))
 
     def recover_scan(self) -> list[Job | CorruptJob]:
         """Rescan the disk after a (re)start (plan 4.1 invariant 3).
 
         Returns every non-terminal job, each with ``flags["needs_recovery"] =
-        True`` persisted (state untouched; nothing is resumed), plus a
-        ``CorruptJob`` for every job directory without a valid state.json.
-        A corrupt state.json is renamed to ``state.json.corrupt-N`` first.
+        True`` persisted (state untouched; nothing is resumed; a stale
+        ``interrupted_transition`` flag is cleared), plus a ``CorruptJob`` for
+        every unresolved job directory without a usable state.json. An
+        invalid state.json is renamed to ``state.json.corrupt-N``; an
+        unreadable one is left in place, and if the job was already loaded it
+        stays loaded. A failure to persist one job's flag keeps the flag in
+        memory and does not stop the scan. Meant for gateway start-up: it
+        flags every live job, including ones this process is working on.
         """
         with self._lock:
             self._require_open()
             out: list[Job | CorruptJob] = []
             fresh: dict[str, Job] = {}
+            corrupt: dict[str, CorruptJob] = {}
             for job_dir in self._iter_job_dirs():
                 self._remove_stale_temp_files(job_dir)
-                try:
-                    job = self._read_job(job_dir)
-                except FileNotFoundError:
-                    out.append(CorruptJob(job_dir.name, str(job_dir), "state.json is missing",
-                                          self._corrupt_files(job_dir)))
+                previous = self._jobs.get(job_dir.name)
+                rec = self._classify(job_dir, quarantine=True, previous=previous)
+                if rec is None:
                     continue
-                except (OSError, ValueError) as e:
-                    out.append(self._quarantine(job_dir, e))
+                if isinstance(rec, CorruptJob):
+                    out.append(rec)
+                    if rec.kind == "unreadable" and previous is not None:
+                        fresh[previous.id] = previous  # an I/O error is no proof of corruption
+                    else:
+                        corrupt[rec.job_id] = rec
                     continue
+                job = rec
                 if not job.terminal:
                     job = self._flag_needs_recovery(job_dir, job)
                     out.append(copy.deepcopy(job))
                 fresh[job.id] = job
             self._jobs = fresh
+            self._corrupt = corrupt
             return out
 
     # ── internals (callers hold self._lock) ─────────────────────────
@@ -842,32 +1069,73 @@ class JobStore:
         live = [j for j in self._jobs.values() if j.profile == profile and not j.terminal]
         return max(live, key=lambda j: j.id) if live else None
 
+    def _blocking_corrupt(self, profile: str) -> CorruptJob | None:
+        for _, rec in sorted(self._corrupt.items()):
+            if rec.profile is None or rec.profile == profile:
+                return rec
+        return None
+
+    @staticmethod
+    def _corrupt_violation(rec: CorruptJob, profile: str) -> StateViolation:
+        return StateViolation(
+            f"job {rec.job_id} has no usable state ({rec.kind}) and may still be live "
+            f"for profile {profile!r}",
+            details={"job_id": rec.job_id, "state": "UNKNOWN", "profile": profile, "corrupt": rec.kind,
+                     "path": rec.path},
+            hint="a human must restore its state.json or abandon the job from the CLI",
+            next_tool="session_status",
+        )
+
     def _commit_transition(self, cur: Job, target: JobState, reason: str, updates: Mapping[str, Any],
-                           *, actor: str | None) -> Job:
+                           merge: _FlagMerge | None, *, actor: str | None) -> Job:
         new = copy.deepcopy(cur)
-        if updates:
-            _apply_updates(new, updates)
+        _apply_updates(new, updates, merge)
         now = self._clock.now_iso()
-        entry: dict[str, Any] = {"from": cur.state.value, "to": target.value, "at": now, "reason": reason}
-        if actor is not None:
-            entry["actor"] = actor
-        new.history.append(entry)
+        reason = _clip(reason, _MAX_REASON_CHARS)
+        last = new.history[-1] if new.history else None
+        if (actor is None and target is cur.state and last is not None and "actor" not in last
+                and last.get("from") == last.get("to") == target.value):
+            # Repeated self-loop (mirrored calls): one entry with a count keeps state.json bounded.
+            merged = dict(last)
+            merged.setdefault("first_at", last.get("at"))
+            merged.update({"at": now, "reason": reason, "count": _entry_count(last) + 1})
+            new.history[-1] = merged
+        else:
+            entry: dict[str, Any] = {"from": cur.state.value, "to": target.value, "at": now, "reason": reason}
+            if actor is not None:
+                entry["actor"] = actor
+            new.history.append(entry)
         new.state = target
         new.updated_at = now
         intent = {"op": "transition", "from": cur.state.value, "to": target.value, "reason": reason,
-                  "seq": len(new.history)}
+                  "seq": _history_count(new.history)}
         if actor is not None:
             intent["actor"] = actor
         self._persist(new, intent)
         self._jobs[new.id] = new
+        if target in _BUSY_STATES:
+            self._busy_here.add(new.id)
+        else:
+            self._busy_here.discard(new.id)
         return copy.deepcopy(new)
 
     def _persist(self, job: Job, intent: Mapping[str, Any]) -> None:
         """Intent first (fsynced), then the atomic state replace. See module docstring."""
         job_dir = self.job_dir(job.id)
         payload = _dump_state(job.to_json())  # fails before any write if not serialisable
-        line = _dump_line({"at": self._clock.now_iso(), "job_id": job.id, **intent})
-        _append_line(job_dir / _INTENT_FILE, line)
+        if len(payload) > _MAX_STATE_BYTES:
+            # Writing it would succeed, but the next open() could not read it back.
+            raise ValueError(f"job state would be too large ({len(payload)} bytes, limit "
+                             f"{_MAX_STATE_BYTES}); keep flags, error and sample small")
+        now = self._clock.now_iso()
+        line = _dump_line({"at": now, "job_id": job.id, **intent})
+        intent_path = job_dir / _INTENT_FILE
+        if _file_size(intent_path) > _MAX_INTENT_BYTES:
+            # Keep one previous generation. The header names the profile so a job
+            # whose state.json is lost can still be attributed (see _intent_profile).
+            os.replace(intent_path, job_dir / _INTENT_ROTATED)
+            line = _dump_line({"at": now, "job_id": job.id, "op": "rotate", "profile": job.profile}) + line
+        _append_line(intent_path, line)
         _atomic_write(job_dir / _STATE_FILE, payload)
 
     def _default_id(self) -> str:
@@ -902,59 +1170,125 @@ class JobStore:
         job.host_root = str(job_dir)  # the directory is authoritative if the root moved
         return job
 
-    def _load_valid_jobs(self) -> dict[str, Job]:
+    def _load(self) -> tuple[dict[str, Job], dict[str, CorruptJob]]:
         jobs: dict[str, Job] = {}
+        corrupt: dict[str, CorruptJob] = {}
         for job_dir in self._iter_job_dirs():
-            with contextlib.suppress(OSError, ValueError):  # recover_scan reports these
-                job = self._read_job(job_dir)
-                jobs[job.id] = job
-        return jobs
+            rec = self._classify(job_dir, quarantine=False, previous=None)
+            if isinstance(rec, CorruptJob):
+                corrupt[rec.job_id] = rec
+            elif rec is not None:
+                jobs[rec.id] = rec
+        return jobs, corrupt
+
+    def _classify(self, job_dir: Path, *, quarantine: bool, previous: Job | None) -> Job | CorruptJob | None:
+        """The directory's job, a CorruptJob, or None if a human abandoned it.
+
+        The abandoned marker only covers a *missing* state.json: abandon moves
+        the file away, so a state.json that reappears is judged on its own.
+        """
+        try:
+            return self._read_job(job_dir)
+        except FileNotFoundError:
+            if (job_dir / _ABANDONED_FILE).exists():
+                return None
+            return self._corrupt_record(job_dir, "missing", "state.json is missing", previous)
+        except ValueError as e:
+            reason = _clip(f"{type(e).__name__}: {e}", 300)
+            if quarantine:
+                return self._quarantine(job_dir, reason, previous)
+            return self._corrupt_record(job_dir, "invalid", reason, previous)
+        except OSError as e:
+            reason = f"state.json is unreadable ({type(e).__name__}); left in place"
+            return self._corrupt_record(job_dir, "unreadable", reason, previous)
+
+    def _corrupt_record(self, job_dir: Path, kind: str, reason: str, previous: Job | None, *,
+                        quarantined: bool = False) -> CorruptJob:
+        profile = previous.profile if previous is not None else self._intent_profile(job_dir)
+        return CorruptJob(job_dir.name, str(job_dir), reason, self._corrupt_files(job_dir),
+                          profile=profile, kind=kind, quarantined=quarantined)
 
     @staticmethod
     def _remove_stale_temp_files(job_dir: Path) -> None:
         # Left by a crash inside _atomic_write. Safe to delete: we hold the root's
         # process lock, so no other writer can own them.
-        for p in job_dir.iterdir():
-            if _TEMP_RE.fullmatch(p.name):
-                with contextlib.suppress(OSError):
-                    p.unlink()
+        with contextlib.suppress(OSError):
+            for p in job_dir.iterdir():
+                if _TEMP_RE.fullmatch(p.name):
+                    with contextlib.suppress(OSError):
+                        p.unlink()
 
     @staticmethod
     def _corrupt_files(job_dir: Path) -> tuple[str, ...]:
         found: list[tuple[int, str]] = []
-        for p in job_dir.iterdir():
-            m = _CORRUPT_RE.fullmatch(p.name)
-            if m:
-                found.append((int(m.group(1)), str(p)))
+        with contextlib.suppress(OSError):
+            for p in job_dir.iterdir():
+                m = _CORRUPT_RE.fullmatch(p.name)
+                if m:
+                    found.append((int(m.group(1)), str(p)))
         return tuple(name for _, name in sorted(found))
 
-    def _quarantine(self, job_dir: Path, exc: BaseException) -> CorruptJob:
-        reason = _clip(f"{type(exc).__name__}: {exc}", 300)
+    @staticmethod
+    def _next_corrupt_index(job_dir: Path) -> int:
         n = 1
-        while (job_dir / f"{_STATE_FILE}.corrupt-{n}").exists():
+        while os.path.lexists(job_dir / f"{_STATE_FILE}.corrupt-{n}"):
             n += 1
+        return n
+
+    def _quarantine(self, job_dir: Path, reason: str, previous: Job | None) -> CorruptJob:
+        """Rename an *invalid* (parsed and rejected) state.json; never an unreadable one."""
+        quarantined = True
+        target = job_dir / f"{_STATE_FILE}.corrupt-{self._next_corrupt_index(job_dir)}"
         try:
-            os.rename(job_dir / _STATE_FILE, job_dir / f"{_STATE_FILE}.corrupt-{n}")
+            os.rename(job_dir / _STATE_FILE, target)
         except OSError as e:
             reason += f"; could not quarantine ({type(e).__name__})"
-        return CorruptJob(job_dir.name, str(job_dir), reason, self._corrupt_files(job_dir))
+            quarantined = False
+        return self._corrupt_record(job_dir, "invalid", reason, previous, quarantined=quarantined)
+
+    @staticmethod
+    def _intent_profile(job_dir: Path) -> str | None:
+        """Profile named by the first record of intent.log (or of its rotated copy)."""
+        for name in (_INTENT_FILE, _INTENT_ROTATED):
+            try:
+                fd = os.open(job_dir / name, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY | _O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                with os.fdopen(fd, "rb", closefd=False) as f:
+                    first = f.readline(_INTENT_HEAD_BYTES)
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+            try:
+                rec = json.loads(first)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(rec, dict) or rec.get("op") not in ("create", "rotate"):
+                continue
+            profile = rec.get("profile")
+            if rec.get("job_id") == job_dir.name and isinstance(profile, str) and profile.strip():
+                return profile
+        return None
 
     def _flag_needs_recovery(self, job_dir: Path, job: Job) -> Job:
         flags = copy.deepcopy(job.flags)
-        changed = False
-        if flags.get("needs_recovery") is not True:
-            flags["needs_recovery"] = True
-            changed = True
+        flags["needs_recovery"] = True
         interrupted = self._interrupted_transition(job_dir, job)
-        if interrupted is not None and flags.get("interrupted_transition") != interrupted:
+        if interrupted is None:
+            flags.pop("interrupted_transition", None)  # a later transition has landed since
+        else:
             flags["interrupted_transition"] = interrupted
-            changed = True
-        if not changed:
+        if flags == job.flags:
             return job
         new = copy.deepcopy(job)
         new.flags = flags
         new.updated_at = self._clock.now_iso()
-        self._persist(new, {"op": "recover", "fields": ["flags"]})
+        # Per-job isolation: if the write fails (disk full, permissions), the job is
+        # still reported and flagged in memory; the next scan retries the write.
+        with contextlib.suppress(OSError, ValueError):
+            self._persist(new, {"op": "recover", "fields": ["flags"]})
         return new
 
     @staticmethod
@@ -975,7 +1309,7 @@ class JobStore:
             if not isinstance(rec, dict) or rec.get("op") != "transition":
                 continue
             seq = rec.get("seq")
-            if type(seq) is int and seq > len(job.history):
+            if type(seq) is int and seq > _history_count(job.history):
                 return {k: rec.get(k) for k in ("from", "to", "at", "reason")}
             return None
         return None
@@ -998,18 +1332,25 @@ class JobStore:
                 return
             remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
+                if owner.get("reclaim") == "unsafe":
+                    hint = ("advisory file locks are unavailable on this filesystem, so a stale lock is "
+                            "never reclaimed automatically; if no gateway is running, delete the lock "
+                            "file by hand")
+                else:
+                    hint = ("stop the other gateway; if it no longer runs (or the lock names this machine "
+                            "under an old hostname), delete the lock file by hand")
                 raise LockTimeout(
                     "jobs root is in use by another gateway process",
                     details={"lock": str(self.root / _LOCK_FILE), "owner_pid": owner.get("pid"),
                              "owner_host": owner.get("host")},
-                    hint="stop the other gateway; if it no longer exists, delete the lock file",
+                    hint=hint,
                 )
             self._clock.sleep(min(_LOCK_POLL_S, remaining))
 
     def _try_lock_once(self) -> dict[str, Any] | None:
         """Create the lock file. Return None on success, else the live owner's record."""
         path = self.root / _LOCK_FILE
-        with _GuardLock(self.root / _GUARD_FILE, self._clock, self._guard_timeout_s):
+        with _GuardLock(self.root / _GUARD_FILE, self._clock, self._guard_timeout_s) as guard:
             owner: dict[str, Any] = {}
             for _ in range(2):
                 try:
@@ -1026,6 +1367,12 @@ class JobStore:
                         return {"pid": None, "host": None, "error": type(e).__name__}
                     if record is not None and self._owner_alive(record):
                         return record
+                    if not guard.locked:
+                        # Without the guard, an empty/garbled lock may belong to a process
+                        # between its O_EXCL create and its record write, and a dead
+                        # owner's lock may be reclaimed by another process at the same
+                        # time. Neither reclaim is provably safe: fail closed.
+                        return {"pid": None, "host": None, **(record or {}), "reclaim": "unsafe"}
                     owner = record or {}
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(path)  # stale: dead owner or torn write
@@ -1076,17 +1423,28 @@ class JobStore:
         return True
 
     def _release_process_lock(self) -> None:
-        if self._nonce is None:
+        nonce, self._nonce = self._nonce, None
+        if nonce is None:
             return
         path = self.root / _LOCK_FILE
         try:
             with _GuardLock(self.root / _GUARD_FILE, self._clock, self._guard_timeout_s):
-                try:
-                    record = self._read_lock(path)
-                except OSError:
-                    record = None  # gone or unreadable: not provably ours, leave it alone
-                if record is not None and record.get("nonce") == self._nonce:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(path)
-        finally:
-            self._nonce = None
+                self._unlink_lock_if_ours(path, nonce)
+            return
+        except (LockTimeout, OSError):
+            pass
+        # Fallback without the guard. Other processes reclaim a lock only if its
+        # record is garbled or names a dead process; ours is intact and this process
+        # is alive, so a nonce-checked unlink cannot race with a reclaim.
+        with contextlib.suppress(OSError):
+            self._unlink_lock_if_ours(path, nonce)
+
+    @classmethod
+    def _unlink_lock_if_ours(cls, path: Path, nonce: str) -> None:
+        try:
+            record = cls._read_lock(path)
+        except OSError:
+            return  # gone or unreadable: not provably ours, leave it alone
+        if record is not None and record.get("nonce") == nonce:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)

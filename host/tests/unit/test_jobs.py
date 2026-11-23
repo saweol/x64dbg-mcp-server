@@ -138,6 +138,7 @@ def test_invalid_job_ids_are_rejected_by_every_store_entry_point(store, bad):
         lambda: store.transition(bad, S.FAILED, reason="x"),
         lambda: store.update(bad, epoch=1),
         lambda: store.discard(bad, DISCARD_ACTOR),
+        lambda: store.abandon_corrupt(bad, DISCARD_ACTOR),
         lambda: store.job_dir(bad),
     ]
     for call in calls:
@@ -580,10 +581,14 @@ def test_discard_by_human_then_revert_then_done(store):
 
 
 @pytest.mark.parametrize("start", sorted(DISCARDABLE_STATES, key=lambda s: s.value))
-def test_discard_allowed_from_every_discardable_state(store, start):
-    job = store.create("win10", GUEST_ROOT)
-    drive(store, job.id, start)
-    assert store.discard(job.id, DISCARD_ACTOR).state == S.DISCARDED
+def test_discard_allowed_from_every_discardable_state(root, start):
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, start)
+    s.close()
+    # reopened: a busy state found on disk has no step of this process in flight
+    s2 = make_store(root).open()
+    assert s2.discard(job.id, DISCARD_ACTOR).state == S.DISCARDED
+    s2.close()
 
 
 @pytest.mark.parametrize("start", [S.REVERTING, S.DISCARDED, S.DONE, S.FAILED])
@@ -910,10 +915,17 @@ def test_concurrent_transitions_are_serialized(store):
     for t in threads:
         t.join(timeout=30)
     assert not errors
+    # self-loops are coalesced into one entry; its count must account for every transition
     expected = len(PATH[S.ANALYZING]) + 160
-    assert len(store.get(job.id).history) == expected
+
+    def total(history: list[dict]) -> int:
+        return sum(h.get("count", 1) for h in history)
+
+    got = store.get(job.id).history
+    assert len(got) == len(PATH[S.ANALYZING]) + 1 and total(got) == expected
     on_disk = json.loads((Path(job.host_root) / "state.json").read_text())
-    assert len(on_disk["history"]) == expected
+    assert total(on_disk["history"]) == expected
+    assert intent_lines(job)[-1]["seq"] == expected
 
 
 def test_concurrent_create_for_same_profile_yields_one_job(store):
@@ -1140,3 +1152,561 @@ def test_pid_alive_default_implementation():
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait(timeout=30)
     assert not pid_alive(p.pid)
+
+
+# ── review fixes: corrupt jobs fail closed (plan 4.1 invariants 1, 3) ──
+def _corrupt_live_job(root: Path, profile: str = "win10", content: bytes = b"{garbage") -> Job:
+    s = make_store(root).open()
+    job = drive(s, s.create(profile, GUEST_ROOT).id, S.ANALYZING)
+    s.close()
+    (Path(job.host_root) / "state.json").write_bytes(content)
+    return job
+
+
+def test_corrupt_live_job_blocks_its_profile_right_after_open(root):
+    job = _corrupt_live_job(root)
+    s = make_store(root).open()
+    with pytest.raises(StateViolation) as ei:
+        s.create("win10", GUEST_ROOT)
+    assert ei.value.details["job_id"] == job.id
+    with pytest.raises(StateViolation) as ei:
+        s.active("win10")  # None would let policy allow a revert of the uncollected job
+    assert ei.value.details["job_id"] == job.id
+    assert [c.job_id for c in s.corrupt_jobs()] == [job.id]
+    assert s.corrupt_jobs()[0].profile == "win10"
+    # open() reports but never renames; recover_scan quarantines
+    assert (Path(job.host_root) / "state.json").exists()
+    s.close()
+
+
+def test_corrupt_live_job_still_blocks_after_recover_scan(root):
+    job = _corrupt_live_job(root)
+    s = make_store(root).open()
+    [rec] = s.recover_scan()
+    assert isinstance(rec, CorruptJob) and rec.quarantined and rec.profile == "win10"
+    with pytest.raises(StateViolation):
+        s.create("win10", GUEST_ROOT)
+    with pytest.raises(StateViolation):
+        s.active("win10")
+    # a later scan (state.json now missing) keeps blocking
+    s.recover_scan()
+    with pytest.raises(StateViolation):
+        s.create("win10", GUEST_ROOT)
+    s.close()
+    with make_store(root) as s2:
+        assert job.id in {c.job_id for c in s2.corrupt_jobs()}
+
+
+def test_corrupt_job_blocks_only_its_own_profile(root):
+    _corrupt_live_job(root, profile="win10")
+    s = make_store(root).open()
+    assert s.active("other") is None
+    s.create("other", GUEST_ROOT)
+    s.close()
+
+
+def test_corrupt_job_of_unknown_profile_blocks_every_profile(root):
+    job = _corrupt_live_job(root)
+    (Path(job.host_root) / "intent.log").unlink()  # nothing left that names the profile
+    s = make_store(root).open()
+    assert s.corrupt_jobs()[0].profile is None
+    for profile in ("win10", "other"):
+        with pytest.raises(StateViolation):
+            s.create(profile, GUEST_ROOT)
+        with pytest.raises(StateViolation):
+            s.active(profile)
+    s.close()
+
+
+def test_empty_job_dir_from_a_crash_inside_create_blocks_until_abandoned(store, root):
+    jd = root / "20261123-000000-0000aa"
+    jd.mkdir()
+    store.recover_scan()
+    with pytest.raises(StateViolation):
+        store.create("win10", GUEST_ROOT)
+    store.abandon_corrupt(jd.name, DISCARD_ACTOR, reason="empty dir after power loss")
+    assert store.create("win10", GUEST_ROOT).state == S.CREATED
+
+
+@pytest.mark.parametrize("actor", ["mcp", "HUMAN-CLI", "", None])
+def test_abandon_corrupt_is_human_only(root, actor):
+    job = _corrupt_live_job(root)
+    s = make_store(root).open()
+    with pytest.raises(StateViolation):
+        s.abandon_corrupt(job.id, actor)
+    assert [c.job_id for c in s.corrupt_jobs()] == [job.id]
+    s.close()
+
+
+def test_abandon_corrupt_unblocks_and_survives_reopen(root):
+    job = _corrupt_live_job(root)
+    jd = Path(job.host_root)
+    s = make_store(root).open()
+    rec = s.abandon_corrupt(job.id, DISCARD_ACTOR, reason="state lost; VM checked by hand")
+    assert rec.job_id == job.id
+    # the unparseable state is kept for inspection, not deleted
+    assert (jd / "state.json.corrupt-1").read_bytes() == b"{garbage"
+    assert not (jd / "state.json").exists()
+    marker = json.loads((jd / "abandoned.json").read_text())
+    assert marker["actor"] == DISCARD_ACTOR and marker["reason"] == "state lost; VM checked by hand"
+    assert intent_lines(job)[-1]["op"] == "abandon"
+    assert s.corrupt_jobs() == [] and s.active("win10") is None
+    assert s.recover_scan() == []
+    s.close()
+    s2 = make_store(root).open()
+    assert s2.corrupt_jobs() == [] and s2.recover_scan() == []
+    assert s2.create("win10", GUEST_ROOT).state == S.CREATED
+    s2.close()
+
+
+def test_abandon_corrupt_refuses_a_job_that_loads_fine(store):
+    job = store.create("win10", GUEST_ROOT)
+    with pytest.raises(StateViolation):
+        store.abandon_corrupt(job.id, DISCARD_ACTOR)
+    assert store.get(job.id).state == S.CREATED
+
+
+def test_restored_state_wins_over_abandoned_marker(root):
+    job = _corrupt_live_job(root)
+    jd = Path(job.host_root)
+    s = make_store(root).open()
+    s.abandon_corrupt(job.id, DISCARD_ACTOR)
+    s.close()
+    (jd / "state.json").write_text(json.dumps(job.to_json()))  # a human restored it
+    s2 = make_store(root).open()
+    assert s2.get(job.id).state == S.ANALYZING
+    assert s2.active("win10").id == job.id
+    s2.close()
+
+
+# ── review fixes: transient read errors are not corruption ──────────
+def test_transient_read_error_does_not_quarantine_a_valid_state(root, monkeypatch):
+    import errno
+
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, S.ANALYZING)
+    before = (Path(job.host_root) / "state.json").read_bytes()
+    real = jobs_mod._read_capped
+
+    def flaky(path, limit):
+        if path.name == "state.json":
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(path, limit)
+
+    monkeypatch.setattr(jobs_mod, "_read_capped", flaky)
+    out = s.recover_scan()
+    monkeypatch.undo()
+    [rec] = out
+    assert isinstance(rec, CorruptJob) and rec.kind == "unreadable" and not rec.quarantined
+    assert (Path(job.host_root) / "state.json").read_bytes() == before
+    assert not list(Path(job.host_root).glob("state.json.corrupt-*"))
+    # the job loaded before the scan stays loaded and keeps blocking its profile
+    assert s.get(job.id).state == S.ANALYZING
+    assert s.active("win10").id == job.id
+    with pytest.raises(StateViolation):
+        s.create("win10", GUEST_ROOT)
+    s.close()
+
+
+@pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="needs a non-root POSIX user")
+def test_unreadable_state_at_open_blocks_and_is_left_in_place(root):
+    job = drive_and_close(root, S.PREPARING_VM)
+    st = Path(job.host_root) / "state.json"
+    st.chmod(0o000)
+    try:
+        s = make_store(root).open()
+        with pytest.raises(StateViolation):
+            s.create("win10", GUEST_ROOT)
+        [rec] = s.recover_scan()
+        assert rec.kind == "unreadable" and not rec.quarantined and rec.profile == "win10"
+        assert st.exists() and not list(st.parent.glob("state.json.corrupt-*"))
+        s.close()
+    finally:
+        st.chmod(0o600)
+    s2 = make_store(root).open()
+    assert s2.get(job.id).state == S.PREPARING_VM  # readable again: nothing was lost
+    s2.close()
+
+
+def drive_and_close(root: Path, target: JobState, profile: str = "win10") -> Job:
+    s = make_store(root).open()
+    job = drive(s, s.create(profile, GUEST_ROOT).id, target)
+    s.close()
+    return job
+
+
+# ── review fixes: bounded state (write cap, history, intent.log) ────
+def test_state_larger_than_the_read_cap_is_refused_before_writing(store, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    job = store.create("win10", GUEST_ROOT)
+    jd = Path(job.host_root)
+    monkeypatch.setattr(jobs_mod, "_MAX_STATE_BYTES", 16 * 1024)
+    n = len(intent_lines(job))
+    before = (jd / "state.json").read_bytes()
+    with pytest.raises(ValueError, match="too large"):
+        store.update(job.id, flags={"x": "a" * 32 * 1024})
+    with pytest.raises(ValueError, match="too large"):
+        store.transition(job.id, S.FAILED, reason="r", error={"blob": "a" * 32 * 1024})
+    assert len(intent_lines(job)) == n and (jd / "state.json").read_bytes() == before
+    assert store.get(job.id).state == S.CREATED
+    # and what is on disk still loads under the same cap
+    assert store.recover_scan()[0].id == job.id
+
+
+def test_repeated_self_transitions_are_coalesced(store):
+    job = drive(store, store.create("win10", GUEST_ROOT).id, S.ANALYZING)
+    base = len(job.history)
+    for i in range(500):
+        got = store.transition(job.id, S.ANALYZING, reason=f"mirror call {i}")
+    assert len(got.history) == base + 1
+    last = got.history[-1]
+    assert last["from"] == last["to"] == "ANALYZING"
+    assert last["count"] == 500 and last["reason"] == "mirror call 499"
+    assert "first_at" in last
+    # a real state change starts a new entry; the next self-loop starts a new run
+    got = store.transition(job.id, S.COLLECTING, reason="collect")
+    assert len(got.history) == base + 2
+    assert intent_lines(job)[-1]["seq"] == base + 500 + 1
+
+
+def test_first_self_transition_keeps_the_plain_entry_shape(store):
+    job = drive(store, store.create("win10", GUEST_ROOT).id, S.ANALYZING)
+    got = store.transition(job.id, S.ANALYZING, reason="debugger restart", epoch=1)
+    assert got.history[-1] == {"from": "ANALYZING", "to": "ANALYZING",
+                               "at": FakeClock().now_iso(), "reason": "debugger restart"}
+
+
+def test_interrupted_transition_is_detected_after_coalesced_entries(root, monkeypatch):
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, S.ANALYZING)
+    for _ in range(3):
+        s.transition(job.id, S.ANALYZING, reason="mirror")
+
+    def boom(src, dst, *a, **kw):
+        raise OSError("power loss")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        s.transition(job.id, S.ANALYZING, reason="restart", epoch=2)
+    monkeypatch.undo()
+    s.close()
+    s2 = make_store(root).open()
+    [rec] = s2.recover_scan()
+    assert rec.flags["interrupted_transition"]["reason"] == "restart"
+    s2.close()
+
+
+def test_landed_coalesced_transitions_are_not_reported_as_interrupted(root):
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, S.ANALYZING)
+    for _ in range(3):
+        s.transition(job.id, S.ANALYZING, reason="mirror")
+    s.close()
+    s2 = make_store(root).open()
+    [rec] = s2.recover_scan()
+    assert "interrupted_transition" not in rec.flags
+    s2.close()
+
+
+def test_long_reasons_are_clipped(store):
+    job = store.create("win10", GUEST_ROOT)
+    got = store.transition(job.id, S.FAILED, reason="x" * 100_000)
+    assert len(got.history[-1]["reason"]) <= 1000
+    assert len(intent_lines(job)[-1]["reason"]) <= 1000
+
+
+def test_intent_log_is_rotated_and_keeps_the_profile(root, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod, "_MAX_INTENT_BYTES", 2048)
+    s = make_store(root).open()
+    job = s.create("win10", GUEST_ROOT)
+    jd = Path(job.host_root)
+    for i in range(200):
+        s.update(job.id, epoch=i)
+    assert (jd / "intent.log.1").exists()
+    assert (jd / "intent.log").stat().st_size <= 2048 + 1024
+    first = json.loads((jd / "intent.log").read_text().splitlines()[0])
+    assert first["op"] == "rotate" and first["profile"] == "win10" and first["job_id"] == job.id
+    s.close()
+    # the rotated log still names the profile of a job whose state is lost
+    (jd / "state.json").write_text("{")
+    s2 = make_store(root).open()
+    assert s2.corrupt_jobs()[0].profile == "win10"
+    s2.create("other", GUEST_ROOT)
+    s2.close()
+
+
+# ── review fixes: recover_scan isolates per-job failures ────────────
+def test_recover_scan_survives_a_failed_flag_write(root, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    a = drive_and_close(root, S.ANALYZING, profile="p1")
+    b = drive_and_close(root, S.VM_READY, profile="p2")
+    s = make_store(root).open()
+    real = jobs_mod._atomic_write
+
+    def flaky(path, data):
+        if path.parent.name == a.id:
+            raise OSError("disk full")
+        return real(path, data)
+
+    monkeypatch.setattr(jobs_mod, "_atomic_write", flaky)
+    out = s.recover_scan()
+    monkeypatch.undo()
+    assert sorted(j.id for j in out) == [a.id, b.id]
+    assert all(j.flags["needs_recovery"] is True for j in out)
+    assert s.get(a.id).flags["needs_recovery"] is True  # in memory only
+    assert s.get(b.id).flags["needs_recovery"] is True
+    s.close()
+    s2 = make_store(root).open()
+    assert "needs_recovery" not in s2.get(a.id).flags  # the write really failed
+    assert s2.get(b.id).flags["needs_recovery"] is True
+    s2.close()
+
+
+# ── review fixes: atomic flag merge ─────────────────────────────────
+def test_set_flags_merges_under_the_lock_and_keeps_store_flags(root):
+    drive_and_close(root, S.ANALYZING)
+    s = make_store(root).open()
+    [job] = s.recover_scan()
+    got = s.transition(job.id, S.ANALYZING, reason="r", set_flags={"note": 1})
+    assert got.flags == {"needs_recovery": True, "note": 1}
+    got = s.update(job.id, set_flags={"other": "x"}, clear_flags=["needs_recovery"])
+    assert got.flags == {"note": 1, "other": "x"}
+    s.close()
+
+
+def test_concurrent_set_flags_lose_nothing(store):
+    job = store.create("win10", GUEST_ROOT)
+
+    def worker(n: int) -> None:
+        for i in range(20):
+            store.update(job.id, set_flags={f"t{n}-{i}": i})
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(store.get(job.id).flags) == 80
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"flags": {"a": 1}, "set_flags": {"b": 2}},
+        {"flags": {"a": 1}, "clear_flags": ["a"]},
+        {"clear_flags": "needs_recovery"},
+        {"set_flags": {1: "x"}},
+        {"set_flags": ["a"]},
+    ],
+)
+def test_flag_merge_arguments_are_checked(store, kwargs):
+    job = store.create("win10", GUEST_ROOT)
+    with pytest.raises(TypeError):
+        store.update(job.id, **kwargs)
+    with pytest.raises(TypeError):
+        store.transition(job.id, S.PREPARING_VM, reason="r", **kwargs)
+    assert store.get(job.id).state == S.CREATED and store.get(job.id).flags == {}
+
+
+def test_stale_interrupted_transition_flag_is_cleared_by_a_later_scan(root, monkeypatch):
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, S.ANALYZING)
+
+    def boom(src, dst, *a, **kw):
+        raise OSError("power loss")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        s.transition(job.id, S.COLLECTING, reason="collect")
+    monkeypatch.undo()
+    s.close()
+    s2 = make_store(root).open()
+    [rec] = s2.recover_scan()
+    assert "interrupted_transition" in rec.flags
+    s2.transition(job.id, S.COLLECTING, reason="collect again")  # this one lands
+    s2.close()
+    s3 = make_store(root).open()
+    [rec] = s3.recover_scan()
+    assert "interrupted_transition" not in rec.flags and rec.flags["needs_recovery"] is True
+    s3.close()
+
+
+# ── review fixes: discard cannot pre-empt a step of this process ────
+@pytest.mark.parametrize("busy", [S.UPLOADING, S.COLLECTING])
+def test_discard_refused_while_this_process_runs_the_busy_step(root, busy):
+    s = make_store(root).open()
+    job = drive(s, s.create("win10", GUEST_ROOT).id, busy)
+    with pytest.raises(StateViolation) as ei:
+        s.discard(job.id, DISCARD_ACTOR)
+    assert ei.value.details == {"job_id": job.id, "state": busy.value}
+    assert s.get(job.id).state == busy
+    s.close()
+    # found in that state after a restart: no step of ours is in flight, so a human may discard
+    s2 = make_store(root).open()
+    assert s2.discard(job.id, DISCARD_ACTOR).state == S.DISCARDED
+    s2.close()
+
+
+def test_discard_allowed_once_the_busy_step_moved_on(store):
+    job = drive(store, store.create("win10", GUEST_ROOT).id, S.COLLECTING)
+    store.transition(job.id, S.COLLECTED_PARTIAL, reason="one file failed")
+    assert store.discard(job.id, DISCARD_ACTOR).state == S.DISCARDED
+
+
+# ── review fixes: guest root shape ──────────────────────────────────
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("C:\\mcp\\jobs", "C:\\mcp\\jobs"),
+        ("C:/mcp/jobs/", "C:\\mcp\\jobs"),
+        ("d:\\lab\\jobs\\\\", "d:\\lab\\jobs"),
+        ("C:\\mcp jobs\\x", "C:\\mcp jobs\\x"),
+    ],
+)
+def test_guest_root_is_normalised(store, raw, expected):
+    job = store.create("win10", raw)
+    assert job.guest_root == f"{expected}\\{job.id}"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mcp\\jobs",  # relative
+        "\\mcp\\jobs",  # drive-relative
+        "\\\\server\\share\\jobs",  # UNC
+        "C:",
+        "C:\\",
+        "C:mcp\\jobs",
+        'C:\\mcp"\\jobs',
+        "C:\\mcp\\jobs\" & calc",
+        "C:\\mcp\\..\\Windows",
+        "C:\\mcp\\.\\jobs",
+        "C:\\mcp\\jobs.",
+        "C:\\mcp\\jobs \\x",
+        "C:\\mcp\\jobs:ads",
+        "C:\\mcp\\j*bs",
+        "C:\\mcp\\jobs\x00",
+        "C:\\mcp\\jobs\n",
+        "",
+    ],
+)
+def test_guest_root_with_unsafe_shape_is_refused(store, raw):
+    with pytest.raises(ValueError):
+        store.create("win10", raw)
+    assert store.list() == []
+
+
+# ── review fixes: lock robustness ───────────────────────────────────
+def _no_advisory_locks(monkeypatch) -> None:
+    import errno
+
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    def unsupported(fd):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(jobs_mod._GuardLock, "_os_lock", staticmethod(unsupported))
+
+
+@pytest.mark.parametrize("content", ["", "garbage", json.dumps({"pid": 999999, "nonce": "x"})])
+def test_without_advisory_locks_no_lock_is_reclaimed(root, monkeypatch, content):
+    # Without the guard another process may be between O_EXCL-create and its pid write,
+    # or reclaiming the same stale lock: reclaiming is not provably safe, so fail closed.
+    _no_advisory_locks(monkeypatch)
+    root.mkdir(parents=True)
+    (root / ".lock").write_text(content)
+    with pytest.raises(LockTimeout) as ei:
+        make_store(root, alive=lambda p: False).open()
+    assert "by hand" in (ei.value.hint or "")
+    assert (root / ".lock").read_text() == content
+
+
+def test_without_advisory_locks_a_free_root_still_opens(root, monkeypatch):
+    _no_advisory_locks(monkeypatch)
+    s = make_store(root).open()
+    assert json.loads((root / ".lock").read_text())["pid"] == OWN_PID
+    s.close()
+    assert not (root / ".lock").exists()
+
+
+def test_close_removes_the_lock_even_if_the_guard_times_out(root, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    s = make_store(root).open()
+
+    def timeout(self):
+        raise LockTimeout("guard busy")
+
+    monkeypatch.setattr(jobs_mod._GuardLock, "__enter__", timeout)
+    s.close()  # must not raise
+    assert not (root / ".lock").exists()
+
+
+def test_guard_timeout_on_exit_does_not_mask_the_original_error(root, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    def timeout(self):
+        raise LockTimeout("guard busy")
+
+    with pytest.raises(KeyError):
+        with make_store(root) as s:
+            assert s.list() == []
+            monkeypatch.setattr(jobs_mod._GuardLock, "__enter__", timeout)
+            raise KeyError("original")
+    assert not (root / ".lock").exists()
+
+
+def test_close_never_removes_a_lock_that_is_not_ours_in_the_fallback(root, monkeypatch):
+    from x64dbg_vm_gateway import jobs as jobs_mod
+
+    s = make_store(root).open()
+    foreign = json.dumps({"pid": 777, "nonce": "someone-else"})
+    (root / ".lock").write_text(foreign)
+
+    def timeout(self):
+        raise LockTimeout("guard busy")
+
+    monkeypatch.setattr(jobs_mod._GuardLock, "__enter__", timeout)
+    s.close()
+    assert (root / ".lock").read_text() == foreign
+
+
+# ── review fixes: durability order ──────────────────────────────────
+def test_intent_fsync_happens_before_state_replace_and_dir_fsync_after(store, monkeypatch):
+    job = store.create("win10", GUEST_ROOT)
+    jd = Path(job.host_root)
+    events: list[tuple[str, str]] = []
+    fd_paths: dict[int, str] = {}
+    real_open, real_fsync, real_replace = os.open, os.fsync, os.replace
+
+    def spy_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        fd_paths[fd] = Path(path).name
+        return fd
+
+    def spy_fsync(fd):
+        events.append(("fsync", fd_paths.get(fd, "?")))
+        return real_fsync(fd)
+
+    def spy_replace(src, dst, *a, **kw):
+        events.append(("replace", Path(dst).name))
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    store.transition(job.id, S.PREPARING_VM, reason="r")
+    monkeypatch.undo()
+    names = [f"{kind}:{name if not name.startswith('.state.json.') else 'tmp'}" for kind, name in events]
+    intent = names.index("fsync:intent.log")
+    tmp = names.index("fsync:tmp")
+    replace = names.index("replace:state.json")
+    assert intent < tmp < replace
+    if POSIX:
+        assert names.index(f"fsync:{jd.name}", replace) > replace

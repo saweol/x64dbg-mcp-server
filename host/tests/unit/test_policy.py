@@ -325,7 +325,7 @@ def test_isolated_vm_passes():
     rep = IsolationReport(False, False, ("hostonly",))
     assert isolation_gate(rep, require=True) == []
     assert isolation_gate(rep, require=False) == []
-    assert isolation_gate(IsolationReport(False, None, ()), require=True) == []
+    assert isolation_gate(IsolationReport(False, None, ("none",)), require=True) == []
     assert isolation_gate(IsolationReport(False, False, ("none", "disconnected")), require=True) == []
 
 
@@ -459,3 +459,63 @@ def test_symlink_loop_is_refused_not_crashing(lab):
     (lab / "loop").symlink_to(lab / "loop")
     with pytest.raises(PathNotAllowed):
         host_path_allowed(lab / "loop" / "x", [lab.parent / "elsewhere"])
+
+
+# ── review fixes ────────────────────────────────────────────────────
+def test_empty_network_type_list_fails_closed():
+    # () cannot tell "no adapters" from "adapters could not be determined";
+    # a provider that knows the VM has no NIC reports ("none",).
+    rep = IsolationReport(False, False, ())
+    with pytest.raises(IsolationRequired) as ei:
+        isolation_gate(rep, require=True)
+    assert len(ei.value.details["violations"]) == 1
+    assert "adapter" in ei.value.details["violations"][0]
+    assert len(isolation_gate(rep, require=False)) == 1
+
+
+@pytest.mark.parametrize("as_type", [str, Path, os.fsencode])
+def test_single_root_instead_of_a_list_is_a_type_error(lab, as_type):
+    # iterating "/x/samples" would yield "/" as a root and allow every absolute path
+    with pytest.raises(TypeError):
+        host_path_allowed("/etc/passwd", as_type(str(lab)))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        host_path_allowed(lab / "a.exe", as_type(str(lab)))  # type: ignore[arg-type]
+
+
+def test_roots_may_be_any_iterable_of_paths(lab):
+    assert host_path_allowed(lab / "a.exe", (r for r in [lab])) == (lab / "a.exe").resolve()
+
+
+@pytest.mark.parametrize("protected", [f"gw-job-{JID}", f"gw-job-{JID}".encode()])
+def test_retention_rejects_a_single_string_as_protected(protected):
+    with pytest.raises(TypeError):
+        retention_plan([f"gw-job-{JID}"], "gw-", RetentionConfig(0, 0), NOW, protected=protected)
+
+
+def test_snapshot_delete_rejects_a_single_string_protected_list():
+    p = profile(protected_snapshots="gw-keep")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ProtectedSnapshotError)):
+        check_snapshot_delete("gw-keep", p)
+
+
+def test_retention_never_returns_snapshots_of_excluded_jobs():
+    active = "20261101-000000-0000aa"
+    names = [gateway_snapshot_name("pre-revert", active, "gw-"), gateway_snapshot_name("job", active, "gw-"),
+             snap("job", 2, 2)]
+    plan = retention_plan(names, "gw-", RetentionConfig(0, 0), NOW, exclude_job_ids=[active])
+    assert plan == [snap("job", 2, 2)]
+
+
+@pytest.mark.parametrize("bad", [JID, ["../x"], [None]])
+def test_retention_exclude_job_ids_is_validated(bad):
+    with pytest.raises((TypeError, PathNotAllowed)):
+        retention_plan([], "gw-", RetentionConfig(1, 1), NOW, exclude_job_ids=bad)
+
+
+def test_retention_zero_limits_are_literal():
+    # documented: 0 snapshots kept by count, 0 days of age allowance (the policy
+    # never touches protected, clean, foreign or excluded-job snapshots)
+    yesterday = snap("job", 22, 1)
+    assert retention_plan([yesterday], "gw-", RetentionConfig(10, 0), NOW) == [yesterday]
+    assert retention_plan([yesterday], "gw-", RetentionConfig(0, 30), NOW) == [yesterday]
+    assert retention_plan([yesterday], "gw-", RetentionConfig(1, 30), NOW) == []

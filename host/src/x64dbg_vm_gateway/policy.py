@@ -167,6 +167,18 @@ def _fold(name: str) -> str:
     return name.strip().casefold()
 
 
+def _reject_single_path(value: object, what: str) -> None:
+    # A lone str would be iterated character by character ("/x/y" -> "/", "x", ...),
+    # silently turning an allowlist or protection list into something else.
+    if isinstance(value, str | bytes | os.PathLike):
+        raise TypeError(f"{what} must be a collection of names or paths, not a single string")
+
+
+def _folded_names(names: Iterable[str], what: str) -> set[str]:
+    _reject_single_path(names, what)
+    return {_fold(n) for n in names if isinstance(n, str)}
+
+
 def _unsafe_snapshot_text(text: str) -> bool:
     # "/" is vmrun's snapshot path separator ("parent/child"); a name containing
     # it could address a different (protected) snapshot. Control characters
@@ -196,7 +208,7 @@ def check_snapshot_delete(name: str, profile: ProfileConfig) -> None:
         raise refuse("no gateway snapshot prefix is configured")
     if not name.startswith(prefix) or len(name) == len(prefix):
         raise refuse(f"only gateway snapshots ({prefix}*) may be deleted")
-    protected = {_fold(p) for p in profile.protected_snapshots}
+    protected = _folded_names(profile.protected_snapshots, "protected_snapshots")
     if profile.clean_snapshot:
         protected.add(_fold(profile.clean_snapshot))
     if _fold(name) in protected:
@@ -230,31 +242,43 @@ def retention_plan(
     retention: RetentionConfig,
     now: datetime,
     protected: Iterable[str] = (),
+    *,
+    exclude_job_ids: Iterable[str] = (),
 ) -> list[str]:
     """Gateway snapshots to delete, oldest first.
 
     Only ``{prefix}{kind}-{job_id}`` names whose job id carries a valid UTC
     timestamp are considered; everything else is never touched. Of those, the
-    newest ``max_gateway_snapshots`` are kept, and any older than
-    ``max_age_days`` is dropped even if within the count. ``protected`` names
-    (case-insensitive) are never returned. A naive ``now`` is taken as UTC.
-    Callers should still pass each result through ``check_snapshot_delete``.
+    newest ``max_gateway_snapshots`` are kept, and any whose job id is older
+    than ``max_age_days`` is dropped even if within the count (age is the job's
+    creation time embedded in its id, not the snapshot's).
+
+    Both limits are literal: ``max_gateway_snapshots=0`` keeps none by count
+    and ``max_age_days=0`` allows no age, so either deletes every eligible
+    snapshot. Never returned: ``protected`` names (case-insensitive; pass the
+    profile's clean snapshot here too), snapshots of ``exclude_job_ids`` (pass
+    the live job, whose ``pre-revert``/``job`` snapshots are still needed),
+    and foreign names. ``protected`` and ``exclude_job_ids`` must be
+    collections; a single string raises TypeError. A naive ``now`` is taken as
+    UTC. Callers should still pass each result through ``check_snapshot_delete``.
     """
     if retention.max_gateway_snapshots < 0 or retention.max_age_days < 0:
         raise ValueError("retention limits must be non-negative")
+    blocked = _folded_names(protected, "protected")
+    _reject_single_path(exclude_job_ids, "exclude_job_ids")
+    excluded = {validate_job_id(j) for j in exclude_job_ids}
     if not prefix:
         return []
     _check_prefix(prefix)
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     pattern = re.compile(re.escape(prefix) + r"(job|pre-revert)-([0-9]{8}-[0-9]{6}-[0-9a-f]{6})")
-    blocked = {_fold(p) for p in protected if isinstance(p, str)}
     stamps: dict[str, datetime] = {}
     for name in snapshot_names:
         if not isinstance(name, str) or name in stamps or _fold(name) in blocked:
             continue
         m = pattern.fullmatch(name)
-        if m is None or JOB_ID_RE.fullmatch(m.group(2)) is None:
+        if m is None or JOB_ID_RE.fullmatch(m.group(2)) is None or m.group(2) in excluded:
             continue
         ts = _job_id_time(m.group(2))
         if ts is not None:
@@ -278,6 +302,14 @@ def isolation_gate(report: IsolationReport, require: bool) -> list[str]:
     whose ``details["violations"]`` lists each problem. An unknown shared
     folder state counts as a violation (fail closed); a writable flag on
     disabled shared folders does not.
+
+    An empty ``network_types`` is also a violation: it cannot be told apart
+    from "adapters could not be determined". A provider that knows the VM has
+    no network adapter reports ``("none",)``.
+
+    This gate, not ``IsolationReport.isolated``, is authoritative: that
+    property treats an unknown (None) shared folder state and an empty
+    adapter list as isolated.
     """
     violations: list[str] = []
     enabled = report.shared_folders_enabled
@@ -287,6 +319,9 @@ def isolation_gate(report: IsolationReport, require: bool) -> list[str]:
         violations.append("shared folders are enabled")
     if report.shared_folders_writable and enabled is not False:
         violations.append("shared folders are writable from the guest")
+    if not report.network_types:
+        violations.append("network adapter types could not be determined (none reported; treated as "
+                          "not host-only)")
     for net in report.network_types:
         if not isinstance(net, str) or net.strip().lower() not in _ISOLATED_NETWORKS:
             violations.append(f"network adapter type {net!r} is not host-only")
@@ -334,7 +369,11 @@ def host_path_allowed(path: str | os.PathLike[str], roots: Iterable[str | os.Pat
 
     Open the returned path, not the original; a symlink swapped in after this
     check (TOCTOU) is outside what a pure check can prevent.
+
+    ``roots`` must be a collection; a single str/bytes/path raises TypeError
+    (iterating ``"/x/samples"`` would make ``"/"`` a root and allow everything).
     """
+    _reject_single_path(roots, "roots")
     try:
         raw = os.fspath(path)
     except TypeError:
