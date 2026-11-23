@@ -8,15 +8,44 @@
 const std = @import("std");
 
 pub fn findHeaderEnd(data: []const u8) ?usize {
-    _ = data;
-    return null;
+    return std.mem.indexOf(u8, data, "\r\n\r\n");
 }
 
+/// Iterates header lines after the request line.
+const HeaderIterator = struct {
+    rest: []const u8,
+
+    fn init(headers: []const u8) HeaderIterator {
+        const first_end = std.mem.indexOf(u8, headers, "\r\n") orelse return .{ .rest = "" };
+        return .{ .rest = headers[first_end + 2 ..] };
+    }
+
+    const Header = struct { name: []const u8, value: []const u8 };
+
+    fn next(self: *HeaderIterator) ?Header {
+        while (self.rest.len > 0) {
+            const end = std.mem.indexOf(u8, self.rest, "\r\n") orelse self.rest.len;
+            const line = self.rest[0..end];
+            self.rest = if (end + 2 <= self.rest.len) self.rest[end + 2 ..] else "";
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            return .{
+                .name = std.mem.trim(u8, line[0..colon], " \t"),
+                .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+            };
+        }
+        return null;
+    }
+};
+
 /// Value of the first header called `name` (case-insensitive), with
-/// surrounding spaces/tabs trimmed. `headers` excludes the final CRLFCRLF.
+/// surrounding spaces/tabs trimmed. `headers` is the request head (request
+/// line + header lines, without the final CRLFCRLF); the request line is
+/// skipped.
 pub fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
-    _ = headers;
-    _ = name;
+    var it = HeaderIterator.init(headers);
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
     return null;
 }
 
@@ -25,8 +54,19 @@ pub const ContentLengthError = error{InvalidContentLength};
 /// Content-Length of the request: 0 when absent, an error when malformed,
 /// overflowing, or repeated with different values.
 pub fn contentLength(headers: []const u8) ContentLengthError!usize {
-    _ = headers;
-    return error.InvalidContentLength;
+    var result: ?usize = null;
+    var it = HeaderIterator.init(headers);
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "Content-Length")) continue;
+        if (h.value.len == 0) return error.InvalidContentLength;
+        for (h.value) |c| if (c < '0' or c > '9') return error.InvalidContentLength;
+        const v = std.fmt.parseInt(usize, h.value, 10) catch return error.InvalidContentLength;
+        if (result) |prev| {
+            if (prev != v) return error.InvalidContentLength;
+        }
+        result = v;
+    }
+    return result orelse 0;
 }
 
 pub const RequestState = union(enum) {
@@ -42,36 +82,54 @@ pub const RequestState = union(enum) {
 
 /// Classifies the bytes received so far for a buffer of `capacity` bytes.
 pub fn requestState(received: []const u8, capacity: usize) RequestState {
-    _ = received;
-    _ = capacity;
-    return .bad;
+    const header_end = findHeaderEnd(received) orelse
+        return if (received.len >= capacity) .too_large else .incomplete;
+    const body_len = contentLength(received[0..header_end]) catch return .bad;
+    const head_len = header_end + 4;
+    if (body_len > capacity -| head_len) return .too_large;
+    if (received.len < head_len + body_len) return .incomplete;
+    return .{ .complete = .{ .header_end = header_end, .body_len = body_len } };
 }
 
 pub const RequestLine = struct { method: []const u8, path: []const u8 };
 
 /// Splits "METHOD SP PATH SP VERSION" (only the first line is examined).
 pub fn parseRequestLine(data: []const u8) ?RequestLine {
-    _ = data;
-    return null;
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse data.len;
+    const line = data[0..line_end];
+    var it = std.mem.splitScalar(u8, line, ' ');
+    const method = it.next() orelse return null;
+    const path = it.next() orelse return null;
+    if (method.len == 0 or path.len == 0) return null;
+    return .{ .method = method, .path = path };
 }
 
 /// Token from "Authorization: Bearer <token>" (scheme is case-insensitive).
 pub fn bearerToken(headers: []const u8) ?[]const u8 {
-    _ = headers;
-    return null;
+    const v = headerValue(headers, "Authorization") orelse return null;
+    const scheme = "bearer";
+    if (v.len <= scheme.len) return null;
+    if (!std.ascii.eqlIgnoreCase(v[0..scheme.len], scheme)) return null;
+    if (v[scheme.len] != ' ' and v[scheme.len] != '\t') return null;
+    const tok = std.mem.trim(u8, v[scheme.len..], " \t");
+    return if (tok.len == 0) null else tok;
 }
 
 /// Value of `?name=value` / `&name=value` in a request path.
 pub fn queryParam(path: []const u8, name: []const u8) ?[]const u8 {
-    _ = path;
-    _ = name;
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, path[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
     return null;
 }
 
 /// Path without the query string.
 pub fn pathOnly(path: []const u8) []const u8 {
-    _ = path;
-    return "";
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse return path;
+    return path[0..q];
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

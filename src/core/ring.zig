@@ -23,28 +23,38 @@ pub fn MessageRing(comptime capacity: usize, comptime msg_size: usize) type {
         count: usize = 0,
 
         pub fn push(self: *Self, msg: []const u8) void {
-            _ = self;
-            _ = msg;
+            const n = @min(msg.len, msg_size);
+            const slot = if (self.count < capacity) (self.head + self.count) % capacity else self.head;
+            @memcpy(self.msgs[slot][0..n], msg[0..n]);
+            self.lens[slot] = n;
+            if (self.count < capacity) {
+                self.count += 1;
+            } else {
+                // Overwrote the oldest entry: the next one becomes the oldest.
+                self.head = (self.head + 1) % capacity;
+            }
         }
 
         pub fn len(self: *const Self) usize {
-            _ = self;
-            return 0;
+            return self.count;
         }
 
         /// Copies message `index` (0 = oldest) into `out` and returns the
         /// copied slice (truncated to out.len). Out-of-range returns "".
         pub fn copyAt(self: *const Self, index: usize, out: []u8) []u8 {
-            _ = self;
-            _ = index;
-            return out[0..0];
+            if (index >= self.count) return out[0..0];
+            const slot = (self.head + index) % capacity;
+            const n = @min(self.lens[slot], out.len);
+            @memcpy(out[0..n], self.msgs[slot][0..n]);
+            return out[0..n];
         }
 
         /// Removes the oldest message, copying it into `out`.
         pub fn popOldest(self: *Self, out: []u8) ?[]u8 {
-            _ = self;
-            _ = out;
-            return null;
+            if (self.count == 0) return null;
+            const copied = self.copyAt(0, out);
+            self.dropOldest();
+            return copied;
         }
 
         /// Pops messages into `out`, separated by `sep`, while each whole
@@ -52,14 +62,35 @@ pub fn MessageRing(comptime capacity: usize, comptime msg_size: usize) type {
         /// single message larger than an empty `out` is truncated so the
         /// queue always makes progress. Returns the number of bytes written.
         pub fn drainJoined(self: *Self, out: []u8, sep: u8) usize {
-            _ = self;
-            _ = out;
-            _ = sep;
-            return 0;
+            var pos: usize = 0;
+            while (self.count > 0) {
+                const msg_len = self.lens[self.head];
+                const need = msg_len + @as(usize, if (pos > 0) 1 else 0);
+                if (pos + need > out.len) {
+                    if (pos == 0 and out.len > 0) {
+                        pos = self.copyAt(0, out).len;
+                        self.dropOldest();
+                    }
+                    break;
+                }
+                if (pos > 0) {
+                    out[pos] = sep;
+                    pos += 1;
+                }
+                pos += self.copyAt(0, out[pos..]).len;
+                self.dropOldest();
+            }
+            return pos;
         }
 
         pub fn clear(self: *Self) void {
-            _ = self;
+            self.head = 0;
+            self.count = 0;
+        }
+
+        fn dropOldest(self: *Self) void {
+            self.head = (self.head + 1) % capacity;
+            self.count -= 1;
         }
     };
 }
@@ -75,36 +106,39 @@ pub fn LockedRing(comptime capacity: usize, comptime msg_size: usize) type {
         ring: Ring = .{},
 
         pub fn push(self: *Self, msg: []const u8) void {
-            _ = self;
-            _ = msg;
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.ring.push(msg);
         }
 
         pub fn len(self: *Self) usize {
-            _ = self;
-            return 0;
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            return self.ring.len();
         }
 
         pub fn copyAt(self: *Self, index: usize, out: []u8) []u8 {
-            _ = self;
-            _ = index;
-            return out[0..0];
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            return self.ring.copyAt(index, out);
         }
 
         pub fn popOldest(self: *Self, out: []u8) ?[]u8 {
-            _ = self;
-            _ = out;
-            return null;
+            self.lock.lock();
+            defer self.lock.unlock();
+            return self.ring.popOldest(out);
         }
 
         pub fn drainJoined(self: *Self, out: []u8, sep: u8) usize {
-            _ = self;
-            _ = out;
-            _ = sep;
-            return 0;
+            self.lock.lock();
+            defer self.lock.unlock();
+            return self.ring.drainJoined(out, sep);
         }
 
         pub fn clear(self: *Self) void {
-            _ = self;
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.ring.clear();
         }
     };
 }

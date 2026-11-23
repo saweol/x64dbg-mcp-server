@@ -92,25 +92,168 @@ pub const Diagnostic = struct {
 };
 
 /// Parses the config text. Missing keys take their defaults.
-pub fn parse(backing: Allocator, text: []const u8, default_port: u16, diag: *Diagnostic) Error!Owned {
-    _ = backing;
-    _ = text;
-    _ = default_port;
-    _ = diag;
-    return error.InvalidJson;
+pub fn parse(backing: Allocator, text_in: []const u8, default_port: u16, diag: *Diagnostic) Error!Owned {
+    if (text_in.len > MAX_CONFIG_BYTES) {
+        diag.* = .{ .reason = "file is larger than 64 KiB" };
+        return error.ConfigTooLarge;
+    }
+    var text = text_in;
+    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
+
+    var owned = initDefault(backing, default_port);
+    errdefer owned.deinit();
+    const a = owned.arena.allocator();
+
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{
+        .duplicate_field_behavior = .@"error",
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DuplicateField => {
+            diag.* = .{ .reason = "duplicate key" };
+            return error.InvalidJson;
+        },
+        else => {
+            diag.* = .{ .reason = "not valid JSON" };
+            return error.InvalidJson;
+        },
+    };
+    if (root != .object) {
+        diag.* = .{ .reason = "top level must be a JSON object" };
+        return error.NotAnObject;
+    }
+
+    const cfg = &owned.config;
+    var extras: std.ArrayListUnmanaged(Extra) = .{};
+    var it = root.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const v = entry.value_ptr.*;
+        if (std.mem.eql(u8, name, key.ip_address)) {
+            cfg.ip_address = try getString(v, key.ip_address, MAX_IP_LEN, diag);
+        } else if (std.mem.eql(u8, name, key.port)) {
+            cfg.port = @intCast(try getInt(v, key.port, 1, 65535, diag));
+        } else if (std.mem.eql(u8, name, key.auto_start)) {
+            cfg.auto_start = try getBool(v, key.auto_start, diag);
+        } else if (std.mem.eql(u8, name, key.auth_token)) {
+            const tok = try getString(v, key.auth_token, MAX_TOKEN_LEN, diag);
+            if (tok.len > 0 and !isValidToken(tok))
+                return invalid(diag, key.auth_token, "must be 1-64 printable ASCII characters without spaces, quotes or backslashes");
+            cfg.auth_token = tok;
+        } else if (std.mem.eql(u8, name, key.allow_external)) {
+            cfg.allow_external = try getBool(v, key.allow_external, diag);
+        } else if (std.mem.eql(u8, name, key.allowed_clients)) {
+            cfg.allowed_clients = try getClients(a, v, diag);
+        } else if (std.mem.eql(u8, name, key.max_clients)) {
+            cfg.max_clients = @intCast(try getInt(v, key.max_clients, 1, MAX_MAX_CLIENTS, diag));
+        } else if (std.mem.eql(u8, name, key.enable_sse)) {
+            cfg.enable_sse = try getBool(v, key.enable_sse, diag);
+        } else if (std.mem.eql(u8, name, key.artifact_dir)) {
+            const dir = try getString(v, key.artifact_dir, pathutil.MAX_PATH_LEN, diag);
+            if (dir.len > 0) pathutil.validateArtifactDir(dir) catch |err|
+                return invalid(diag, key.artifact_dir, pathutil.describe(err));
+            cfg.artifact_dir = dir;
+        } else if (std.mem.eql(u8, name, key.auth_max_failures)) {
+            cfg.auth_max_failures = @intCast(try getInt(v, key.auth_max_failures, 1, MAX_AUTH_MAX_FAILURES, diag));
+        } else if (std.mem.eql(u8, name, key.auth_lockout_seconds)) {
+            cfg.auth_lockout_seconds = @intCast(try getInt(v, key.auth_lockout_seconds, 1, MAX_AUTH_LOCKOUT_SECONDS, diag));
+        } else {
+            // Unknown key: keep it so saving from the dialog does not drop it.
+            const js = try std.json.stringifyAlloc(a, v, .{});
+            try extras.append(a, .{ .name = name, .json = js });
+        }
+    }
+    cfg.extra = extras.items;
+    return owned;
+}
+
+fn invalid(diag: *Diagnostic, k: []const u8, reason: []const u8) Error {
+    diag.* = .{ .key = k, .reason = reason };
+    return error.InvalidValue;
+}
+
+fn getString(v: std.json.Value, k: []const u8, max_len: usize, diag: *Diagnostic) Error![]const u8 {
+    if (v != .string) return invalid(diag, k, "must be a string");
+    if (v.string.len > max_len) return invalid(diag, k, "is too long");
+    for (v.string) |c| if (c < 0x20) return invalid(diag, k, "contains control characters");
+    return v.string;
+}
+
+fn getBool(v: std.json.Value, k: []const u8, diag: *Diagnostic) Error!bool {
+    if (v != .bool) return invalid(diag, k, "must be true or false");
+    return v.bool;
+}
+
+fn getInt(v: std.json.Value, k: []const u8, min: i64, max: i64, diag: *Diagnostic) Error!i64 {
+    if (v != .integer) return invalid(diag, k, "must be an integer");
+    if (v.integer < min or v.integer > max) return invalid(diag, k, "is out of range");
+    return v.integer;
+}
+
+fn getClients(a: Allocator, v: std.json.Value, diag: *Diagnostic) Error![]const []const u8 {
+    const k = key.allowed_clients;
+    if (v != .array) return invalid(diag, k, "must be an array of strings");
+    const items = v.array.items;
+    if (items.len > MAX_ALLOWED_CLIENTS) return invalid(diag, k, "has too many entries (max 64)");
+    const out = try a.alloc([]const u8, items.len);
+    for (items, 0..) |item, i| {
+        if (item != .string) return invalid(diag, k, "must be an array of strings");
+        if (item.string.len > MAX_CLIENT_ENTRY_LEN) return invalid(diag, k, "entry is too long");
+        _ = netpolicy.parseCidr(item.string) catch
+            return invalid(diag, k, "entries must be IPv4 addresses or CIDR ranges (a.b.c.d/n)");
+        out[i] = item.string;
+    }
+    return out;
 }
 
 /// Serialises `cfg` as pretty JSON. The four v1.9 keys come first so an
 /// older plugin (which only reads the first 512 bytes) still finds them.
 pub fn serialize(allocator: Allocator, cfg: *const Config) Allocator.Error![]u8 {
-    _ = cfg;
-    return allocator.alloc(u8, 0);
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+
+    try w.writeAll("{\n");
+    try writeField(w, key.ip_address, cfg.ip_address);
+    try w.print("  \"{s}\": {d},\n", .{ key.port, cfg.port });
+    try w.print("  \"{s}\": {},\n", .{ key.auto_start, cfg.auto_start });
+    try writeField(w, key.auth_token, cfg.auth_token);
+    try w.print("  \"{s}\": {},\n", .{ key.allow_external, cfg.allow_external });
+    try w.print("  \"{s}\": [", .{key.allowed_clients});
+    for (cfg.allowed_clients, 0..) |c, i| {
+        if (i > 0) try w.writeAll(", ");
+        try std.json.stringify(c, .{}, w);
+    }
+    try w.writeAll("],\n");
+    try w.print("  \"{s}\": {d},\n", .{ key.max_clients, cfg.max_clients });
+    try w.print("  \"{s}\": {},\n", .{ key.enable_sse, cfg.enable_sse });
+    try writeField(w, key.artifact_dir, cfg.artifact_dir);
+    try w.print("  \"{s}\": {d},\n", .{ key.auth_max_failures, cfg.auth_max_failures });
+    try w.print("  \"{s}\": {d}", .{ key.auth_lockout_seconds, cfg.auth_lockout_seconds });
+    for (cfg.extra) |e| {
+        try w.writeAll(",\n  ");
+        try std.json.stringify(e.name, .{}, w);
+        try w.writeAll(": ");
+        try w.writeAll(e.json);
+    }
+    try w.writeAll("\n}\n");
+    return out.toOwnedSlice();
 }
 
-/// True when `token` is acceptable as AuthToken: 1..64 visible ASCII chars.
+fn writeField(w: anytype, name: []const u8, value: []const u8) !void {
+    try w.print("  \"{s}\": ", .{name});
+    try std.json.stringify(value, .{}, w);
+    try w.writeAll(",\n");
+}
+
+/// True when `token` is acceptable as AuthToken: 1..64 printable ASCII
+/// characters excluding space, double quote and backslash.
 pub fn isValidToken(token: []const u8) bool {
-    _ = token;
-    return false;
+    if (token.len == 0 or token.len > MAX_TOKEN_LEN) return false;
+    for (token) |c| {
+        if (c < 0x21 or c > 0x7E or c == '"' or c == '\\') return false;
+    }
+    return true;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

@@ -14,60 +14,67 @@ const builtin = @import("builtin");
 pub const RwLock = if (builtin.os.tag == .windows) SrwLock else StdRwLock;
 
 const SrwLock = struct {
-    raw: std.os.windows.SRWLOCK = .{},
+    raw: windows.SRWLOCK = .{},
 
     pub fn lock(self: *SrwLock) void {
-        _ = self;
+        windows.kernel32.AcquireSRWLockExclusive(&self.raw);
     }
     pub fn unlock(self: *SrwLock) void {
-        _ = self;
+        windows.kernel32.ReleaseSRWLockExclusive(&self.raw);
     }
     pub fn tryLock(self: *SrwLock) bool {
-        _ = self;
-        return false;
+        return windows.kernel32.TryAcquireSRWLockExclusive(&self.raw) != windows.FALSE;
     }
     pub fn lockShared(self: *SrwLock) void {
-        _ = self;
+        AcquireSRWLockShared(&self.raw);
     }
     pub fn unlockShared(self: *SrwLock) void {
-        _ = self;
+        ReleaseSRWLockShared(&self.raw);
     }
     pub fn tryLockShared(self: *SrwLock) bool {
-        _ = self;
-        return false;
+        return TryAcquireSRWLockShared(&self.raw) != windows.FALSE;
     }
 };
+
+// The shared-mode SRWLOCK functions are not declared by std (0.14).
+const windows = std.os.windows;
+extern "kernel32" fn AcquireSRWLockShared(lock: *windows.SRWLOCK) callconv(.winapi) void;
+extern "kernel32" fn ReleaseSRWLockShared(lock: *windows.SRWLOCK) callconv(.winapi) void;
+extern "kernel32" fn TryAcquireSRWLockShared(lock: *windows.SRWLOCK) callconv(.winapi) windows.BOOLEAN;
 
 const StdRwLock = struct {
     inner: std.Thread.RwLock = .{},
 
     pub fn lock(self: *StdRwLock) void {
-        _ = self;
+        self.inner.lock();
     }
     pub fn unlock(self: *StdRwLock) void {
-        _ = self;
+        self.inner.unlock();
     }
     pub fn tryLock(self: *StdRwLock) bool {
-        _ = self;
-        return false;
+        return self.inner.tryLock();
     }
     pub fn lockShared(self: *StdRwLock) void {
-        _ = self;
+        self.inner.lockShared();
     }
     pub fn unlockShared(self: *StdRwLock) void {
-        _ = self;
+        self.inner.unlockShared();
     }
     pub fn tryLockShared(self: *StdRwLock) bool {
-        _ = self;
-        return false;
+        return self.inner.tryLockShared();
     }
 };
 
 /// Tries to take `l` exclusively, polling until `timeout_ms` elapses.
 /// Returns false when the lock could not be acquired in time.
 pub fn tryLockFor(l: *RwLock, timeout_ms: u64) bool {
-    _ = l;
-    _ = timeout_ms;
+    if (l.tryLock()) return true;
+    var timer = std.time.Timer.start() catch return false;
+    const limit_ns = timeout_ms * std.time.ns_per_ms;
+    while (timer.read() < limit_ns) {
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+        if (l.tryLock()) return true;
+    }
     return false;
 }
 
@@ -107,14 +114,18 @@ test "tryLockFor times out while the lock is held" {
 
 test "tryLockFor succeeds once another thread releases" {
     var l: RwLock = .{};
-    l.lock();
-    const Releaser = struct {
-        fn run(lk: *RwLock) void {
+    var held = std.atomic.Value(bool).init(false);
+    const Holder = struct {
+        fn run(lk: *RwLock, flag: *std.atomic.Value(bool)) void {
+            lk.lock();
+            flag.store(true, .release);
             std.Thread.sleep(20 * std.time.ns_per_ms);
             lk.unlock();
         }
     };
-    const t = try std.Thread.spawn(.{}, Releaser.run, .{&l});
+    const t = try std.Thread.spawn(.{}, Holder.run, .{ &l, &held });
+    while (!held.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+    try testing.expect(!l.tryLock());
     try testing.expect(tryLockFor(&l, 5000));
     l.unlock();
     t.join();

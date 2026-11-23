@@ -26,25 +26,45 @@ pub const MAX_TOKEN_LEN = 64;
 /// Parses dotted-quad IPv4 strictly: exactly four decimal octets 0-255,
 /// no leading zeros (avoids octal ambiguity), no whitespace or suffixes.
 pub fn parseIpv4(s: []const u8) ParseError!Ipv4 {
-    _ = s;
-    return error.InvalidAddress;
+    var out: Ipv4 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4) return error.InvalidAddress;
+        out[i] = try parseOctet(part);
+    }
+    if (i != 4) return error.InvalidAddress;
+    return out;
+}
+
+fn parseOctet(part: []const u8) ParseError!u8 {
+    if (part.len == 0 or part.len > 3) return error.InvalidAddress;
+    if (part.len > 1 and part[0] == '0') return error.InvalidAddress;
+    var v: u16 = 0;
+    for (part) |c| {
+        if (c < '0' or c > '9') return error.InvalidAddress;
+        v = v * 10 + (c - '0');
+    }
+    if (v > 255) return error.InvalidAddress;
+    return @intCast(v);
+}
+
+fn hostOrder(ip: Ipv4) u32 {
+    return std.mem.readInt(u32, &ip, .big);
 }
 
 /// The value to store in `sockaddr_in.sin_addr` (memory = network order).
 pub fn toNetworkU32(ip: Ipv4) u32 {
-    _ = ip;
-    return 0;
+    return @bitCast(ip);
 }
 
 /// Inverse of `toNetworkU32` (e.g. for the peer address from accept()).
 pub fn fromNetworkU32(v: u32) Ipv4 {
-    _ = v;
-    return .{ 0, 0, 0, 0 };
+    return @bitCast(v);
 }
 
 pub fn isLoopback(ip: Ipv4) bool {
-    _ = ip;
-    return false;
+    return ip[0] == 127;
 }
 
 pub const Cidr = struct {
@@ -53,9 +73,7 @@ pub const Cidr = struct {
     prefix: u6,
 
     pub fn contains(self: Cidr, ip: Ipv4) bool {
-        _ = self;
-        _ = ip;
-        return false;
+        return (hostOrder(ip) & maskFor(self.prefix)) == self.base;
     }
 
     pub fn isAllAddresses(self: Cidr) bool {
@@ -66,8 +84,29 @@ pub const Cidr = struct {
 /// Parses "a.b.c.d/n" (n = 0..32) or a bare address (= /32). Host bits are
 /// cleared, so "10.0.0.5/24" means 10.0.0.0/24.
 pub fn parseCidr(s: []const u8) ParseError!Cidr {
-    _ = s;
-    return error.InvalidAddress;
+    var addr_part = s;
+    var prefix: u6 = 32;
+    if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
+        addr_part = s[0..slash];
+        const p = s[slash + 1 ..];
+        if (p.len == 0 or p.len > 2) return error.InvalidAddress;
+        if (p.len > 1 and p[0] == '0') return error.InvalidAddress;
+        var v: u8 = 0;
+        for (p) |c| {
+            if (c < '0' or c > '9') return error.InvalidAddress;
+            v = v * 10 + (c - '0');
+        }
+        if (v > 32) return error.InvalidAddress;
+        prefix = @intCast(v);
+    }
+    const ip = try parseIpv4(addr_part);
+    return .{ .base = hostOrder(ip) & maskFor(prefix), .prefix = prefix };
+}
+
+fn maskFor(prefix: u6) u32 {
+    if (prefix == 0) return 0;
+    const shift: u5 = @intCast(32 - @as(u6, prefix));
+    return @as(u32, 0xFFFF_FFFF) << shift;
 }
 
 pub const AllowlistError = error{ InvalidAllowedClient, TooManyAllowedClients };
@@ -81,15 +120,24 @@ pub const Allowlist = struct {
 
     /// On InvalidAllowedClient, `bad_index` receives the offending index.
     pub fn fromStrings(items: []const []const u8, bad_index: *usize) AllowlistError!Allowlist {
-        _ = items;
-        _ = bad_index;
-        return error.InvalidAllowedClient;
+        if (items.len > MAX_ALLOWED_CLIENTS) return error.TooManyAllowedClients;
+        var list: Allowlist = .{};
+        for (items, 0..) |item, i| {
+            list.entries[i] = parseCidr(item) catch {
+                bad_index.* = i;
+                return error.InvalidAllowedClient;
+            };
+        }
+        list.len = items.len;
+        return list;
     }
 
     pub fn permits(self: *const Allowlist, peer: Ipv4) bool {
-        _ = self;
-        _ = peer;
-        return true;
+        if (isLoopback(peer)) return true;
+        for (self.entries[0..self.len]) |e| {
+            if (e.contains(peer)) return true;
+        }
+        return false;
     }
 
     pub fn allowsAll(self: *const Allowlist) bool {
@@ -140,18 +188,46 @@ pub const StartupDiag = struct {
 ///   - With AllowExternal=true the token must be >= 32 chars; on a
 ///     loopback-only setup a short token only produces a warning.
 pub fn planStartup(input: StartupInput, diag: *StartupDiag) StartupError!StartupPlan {
-    _ = input;
-    _ = diag;
-    return error.InvalidIpAddress;
+    const bind = parseIpv4(input.ip_address) catch return error.InvalidIpAddress;
+    if (input.token.len == 0) return error.MissingToken;
+    if (input.token.len > MAX_TOKEN_LEN) return error.TokenTooLong;
+
+    const allowlist = Allowlist.fromStrings(input.allowed_clients, &diag.bad_client_index) catch |err| return switch (err) {
+        error.InvalidAllowedClient => error.InvalidAllowedClient,
+        error.TooManyAllowedClients => error.TooManyAllowedClients,
+    };
+
+    if (!isLoopback(bind)) {
+        if (!input.allow_external) return error.ExternalBindNotAllowed;
+        if (allowlist.len == 0) return error.AllowedClientsRequired;
+    }
+    const short = input.token.len < MIN_EXTERNAL_TOKEN_LEN;
+    if (input.allow_external and short) return error.TokenTooShort;
+
+    return .{
+        .bind = bind,
+        .allowlist = allowlist,
+        .warn_short_token = short,
+        .warn_allow_all = allowlist.allowsAll(),
+    };
 }
 
 /// Constant-time comparison of a presented bearer token with the expected
 /// one. Both are padded to MAX_TOKEN_LEN so the timing does not depend on
 /// where they differ. Never matches an empty expected token.
 pub fn tokenEql(expected: []const u8, presented: []const u8) bool {
-    _ = expected;
-    _ = presented;
-    return false;
+    if (expected.len == 0 or expected.len > MAX_TOKEN_LEN) return false;
+    // The presented length is chosen by the client, so rejecting an
+    // over-long value early reveals nothing about the expected token.
+    if (presented.len > MAX_TOKEN_LEN) return false;
+    var a = [_]u8{0} ** MAX_TOKEN_LEN;
+    var b = [_]u8{0} ** MAX_TOKEN_LEN;
+    @memcpy(a[0..expected.len], expected);
+    @memcpy(b[0..presented.len], presented);
+    const bytes_equal = std.crypto.timing_safe.eql([MAX_TOKEN_LEN]u8, a, b);
+    const len_equal = expected.len == presented.len;
+    // Combine without short-circuiting.
+    return (@intFromBool(bytes_equal) & @intFromBool(len_equal)) == 1;
 }
 
 /// Per-IP authentication failure tracking with temporary lockout.
@@ -180,24 +256,65 @@ pub const AuthLimiter = struct {
     }
 
     pub fn isLocked(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) bool {
-        _ = self;
-        _ = ip;
-        _ = now_ms;
-        return false;
+        const i = self.indexOf(ip) orelse return false;
+        return self.entries[i].locked_until > now_ms;
     }
 
     /// Records a failed authentication. Returns true when this failure
     /// started a lockout.
     pub fn recordFailure(self: *AuthLimiter, ip: Ipv4, now_ms: u64) bool {
-        _ = self;
-        _ = ip;
-        _ = now_ms;
+        const e = self.findOrClaim(ip, now_ms);
+        e.last_seen = now_ms;
+        if (e.locked_until > now_ms) return false; // already locked
+        if (e.failures == 0 or now_ms -| e.window_start >= self.window_ms) {
+            e.failures = 0;
+            e.window_start = now_ms;
+        }
+        e.failures += 1;
+        if (e.failures >= self.max_failures) {
+            e.failures = 0;
+            e.locked_until = now_ms +| self.lockout_ms;
+            return true;
+        }
         return false;
     }
 
     pub fn recordSuccess(self: *AuthLimiter, ip: Ipv4) void {
-        _ = self;
-        _ = ip;
+        const i = self.indexOf(ip) orelse return;
+        // A successful request never lifts an active lockout (it could not
+        // have been served), so just forget the failure history.
+        self.entries[i].failures = 0;
+    }
+
+    fn indexOf(self: *const AuthLimiter, ip: Ipv4) ?usize {
+        for (&self.entries, 0..) |*e, i| {
+            if (e.used and std.mem.eql(u8, &e.ip, &ip)) return i;
+        }
+        return null;
+    }
+
+    /// Returns the entry for `ip`, claiming a slot if needed. When the table
+    /// is full, the unlocked entry with the oldest activity is evicted; only
+    /// when every entry is locked is the one whose lock expires first reused.
+    fn findOrClaim(self: *AuthLimiter, ip: Ipv4, now_ms: u64) *Entry {
+        if (self.indexOf(ip)) |i| return &self.entries[i];
+        var victim: *Entry = &self.entries[0];
+        for (&self.entries) |*e| {
+            if (!e.used) {
+                victim = e;
+                break;
+            }
+            const e_locked = e.locked_until > now_ms;
+            const v_locked = victim.locked_until > now_ms;
+            if (v_locked and !e_locked) {
+                victim = e;
+            } else if (v_locked == e_locked) {
+                const better = if (e_locked) e.locked_until < victim.locked_until else e.last_seen < victim.last_seen;
+                if (better) victim = e;
+            }
+        }
+        victim.* = .{ .ip = ip, .used = true, .last_seen = now_ms };
+        return victim;
     }
 };
 
@@ -206,13 +323,16 @@ pub const ClientSlots = struct {
     active: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn tryAcquire(self: *ClientSlots, max: u32) bool {
-        _ = self;
-        _ = max;
-        return true;
+        var cur = self.active.load(.acquire);
+        while (cur < max) {
+            cur = self.active.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) orelse return true;
+        }
+        return false;
     }
 
     pub fn release(self: *ClientSlots) void {
-        _ = self;
+        const prev = self.active.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
     }
 
     pub fn count(self: *const ClientSlots) u32 {
@@ -229,10 +349,10 @@ pub const TOTAL_TIMEOUT_MS: u64 = 10000;
 /// current phase is exhausted. Never returns 0 (0 means "infinite" to
 /// SO_RCVTIMEO).
 pub fn recvTimeoutMs(start_ms: u64, now_ms: u64, headers_done: bool) ?u32 {
-    _ = start_ms;
-    _ = now_ms;
-    _ = headers_done;
-    return null;
+    const elapsed = now_ms -| start_ms;
+    const limit = if (headers_done) TOTAL_TIMEOUT_MS else HEADER_TIMEOUT_MS;
+    if (elapsed >= limit) return null;
+    return @intCast(limit - elapsed);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -249,10 +369,10 @@ test "parseIpv4 accepts canonical dotted quads" {
 
 test "parseIpv4 rejects malformed input instead of returning INADDR_ANY" {
     const bad = [_][]const u8{
-        "",                "1.2.3",       "1.2.3.4.5",   "256.0.0.1",   "1..2.3",
-        "1.2.3.",          ".1.2.3",      " 1.2.3.4",    "1.2.3.4 ",    "01.2.3.4",
-        "1.2.3.4a",        "a.b.c.d",     "1.2.3.-4",    "1234.1.1.1",  "localhost",
-        "::1",             "127.0.0.l",   "1.2.3.4/32",  "0x7f.0.0.1",  "1.2.3.00",
+        "",                "1.2.3",       "1.2.3.4.5",  "256.0.0.1",  "1..2.3",
+        "1.2.3.",          ".1.2.3",      " 1.2.3.4",   "1.2.3.4 ",   "01.2.3.4",
+        "1.2.3.4a",        "a.b.c.d",     "1.2.3.-4",   "1234.1.1.1", "localhost",
+        "::1",             "127.0.0.l",   "1.2.3.4/32", "0x7f.0.0.1", "1.2.3.00",
         "999.999.999.999", "1.2.3.4\x00",
     };
     for (bad) |s| {
@@ -457,10 +577,12 @@ test "AuthLimiter success clears the failure count; IPs are independent" {
 }
 
 test "AuthLimiter keeps locked entries when the table overflows" {
-    var lim = AuthLimiter.init(1, 60_000, 60_000);
+    var lim = AuthLimiter.init(2, 60_000, 60_000);
     const victim = Ipv4{ 172, 16, 0, 1 };
+    _ = lim.recordFailure(victim, 0);
     try testing.expect(lim.recordFailure(victim, 0));
-    // Flood the table with other addresses.
+    // Flood the table with other addresses, one (non-locking) failure each,
+    // trying to evict the locked entry.
     var i: u32 = 0;
     while (i < AuthLimiter.CAPACITY * 2) : (i += 1) {
         const ip = Ipv4{ 10, @intCast((i >> 16) & 0xff), @intCast((i >> 8) & 0xff), @intCast(i & 0xff) };

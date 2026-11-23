@@ -35,12 +35,13 @@ Built with [Zig](https://ziglang.org/) — zero dependencies, single-binary outp
 
 ## Features
 
-- **84 MCP Tools:** Full debugger control — disassembly, stepping, breakpoints, memory allocation, registers, modules, threads, call stack, pattern scanning, string extraction, xrefs, symbols, bookmarks, PE analysis, OEP detection, module dumping, PEB/SEH inspection, tracing, and more.
+- **82 MCP Tools:** Full debugger control — disassembly, stepping, breakpoints, memory allocation, registers, modules, threads, call stack, pattern scanning, string extraction, xrefs, symbols, bookmarks, PE analysis, OEP detection, module dumping, PEB/SEH inspection, tracing, and more.
 - **22 Event Callbacks:** Full debugger event coverage — init, stop, breakpoint, exception, step, attach/detach, DLL load/unload, threads, and more.
 - **Zero Dependencies:** Pure native plugin, no runtime or framework needed.
 - **x32 and x64:** Single codebase, builds both architectures from one command.
-- **Dual Transport:** Streamable HTTP + SSE — compatible with any MCP client (new and legacy).
-- **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request to prevent unauthorized access.
+- **Dual Transport:** Streamable HTTP + SSE — compatible with any MCP client (new and legacy). SSE can be switched off.
+- **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request (compared in constant time, with per-IP lockout after repeated failures).
+- **Hardened Networking:** Loopback by default, fail-closed bind, client IP allowlist, request timeouts, bounded client threads, exclusive port binding.
 - **Config Dialog:** Change IP/port/token from the Plugins menu, auto-restarts the server on save.
 - **Auto-Start:** MCP server starts automatically when x64dbg launches.
 - **Cross-Compile:** Build Windows plugins from Linux, macOS, or WSL.
@@ -53,9 +54,9 @@ Download the latest release or build from source:
 1. Copy the contents of `dist/` into your x64dbg root folder (deploys both x32 and x64)
 2. Launch x64dbg
 
-The MCP server starts automatically. Default ports:
-- **x64:** `0.0.0.0:9094`
-- **x32:** `0.0.0.0:9095`
+The MCP server starts automatically. Default addresses (loopback only):
+- **x64:** `127.0.0.1:9094`
+- **x32:** `127.0.0.1:9095`
 
 
 ## Usage
@@ -92,7 +93,7 @@ Add to your MCP client config (`.mcp.json`, etc.):
 }
 ```
 
-If connecting from WSL or a remote machine, use the host's IP address and set the bind address to `0.0.0.0` in the config dialog.
+If connecting from WSL or a remote machine, prefer an SSH tunnel to `127.0.0.1`. To bind another address (for example `0.0.0.0`) you must also opt in through `mcp_config.json`: set `"AllowExternal": true`, list the permitted clients in `"AllowedClients"`, and use a token of at least 32 characters (see [Remote access](#remote-access)). Otherwise the server refuses to start. The traffic is plain HTTP, so only expose it on a trusted, isolated network.
 
 **Example — AI-assisted reverse engineering session:**
 ```
@@ -116,13 +117,15 @@ AI: [calls StepOver x3, GetCallStack]
 
 ## Tools
 
-72 MCP tools covering the full x64dbg debugging workflow.
+82 MCP tools covering the full x64dbg debugging workflow.
 
 ### Always available
 | Tool | Description |
 |------|-------------|
 | `GetDebugState` | Current debugger state, PID, instruction pointer |
-| `LoadBinary` | Load an executable into the debugger |
+| `GetServerInfo` | Identify the backend: arch, version, x64dbg PID, debuggee path, ArtifactDir (JSON) |
+| `LoadBinary` | Load an executable (optional arguments / working directory) and wait until it is paused |
+| `SetArtifactDir` | Set the directory that relative dump/database paths are written to |
 | `ExecuteDebuggerCommand` | Run any x64dbg command |
 | `ListCommandsByCategory` | List available MCP tools |
 | `SearchForStrings` | Search process memory for text |
@@ -188,8 +191,8 @@ AI: [calls StepOver x3, GetCallStack]
 | `GetFunctions` | List analyzed functions with addresses and labels |
 | `AnalyzeModule` | PE structure analysis: sections, EP, image size |
 | `DetectOEP` | Detect Original Entry Point for packed executables |
-| `DumpMemory` | Save memory region to file on disk |
-| `DumpModule` | Dump an entire module to a file |
+| `DumpMemory` | Save memory region to file on disk (relative paths go to ArtifactDir) |
+| `DumpModule` | Dump an entire module to a file (relative paths go to ArtifactDir) |
 | `RunToAddress` | Run until hitting a specific address |
 | `TraceInto` | Step N instructions recording address + disassembly |
 | `FollowPointer` | Dereference pointer chain N levels deep |
@@ -204,29 +207,85 @@ AI: [calls StepOver x3, GetCallStack]
 | `TraceOver` | Trace N instructions stepping over calls |
 | `SetBreakpointCommand` | Set a command to execute when a breakpoint is hit |
 | `SetBreakpointFastResume` | Enable/disable fast resume (auto-continue) on a breakpoint |
-| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32) |
+| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file |
 
 
 ## Configuration
 
-Go to **Plugins > x64dbg-MCP Server > Configure MCP Server...** to change the bind address, port, and auth token.
+Go to **Plugins > x64dbg-MCP Server > Configure MCP Server...** to change the bind address, port, auto-start and auth token.
 
-- `0.0.0.0` — listen on all interfaces (for WSL/remote access)
-- `127.0.0.1` — local-only access
+- `127.0.0.1` — local-only access (default)
+- any other address (e.g. `0.0.0.0`) — needs the file-only keys described under [Remote access](#remote-access)
+
+Changes take effect immediately — the server auto-restarts on save. Config is persisted to `mcp_config.json` next to the x64dbg executable (x32dbg and x64dbg each have their own file and token).
 
 ### Authentication
 
-A Bearer token is auto-generated on first run and required on every request. The MCP server has full debugger control and can read/write process memory — all requests without a valid token receive `401 Unauthorized`. Click **Generate** in the config dialog to rotate the token, or **Copy** to copy it to clipboard. Clients must include the token as an `Authorization: Bearer <token>` header.
+A Bearer token is auto-generated on first run and required on every request, for every HTTP method (including `OPTIONS`, which is answered with `405` once authenticated; the server sends no CORS headers because MCP clients are not browsers). The MCP server has full debugger control and can read/write process memory — all requests without a valid token receive `401 Unauthorized`. Click **Generate** in the config dialog to rotate the token, or **Copy** to copy it to clipboard. Clients must include the token as an `Authorization: Bearer <token>` header.
 
-Changes take effect immediately — the server auto-restarts on save. Config is persisted to `mcp_config.json` next to the x64dbg executable.
+Tokens are compared in constant time. After `AuthMaxFailures` failed attempts within 60 seconds an IP address is blocked for `AuthLockoutSeconds` (connections are dropped, and an in-flight request gets `429`).
+
+### mcp_config.json
+
+The dialog edits the first four keys; all other keys are **file-only** (edit the JSON while x64dbg is closed, or edit it and then press **Save** in the dialog to restart the server; unknown keys are preserved when the dialog saves).
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `IpAddress` | `"127.0.0.1"` | IPv4 address to bind. Must be a valid dotted IPv4 address — an invalid value makes the server refuse to start (it no longer falls back to `0.0.0.0`). |
+| `Port` | `9094` (x64) / `9095` (x32) | TCP port, 1–65535. |
+| `AutoStart` | `true` | Start the server when the plugin loads. |
+| `AuthToken` | generated | 1–64 printable ASCII characters (no spaces, quotes or backslashes). |
+| `AllowExternal` | `false` | Must be `true` to bind any non-loopback address. Then the token must be at least 32 characters. |
+| `AllowedClients` | `[]` | IPv4 addresses or CIDR ranges (`"192.168.56.0/24"`, `"10.0.0.5"`) allowed to connect, max 64. Required (non-empty) for a non-loopback bind. Loopback clients are always allowed. |
+| `MaxClients` | `16` | Maximum concurrent connections (1–256); extra connections are closed immediately. |
+| `EnableSse` | `true` | Serve the legacy SSE transport (`/sse`, `/messages`). Set `false` when exposing the server; Streamable HTTP keeps working. |
+| `ArtifactDir` | `""` | Absolute directory (drive or UNC path) for relative `filePath` arguments of `DumpMemory`, `DumpModule` and `SaveDatabase`. |
+| `AuthMaxFailures` | `5` | Failed authentications per IP (within 60 s) before a lockout, 1–1000. |
+| `AuthLockoutSeconds` | `300` | Lockout duration in seconds, 1–86400. |
+
+If `mcp_config.json` exists but cannot be parsed (invalid JSON, a duplicate key, a wrong type or an out-of-range value), the plugin logs the offending key, leaves the file untouched and does not start the server. Fix the file, or open the dialog and press **Save** to replace it.
+
+### Remote access
+
+The server speaks plain HTTP. Prefer an SSH tunnel to `127.0.0.1`. If you must listen on another interface (for example for a host-side gateway talking to a VM over a host-only network):
+
+```json
+{
+  "IpAddress": "0.0.0.0",
+  "Port": 9094,
+  "AutoStart": true,
+  "AuthToken": "<at least 32 characters>",
+  "AllowExternal": true,
+  "AllowedClients": ["192.168.56.1"],
+  "EnableSse": false
+}
+```
+
+Hardening that applies to every bind:
+
+- The request line and headers must arrive within 5 seconds and the whole request within 10 seconds of connecting; responses use a 10 second send timeout.
+- At most `MaxClients` connections are served at once; the peer address is checked against `AllowedClients` and the lockout table **before** a thread is created for it.
+- The port is bound with `SO_EXCLUSIVEADDRUSE`, so another process cannot share it. If the port is still busy when the server restarts (another process, or connections of the previous instance that are still open), the server keeps retrying once per second and logs this.
+- SSE notifications are queued per client; a client that stops reading is dropped after a 5 second send timeout and never blocks the debugger thread.
+- State-changing tools are serialised. While one runs (for example a blocking `run`), another state-changing call waits up to 10 seconds and then returns `BUSY` without executing. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked.
+
+### Artifact directory
+
+`GetServerInfo` reports the current `artifact_dir`. Set it in `mcp_config.json` (`ArtifactDir`) or at runtime with `SetArtifactDir` (runtime only; saving the dialog or reloading the plugin restores the file value). Relative `filePath` values are joined to it; absolute paths are used as-is. Paths with `..`, alternate data streams (`file:stream`), device prefixes (`\\?\`, `\\.\`), reserved names (`CON`, `NUL`, ...) or control characters are rejected. Without an `ArtifactDir`, relative paths are passed to x64dbg unchanged, as before.
 
 
 ## Building
 
-Requires [Zig 0.16-dev](https://ziglang.org/download/) or later. Builds on Windows, WSL, Linux, or macOS.
+Requires [Zig 0.14.0](https://ziglang.org/download/#release-0.14.0) (the version CI uses). Builds on Windows, WSL, Linux, or macOS.
 
 ```console
 zig build -Doptimize=ReleaseSafe --prefix dist
+```
+
+Run the unit tests (pure logic: JSON, config parsing, network policy, path resolution, queues; they run on the build host):
+
+```console
+zig build test
 ```
 
 Output mirrors x64dbg's folder structure — copy the contents of `dist/` into your x64dbg root to deploy both architectures at once:
@@ -251,9 +310,20 @@ dist/
     ├── core/
     │   ├── bridge.zig            # x64dbg SDK bindings (runtime-resolved)
     │   ├── config.zig            # Win32 config dialog and persistence
-    │   └── mcp_server.zig        # HTTP server and JSON-RPC dispatch
+    │   ├── cfgjson.zig           # mcp_config.json parse/serialize (tested)
+    │   ├── http.zig              # HTTP request framing helpers (tested)
+    │   ├── launch.zig            # LoadBinary/RestartDebug launch tracking (tested)
+    │   ├── mcp_server.zig        # HTTP server and JSON-RPC dispatch
+    │   ├── netpolicy.zig         # bind policy, allowlist, token, lockout (tested)
+    │   ├── pathutil.zig          # ArtifactDir path resolution (tested)
+    │   ├── ring.zig              # locked event queues (tested)
+    │   ├── ssehub.zig            # SSE client table and send queues (tested)
+    │   └── sync.zig              # SRWLOCK wrapper (tested)
     ├── mcp/
-    │   ├── json.zig              # JSON writer and parser helpers
+    │   ├── cmdline.zig           # x64dbg command quoting (tested)
+    │   ├── json.zig              # JSON writer and parser helpers (tested)
+    │   ├── serverinfo.zig        # GetServerInfo payload (tested)
+    │   ├── toolpolicy.zig        # which tools are serialised (tested)
     │   └── tools.zig             # MCP tool definitions and handlers
     └── resources/
         └── icons.zig             # embedded PNG icon data
@@ -275,7 +345,7 @@ No polling, no external processes — the plugin lives inside x64dbg's address s
 >
 > By using this software, you accept full responsibility for how it is used. The author is not liable for any misuse, damage, or legal consequences resulting from the use of this tool. Always ensure you have proper authorization before debugging or analyzing any software.
 >
-> Do not expose the MCP server to untrusted networks. While Bearer token authentication is enforced, the server communicates over unencrypted HTTP.
+> Do not expose the MCP server to untrusted networks. While Bearer token authentication is enforced, the server communicates over unencrypted HTTP, and anyone holding the token can run arbitrary debugger commands (and therefore code) on the debugging machine.
 
 
 ---

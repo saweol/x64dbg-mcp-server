@@ -43,34 +43,67 @@ pub const LaunchState = struct {
     has_pending: bool = false,
 
     pub fn setPending(self: *LaunchState, path: []const u8, args: []const u8, workdir: []const u8) error{TooLong}!void {
-        _ = self;
-        _ = path;
-        _ = args;
-        _ = workdir;
+        if (path.len >= MAX_LEN or args.len >= MAX_LEN or workdir.len >= MAX_LEN) return error.TooLong;
+        self.lock.lock();
+        defer self.lock.unlock();
+        copyInto(&self.pending.path_buf, &self.pending.path_len, path);
+        copyInto(&self.pending.args_buf, &self.pending.args_len, args);
+        copyInto(&self.pending.workdir_buf, &self.pending.workdir_len, workdir);
+        self.has_pending = true;
     }
 
     pub fn clearPending(self: *LaunchState) void {
-        _ = self;
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.has_pending = false;
     }
 
     /// Called from CB_INITDEBUG with the executable x64dbg started.
     pub fn onInitDebug(self: *LaunchState, path: []const u8) void {
-        _ = self;
-        _ = path;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const cur = &self.current;
+        if (self.has_pending and samePath(self.pending.path(), path)) {
+            copyInto(&cur.args_buf, &cur.args_len, self.pending.args());
+            copyInto(&cur.workdir_buf, &cur.workdir_len, self.pending.workdir());
+        } else if (!samePath(cur.path(), path)) {
+            cur.args_len = 0;
+            cur.workdir_len = 0;
+        }
+        self.has_pending = false;
+        if (path.len < MAX_LEN) {
+            copyInto(&cur.path_buf, &cur.path_len, path);
+        } else {
+            // Cannot be replayed faithfully; report the path as unknown.
+            cur.* = .{};
+        }
     }
 
     /// Copies the current launch into `out`.
     pub fn snapshot(self: *LaunchState, out: *Launch) void {
-        _ = self;
-        out.* = .{};
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        copyInto(&out.path_buf, &out.path_len, self.current.path());
+        copyInto(&out.args_buf, &out.args_len, self.current.args());
+        copyInto(&out.workdir_buf, &out.workdir_len, self.current.workdir());
     }
 };
 
+fn copyInto(buf: *[MAX_LEN]u8, len: *usize, s: []const u8) void {
+    const n = @min(s.len, MAX_LEN);
+    @memcpy(buf[0..n], s[0..n]);
+    len.* = n;
+}
+
 /// Windows path equality: ASCII case-insensitive, '/' == '\'.
 pub fn samePath(a: []const u8, b: []const u8) bool {
-    _ = a;
-    _ = b;
-    return false;
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const nx = if (x == '/') '\\' else std.ascii.toLower(x);
+        const ny = if (y == '/') '\\' else std.ascii.toLower(y);
+        if (nx != ny) return false;
+    }
+    return true;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

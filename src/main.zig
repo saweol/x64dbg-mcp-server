@@ -4,6 +4,8 @@ const std = @import("std");
 const bridge = @import("core/bridge.zig");
 const mcp = @import("core/mcp_server.zig");
 const config = @import("core/config.zig");
+const ring = @import("core/ring.zig");
+const launch = @import("core/launch.zig");
 const icons = @import("resources/icons.zig");
 const tools_mod = @import("mcp/tools.zig");
 
@@ -19,56 +21,43 @@ const MENU_CONFIG: c_int = 2;
 const MENU_ABOUT: c_int = 3;
 
 // ── Event log ring buffer ──────────────────────────────────────────
+// Written by x64dbg callbacks (debugger thread), read and cleared by tool
+// handlers (HTTP threads): LockedRing copies data out under an SRWLOCK.
 const EVENT_LOG_SIZE = 64;
-const EVENT_MSG_SIZE = 192;
+pub const EVENT_MSG_SIZE = 192;
 
-var event_log: [EVENT_LOG_SIZE][EVENT_MSG_SIZE]u8 = undefined;
-var event_log_lens: [EVENT_LOG_SIZE]usize = [_]usize{0} ** EVENT_LOG_SIZE;
-var event_log_head: usize = 0;
-var event_log_count: usize = 0;
+var event_log: ring.LockedRing(EVENT_LOG_SIZE, EVENT_MSG_SIZE) = .{};
 
 pub fn pushEvent(msg: []const u8) void {
-    const len = @min(msg.len, EVENT_MSG_SIZE);
-    @memcpy(event_log[event_log_head][0..len], msg[0..len]);
-    event_log_lens[event_log_head] = len;
-    event_log_head = (event_log_head + 1) % EVENT_LOG_SIZE;
-    if (event_log_count < EVENT_LOG_SIZE) event_log_count += 1;
+    event_log.push(msg);
 }
 
 pub fn getEventCount() usize {
-    return event_log_count;
+    return event_log.len();
 }
 
-pub fn getEvent(index: usize) []const u8 {
-    if (index >= event_log_count) return "";
-    const start = if (event_log_count < EVENT_LOG_SIZE) 0 else event_log_head;
-    const i = (start + index) % EVENT_LOG_SIZE;
-    return event_log[i][0..event_log_lens[i]];
+/// Copies event `index` (0 = oldest) into `out`; "" when out of range.
+pub fn copyEvent(index: usize, out: []u8) []const u8 {
+    return event_log.copyAt(index, out);
 }
 
 pub fn clearEvents() void {
-    event_log_count = 0;
-    event_log_head = 0;
+    event_log.clear();
 }
 
-// ── Current debuggee path ───────────────────────────────────────────
+// ── Debuggee launch tracking ────────────────────────────────────────
 //
-// x64dbg supplies the full executable path in CB_INITDEBUG.  Keep a
-// private copy so RestartDebug can issue the same "init <path>"
-// operation as x64dbg's normal restart behaviour.
-const DEBUGGEE_PATH_SIZE = 1024;
-var current_debuggee_path: [DEBUGGEE_PATH_SIZE]u8 = undefined;
-var current_debuggee_path_len: usize = 0;
+// x64dbg supplies the full executable path in CB_INITDEBUG. `launch_state`
+// keeps it together with the arguments / working directory LoadBinary used,
+// so RestartDebug can repeat the same "init" (see core/launch.zig).
+pub var launch_state: launch.LaunchState = .{};
 
-pub fn setCurrentDebuggeePath(path: []const u8) void {
-    const len = @min(path.len, DEBUGGEE_PATH_SIZE - 1);
-    @memcpy(current_debuggee_path[0..len], path[0..len]);
-    current_debuggee_path[len] = 0;
-    current_debuggee_path_len = len;
-}
+/// Incremented on every CB_INITDEBUG; LoadBinary uses it to tell a new
+/// debug session from the one that was active before its init command.
+var init_debug_seq = std.atomic.Value(u32).init(0);
 
-pub fn getCurrentDebuggeePath() []const u8 {
-    return current_debuggee_path[0..current_debuggee_path_len];
+pub fn initDebugSeq() u32 {
+    return init_debug_seq.load(.acquire);
 }
 
 const HWND = ?*anyopaque;
@@ -153,13 +142,17 @@ export fn plugsetup(setupStruct: *bridge.PLUG_SETUPSTRUCT) callconv(.c) void {
     logToolCount(tools_mod.tools.len);
 
     // Load saved config or use defaults
-    const cfg = config.load();
-    mcp.setConfig(cfg.ip[0..cfg.ip_len], cfg.port, cfg.tokenSlice());
+    var loaded = config.load();
+    defer loaded.deinit();
+    config.applyToRuntime(&loaded.owned.config);
 
     // Log plugin handle
     logPluginHandle();
 
-    if (cfg.auto_start) {
+    if (loaded.status == .invalid) {
+        mcp.markConfigInvalid();
+        bridge.logPuts("[x64dbg-MCP Server] Server not started: mcp_config.json is invalid. Fix it or save the configuration dialog.\x00");
+    } else if (loaded.owned.config.auto_start) {
         mcp.start();
     } else {
         bridge.logPuts("[x64dbg-MCP Server] Auto-start disabled. Use menu to start.\x00");
@@ -184,7 +177,7 @@ export fn CBMENUENTRY(_: bridge.CBTYPE, info: *bridge.PLUG_CB_MENUENTRY) callcon
 }
 
 fn toggleServer() void {
-    if (mcp.server_running) {
+    if (mcp.isRunning()) {
         mcp.stop();
     } else {
         mcp.start();
@@ -195,7 +188,7 @@ fn toggleServer() void {
 fn rebuildMenu() void {
     _ = bridge._plugin_menuclear(main_menu);
 
-    if (mcp.server_running) {
+    if (mcp.isRunning()) {
         _ = bridge._plugin_menuaddentry(main_menu, MENU_TOGGLE, "&Stop MCP Server\x00");
         setEntryIcon(MENU_TOGGLE, icons.stop_icon);
     } else {
@@ -367,7 +360,8 @@ fn logAndPush(msg: []const u8) void {
 fn cbInitDebug(_: bridge.CBTYPE, info: *anyopaque) callconv(.c) void {
     const cb: *bridge.PLUG_CB_INITDEBUG = @ptrCast(@alignCast(info));
     const path = std.mem.span(cb.szFileName);
-    setCurrentDebuggeePath(path);
+    launch_state.onInitDebug(path);
+    _ = init_debug_seq.fetchAdd(1, .acq_rel);
 
     logAndPush("[x64dbg-MCP Server] Debug session started.\x00");
     mcp.notifyEvent("info", "Debug session started. Binary loaded.");

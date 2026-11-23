@@ -11,9 +11,13 @@ const std = @import("std");
 /// How long a mutating call waits for the lock before failing with BUSY.
 pub const LOCK_WAIT_MS: u64 = 10_000;
 
+const lock_free_tools = [_][]const u8{ "PauseDebug", "WaitForEvent", "WaitForPause", "GetDebugState" };
+
 pub fn bypassesMutationLock(name: []const u8, read_only: bool) bool {
-    _ = name;
-    _ = read_only;
+    if (read_only) return true;
+    for (lock_free_tools) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
     return false;
 }
 

@@ -47,8 +47,9 @@ GetDebugState → SetBreakpoint → run → GetDebugState → Disassemble
 ### Load and analyze a binary
 ```
 GetDebugState
-LoadBinary (path)
-WaitForPause            — target pauses at system breakpoint
+LoadBinary (filePath, arguments?, workingDir?)
+                        — waits until the new session is PAUSED (system breakpoint)
+                        — LOADED_NOT_PAUSED means it started but did not stop: WaitForPause / PauseDebug
 GetDebugState           — confirm PAUSED, note the address
 GetAllRegisters         — see initial state
 ListModules             — see what's loaded
@@ -111,6 +112,16 @@ Disassemble (address)   — verify the patch
 GetPatches              — see all active patches
 ```
 
+### Save artifacts (dumps, database) to a known directory
+```
+GetServerInfo                         — arch, version, x64dbg pid, debuggee_path, artifact_dir
+SetArtifactDir (path)                 — e.g. the job output folder (absolute drive or UNC path)
+DumpModule (module, filePath: "unpacked.bin")   — relative paths land in artifact_dir
+DumpMemory (address, size, filePath: "region.bin")
+SaveDatabase (filePath: "sample.dd64")          — labels, comments, breakpoints
+```
+Relative paths with `..`, `file:stream`, `\\?\`/`\\.\` prefixes or reserved names (CON, NUL, ...) are rejected. Absolute paths are used as-is.
+
 ### Monitor while user interacts with GUI (HTTP only)
 ```
 WaitForEvent (timeoutMs: 120000)  — long-poll up to 2 minutes
@@ -121,21 +132,25 @@ WaitForEvent (timeoutMs: 120000)  — keep watching
 
 ---
 
-## Rule 4: All 84 Tools Reference
+## Rule 4: All 82 Tools Reference
 
 Every tool response includes a `[state]` line showing current debugger status and any `[event:*]` lines with queued events. You always know where you are.
+
+State-changing tools run one at a time. If one is still running (typically a blocking `run`), another state-changing call waits up to 10 s and then returns `BUSY` **without executing**. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked — use `PauseDebug` to interrupt a long `run`.
 
 ### State & Control (always available)
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `GetDebugState` | — | Current state (NO_TARGET/RUNNING/PAUSED), PID, address, module |
-| `LoadBinary` | `filePath` | Load an executable into the debugger |
+| `GetServerInfo` | — | JSON: `backend`, `arch` (x64/x32), `version`, `pid` (x64dbg process), `debuggee_path`, `artifact_dir`, `capabilities`, `max_chunk` |
+| `LoadBinary` | `filePath`, `arguments?`, `workingDir?`, `timeoutMs?` (default 10000) | Load an executable and wait until the new session is paused |
+| `SetArtifactDir` | `path` (absolute; `""` clears) | Directory for relative `filePath` of DumpMemory/DumpModule/SaveDatabase (runtime only) |
 | `AttachProcess` | `pid` | Attach to a running process by PID |
 | `run` | `timeoutMs?` (default 300000) | Resume execution (F9). Blocks until target pauses or timeout |
 | `PauseDebug` | — | Pause the target (F12) |
-| `WaitForPause` | `timeout?` (ms, default 10000) | Block until target pauses (breakpoint/exception) |
+| `WaitForPause` | `timeoutMs?` (default 30000, max 120000) | Block until target pauses (breakpoint/exception) |
 | `StopDebug` | — | Terminate debug session |
-| `RestartDebug` | — | Restart debug session |
+| `RestartDebug` | — | Restart debug session (reuses LoadBinary's arguments / working directory) |
 | `ExecuteDebuggerCommand` | `command` | Run any x64dbg command string. Blocks if target becomes RUNNING |
 | `EvalExpression` | `expression` | Evaluate expression (address, register, symbol, arithmetic) |
 | `Echo` | `message` | Echo input back (connectivity test) |
@@ -206,7 +221,7 @@ Every tool response includes a `[state]` line showing current debugger status an
 | `FindPattern` | `pattern`, `module?` | Scan for byte pattern with ?? wildcards |
 | `GetPatches` | — | List all memory patches |
 | `RestorePatches` | — | Restore all patches to original bytes |
-| `DumpMemory` | `address`, `size`, `filePath` | Save memory region to file |
+| `DumpMemory` | `address`, `size`, `filePath` | Save memory region to file (relative path → artifact_dir) |
 
 ### Modules & Symbols (requires debug session)
 | Tool | Parameters | Description |
@@ -224,10 +239,10 @@ Every tool response includes a `[state]` line showing current debugger status an
 | `AnalyzeModule` | `module?` | PE structure: sections, EP, image size, characteristics |
 | `AnalyzeCode` | `address?`, `type` (function/module/controlflow) | Run code analysis |
 | `DetectOEP` | `module?` | Detect Original Entry Point for packed executables |
-| `DumpModule` | `module`, `filePath` | Dump entire module to file |
+| `DumpModule` | `module`, `filePath` | Dump entire module to file (relative path → artifact_dir) |
 | `GetPEB` | — | Read Process Environment Block fields |
 | `GetSEHChain` | — | Walk Structured Exception Handler chain (x32) |
-| `SaveDatabase` | — | Save the x64dbg database (.dd64/.dd32) |
+| `SaveDatabase` | `filePath?` | Save the x64dbg database (.dd64/.dd32); with `filePath`, to that file (relative → artifact_dir) |
 
 ### Bookmarks & Comments (requires debug session)
 | Tool | Parameters | Description |
@@ -261,6 +276,8 @@ Every tool response includes a `[state]` line showing current debugger status an
 | Pass MCP tool name to `ExecuteDebuggerCommand` | Call the tool directly — `ExecuteDebuggerCommand` rejects MCP tool names |
 | Use `erun` to blindly pass all exceptions | Use `SetExceptionBreakpoint` for selective exception handling |
 | Go idle while user interacts with GUI | Call `WaitForEvent` with longer timeout (60-120s) to watch for events |
+| Retry a tool that returned `BUSY` in a tight loop | `BUSY` means it did not run: `PauseDebug` or `WaitForPause` first, then retry once |
+| Dump to a guessed relative path | `GetServerInfo` to see `artifact_dir`, or `SetArtifactDir` first |
 
 ---
 

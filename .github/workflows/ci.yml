@@ -8,8 +8,15 @@ on:
 
 jobs:
   test:
-    name: Unit Tests
-    runs-on: windows-latest
+    name: Unit Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The tested modules are pure logic; running them on Linux as well
+        # keeps them free of accidental Win32 dependencies, while the
+        # Windows run exercises the real SRWLOCK code path.
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +26,7 @@ jobs:
           version: 0.14.0
 
       - name: Run tests
-        run: zig build test
+        run: zig build test --summary all
 
   build:
     name: Build Plugins
@@ -33,4 +40,4 @@ jobs:
           version: 0.14.0
 
       - name: Build x32 and x64 plugins
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseSafe

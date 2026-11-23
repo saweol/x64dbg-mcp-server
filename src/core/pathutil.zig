@@ -37,30 +37,128 @@ pub const Error = error{
 
 pub const Kind = enum { relative, drive_absolute, unc };
 
+fn isSep(c: u8) bool {
+    return c == '\\' or c == '/';
+}
+
+/// Classifies the path prefix. Index where the component list starts is
+/// returned through `body_start`.
+fn classify(p: []const u8, body_start: *usize) Error!Kind {
+    if (p.len == 0) return error.EmptyPath;
+    if (p.len >= 2 and isSep(p[0]) and isSep(p[1])) {
+        // "\\?\", "\\.\" (Win32 device/namespace) and their "//" spellings.
+        if (p.len >= 3 and (p[2] == '?' or p[2] == '.') and (p.len == 3 or isSep(p[3])))
+            return error.DevicePath;
+        // UNC: \\server\share[\...]; server and share are checked like any
+        // other component.
+        var it = std.mem.tokenizeAny(u8, p[2..], "\\/");
+        _ = it.next() orelse return error.InvalidUncPath; // server
+        _ = it.next() orelse return error.InvalidUncPath; // share
+        body_start.* = 2;
+        return .unc;
+    }
+    if (isSep(p[0])) {
+        // "\??\" is the NT object-manager prefix.
+        if (p.len >= 4 and p[1] == '?' and p[2] == '?' and isSep(p[3])) return error.DevicePath;
+        return error.AmbiguousPath; // rooted on the current drive
+    }
+    if (p.len >= 2 and p[1] == ':' and std.ascii.isAlphabetic(p[0])) {
+        if (p.len == 2 or !isSep(p[2])) return error.AmbiguousPath; // "C:" / "C:x"
+        body_start.* = 3;
+        return .drive_absolute;
+    }
+    body_start.* = 0;
+    return .relative;
+}
+
+const reserved_names = [_][]const u8{
+    "CON",  "PRN",  "AUX",  "NUL",
+    "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3",
+    "LPT4", "LPT5", "LPT6", "LPT7",
+    "LPT8", "LPT9",
+};
+
+fn isReservedName(component: []const u8) bool {
+    // Windows ignores the extension: "nul.txt" is still the NUL device.
+    const dot = std.mem.indexOfScalar(u8, component, '.') orelse component.len;
+    const base = std.mem.trimRight(u8, component[0..dot], " ");
+    for (reserved_names) |r| {
+        if (std.ascii.eqlIgnoreCase(base, r)) return true;
+    }
+    return false;
+}
+
+fn checkComponent(c: []const u8) Error!void {
+    if (c.len == 0 or std.mem.eql(u8, c, ".")) return;
+    if (std.mem.eql(u8, c, "..")) return error.ParentTraversal;
+    // "...", trailing dots and trailing spaces are silently stripped by
+    // Win32, which makes two different strings name the same file.
+    const last = c[c.len - 1];
+    if (last == '.' or last == ' ') return error.BadComponent;
+    if (isReservedName(c)) return error.ReservedName;
+}
+
 /// Validates `p` and returns its kind.
 pub fn validate(p: []const u8) Error!Kind {
-    _ = p;
-    return error.EmptyPath;
+    var body_start: usize = 0;
+    const kind = try classify(p, &body_start);
+    for (p, 0..) |c, i| {
+        switch (c) {
+            0...0x1F, '"', '<', '>', '|', '*', '?' => return error.InvalidCharacter,
+            ':' => if (!(kind == .drive_absolute and i == 1)) return error.AlternateDataStream,
+            else => {},
+        }
+    }
+    var it = std.mem.splitAny(u8, p[body_start..], "\\/");
+    while (it.next()) |comp| try checkComponent(comp);
+    return kind;
 }
 
 /// ArtifactDir must be a valid absolute (drive or UNC) path.
 pub fn validateArtifactDir(dir: []const u8) Error!void {
-    _ = dir;
-    return error.EmptyPath;
+    const kind = try validate(dir);
+    if (kind == .relative) return error.NotAbsolute;
+}
+
+/// Copies `s` to `out[pos..]`, converting '/' to '\'.
+fn appendNormalized(out: []u8, pos: *usize, s: []const u8) Error!void {
+    if (out.len - pos.* < s.len) return error.PathTooLong;
+    for (s, 0..) |c, i| out[pos.* + i] = if (c == '/') '\\' else c;
+    pos.* += s.len;
 }
 
 /// Resolves `file_path` against `artifact_dir` into `buf`.
 pub fn resolve(buf: []u8, artifact_dir: []const u8, file_path: []const u8) Error![]const u8 {
-    _ = buf;
-    _ = artifact_dir;
-    _ = file_path;
-    return error.EmptyPath;
+    const out = buf[0..@min(buf.len, MAX_PATH_LEN)];
+    const kind = try validate(file_path);
+    var pos: usize = 0;
+    if (kind == .relative and artifact_dir.len > 0) {
+        try validateArtifactDir(artifact_dir);
+        var dir = artifact_dir;
+        while (dir.len > 0 and isSep(dir[dir.len - 1])) dir = dir[0 .. dir.len - 1];
+        try appendNormalized(out, &pos, dir);
+        try appendNormalized(out, &pos, "\\");
+    }
+    try appendNormalized(out, &pos, file_path);
+    return out[0..pos];
 }
 
 /// Short human-readable explanation for tool error messages.
 pub fn describe(err: Error) []const u8 {
     return switch (err) {
-        else => "",
+        error.EmptyPath => "path is empty",
+        error.PathTooLong => "path is too long",
+        error.InvalidCharacter => "path contains a control character or one of \" < > | ? *",
+        error.AlternateDataStream => "':' is only allowed after the drive letter (no alternate data streams)",
+        error.ParentTraversal => "'..' path components are not allowed",
+        error.DevicePath => "device/namespace paths (\\\\?\\, \\\\.\\, \\??\\) are not allowed",
+        error.AmbiguousPath => "path must be relative, 'X:\\...' or '\\\\server\\share\\...' (no '\\x' or 'X:x')",
+        error.InvalidUncPath => "UNC path needs both a server and a share",
+        error.BadComponent => "path components must not end with '.' or ' '",
+        error.ReservedName => "reserved device name (CON, NUL, COM1, ...) in path",
+        error.NotAbsolute => "ArtifactDir must be an absolute path",
     };
 }
 
@@ -72,14 +170,20 @@ pub const ArtifactDirState = struct {
 
     /// Validates and stores `dir`; an empty string clears it.
     pub fn set(self: *ArtifactDirState, dir: []const u8) Error!void {
-        _ = self;
-        _ = dir;
+        if (dir.len > 0) try validateArtifactDir(dir);
+        if (dir.len > MAX_PATH_LEN) return error.PathTooLong;
+        self.lock.lock();
+        defer self.lock.unlock();
+        @memcpy(self.buf[0..dir.len], dir);
+        self.len = dir.len;
     }
 
     /// Copies the current value into `out` ("" when unset).
     pub fn get(self: *ArtifactDirState, out: *[MAX_PATH_LEN]u8) []const u8 {
-        _ = self;
-        return out[0..0];
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        @memcpy(out[0..self.len], self.buf[0..self.len]);
+        return out[0..self.len];
     }
 };
 
@@ -143,6 +247,8 @@ test "traversal, streams and device paths are rejected" {
     try expectRejected(out_dir, "C:relative", error.AmbiguousPath);
     try expectRejected(out_dir, "\\\\server", error.InvalidUncPath);
     try expectRejected(out_dir, "\\\\server\\", error.InvalidUncPath);
+    try expectRejected(out_dir, "\\\\..\\share\\a", error.ParentTraversal);
+    try expectRejected(out_dir, "\\\\srv\\..\\a", error.ParentTraversal);
 }
 
 test "bad characters and names are rejected" {

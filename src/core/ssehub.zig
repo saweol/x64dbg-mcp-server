@@ -53,68 +53,102 @@ pub const Hub = struct {
 
     /// Frees every queued frame. No other thread may use the hub afterwards.
     pub fn deinit(self: *Hub) void {
-        _ = self;
+        for (&self.slots) |*s| self.clearQueue(s);
     }
 
     /// Registers a new client; null when the table is full.
     pub fn add(self: *Hub) ?Handle {
-        _ = self;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.slots, 0..) |*s, i| {
+            if (s.state != .free) continue;
+            s.state = .active;
+            s.gen +%= 1;
+            const id = self.next_session;
+            self.next_session +%= 1;
+            if (self.next_session == 0) self.next_session = 1;
+            s.session_len = (std.fmt.bufPrint(&s.session_buf, "{d}", .{id}) catch unreachable).len;
+            return .{ .idx = @intCast(i), .gen = s.gen };
+        }
         return null;
     }
 
     /// Copies the client's session id into `out`.
     pub fn sessionId(self: *Hub, h: Handle, out: *[SESSION_ID_MAX]u8) ?[]const u8 {
-        _ = self;
-        _ = h;
-        _ = out;
-        return null;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const s = self.slotFor(h) orelse return null;
+        @memcpy(out[0..s.session_len], s.session_buf[0..s.session_len]);
+        return out[0..s.session_len];
     }
 
     /// Releases the slot (no-op for a stale handle) and frees its queue.
     pub fn remove(self: *Hub, h: Handle) void {
-        _ = self;
-        _ = h;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const s = self.slotFor(h) orelse return;
+        self.clearQueue(s);
+        s.state = .free;
+        s.session_len = 0;
     }
 
     pub fn isAlive(self: *Hub, h: Handle) bool {
-        _ = self;
-        _ = h;
-        return false;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const s = self.slotFor(h) orelse return false;
+        return s.state == .active;
     }
 
     pub fn markDead(self: *Hub, h: Handle) void {
-        _ = self;
-        _ = h;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const s = self.slotFor(h) orelse return;
+        self.kill(s);
     }
 
     /// Marks every client dead (server shutdown).
     pub fn killAll(self: *Hub) void {
-        _ = self;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.slots) |*s| {
+            if (s.state == .active) self.kill(s);
+        }
     }
 
     /// Queues "event: <event>\ndata: <data>\n\n" for every live client.
     /// Returns how many clients accepted the frame.
     pub fn broadcast(self: *Hub, event: []const u8, data: []const u8) usize {
-        _ = self;
-        _ = event;
-        _ = data;
-        return 0;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        for (&self.slots) |*s| {
+            if (s.state != .active) continue;
+            if (self.enqueue(s, event, data)) n += 1;
+        }
+        return n;
     }
 
     /// Queues a frame for the live client with `session_id`.
     pub fn sendTo(self: *Hub, session_id: []const u8, event: []const u8, data: []const u8) bool {
-        _ = self;
-        _ = session_id;
-        _ = event;
-        _ = data;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.slots) |*s| {
+            if (s.state != .active) continue;
+            if (!std.mem.eql(u8, s.session_buf[0..s.session_len], session_id)) continue;
+            return self.enqueue(s, event, data);
+        }
         return false;
     }
 
     /// Takes the oldest queued frame of a live client.
     pub fn pop(self: *Hub, h: Handle) ?[]u8 {
-        _ = self;
-        _ = h;
-        return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const s = self.slotFor(h) orelse return null;
+        if (s.state != .active or s.queue.items.len == 0) return null;
+        const f = s.queue.orderedRemove(0);
+        s.queued_bytes -= f.len;
+        return f;
     }
 
     pub fn free(self: *Hub, frame: []u8) void {
@@ -122,8 +156,57 @@ pub const Hub = struct {
     }
 
     pub fn activeCount(self: *Hub) usize {
-        _ = self;
-        return 0;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        var n: usize = 0;
+        for (&self.slots) |*s| {
+            if (s.state == .active) n += 1;
+        }
+        return n;
+    }
+
+    // ── internals (caller holds the lock) ──
+
+    fn slotFor(self: *Hub, h: Handle) ?*Slot {
+        if (h.idx >= MAX_CLIENTS) return null;
+        const s = &self.slots[h.idx];
+        if (s.state == .free or s.gen != h.gen) return null;
+        return s;
+    }
+
+    fn kill(self: *Hub, s: *Slot) void {
+        s.state = .dead;
+        self.clearQueue(s);
+    }
+
+    fn clearQueue(self: *Hub, s: *Slot) void {
+        for (s.queue.items) |f| self.allocator.free(f);
+        s.queue.deinit(self.allocator);
+        s.queue = .{};
+        s.queued_bytes = 0;
+    }
+
+    /// Appends a frame; on overflow or allocation failure the client is
+    /// killed (a half-delivered stream is useless) and false is returned.
+    fn enqueue(self: *Hub, s: *Slot, event: []const u8, data: []const u8) bool {
+        const size = "event: ".len + event.len + "\ndata: ".len + data.len + "\n\n".len;
+        if (s.queue.items.len + 1 > self.limits.max_queued_frames or
+            s.queued_bytes + size > self.limits.max_queued_bytes)
+        {
+            self.kill(s);
+            return false;
+        }
+        const f = std.fmt.allocPrint(self.allocator, "event: {s}\ndata: {s}\n\n", .{ event, data }) catch {
+            self.kill(s);
+            return false;
+        };
+        s.queue.append(self.allocator, f) catch {
+            self.allocator.free(f);
+            self.kill(s);
+            return false;
+        };
+        s.queued_bytes += f.len;
+        return true;
     }
 };
 

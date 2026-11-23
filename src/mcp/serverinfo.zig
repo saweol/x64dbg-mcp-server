@@ -21,14 +21,23 @@ pub const ServerInfo = struct {
 
 /// "x64" for the .dp64 build, "x32" for the .dp32 build.
 pub fn archName() []const u8 {
-    return "";
+    return if (@sizeOf(usize) == 8) "x64" else "x32";
 }
 
 /// Writes {backend, arch, version, pid, debuggee_path, artifact_dir,
 /// capabilities, max_chunk} as a JSON object.
 pub fn write(w: *JsonWriter, info: ServerInfo) void {
-    _ = w;
-    _ = info;
+    w.beginObject();
+    w.fieldStr("backend", "x64dbg");
+    w.fieldStr("arch", info.arch);
+    w.fieldStr("version", info.version);
+    w.fieldInt("pid", info.pid);
+    if (info.debuggee_path) |p| w.fieldStr("debuggee_path", p) else w.fieldNull("debuggee_path");
+    if (info.artifact_dir) |d| w.fieldStr("artifact_dir", d) else w.fieldNull("artifact_dir");
+    // P7 file tools are not implemented, so no chunked transfer (max_chunk 0).
+    w.fieldRaw("capabilities", "[\"artifact_dir\"]");
+    w.fieldInt("max_chunk", 0);
+    w.endObject();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
