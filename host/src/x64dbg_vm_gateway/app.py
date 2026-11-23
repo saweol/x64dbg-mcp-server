@@ -105,7 +105,7 @@ from typing import Any
 
 from . import ida_sync, policy, transfer
 from . import platform as gw_platform
-from .app_api import WARM_UP_TIMEOUT_S, GatewayApp
+from .app_api import GatewayApp
 from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
 from .contracts import (
@@ -184,6 +184,9 @@ POLL_S = 2.0
 #: How long the debugger stage of analysis_start keeps re-reading a backend's token while
 #: VMware Tools are still starting after the revert (E4), before the supervisor is asked.
 RESOLVE_TIMEOUT_S = 120.0
+#: How long ``Gateway.warm_up`` lets the backends report their plugin version before an MCP
+#: front-end serves (E5); the only definition (the front-ends call ``warm_up()`` without one).
+WARM_UP_TIMEOUT_S = 5.0
 #: vmware-vmx processes of this .vmx that vmrun does not list: how long a start waits for
 #: them to exit (the reverted instance takes a few seconds), and how often it looks (E1).
 ORPHAN_EXIT_WAIT_S = 15.0

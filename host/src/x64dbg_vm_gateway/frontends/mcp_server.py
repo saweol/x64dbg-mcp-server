@@ -26,8 +26,9 @@ calls cannot starve another scope's.
 
 Start-up: ``run_stdio`` (and ``http_server.serve_http``) call ``warm_up(app)`` before the
 server is built, so the first ``tools/list`` already carries the tools of the live plugin
-build (the app resolves the backends and reads their version, bounded by
-``WARM_UP_TIMEOUT_S``; see ``app.Gateway.warm_up``).
+build (the app resolves the backends and reads their version, bounded by its own budget,
+``app.WARM_UP_TIMEOUT_S``; see ``app.Gateway.warm_up``). An app that warms up satisfies
+``WarmUpApp`` (``app.Gateway`` does; a test pins it), one without it is served as before.
 
 Mirrored tools: ``tools/list`` asks the app every time and remembers the answer;
 ``tools/call`` looks the tool (and its ``read_only`` flag, which decides the
@@ -60,7 +61,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import anyio
 import anyio.to_thread
@@ -70,7 +71,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from .. import __version__
-from ..app_api import WARM_UP_TIMEOUT_S, GatewayApp
+from ..app_api import GatewayApp
 from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
@@ -87,7 +88,7 @@ from .tool_defs import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["SCOPES", "SERVER_NAME", "WARM_UP_TIMEOUT_S", "AuditHook", "ToolCallRecord", "allowed_tiers",
+__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "ToolCallRecord", "WarmUpApp", "allowed_tiers",
            "build_server", "run_stdio", "warm_up"]
 
 SERVER_NAME = "x64dbg-vm-gateway"
@@ -369,17 +370,35 @@ class _Handlers:
             log.warning("audit hook failed for tool %s", _log_name(name), exc_info=True)
 
 
-def warm_up(app: GatewayApp, timeout_s: float = WARM_UP_TIMEOUT_S) -> None:
+@runtime_checkable
+class WarmUpApp(Protocol):
+    """An app that can learn the live plugin versions before it is served (E5).
+
+    Kept beside the front-end that calls it (``app_api.GatewayApp`` predates it);
+    ``app.Gateway`` satisfies it, which a unit test checks, so renaming the method is a
+    test failure rather than a silently skipped warm-up.
+    """
+
+    def warm_up(self) -> Any:
+        """Bounded by the app's own budget; returns a report (never needed here)."""
+        ...
+
+
+def warm_up(app: GatewayApp) -> None:
     """Let the app learn the live plugin versions before the first ``tools/list`` (E5).
 
     Clients such as Claude Code do not reliably re-read the list after
     ``notifications/tools/list_changed``, so the list answered at start-up must already
-    match the plugin build in the guest. ``GatewayApp.warm_up`` is bounded by the app
-    and never fatal here: serving starts whatever happens (an app without it, or one
-    that fails, is logged as a warning).
+    match the plugin build in the guest. ``WarmUpApp.warm_up`` is bounded by the app and
+    never fatal here: serving starts whatever happens (an app without it, or one that
+    fails, is logged as a warning).
     """
+    if not isinstance(app, WarmUpApp):
+        log.warning("app %s has no warm_up; serving the cached / builtin tool list",
+                    type(app).__name__)
+        return
     try:
-        app.warm_up(timeout_s=timeout_s)
+        app.warm_up()
     except Exception:
         log.warning("warm-up failed; serving the cached / builtin tool list", exc_info=True)
 

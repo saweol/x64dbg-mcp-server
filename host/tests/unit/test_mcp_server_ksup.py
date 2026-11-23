@@ -31,7 +31,7 @@ class WarmApp(FakeApp):
         self.warm_fail = fail
         self.warm_kwargs: list[dict[str, Any]] = []
 
-    def warm_up(self, timeout_s: float = 5.0) -> dict[str, Any]:
+    def warm_up(self, timeout_s: float | None = None) -> dict[str, Any]:
         self.order.append("warm_up")
         self.warm_kwargs.append({"timeout_s": timeout_s})
         if self.warm_fail is not None:
@@ -57,7 +57,8 @@ def test_run_stdio_warms_the_app_up_before_building_the_server(monkeypatch):
     monkeypatch.setattr(mcp_server, "stdio_server", closed_stdio)
     mcp_server.run_stdio(app)
     assert app.order[:2] == ["warm_up", "instructions"]
-    assert app.warm_kwargs == [{"timeout_s": mcp_server.WARM_UP_TIMEOUT_S}]
+    # The front-end leaves the budget to the app (app.WARM_UP_TIMEOUT_S, its only definition).
+    assert app.warm_kwargs == [{"timeout_s": None}]
 
 
 def test_a_failing_warm_up_never_stops_serving(monkeypatch):
@@ -81,20 +82,38 @@ def test_an_app_without_warm_up_is_served_as_before(monkeypatch):
     mcp_server.run_stdio(app)  # no AttributeError
 
 
-def test_warm_up_is_part_of_the_app_contract():
-    """Review: ``warm_up`` is a ``GatewayApp`` member (a renamed method is a type error, not a
-    silently skipped warm-up) and its default budget is defined once, in the contract."""
+def test_warm_up_contract_is_checked_against_the_gateway(tmp_path):
+    """Review: a renamed ``Gateway.warm_up`` must fail a test, not silently skip the warm-up.
+
+    The contract is the front-end's ``WarmUpApp`` protocol (``app_api.GatewayApp`` is not
+    this feature's to change), and the start-up budget is defined once, in ``app``: the
+    front-end calls ``warm_up()`` without a budget of its own.
+    """
     import inspect
 
     from x64dbg_vm_gateway import app as app_mod
     from x64dbg_vm_gateway import app_api
 
-    assert isinstance(FakeApp(), app_api.GatewayApp)
-    assert not isinstance(NoWarmUpApp(), app_api.GatewayApp)
-    assert mcp_server.WARM_UP_TIMEOUT_S is app_api.WARM_UP_TIMEOUT_S
-    assert app_mod.WARM_UP_TIMEOUT_S is app_api.WARM_UP_TIMEOUT_S
+    lab = make_lab(tmp_path)
+    try:
+        assert isinstance(lab.gateway(), mcp_server.WarmUpApp)
+    finally:
+        lab.close()
+    assert isinstance(FakeApp(), mcp_server.WarmUpApp)
+    assert not isinstance(NoWarmUpApp(), mcp_server.WarmUpApp)
     default = inspect.signature(app_mod.Gateway.warm_up).parameters["timeout_s"].default
-    assert default is app_api.WARM_UP_TIMEOUT_S
+    assert default is app_mod.WARM_UP_TIMEOUT_S
+    assert "WARM_UP_TIMEOUT_S" not in vars(mcp_server)
+    assert "WARM_UP_TIMEOUT_S" not in vars(app_api)
+    assert "warm_up" not in vars(app_api.GatewayApp)
+
+
+def test_an_app_without_warm_up_is_logged_and_served(monkeypatch, caplog):
+    app = NoWarmUpApp()
+    monkeypatch.setattr(mcp_server, "stdio_server", closed_stdio)
+    with caplog.at_level("WARNING", logger=mcp_server.__name__):
+        mcp_server.run_stdio(app)
+    assert any("warm_up" in r.getMessage() for r in caplog.records)
 
 
 def test_serve_http_warms_the_app_up_before_serving(tmp_path, monkeypatch):
