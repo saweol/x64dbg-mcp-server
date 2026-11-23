@@ -92,10 +92,12 @@ from .errors import (
     BackendAuthError,
     BackendError,
     BackendRestarted,
+    BackendThrottled,
     ConfigError,
     CrashLoop,
     GatewayError,
     GuestOperationError,
+    InvalidArgument,
     PathNotAllowed,
     ProtectedSnapshotError,
     StateViolation,
@@ -113,18 +115,8 @@ from .wiring import Runtime, builtin_catalog_for
 
 log = logging.getLogger(__name__)
 
+# InvalidArgument lives in errors.py; it stays importable from here for older callers.
 __all__ = ["LOOP_RULES", "Gateway", "InvalidArgument", "probe_vmrun_version"]
-
-
-class InvalidArgument(GatewayError):
-    """A tool argument is malformed.
-
-    Defined here because errors.py is a shared contract file; moving this code
-    there is requested as a contract change (front-ends map it like any other
-    ``GatewayError`` through ``to_dict()``).
-    """
-
-    code = "INVALID_ARGUMENT"
 
 
 LOOP_RULES = """\
@@ -954,6 +946,14 @@ class Gateway(GatewayApp):
                 alive = probe.health_l1()
             except BackendAuthError:
                 return True, f"{url} answers (bearer token required)", None
+            except BackendThrottled as e:
+                retry = e.details.get("retry_after_s")
+                return (
+                    True,
+                    f"{url} answers but has locked this host out after failed logins "
+                    f"(retry after {retry if retry is not None else '?'} s)",
+                    "wait for the lockout to end; repeated lockouts mean the gateway's token is wrong",
+                )
             return (
                 alive,
                 f"{url} {'answers' if alive else 'does not answer'}",

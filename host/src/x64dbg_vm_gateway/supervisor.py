@@ -15,6 +15,7 @@ supervisor paused (a VM operation holds the write lock)    PAUSED
 VM power state is not RUNNING                              VM_DOWN
 VMware Tools not RUNNING                                   TOOLS_DOWN
 HTTP 401 (after one token refresh per epoch)               AUTH
+HTTP 429 on L1 or L2 (plugin v1.10 auth-failure lockout)   THROTTLED
 L1 refused, no guest process named basename(exe)           DEAD
 L1 refused, process present, < boot_grace_s since first    LOADING
 L1 refused, process present, >= boot_grace_s               HUNG
@@ -26,6 +27,12 @@ otherwise                                                  HEALTHY
 
 Without a VM provider / guest channel (endpoint mode) only the HTTP rows apply
 and relaunching is impossible.
+
+THROTTLED means the plugin is alive but has locked this host out after repeated
+authentication failures (``details["retry_after_s"]``). It is never a reason to
+kill or relaunch the debugger (a new instance would only hide the token problem):
+``ensure_alive`` raises BackendThrottled for it, also while waiting for a
+relaunched debugger to become ready.
 
 Epochs: an integer per backend, incremented whenever debuggee state is lost:
 ``ensure_alive`` bumps it as soon as a relaunch has been issued (after a HUNG
@@ -72,6 +79,7 @@ from .contracts import BackendClient, Clock, GuestChannel, PowerState, SystemClo
 from .errors import (
     BackendAuthError,
     BackendError,
+    BackendThrottled,
     BackendUnavailable,
     CancelledByVmOp,
     ConfigError,
@@ -93,6 +101,7 @@ class HealthState(enum.StrEnum):
     DEAD = "DEAD"
     HUNG = "HUNG"
     AUTH = "AUTH"
+    THROTTLED = "THROTTLED"
     VM_DOWN = "VM_DOWN"
     TOOLS_DOWN = "TOOLS_DOWN"
     PAUSED = "PAUSED"
@@ -384,6 +393,8 @@ class Supervisor:
             l1 = client.health_l1(timeout_s=self._l1_timeout_s)
         except BackendAuthError:
             return self._on_auth(backend_id, allow_refresh)
+        except BackendThrottled as e:
+            return self._throttled_report(backend_id, e, "L1")
         except (BackendError, CancelledByVmOp, OSError):
             l1 = False
         if not l1:
@@ -407,6 +418,8 @@ class Supervisor:
             l2 = client.health_l2(timeout_s=self._l2_timeout_s)
         except BackendAuthError:
             return self._on_auth(backend_id, allow_refresh)
+        except BackendThrottled as e:
+            return self._throttled_report(backend_id, e, "L2")
         except (BackendError, CancelledByVmOp, OSError):
             l2 = False
         now = self._clock.monotonic()
@@ -424,6 +437,13 @@ class Supervisor:
                                 l2_failing_for_s=span, reason="L1 answers but GetDebugState keeps failing")
         return self._report(HealthState.HEALTHY, backend_id, epoch=epoch, l2_ok=False, l2_failures=failures,
                             l2_failing_for_s=span)
+
+    def _throttled_report(self, backend_id: str, exc: BackendThrottled, level: str) -> HealthReport:
+        """The plugin is up but locked this host out: not dead, not hung (no L2 failure counted)."""
+        with self._lock:
+            self._tr(backend_id).loading_since = None
+        return self._report(HealthState.THROTTLED, backend_id, level=level,
+                            retry_after_s=exc.details.get("retry_after_s"))
 
     def _on_auth(self, backend_id: str, allow_refresh: bool) -> HealthReport:
         epoch = self.epoch(backend_id)
@@ -599,9 +619,24 @@ class Supervisor:
         if state is HealthState.AUTH:
             raise BackendAuthError(f"backend {backend_id} rejects the bearer token", stage="supervisor",
                                    details=details, hint="check token_source / the token env var")
+        if state is HealthState.THROTTLED:
+            raise self._throttled_error(backend_id, details)
         if state is HealthState.UNKNOWN:
             raise BackendUnavailable(f"cannot determine the health of backend {backend_id}",
                                      stage="supervisor", details=details)
+
+    @staticmethod
+    def _throttled_error(backend_id: str, details: dict[str, Any]) -> BackendThrottled:
+        retry = details.get("retry_after_s")
+        wait = f"retry after {retry} s" if retry is not None else "retry later"
+        return BackendThrottled(
+            f"backend {backend_id} has locked this host out after repeated authentication failures; "
+            "it is running and was not restarted",
+            stage="supervisor", retry_after_s=retry, next_tool="session_status",
+            details={**details, "backend": backend_id},
+            hint=f"wait ({wait}); if the lockout comes back the gateway's token is wrong "
+                 "(x64dbg-vm-gateway doctor)",
+        )
 
     def _run_hang_hook(self, backend_id: str, report: HealthReport) -> None:
         if self._hang_hook is None:
@@ -722,6 +757,12 @@ class Supervisor:
                 if report.state is HealthState.AUTH:
                     raise BackendAuthError(f"relaunched backend {backend_id} rejects the bearer token",
                                            stage="relaunch", details=dict(report.details)) from None
+                if report.state is HealthState.THROTTLED:
+                    raise self._throttled_error(backend_id, dict(report.details)) from None
+            except BackendThrottled as e:
+                # alive but locked out: polling on would only prolong the lockout
+                raise self._throttled_error(backend_id, {"retry_after_s": e.details.get("retry_after_s"),
+                                                         "stage": "relaunch"}) from None
             except (BackendError, CancelledByVmOp, OSError):
                 pass
             if self._clock.monotonic() >= deadline or polls >= max_polls:

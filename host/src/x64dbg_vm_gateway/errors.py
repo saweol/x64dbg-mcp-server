@@ -46,6 +46,14 @@ class GatewayError(Exception):
         }
 
 
+# ── arguments ───────────────────────────────────────────────────────
+class InvalidArgument(GatewayError):
+    """A tool argument is malformed or inconsistent with the others (checked by the
+    orchestrator, after the front-end's schema validation, ``INVALID_ARGUMENTS``)."""
+
+    code = "INVALID_ARGUMENT"
+
+
 # ── configuration / platform ────────────────────────────────────────
 class ConfigError(GatewayError):
     code = "CONFIG_INVALID"
@@ -167,6 +175,23 @@ class BackendProtocolError(BackendError):
 
 class BackendTimeout(BackendError):
     code = "BACKEND_TIMEOUT"
+
+
+class BackendThrottled(BackendError):
+    """The plugin answered HTTP 429: it locked this client's address out after repeated
+    authentication failures (plugin v1.10 ``AuthMaxFailures`` / ``AuthLockoutSeconds``).
+
+    The backend is alive: it must never be relaunched or killed for this, and calls are
+    never retried automatically. ``details["retry_after_s"]`` holds the remaining lockout
+    in seconds (None when the plugin did not say).
+    """
+
+    code = "BACKEND_THROTTLED"
+    retryable = True
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None, **kwargs: Any) -> None:
+        super().__init__(message, **kwargs)
+        self.details.setdefault("retry_after_s", retry_after_s)
 
 
 class BackendRestarted(BackendError):

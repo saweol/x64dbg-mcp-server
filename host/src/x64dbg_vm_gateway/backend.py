@@ -14,6 +14,8 @@ transport / payload                       raised
 ========================================  ==========================================
 refused, reset, EOF before/inside body    BackendUnavailable
 HTTP 401                                  BackendAuthError
+HTTP 429 (v1.10 auth-failure lockout)     BackendThrottled (``details["retry_after_s"]``
+                                          from ``Retry-After``, else the JSON body)
 socket timeout / overall deadline         BackendTimeout
 malformed JSON, oversized body, JSON      BackendProtocolError
 nesting > 64, non-200 status, other
@@ -29,6 +31,11 @@ it then reports as a JSON parse error with ``id: null``. Bodies larger than
 
 Untrusted text: JSON-RPC error messages come from the guest; the copy placed in
 exception ``details`` is stripped of control/bidi characters and clipped.
+
+Server version: ``server_info`` (``GET /``) and ``initialize`` record the plugin
+version they saw; ``on_server_version(callback)`` registers a callback that gets
+each newly seen version (the runtime uses it to pick the tool catalog matching
+the plugin, see ``catalog.ToolCatalog.set_server_version``).
 
 Thread-safety: an instance may be used from many threads at once. The only
 shared mutable state is the in-flight registry, the endpoint (replaced by
@@ -60,6 +67,7 @@ from .errors import (
     BackendAuthError,
     BackendError,
     BackendProtocolError,
+    BackendThrottled,
     BackendTimeout,
     BackendUnavailable,
     CancelledByVmOp,
@@ -73,6 +81,10 @@ MAX_JSON_DEPTH = 64
 MCP_PROTOCOL_VERSION = "2024-11-05"
 PLUGIN_RECV_BUFFER = 65536  # mcp_server.zig RecvResult.buf: request line + headers + body
 MAX_REQUEST_BYTES = PLUGIN_RECV_BUFFER - 2048  # leave room for the request line and headers
+THROTTLED_STATUS = 429  # plugin v1.10: peer locked out after repeated authentication failures
+#: Upper bound for a reported lockout (the plugin prints a u64; its own limit is far lower).
+MAX_RETRY_AFTER_S = 86_400
+_MAX_VERSION_CHARS = 64
 _CONNECT_POLL_S = 0.1  # granularity at which a pending connect() notices cancel_all()
 _READ_CHUNK = 65536
 _MAX_ERROR_TEXT = 500  # untrusted text copied into exception details is truncated
@@ -156,6 +168,23 @@ def _clip(text: Any) -> str:
     return sanitize_untrusted_text(str(text), _MAX_ERROR_TEXT)
 
 
+def _retry_after_s(header: str | None, body: bytes) -> int | None:
+    """Seconds of a 429 lockout: the ``Retry-After`` header (delta-seconds), else the
+    ``retry_after_s`` field of the plugin's JSON body; clamped to ``MAX_RETRY_AFTER_S``."""
+    value: Any = None
+    if header is not None and header.strip().isdigit():
+        value = int(header.strip())
+    else:
+        try:
+            doc = json.loads(body[:4096].decode("utf-8", errors="replace"))
+        except (ValueError, RecursionError):
+            doc = None
+        raw = doc.get("retry_after_s") if isinstance(doc, dict) else None
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            value = raw
+    return None if value is None else min(int(value), MAX_RETRY_AFTER_S)
+
+
 def _validated_token(backend_id: str, token: Secret | str) -> Secret:
     """Return the token as a Secret, stripped of surrounding whitespace.
 
@@ -206,12 +235,50 @@ class HttpBackendClient:
         self._lock = threading.Lock()
         self._inflight: set[_InFlight] = set()
         self._ids = itertools.count(1)
+        self._server_version: str | None = None
+        self._version_listeners: list[Callable[[str], None]] = []
 
     # ── identity ────────────────────────────────────────────────────
     @property
     def endpoint(self) -> BackendEndpoint:
         with self._lock:
             return self._endpoint
+
+    @property
+    def server_version(self) -> str | None:
+        """Plugin version from the last ``GET /`` or ``initialize`` answer (None until seen)."""
+        with self._lock:
+            return self._server_version
+
+    def on_server_version(self, callback: Callable[[str], None]) -> None:
+        """Call ``callback(version)`` whenever a different plugin version is seen (and now, if known).
+
+        The callback runs on the calling thread after the answer was parsed; its
+        exceptions are logged and ignored.
+        """
+        with self._lock:
+            self._version_listeners.append(callback)
+            known = self._server_version
+        if known is not None:
+            self._notify_version(callback, known)
+
+    def _notify_version(self, callback: Callable[[str], None], version: str) -> None:
+        try:
+            callback(version)
+        except Exception:  # noqa: BLE001 - a listener must never break a backend call
+            log.warning("backend %s: server version listener failed", self._endpoint.id, exc_info=True)
+
+    def _saw_version(self, raw: Any) -> None:
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        version = _clip(raw.strip())[:_MAX_VERSION_CHARS]
+        with self._lock:
+            if version == self._server_version:
+                return
+            self._server_version = version
+            listeners = list(self._version_listeners)
+        for callback in listeners:
+            self._notify_version(callback, version)
 
     def update_token(self, token: Secret | str) -> None:
         """Replace the bearer token (used by the supervisor's token refresher).
@@ -275,7 +342,10 @@ class HttpBackendClient:
         raise last if last is not None else OSError("no addresses for backend host")
 
     def _exchange(self, method: str, body: bytes | None, timeout_s: float) -> tuple[int, bytes]:
-        """Send one HTTP request on a fresh connection; return (status, body)."""
+        """Send one HTTP request on a fresh connection; return (status, body).
+
+        HTTP 429 raises BackendThrottled here, so every request kind reports it alike.
+        """
         endpoint = self.endpoint
         call = _InFlight()
         with self._lock:
@@ -328,7 +398,10 @@ class HttpBackendClient:
                 total += len(chunk)
                 if total > self._max_bytes:
                     raise self._oversized(total)
-            return status, b"".join(chunks)
+            data = b"".join(chunks)
+            if status == THROTTLED_STATUS:
+                raise self._throttled(_retry_after_s(resp.getheader("Retry-After"), data))
+            return status, data
         except BackendError:
             raise
         except _Cancelled:
@@ -371,6 +444,17 @@ class HttpBackendClient:
         return BackendProtocolError(
             f"backend {self._endpoint.id} response exceeds {self._max_bytes} bytes",
             stage="backend_call", details=self._details(size=size, max_response_bytes=self._max_bytes),
+        )
+
+    def _throttled(self, retry_after_s: int | None) -> BackendThrottled:
+        wait = f"retry after {retry_after_s} s" if retry_after_s is not None else "retry later"
+        return BackendThrottled(
+            f"backend {self._endpoint.id} has locked this host out after repeated authentication "
+            f"failures (HTTP 429); {wait}",
+            stage="backend_call", retry_after_s=retry_after_s,
+            hint=f"the plugin is running; do not restart it. Wait ({wait}), then retry; if it keeps "
+                 "happening the gateway's token is wrong (x64dbg-vm-gateway doctor)",
+            details=self._details(status=THROTTLED_STATUS),
         )
 
     def _cancelled(self) -> CancelledByVmOp:
@@ -487,17 +571,20 @@ class HttpBackendClient:
         if not isinstance(info, dict):
             raise BackendProtocolError(f"backend {self._endpoint.id}: server info is not an object",
                                        stage="backend_call", details=self._details())
+        self._saw_version(info.get("version"))
         return info
 
     def health_l1(self, timeout_s: float = 2.0) -> bool:
         """True iff ``GET /`` answers 200 with a ``name`` field.
 
         Returns False when unreachable, slow or malformed. Raises
-        BackendAuthError on 401 (the server is alive but the token is wrong).
+        BackendAuthError on 401 (the server is alive but the token is wrong) and
+        BackendThrottled on 429 (alive, but this host is locked out): neither may
+        be mistaken for a dead backend.
         """
         try:
             info = self.server_info(timeout_s)
-        except BackendAuthError:
+        except (BackendAuthError, BackendThrottled):
             raise
         except (BackendError, CancelledByVmOp):
             return False
@@ -506,11 +593,12 @@ class HttpBackendClient:
     def health_l2(self, timeout_s: float = 5.0) -> bool:
         """True iff ``tools/call GetDebugState`` returns any result within ``timeout_s``.
 
-        Raises BackendAuthError on 401; every other failure returns False.
+        Raises BackendAuthError on 401 and BackendThrottled on 429; every other
+        failure returns False.
         """
         try:
             self.call_tool("GetDebugState", {}, timeout_s)
-        except BackendAuthError:
+        except (BackendAuthError, BackendThrottled):
             raise
         except (BackendError, CancelledByVmOp):
             return False
@@ -525,6 +613,9 @@ class HttpBackendClient:
         if not isinstance(result, dict):
             raise BackendProtocolError(f"backend {self._endpoint.id}: initialize result is not an object",
                                        stage="backend_call", details=self._details())
+        server = result.get("serverInfo")
+        if isinstance(server, dict):
+            self._saw_version(server.get("version"))
         return result
 
     def list_tools(self, timeout_s: float = 10.0) -> list[ToolInfo]:
