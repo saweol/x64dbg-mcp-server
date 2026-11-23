@@ -213,6 +213,14 @@ def test_exec_failure_maps_to_vmrun_error():
     assert "/usr/bin/vmrun" in ei.value.message
 
 
+def test_exec_failure_does_not_chain_an_error_that_holds_argv():
+    # worst case: a spawn error whose text includes the full command line
+    leaky = OSError(7, "Argument list too long", f"/usr/bin/vmrun -gu mcp -gp {PASSWORD} x")
+    with pytest.raises(VmrunError) as ei:
+        make_cli(FakePopen(exc=leaky), creds=CREDS).run("runScriptInGuest", "cmd", "x", guest=True)
+    assert_no_password(ei.value)
+
+
 # ── VmrunCli: output handling ───────────────────────────────────────
 def test_noise_lines_filtered_from_real_capture():
     out, err, rc = raw("listSnapshots_showTree")
@@ -378,7 +386,10 @@ def test_power_state_running_when_listed(tmp_path):
 def test_power_state_matches_through_symlink(tmp_path):
     prov, r, vmx = provider(tmp_path)
     link = tmp_path / "link"
-    link.symlink_to(vmx.parent, target_is_directory=True)
+    try:
+        link.symlink_to(vmx.parent, target_is_directory=True)
+    except OSError as e:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create symlinks here: {e}")
     r.queue("list", f"Total running VMs: 1\n{link / 'x.vmx'}")
     assert prov.power_state() is PowerState.RUNNING
 

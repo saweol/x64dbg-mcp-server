@@ -211,16 +211,21 @@ class VmrunCli:
         started = self._clock.monotonic()
 
         with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            spawn_error: str | None = None
             try:
                 proc = self._popen(argv, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
                                    shell=False, close_fds=True, **subprocess_kwargs(self._system))
             except OSError as e:
+                spawn_error = _truncate(self._scrub(e.strerror or type(e).__name__))
+            if spawn_error is not None:
+                # Raised outside the handler so the OSError (whose filename/text could carry
+                # the command line) is not kept as __context__.
                 raise VmrunError(
-                    f"cannot execute vmrun at {self._vmrun}: {e.strerror or type(e).__name__}",
+                    f"cannot execute vmrun at {self._vmrun}: {spawn_error}",
                     stage="vmrun",
                     hint="check the vmrun path (profiles.<name>.vmrun) and its permissions",
                     details=self._details(argv, None, "", "", command, started),
-                ) from None
+                )
             timed_out = False
             try:
                 returncode: int | None = proc.wait(timeout=timeout)
