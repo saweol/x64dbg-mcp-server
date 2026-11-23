@@ -33,7 +33,10 @@ Rules applied to every ``Proxy.call``:
     by those (seconds, not the boot wait). BACKEND_THROTTLED (HTTP 429, the
     plugin's auth-failure lockout) is surfaced as it is: never retried, no health
     check, no relaunch; a health check that finds the backend THROTTLED after
-    another failure does not relaunch it either.
+    another failure does not relaunch it either. Nor does one that finds it
+    UNRESOLVED (the supervisor could not obtain a client, e.g. a VM revert dropped
+    the token while the call was in flight and VMware Tools are not back yet): the
+    supervisor never judges a backend it cannot reach.
 (e) Epoch gating: after a relaunch / VM revert, the first mutating call fails with
     BACKEND_RESTARTED without reaching the backend until ``ack()`` is called. The
     epoch read by the gate is the reference for the failure path, so a relaunch

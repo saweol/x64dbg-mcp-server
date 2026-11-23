@@ -72,7 +72,7 @@ from ..contracts import Secret
 from ..errors import ConfigError
 from ..platform import secure_dir, secure_file
 from ..proxy import sanitize_untrusted_text
-from .mcp_server import SCOPES, ToolCallRecord, build_server
+from .mcp_server import SCOPES, ToolCallRecord, build_server, warm_up
 
 log = logging.getLogger(__name__)
 
@@ -499,13 +499,17 @@ def serve_http(app: GatewayApp, http_cfg: HttpServerConfig, *, jobs_root: Path |
     """Serve ``app`` over streamable HTTP until interrupted (blocking).
 
     ``jobs_root`` is the configured jobs root (``GatewayConfig.jobs_root_path``);
-    the audit log goes to ``<jobs_root>/_audit``.
+    the audit log goes to ``<jobs_root>/_audit``. The settings are checked first; then
+    the app warms up (``mcp_server.warm_up``) before the servers are built, so the
+    first ``tools/list`` carries the live plugin build's tools.
     """
-    asgi = build_asgi_app(app, http_cfg, environ=environ, audit_dir=Path(jobs_root).expanduser() / "_audit")
+    check_http_config(http_cfg, environ)  # refuse unsafe settings before touching the VM
     for key, value in (("http.tls_cert", http_cfg.tls_cert), ("http.tls_key", http_cfg.tls_key)):
         if value is not None and not Path(value).expanduser().is_file():
             raise ConfigError(f"config key {key}: file not found: {value}", stage="http",
                               details={"key": key})
+    warm_up(app)
+    asgi = build_asgi_app(app, http_cfg, environ=environ, audit_dir=Path(jobs_root).expanduser() / "_audit")
     tls = bool(http_cfg.tls_cert and http_cfg.tls_key)
     scheme = "https" if tls else "http"
     log.info("serving MCP on %s://%s:%d%s", scheme, http_cfg.bind, http_cfg.port, MCP_PATH)

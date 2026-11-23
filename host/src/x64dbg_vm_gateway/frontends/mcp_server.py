@@ -24,6 +24,11 @@ tool list, and a "work" pool for everything else. Long VM operations therefore
 cannot starve ``session_status`` or ``tools/list``, and in HTTP mode one scope's
 calls cannot starve another scope's.
 
+Start-up: ``run_stdio`` (and ``http_server.serve_http``) call ``warm_up(app)`` before the
+server is built, so the first ``tools/list`` already carries the tools of the live plugin
+build (the app resolves the backends and reads their version, bounded by
+``WARM_UP_TIMEOUT_S``; see ``app.Gateway.warm_up``).
+
 Mirrored tools: ``tools/list`` asks the app every time and remembers the answer;
 ``tools/call`` looks the tool (and its ``read_only`` flag, which decides the
 scope check and the pool) up in that answer and asks the app again only when the
@@ -82,8 +87,8 @@ from .tool_defs import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "ToolCallRecord", "allowed_tiers", "build_server",
-           "run_stdio"]
+__all__ = ["SCOPES", "SERVER_NAME", "WARM_UP_TIMEOUT_S", "AuditHook", "ToolCallRecord", "allowed_tiers",
+           "build_server", "run_stdio", "warm_up"]
 
 SERVER_NAME = "x64dbg-vm-gateway"
 SCOPES: tuple[str, ...] = ("read", "analyze", "admin")
@@ -108,6 +113,8 @@ _WORK_THREADS = 40    # everything else: VM operations, transfers, backend calls
 # Mirrored tool lookups for tools/call (read at call time).
 _MIRROR_TTL_S = 30.0
 _MIRROR_MISS_REFRESH_S = 1.0
+#: Bound of the start-up warm-up (``warm_up``) before serving.
+WARM_UP_TIMEOUT_S = 5.0
 
 
 def allowed_tiers(scope: str | None) -> frozenset[RiskTier]:
@@ -364,6 +371,24 @@ class _Handlers:
             log.warning("audit hook failed for tool %s", _log_name(name), exc_info=True)
 
 
+def warm_up(app: GatewayApp, timeout_s: float = WARM_UP_TIMEOUT_S) -> None:
+    """Let the app learn the live plugin versions before the first ``tools/list`` (E5).
+
+    Clients such as Claude Code do not reliably re-read the list after
+    ``notifications/tools/list_changed``, so the list answered at start-up must already
+    match the plugin build in the guest. Feature-tested (``app.warm_up`` is not part of
+    the ``GatewayApp`` protocol), bounded by the app, and never fatal: serving starts
+    whatever happens.
+    """
+    fn = getattr(app, "warm_up", None)
+    if not callable(fn):
+        return
+    try:
+        fn(timeout_s=timeout_s)
+    except Exception:
+        log.warning("warm-up failed; serving the cached / builtin tool list", exc_info=True)
+
+
 def _instructions(app: GatewayApp) -> str:
     try:
         text = app.instructions()
@@ -401,5 +426,6 @@ async def _serve_stdio(server: Server[Any]) -> None:
 
 
 def run_stdio(app: GatewayApp) -> None:
-    """Serve ``app`` over stdin/stdout until the client closes the stream."""
+    """Serve ``app`` over stdin/stdout until the client closes the stream (after ``warm_up``)."""
+    warm_up(app)
     anyio.run(_serve_stdio, build_server(app))

@@ -15,6 +15,13 @@ these, and for a version that does not parse (e.g. ``1.10.0-dev``), the backend
 keeps its current list (initially the constructor's ``builtin_json``). When a
 backend's builtin changes, its live list is classified again.
 
+A live/cached list of another plugin build is not served: once the plugin reported
+a parsable version that differs from the list's (all numeric components compared,
+``1.10`` == ``v1.10.0``), the builtin list of the reported version serves until a
+live list of that build arrives (E5 on the spike VM: the list cached from the old
+v1.3 plugin hid GetServerInfo / SetArtifactDir / ProbeFile of the running v1.10).
+A version that does not parse on either side keeps the list.
+
 The gateway exposes the full list at session start because some MCP clients
 ignore ``notifications/tools/list_changed`` (plan 5.5). Schemas are sanitised so
 the mirrored ``inputSchema`` is always a JSON-Schema object.
@@ -67,6 +74,7 @@ BUILTIN_CATALOGS: Mapping[tuple[int, int], str] = MappingProxyType({
     (1, 10): "data/tools-v1.10.json",
 })
 _VERSION_RE = re.compile(r"\s*v?(\d+)\.(\d+)(?:\.\d+)*\s*")
+_BUILD_RE = re.compile(r"\s*v?(\d+(?:\.\d+)*)\s*")
 
 CACHE_FORMAT = 1
 MAX_DESCRIPTION_CHARS = 4000  # builtin descriptions are < 300 chars
@@ -82,6 +90,23 @@ def version_tuple(version: str | None) -> tuple[int, int] | None:
     """``"1.10"`` / ``"v1.10.2"`` -> ``(1, 10)``; None for anything else."""
     m = _VERSION_RE.fullmatch(version or "") if isinstance(version, str) else None
     return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _build_tuple(version: str | None) -> tuple[int, ...] | None:
+    """``"v1.10.0"`` -> ``(1, 10)`` (every numeric component, trailing zeros dropped)."""
+    m = _BUILD_RE.fullmatch(version or "") if isinstance(version, str) else None
+    if m is None:
+        return None
+    parts = [int(p) for p in m.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def same_build(a: str | None, b: str | None) -> bool | None:
+    """Whether two plugin versions name the same build; None when either does not parse."""
+    ta, tb = _build_tuple(a), _build_tuple(b)
+    return None if ta is None or tb is None else ta == tb
 
 
 def builtin_for_version(version: str | None) -> str:
@@ -368,21 +393,28 @@ class ToolCatalog:
             return self._backend_builtin(backend_id).version
 
     # ── queries ─────────────────────────────────────────────────────
+    def _current_live(self, backend_id: str) -> tuple[str, list[ToolInfo]] | None:
+        """The backend's live/cached list unless the plugin reported another build (lock held)."""
+        self._load_cache(backend_id)
+        live = self._live.get(backend_id)
+        if live is not None and same_build(live[0], self._explicit.get(backend_id)) is False:
+            return None  # e.g. cached from the old v1.3 plugin, the guest now runs v1.10 (E5)
+        return live
+
     def tools(self, backend_id: str) -> list[ToolInfo]:
-        """Tool list for ``backend_id``: its live cache if present, else its builtin list.
+        """Tool list for ``backend_id``: its live cache if present and of the build the
+        plugin reported (when it reported a parsable one), else its builtin list.
 
         Returned ToolInfo objects are shared; treat their ``input_schema`` as read-only.
         """
         with self._lock:
-            self._load_cache(backend_id)
-            live = self._live.get(backend_id)
+            live = self._current_live(backend_id)
             return list(live[1] if live is not None else self._backend_builtin(backend_id).tools)
 
     def server_version(self, backend_id: str) -> str | None:
         """Plugin version the cached list came from, or None when the builtin list is used."""
         with self._lock:
-            self._load_cache(backend_id)
-            live = self._live.get(backend_id)
+            live = self._current_live(backend_id)
             return live[0] if live is not None else None
 
     def tool(self, name: str, backend_id: str | None = None) -> ToolInfo | None:

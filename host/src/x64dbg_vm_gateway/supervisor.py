@@ -14,7 +14,10 @@ observation                                                state
 supervisor paused (a VM operation holds the write lock)    PAUSED
 VM power state is not RUNNING                              VM_DOWN
 VMware Tools not RUNNING                                   TOOLS_DOWN
-HTTP 401 (after one token refresh per epoch)               AUTH
+no resolved client (VM not ready, Tools starting, guest    UNRESOLVED
+channel error while reading the token, placeholder)
+token unusable while resolving, or HTTP 401 (after one     AUTH
+token refresh per epoch)
 HTTP 429 on L1 or L2 (plugin v1.10 auth-failure lockout)   THROTTLED
 L1 refused, no guest process named basename(exe)           DEAD
 L1 refused, process present, < boot_grace_s since first    LOADING
@@ -27,6 +30,19 @@ otherwise                                                  HEALTHY
 
 Without a VM provider / guest channel (endpoint mode) only the HTTP rows apply
 and relaunching is impossible.
+
+Resolved clients only (E4 on the spike VM): ``check`` and ``ensure_alive`` first
+obtain the client through ``resolve(backend_id)`` (the runtime passes
+``Runtime.connect``, which reads the guest token if needed); without a resolver
+the ``clients`` entry is used. A client that cannot be resolved, or a placeholder
+(``is_unresolved_client``: ``wiring.UnresolvedClient`` until the URL and token are
+known), is UNRESOLVED: nothing is probed, nothing is classified from guest
+processes, no L2 failure is counted, nothing is killed or relaunched, and
+``ensure_alive`` raises VmNotReady (retryable). Health probes refuse a placeholder
+outright (AssertionError), so a stand-in can never look like a refused plugin.
+After a revert the placeholder answered ``health_l1() == False`` while x64dbg ran:
+the old classification turned that into LOADING, then HUNG, and killed a healthy
+debugger.
 
 THROTTLED means the plugin is alive but has locked this host out after repeated
 authentication failures (``details["retry_after_s"]``). It is never a reason to
@@ -105,7 +121,23 @@ class HealthState(enum.StrEnum):
     VM_DOWN = "VM_DOWN"
     TOOLS_DOWN = "TOOLS_DOWN"
     PAUSED = "PAUSED"
+    UNRESOLVED = "UNRESOLVED"
     UNKNOWN = "UNKNOWN"
+
+
+def is_unresolved_client(client: object) -> bool:
+    """True for a stand-in client whose backend URL/token are not known yet
+    (``wiring.UnresolvedClient`` sets ``unresolved = True``): never probe it."""
+    return getattr(client, "unresolved", False) is True
+
+
+class _Unresolved(Exception):
+    """No usable client for a backend (reported as HealthState.UNRESOLVED)."""
+
+    def __init__(self, reason: str, code: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -145,12 +177,16 @@ class Supervisor:
         hang_hook: Callable[[str, HealthReport], None] | None = None,
         crash_loop_window_s: float = 600.0,
         kill_exit_timeout_s: float = 10.0,
+        resolve: Callable[[str], BackendClient] | None = None,
     ) -> None:
         """``clients`` is read on every use (not copied), so a token refresher may
         replace an entry; ``backends`` supplies exe/launch_task (falling back to the
         client's endpoint fields). ``hang_hook(backend_id, report)`` runs before a
         HUNG debugger is killed (e.g. to save a screenshot into the job directory);
-        its exceptions are logged and ignored."""
+        its exceptions are logged and ignored. ``resolve(backend_id)`` returns a
+        usable client (resolving URL and token when needed, bounded by its own
+        timeout); without it the ``clients`` entry is used (see "Resolved clients
+        only" in the module docstring)."""
         if relaunch_mode not in RELAUNCH_MODES:
             raise ConfigError(f"relaunch_mode must be one of {RELAUNCH_MODES}, got {relaunch_mode!r}")
         self._vm = vm
@@ -171,6 +207,7 @@ class Supervisor:
         self._hang_hook = hang_hook
         self._crash_window_s = crash_loop_window_s
         self._kill_exit_timeout_s = kill_exit_timeout_s
+        self._resolve = resolve
         # LOADING turns HUNG after boot_grace_s; this caps the polls in case the clock stalls
         self._max_loading_polls = int(boot_grace_s / max(poll_interval_s, 0.01)) + 2
         # real-time bound for waiting on another caller's relaunch
@@ -195,6 +232,38 @@ class Supervisor:
             return self._clients[backend_id]
         except KeyError:
             raise ConfigError(f"unknown backend: {backend_id!r}") from None
+
+    def _resolved_client(self, backend_id: str, client: BackendClient | None = None) -> BackendClient:
+        """A client that may be probed: ``client`` if given, else the resolver's, else the
+        ``clients`` entry. Raises _Unresolved (no usable client: VM not ready, Tools
+        starting, guest-channel error, placeholder), BackendAuthError (the token cannot
+        be used), BackendThrottled and ConfigError."""
+        if client is None:
+            if self._resolve is None:
+                client = self._client(backend_id)
+            else:
+                try:
+                    client = self._resolve(backend_id)
+                except (BackendAuthError, BackendThrottled, ConfigError):
+                    raise
+                except GatewayError as e:
+                    raise _Unresolved(f"{e.code}: {e.message}", e.code) from e
+        if is_unresolved_client(client):
+            reason = getattr(client, "reason", None) or "endpoint not resolved"
+            raise _Unresolved(f"backend {backend_id} is not resolved yet ({reason})")
+        return client
+
+    @staticmethod
+    def _probe_l1(client: BackendClient, timeout_s: float) -> bool:
+        if is_unresolved_client(client):  # never a silent False: that reads as "refused"
+            raise AssertionError("health_l1 must never run against an unresolved placeholder")
+        return client.health_l1(timeout_s=timeout_s)
+
+    @staticmethod
+    def _probe_l2(client: BackendClient, timeout_s: float) -> bool:
+        if is_unresolved_client(client):
+            raise AssertionError("health_l2 must never run against an unresolved placeholder")
+        return client.health_l2(timeout_s=timeout_s)
 
     def _cfg(self, backend_id: str, attr: str) -> str | None:
         cfg = self._backends.get(backend_id)
@@ -370,29 +439,63 @@ class Supervisor:
                 self._restarts[job_id] = done + 1
 
     # ── classification ──────────────────────────────────────────────
-    def check(self, backend_id: str) -> HealthReport:
-        """Classify the backend's health (see module docstring). Never relaunches."""
+    def check(self, backend_id: str, *, client: BackendClient | None = None,
+              vm_state: tuple[PowerState, ToolsState] | None = None,
+              record_pids: bool = True) -> HealthReport:
+        """Classify the backend's health (see module docstring). Never relaunches.
+
+        ``client``: probe this client instead of resolving one (a placeholder is
+        UNRESOLVED). ``vm_state``: the (power, Tools) states the caller just observed,
+        so the VM is not asked again. ``record_pids=False`` (status polling) lists guest
+        processes only when L1 fails; the default also records the debugger's process
+        ids once per epoch, the evidence of the external-restart detection.
+        """
         self._client(backend_id)
         if self.is_paused():
             return self._report(HealthState.PAUSED, backend_id)
         if self._vm is not None:
-            try:
-                power = self._vm.power_state()
-                if power != PowerState.RUNNING:
-                    return self._report(HealthState.VM_DOWN, backend_id, power=str(power.value))
-                tools = self._vm.tools_state()
-            except GatewayError as e:
-                return self._report(HealthState.UNKNOWN, backend_id, error=e.code, message=e.message)
+            if vm_state is not None:
+                power, tools = vm_state
+            else:
+                try:
+                    power = self._vm.power_state()
+                    tools = self._vm.tools_state() if power == PowerState.RUNNING else ToolsState.UNKNOWN
+                except GatewayError as e:
+                    return self._report(HealthState.UNKNOWN, backend_id, error=e.code, message=e.message)
+            if power != PowerState.RUNNING:
+                return self._report(HealthState.VM_DOWN, backend_id, power=str(power.value))
             if tools != ToolsState.RUNNING:
                 return self._report(HealthState.TOOLS_DOWN, backend_id, tools=str(tools.value))
-        return self._check_http(backend_id, allow_refresh=True)
+        return self._probe(backend_id, client, refreshed=False, record_pids=record_pids)
 
-    def _check_http(self, backend_id: str, *, allow_refresh: bool) -> HealthReport:
-        client = self._client(backend_id)
+    def _probe(self, backend_id: str, client: BackendClient | None, *, refreshed: bool,
+               record_pids: bool = True) -> HealthReport:
+        """Resolve a client (unless given) and classify it over HTTP. ``refreshed``: the
+        token was re-read already, so a 401 is not answered with another refresh."""
         try:
-            l1 = client.health_l1(timeout_s=self._l1_timeout_s)
+            target = self._resolved_client(backend_id, client)
+        except _Unresolved as u:
+            return self._report(HealthState.UNRESOLVED, backend_id, reason=u.reason, error=u.code)
+        except BackendAuthError as e:
+            return self._report(HealthState.AUTH, backend_id, token_refreshed=refreshed,
+                                resolve_error=e.code, message=e.message)
+        except BackendThrottled as e:
+            return self._throttled_report(backend_id, e, "connect")
+        again = None if refreshed else self._recheck(backend_id, client, record_pids)
+        return self._check_http(backend_id, target, again=again, record_pids=record_pids)
+
+    def _recheck(self, backend_id: str, client: BackendClient | None,
+                 record_pids: bool = True) -> Callable[[], HealthReport]:
+        return lambda: self._probe(backend_id, client, refreshed=True, record_pids=record_pids)
+
+    def _check_http(self, backend_id: str, client: BackendClient, *,
+                    again: Callable[[], HealthReport] | None, record_pids: bool = True) -> HealthReport:
+        """L1 + L2 of a resolved ``client``. ``again`` re-checks after a token refresh
+        (None: a refresh happened already or is not allowed)."""
+        try:
+            l1 = self._probe_l1(client, self._l1_timeout_s)
         except BackendAuthError:
-            return self._on_auth(backend_id, allow_refresh)
+            return self._on_auth(backend_id, again)
         except BackendThrottled as e:
             return self._throttled_report(backend_id, e, "L1")
         except (BackendError, CancelledByVmOp, OSError):
@@ -410,14 +513,14 @@ class Supervisor:
             tr.loading_since = None
             self._seen_up_epoch[backend_id] = epoch
             known = self._known_pids.get(backend_id)
-        if not was_loading and (known is None or known[0] != epoch):
+        if record_pids and not was_loading and (known is None or known[0] != epoch):
             # Once per epoch: evidence for restart detection. Not right after LOADING, where
             # the process that answers may already be a restarted instance.
             self._record_pids(backend_id, epoch)
         try:
-            l2 = client.health_l2(timeout_s=self._l2_timeout_s)
+            l2 = self._probe_l2(client, self._l2_timeout_s)
         except BackendAuthError:
-            return self._on_auth(backend_id, allow_refresh)
+            return self._on_auth(backend_id, again)
         except BackendThrottled as e:
             return self._throttled_report(backend_id, e, "L2")
         except (BackendError, CancelledByVmOp, OSError):
@@ -445,16 +548,17 @@ class Supervisor:
         return self._report(HealthState.THROTTLED, backend_id, level=level,
                             retry_after_s=exc.details.get("retry_after_s"))
 
-    def _on_auth(self, backend_id: str, allow_refresh: bool) -> HealthReport:
+    def _on_auth(self, backend_id: str, again: Callable[[], HealthReport] | None) -> HealthReport:
+        """HTTP 401: re-read the token once per epoch, then ``again()`` checks once more."""
         epoch = self.epoch(backend_id)
-        refresher = self._token_refresher if allow_refresh else None
+        refresher = self._token_refresher if again is not None else None
         if refresher is not None:
             with self._lock:
                 if self._auth_refreshed_epoch.get(backend_id) == epoch:
                     refresher = None  # already refreshed once in this epoch
                 else:
                     self._auth_refreshed_epoch[backend_id] = epoch
-        if refresher is not None:
+        if refresher is not None and again is not None:
             try:
                 refresher(backend_id)
             except Exception as e:  # noqa: BLE001 - user callback; reported, never fatal
@@ -462,7 +566,7 @@ class Supervisor:
                 log.warning("backend %s: token refresh failed (%s)", backend_id, code)
                 return self._report(HealthState.AUTH, backend_id, token_refreshed=False, refresh_error=code)
             log.info("backend %s: token refreshed after HTTP 401; re-checking", backend_id)
-            return self._check_http(backend_id, allow_refresh=False)
+            return again()
         with self._lock:
             refreshed = self._auth_refreshed_epoch.get(backend_id) == epoch
         return self._report(HealthState.AUTH, backend_id, token_refreshed=refreshed)
@@ -509,7 +613,8 @@ class Supervisor:
         raised with ``details['relaunch_pending'] = True`` and the epoch has
         already been bumped.
 
-        Raises CancelledByVmOp (paused), VmNotReady (VM/Tools down), BackendAuthError,
+        Raises CancelledByVmOp (paused), VmNotReady (VM/Tools down, or UNRESOLVED: no
+        client could be resolved, nothing was probed or restarted), BackendAuthError,
         BackendUnavailable (endpoint mode, relaunch failed or not ready in time),
         CrashLoop (too many relaunches for ``job_id`` / for the backend without a job),
         ConfigError, LockTimeout, and guest-channel errors from kill/run.
@@ -616,6 +721,14 @@ class Supervisor:
         if state in (HealthState.VM_DOWN, HealthState.TOOLS_DOWN):
             raise VmNotReady(f"cannot recover backend {backend_id}: {state.value}", stage="supervisor",
                              details=details, next_tool="session_status")
+        if state is HealthState.UNRESOLVED:
+            raise VmNotReady(
+                f"backend {backend_id} cannot be reached yet ({details.get('reason')}); it was neither "
+                "probed nor restarted",
+                stage="supervisor", next_tool="session_status", retryable=True,
+                details={**details, "state": state.value},
+                hint="the guest may still be starting (VMware Tools); call session_status and retry",
+            )
         if state is HealthState.AUTH:
             raise BackendAuthError(f"backend {backend_id} rejects the bearer token", stage="supervisor",
                                    details=details, hint="check token_source / the token env var")
@@ -745,13 +858,24 @@ class Supervisor:
         while True:
             polls += 1
             self._raise_if_paused(backend_id)
-            client = self._client(backend_id)
             try:
-                if client.health_l1(timeout_s=self._l1_timeout_s) and \
-                        client.health_l2(timeout_s=self._l2_timeout_s):
+                client: BackendClient | None = self._resolved_client(backend_id)
+            except _Unresolved:
+                client = None  # e.g. the token cannot be read yet: not ready, keep polling
+            except BackendAuthError as e:
+                raise BackendAuthError(
+                    f"relaunched backend {backend_id}: its token cannot be used ({e.message})",
+                    stage="relaunch", hint=e.hint, details={"backend": backend_id, "cause": e.code},
+                ) from None
+            except BackendThrottled as e:
+                raise self._throttled_error(backend_id, {"retry_after_s": e.details.get("retry_after_s"),
+                                                         "stage": "relaunch"}) from None
+            try:
+                if client is not None and self._probe_l1(client, self._l1_timeout_s) and \
+                        self._probe_l2(client, self._l2_timeout_s):
                     return
             except BackendAuthError:
-                report = self._on_auth(backend_id, allow_refresh=True)
+                report = self._on_auth(backend_id, self._recheck(backend_id, None))
                 if report.state is HealthState.HEALTHY:
                     return
                 if report.state is HealthState.AUTH:

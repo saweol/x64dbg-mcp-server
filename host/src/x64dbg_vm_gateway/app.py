@@ -22,7 +22,21 @@ Hard rules enforced here (not delegated to the MCP client):
   gateway's own config / env file are refused) and guest paths against the job
   / debugger dirs;
 - the debugger state is part of a collection: a failed SaveDatabase or module
-  list leaves the job COLLECTED_PARTIAL (no debug session = nothing to save).
+  list leaves the job COLLECTED_PARTIAL (no debug session = nothing to save);
+- never a second instance of the VM (E1 on the spike VM): before ``vmrun start``,
+  host ``vmware-vmx`` processes of the .vmx that vmrun does not list are waited for
+  (``ORPHAN_EXIT_WAIT_S``) and then refused with VM_LOCKED, and so is a duplicate
+  seen after the start (provider ``instance_report`` / ``vm_process_ids``, feature
+  tested); ``gateway_doctor`` reports it as ``single_vm_instance``;
+- the supervisor only judges a backend it can reach: the debugger stage of
+  analysis_start resolves the client first (re-reading the token while VMware
+  Tools still start after the revert, ``RESOLVE_TIMEOUT_S``), see
+  ``supervisor`` "Resolved clients only" (E4).
+
+Start-up (E5): ``warm_up`` learns the live plugin versions before the MCP front-end
+answers its first ``tools/list``. Status polling (E6): ``session_status`` answers
+from VM observations younger than ``wiring.VM_STATE_TTL_S``, checks the backends in
+parallel and lists guest processes only when L1 fails.
 
 Recovery after a gateway restart (``recover_scan`` flags live jobs with
 ``needs_recovery``; nothing is resumed automatically): a job left COLLECTING is
@@ -79,7 +93,9 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
@@ -102,6 +118,7 @@ from .contracts import (
     ToolCallResult,
     ToolInfo,
     ToolsState,
+    VersionReportingClient,
 )
 from .errors import (
     BackendAuthError,
@@ -118,6 +135,7 @@ from .errors import (
     ProtectedSnapshotError,
     StateViolation,
     TransferError,
+    VmLocked,
     VmNotReady,
 )
 from .guest import POWERSHELL_EXE, is_reserved_name, validate_guest_path
@@ -160,6 +178,15 @@ VM_START_JOIN_S = 30.0  # `vmrun start` may block for minutes although the VM al
 VM_START_TIMEOUT_S = 300.0
 TOOLS_TIMEOUT_S = 300.0
 POLL_S = 2.0
+#: How long the debugger stage of analysis_start keeps re-reading a backend's token while
+#: VMware Tools are still starting after the revert (E4), before the supervisor is asked.
+RESOLVE_TIMEOUT_S = 120.0
+#: vmware-vmx processes of this .vmx that vmrun does not list: how long a start waits for
+#: them to exit (the reverted instance takes a few seconds), and how often it looks (E1).
+ORPHAN_EXIT_WAIT_S = 15.0
+ORPHAN_POLL_S = 1.0
+#: Start-up warm-up: how long the front-end waits for the backends' plugin versions (E5).
+WARM_UP_TIMEOUT_S = 5.0
 WRITE_LOCK_TIMEOUT_S = 120.0
 READ_LOCK_TIMEOUT_S = 60.0
 STATUS_LOCK_TIMEOUT_S = 5.0
@@ -404,6 +431,15 @@ def _resolved(path: str | os.PathLike[str] | None) -> Path | None:
 
 def _no_session(res: ToolCallResult) -> bool:
     return bool(res.is_error) and any(_NO_SESSION_RE.search(t) for t in res.texts)
+
+
+def _stray_vmx_pids(listed: bool, pids: list[int], orphans: list[int]) -> list[int]:
+    """vmware-vmx pids of this .vmx that are not the instance vmrun manages: all of them
+    when vmrun does not list the VM, else the provider's orphans (every pid when it found
+    more than one but could not tell which one is registered)."""
+    if not listed:
+        return list(pids)
+    return list(orphans) or (list(pids) if len(pids) > 1 else [])
 
 
 def _attach(exc: BaseException, job_id: str | None, steps: _Steps) -> None:
@@ -676,8 +712,81 @@ class Gateway(GatewayApp):
                 )
             self._clock.sleep(POLL_S)
 
+    def _instances(
+        self, rt: Runtime, *, quiet: bool = True
+    ) -> tuple[bool | None, list[int], list[int]] | None:
+        """(listed, pids, orphans) of the host ``vmware-vmx`` processes running this .vmx, from
+        the provider's ``instance_report()`` (or ``vm_process_ids()``: listed unknown, no
+        orphan split). None when the provider offers neither, or (``quiet``) the query failed."""
+        report_fn = getattr(rt.vm, "instance_report", None)
+        pids_fn = getattr(rt.vm, "vm_process_ids", None)
+        try:
+            if callable(report_fn):
+                rep = report_fn()
+                listed = bool(rep.get("listed"))
+                pids = [int(p) for p in rep.get("pids") or ()]
+                orphans = [int(p) for p in rep.get("orphans") or ()] if listed else list(pids)
+                return listed, pids, orphans
+            if callable(pids_fn):
+                return None, [int(p) for p in pids_fn()], []
+        except (GatewayError, OSError, ValueError, TypeError, AttributeError) as e:
+            if not quiet:
+                raise
+            log.warning("profile %s: cannot list the VM's host processes (%s); not checked",
+                        rt.profile.name, type(e).__name__)
+        return None
+
+    def _refuse_second_instance(self, rt: Runtime) -> None:
+        """Before ``vmrun start`` (E1): vmware-vmx processes of this .vmx that vmrun does not
+        list are waited for (the instance a revert replaced exits within seconds); any that
+        stay are an unmanaged copy of the VM and the start is refused, since a second
+        instance would share its MAC/IP (HTTP would reach one, vmrun the other)."""
+        deadline = self._clock.monotonic() + ORPHAN_EXIT_WAIT_S
+        max_polls = int(ORPHAN_EXIT_WAIT_S / ORPHAN_POLL_S) + 2  # in case the clock stalls
+        polls = 0
+        while True:
+            seen = self._instances(rt)
+            if seen is None:
+                return
+            listed, pids, orphans = seen
+            stray = _stray_vmx_pids(bool(listed), pids, orphans)
+            if not stray:
+                return
+            polls += 1
+            if self._clock.monotonic() >= deadline or polls >= max_polls:
+                raise VmLocked(
+                    f"orphan VM process(es) {stray} for this .vmx are still running; refusing to start a "
+                    "second instance",
+                    stage="vm_start",
+                    hint="stop the orphan process (it is an unmanaged copy of this VM) and retry",
+                    next_tool="gateway_doctor",
+                    details={"pids": stray, "vmx": rt.profile.vmx, "listed": listed,
+                             "waited_s": ORPHAN_EXIT_WAIT_S},
+                )
+            self._clock.sleep(ORPHAN_POLL_S)
+
+    def _refuse_duplicate_after_start(self, rt: Runtime) -> None:
+        seen = self._instances(rt)
+        if seen is None:
+            return
+        listed, pids, orphans = seen
+        if len(pids) > 1:
+            raise VmLocked(
+                f"{len(pids)} VM processes {pids} run this .vmx after the start; refusing to use a "
+                "duplicated VM",
+                stage="vm_start",
+                hint="stop the process(es) that are not the instance vmrun lists (gateway_doctor shows "
+                "them), then retry",
+                next_tool="gateway_doctor",
+                details={"pids": pids, "orphans": orphans, "listed": listed, "vmx": rt.profile.vmx},
+            )
+
     def _start_vm(self, rt: Runtime) -> None:
-        """``vmrun start nogui`` on a worker (it may block long after the VM runs), then poll power."""
+        """``vmrun start nogui`` on a worker (it may block long after the VM runs), then poll power.
+
+        Never starts a second instance of the VM: see ``_refuse_second_instance``; a
+        duplicate seen after the start is refused as well."""
+        self._refuse_second_instance(rt)
         box: dict[str, BaseException] = {}
 
         def work() -> None:
@@ -704,6 +813,7 @@ class Gateway(GatewayApp):
             VM_START_TIMEOUT_S,
             "check the VM in VMware (vm_screenshot) and retry vm_power start",
         )
+        self._refuse_duplicate_after_start(rt)
 
     def _ready_vm(self, rt: Runtime, progress: Progress | None) -> dict[str, Any]:
         """Make sure the VM runs with VMware Tools up and a known guest IP."""
@@ -769,13 +879,19 @@ class Gateway(GatewayApp):
         vmware = rt.profile.mode == "vmware"
         vm: dict[str, Any] = {"power": None, "tools": None, "ip": None}
         power: PowerState | None = None
+        vm_state: tuple[PowerState, ToolsState] | None = None
         if vmware:
+            # Short-lived observations (E6): one vmrun list/checkToolsState per status call at
+            # most, none while fresh ones exist; any VM operation drops them.
+            observed = rt.vm_state if rt.vm_state is not None else rt.vm
             try:
-                power = rt.vm.power_state()
+                power = observed.power_state()
                 vm["power"] = power.value
                 running = power == PowerState.RUNNING
-                vm["tools"] = (rt.vm.tools_state() if running else ToolsState.UNKNOWN).value
+                tools = observed.tools_state() if running else ToolsState.UNKNOWN
+                vm["tools"] = tools.value
                 vm["ip"] = rt.guest_ip() if running else None
+                vm_state = (power, tools)
             except GatewayError as e:
                 warnings.append(f"VM state unavailable: {e.code}: {_clip(e.message)}")
         job: Job | None = None
@@ -786,11 +902,19 @@ class Gateway(GatewayApp):
         job = self._sync_job(rt, job)
         busy = rt.supervisor.is_paused() or bool(rt.lock.state()["writer"])
         routed = self._route_or_none(rt, job)
-        backends: dict[str, Any] = {}
-        for bid, cfg in rt.backends.items():
-            backends[bid] = self._backend_status(
-                rt, bid, cfg, busy=busy, power=power if vmware else None, selected=bid == routed
-            )
+
+        def one(item: tuple[str, BackendConfig]) -> dict[str, Any]:
+            bid, cfg = item
+            return self._backend_status(rt, bid, cfg, busy=busy, power=power if vmware else None,
+                                        vm_state=vm_state, selected=bid == routed)
+
+        items = list(rt.backends.items())
+        if len(items) > 1:  # health checks of several backends run in parallel (E6)
+            with ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="gw-status") as pool:
+                entries = list(pool.map(one, items))
+        else:
+            entries = [one(item) for item in items]
+        backends: dict[str, Any] = {bid: entry for (bid, _cfg), entry in zip(items, entries, strict=True)}
         isolation: list[str] = []
         if vmware:
             try:
@@ -857,7 +981,11 @@ class Gateway(GatewayApp):
         busy: bool,
         power: PowerState | None,
         selected: bool,
+        vm_state: tuple[PowerState, ToolsState] | None = None,
     ) -> dict[str, Any]:
+        """One backend's status entry. Never waits behind another thread's token read; the
+        supervisor gets the VM state already observed and lists guest processes only when
+        L1 fails (E6)."""
         entry: dict[str, Any] = {
             "id": bid,
             "arch": cfg.arch,
@@ -874,11 +1002,11 @@ class Gateway(GatewayApp):
             return entry
         try:
             if power is not None and power != PowerState.RUNNING:
-                report = rt.supervisor.check(bid)  # VM_DOWN without touching the guest
+                report = rt.supervisor.check(bid, vm_state=vm_state)  # VM_DOWN without touching the guest
             else:
                 with rt.lock.read(timeout_s=STATUS_LOCK_TIMEOUT_S):
-                    rt.connect(bid, wait=False)  # never wait behind another thread's token read
-                    report = rt.supervisor.check(bid)
+                    client = rt.connect(bid, wait=False)  # never wait behind another thread's token read
+                    report = rt.supervisor.check(bid, client=client, vm_state=vm_state, record_pids=False)
         except GatewayError as e:
             entry["health"] = "UNRESOLVED"
             entry["error"] = e.to_dict()
@@ -959,6 +1087,7 @@ class Gateway(GatewayApp):
             )
 
         check("clean_snapshot", clean)
+        check("single_vm_instance", lambda: self._single_instance_check(rt))
 
         def power() -> tuple[bool, str, str | None]:
             state = rt.vm.power_state()
@@ -1001,6 +1130,26 @@ class Gateway(GatewayApp):
             return True, f"{root} created", None
 
         check("guest_job_root", guest_root)
+
+    def _single_instance_check(self, rt: Runtime) -> tuple[bool, str, str | None]:
+        """E1: at most one vmware-vmx process runs this .vmx, and it is the one vmrun lists."""
+        seen = self._instances(rt, quiet=False)
+        if seen is None:
+            return True, "not checked: the VM provider cannot list host vmware-vmx processes", None
+        listed, pids, orphans = seen
+        hint = ("stop the orphan process (it is an unmanaged copy of this VM that shares its MAC/IP, so "
+                "HTTP and vmrun may reach different instances), then retry")
+        if listed is None:  # pids only: which one vmrun manages is unknown
+            if len(pids) > 1:
+                return False, f"{len(pids)} vmware-vmx processes {pids} run this .vmx", hint
+            return True, f"{len(pids)} vmware-vmx process(es) {pids} run this .vmx", None
+        stray = _stray_vmx_pids(listed, pids, orphans)
+        if stray:
+            where = "besides the instance vmrun lists" if listed else "while vmrun does not list the VM"
+            return False, f"orphan vmware-vmx process(es) {stray} run this .vmx {where}", hint
+        if not pids:
+            return True, "no vmware-vmx process runs this .vmx (the VM is not running)", None
+        return True, f"one vmware-vmx process (pid {pids[0]}) runs this .vmx, listed by vmrun", None
 
     @staticmethod
     def _isolation_check(rt: Runtime) -> tuple[bool, str, str | None]:
@@ -1105,6 +1254,69 @@ class Gateway(GatewayApp):
                     builtin_catalog_for(None), cache_dir=self.config.jobs_root_path / "_no_cache"
                 )
             return self._fallback_catalog.tools("_builtin")
+
+    def warm_up(self, timeout_s: float = WARM_UP_TIMEOUT_S) -> dict[str, Any]:
+        """Learn the plugin version of every backend of the default profile before an MCP
+        front-end answers its first ``tools/list`` (E5: some clients never re-read the
+        list, so it must carry the tools of the live plugin build from the start).
+
+        If the VM runs (or in endpoint mode) each backend is resolved in its own thread
+        (token read, then ``GET /`` on first contact, which selects the builtin list of
+        that version: ``catalog.set_server_version``); the call returns after
+        ``timeout_s`` at most, unfinished threads go on in the background. Otherwise
+        the catalog keeps the most recent cached version. Never raises; returns
+        ``{"profile", "backends": {id: {"version", "source": live|cache|builtin,
+        "skipped"?, "error"?, "pending"?}}}``.
+        """
+        try:
+            rt = self.runtime()
+        except GatewayError as e:
+            return {"profile": None, "backends": {}, "error": e.code}
+        budget = max(0.0, float(timeout_s))
+        results: dict[str, dict[str, Any]] = {bid: {} for bid in rt.backends}
+
+        def learn(bid: str) -> None:
+            out = results[bid]
+            try:
+                if rt.profile.mode == "vmware":
+                    observed = rt.vm_state if rt.vm_state is not None else rt.vm
+                    power = observed.power_state()
+                    if power != PowerState.RUNNING:
+                        out["skipped"] = f"the VM is {power.value}"
+                        return
+                with rt.lock.read(timeout_s=budget):
+                    client = rt.connect(bid, wait=True, timeout_s=budget)  # GET / on first contact
+                reports = isinstance(client, VersionReportingClient)
+                if rt.catalog.reported_version(bid) is None and not reports:
+                    out["skipped"] = "this client does not report the plugin version"
+            except GatewayError as e:
+                out["error"] = e.code
+            except Exception as e:  # noqa: BLE001 - start-up must go on; the cause goes to the log
+                out["error"] = type(e).__name__
+                log.warning("warm-up of backend %s failed", bid, exc_info=True)
+
+        threads = {bid: threading.Thread(target=learn, args=(bid,), name=f"gw-warm-up-{bid}", daemon=True)
+                   for bid in rt.backends}
+        deadline = time.monotonic() + budget
+        for t in threads.values():
+            t.start()
+        for t in threads.values():
+            t.join(max(0.0, deadline - time.monotonic()))
+        summary: dict[str, dict[str, Any]] = {}
+        for bid in rt.backends:
+            out = dict(results[bid])  # a thread still running may write its own dict later
+            reported, cached = rt.catalog.reported_version(bid), rt.catalog.server_version(bid)
+            if reported:
+                out.update(version=reported, source="live")
+            elif cached:
+                out.update(version=cached, source="cache")
+            else:
+                out.update(version=rt.catalog.builtin_version(bid), source="builtin")
+            if threads[bid].is_alive():
+                out["pending"] = True
+            summary[bid] = out
+        log.info("warm-up: %s", {bid: (o["version"], o["source"]) for bid, o in summary.items()})
+        return {"profile": rt.profile.name, "backends": summary}
 
     def _active_or_none(self, rt: Runtime) -> Job | None:
         try:
@@ -1838,7 +2050,9 @@ class Gateway(GatewayApp):
 
     def _ready_backend(self, rt: Runtime, bid: str, job: Job, steps: _Steps) -> int:
         with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-            rt.connect(bid)
+            # Resolve first, re-reading the token while VMware Tools still start after the revert:
+            # the supervisor only ever judges (and may kill) a debugger it can reach (E4).
+            rt.connect(bid, wait=True, timeout_s=RESOLVE_TIMEOUT_S)
             try:
                 epoch = rt.supervisor.ensure_alive(bid, job_id=job.id, reason=f"analysis_start {job.id}")
             except CrashLoop as e:

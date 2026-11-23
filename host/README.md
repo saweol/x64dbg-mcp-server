@@ -319,3 +319,43 @@ uv run pytest            # unit tests (no VM)
 uv run pytest -m vm      # real-VM tests (needs the spike VM + env vars)
 uv run ruff check src tests
 ```
+
+### Testing
+
+`uv run pytest` runs the unit tests only (`-m 'not vm'` is the default): the VM, the guest and
+the plugin are fakes (`tests/fakes/`), and the plugin speaks real HTTP on loopback.
+
+The real-VM end-to-end suite `tests/vm/test_e2e_spike.py` (marker `vm`) drives a real VMware VM
+through the gateway. **It changes that VM**: it reverts it to the profile's clean snapshot,
+starts it, uploads and runs the benign samples, and kills `x64dbg.exe` once. Run it only against
+a disposable clone such as the spike VM, never a production analysis VM.
+
+1. Build the samples (needs Zig 0.14): `tests/vm/samples/build.sh /path/to/samples` writes
+   `e2e_sample_x86_64.exe` and `e2e_sample_x86.exe`.
+2. Write a gateway config for the clone (see [Configure](#configure)). Its default profile is
+   used unless `X64DBG_VM_E2E_PROFILE` names another one; `gateway.upload_roots` must contain the
+   sample directory, the guest password variable must be set, and the guest must run plugin
+   v1.10 (`install-plugin`) with a clean snapshot taken after `provision`.
+3. Run it:
+
+   ```console
+   export X64DBG_VM_E2E_CONFIG=~/mcp-lab/spike.toml
+   export X64DBG_VM_E2E_SAMPLE_X64=/path/to/samples/e2e_sample_x86_64.exe
+   export X64DBG_VM_E2E_SAMPLE_X32=/path/to/samples/e2e_sample_x86.exe
+   uv run pytest -m vm tests/vm -v
+   ```
+
+Without `X64DBG_VM_E2E_CONFIG` every test is skipped; without a sample variable the loop of that
+architecture is skipped. No other gateway may serve the same jobs root while it runs (the stdio
+smoke test starts its own `serve`). The suite covers:
+
+| Test | What it checks |
+|---|---|
+| `test_a_doctor_...` | `doctor` is all green, including `single_vm_instance` |
+| `test_b_full_loop_x64`, `test_c_full_loop_x32` | `analysis_start` (polling `session_status` while `in_progress`), `GetServerInfo`, `ListModules`, `SetBreakpoint kernel32.Sleep`, `run` until paused there, `GetCallStack`, `DumpMemory` to a relative `filePath`, `analysis_collect` (the dump and the `.dd64`/`.dd32` are collected), `ida_export_annotations`, `analysis_finish(revert)` |
+| `test_d_killed_debugger_...` | x64dbg killed in the guest while ANALYZING: the next mutating call answers `BACKEND_RESTARTED`, `session_status` acknowledges, `LoadBinary` works again |
+| `test_e_mcp_stdio_smoke` | `serve` over stdio with the `mcp` SDK client: the first `tools/list` has the v1.10 tools (`GetServerInfo`, `SetArtifactDir`, `ProbeFile`), `session_status` answers |
+
+After every VM operation the suite asserts that exactly one `vmware-vmx` process runs the .vmx
+(`platform.find_vmx_processes` when available, else `pgrep -af vmware-vmx`): a second instance
+of the same VM shares its MAC and IP, so HTTP and vmrun could reach different instances.
