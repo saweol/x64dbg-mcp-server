@@ -750,7 +750,7 @@ def test_backup_happens_before_the_swap(rt, timeline, tmp_path) -> None:
 # ── the new PowerShell parses (only where PowerShell 7 is installed) ─
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) is not installed")
 def test_kvm_powershell_parses(tmp_path: Path) -> None:
-    # Syntax only (PowerShell 7 parser); behaviour on 5.1 needs the spike VM (tests/vm).
+    # Syntax only (PowerShell 7 parser); behaviour on 5.1 needs the spike VM (test_vm_e2e_kvm.py).
     from x64dbg_vm_gateway import platform as plat
     from x64dbg_vm_gateway import provision as prov
     from x64dbg_vm_gateway.ps import ps_quote

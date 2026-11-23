@@ -60,7 +60,6 @@ from .errors import (
 )
 from .guest import GUEST_ENV_ERRORS, POWERSHELL_EXE, fold_case, is_reserved_name, validate_guest_path
 from .pe import sha256_file
-from .ps import PS_BASE_ARGS, encode_command
 
 __all__ = [
     "DEFAULT_EXTRACT_LIMITS",
@@ -93,9 +92,7 @@ _HASH_FILE_MAX = 4 * _KiB  # a SHA-256 hex line is 66 bytes; anything larger is 
 _SIZE_FILE_MAX = 256  # a decimal file length plus line ending (any encoding)
 _PROBE_TIMEOUT_S = 120.0  # PowerShell start-up in a loaded guest can take several seconds
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
-# One-liners go as -EncodedCommand (UTF-16LE base64): the text never depends on vmrun's
-# argument quoting (E3, docs/PHASE0_RESULTS.md row V4) or on PowerShell re-parsing -Command.
-_PS_PREFIX = (*PS_BASE_ARGS, "-EncodedCommand")
+_PS_PREFIX = ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command")
 # Characters PowerShell interprets as wildcards / escapes in -Path / -FilePath arguments.
 _PS_WILDCARD_CHARS = frozenset("[]`")
 _EXT_BY_KIND = MappingProxyType({"exe": "exe", "dotnet-exe": "exe", "dll": "dll", "dotnet-dll": "dll"})
@@ -214,9 +211,7 @@ def _delete_guest_if_exists(channel: GuestChannel, path: str) -> None:
 
 
 def _ps(channel: GuestChannel, powershell: str, command: str, timeout_s: float) -> int | None:
-    """Run a PowerShell one-liner; its exit code (``-EncodedCommand`` behaves like ``-Command``)."""
-    return channel.run_program(powershell, [*_PS_PREFIX, encode_command(command)], wait=True,
-                               timeout_s=timeout_s)
+    return channel.run_program(powershell, [*_PS_PREFIX, command], wait=True, timeout_s=timeout_s)
 
 
 def _exit_problem(rc: int | None) -> str:

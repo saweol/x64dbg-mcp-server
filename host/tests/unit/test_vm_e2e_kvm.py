@@ -1,6 +1,9 @@
 """Real-VM checks for the K-vm fixes (opt-in: ``-m vm`` and X64DBG_VM_E2E_CONFIG).
 
-Set ``X64DBG_VM_E2E_CONFIG`` to a gateway config file whose default profile is
+Run with ``uv run pytest -m vm tests/unit/test_vm_e2e_kvm.py`` (the default
+``addopts`` deselect the ``vm`` marker; like ``test_vmrun.py``'s real-vmrun test,
+this file sits under tests/unit, the directory K-vm owns). Set
+``X64DBG_VM_E2E_CONFIG`` to a gateway config file whose default profile is
 the spike VM (vmware mode, guest credentials resolvable). These tests are
 written to be run by the main session on the spike VM; they do not change the
 VM's power state or snapshots:
@@ -9,9 +12,11 @@ VM's power state or snapshots:
   exactly (it writes ``[Environment]::GetCommandLineArgs()``, ``$args`` and the raw
   command line as JSON to a guest file that is copied back). Guest side effects:
   the script and its output file under ``C:\\mcp\\tmp`` (both deleted).
-- E3: transfer.py's PowerShell one-liners (now ``-EncodedCommand``) run and
-  write what they should (a guest file under ``C:\\mcp\\tmp`` with a blank in
-  its name, deleted afterwards).
+- E3: transfer.py's PowerShell one-liners (``-Command <one argument>``, now
+  escaped by ``escape_for_vmrun`` instead of list2cmdline) run and write what
+  they should: text with single and double quotes, ``&``, a backslash and
+  blanks, to a guest file under ``C:\\mcp\\tmp`` with a blank in its name
+  (deleted afterwards).
 - E1: ``instance_report()`` (``vmrun list`` + host process scan, read-only).
 - E2: ``guest_boot_time()`` returns an ISO-8601 UTC time, and the boot query's
   uptime grows while the boot time stays (two PowerShell runs each).

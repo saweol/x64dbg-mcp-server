@@ -33,7 +33,6 @@ from x64dbg_vm_gateway.errors import (
     UnsafeArchiveError,
 )
 from x64dbg_vm_gateway.guest import VixChannel
-from x64dbg_vm_gateway.ps import decode_command, encode_command
 from x64dbg_vm_gateway.transfer import (
     DEFAULT_EXTRACT_LIMITS,
     ExtractedEntry,
@@ -47,7 +46,7 @@ from x64dbg_vm_gateway.transfer import (
 )
 
 POSIX = os.name == "posix"
-PS_PREFIX = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]
+PS_PREFIX = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
 TAR_EXE = "C:\\Windows\\System32\\tar.exe"
 IN_DIR = "C:\\mcp\\jobs\\j1\\in"
 JOB_DIR = "C:\\mcp\\jobs\\j1"
@@ -111,8 +110,7 @@ class GuestPowerShell:
             return self._tar(exe, args)
         assert exe.lower().endswith("\\powershell.exe")
         assert list(args[:5]) == PS_PREFIX and len(args) == 6
-        assert re.fullmatch(r"[A-Za-z0-9+/]+=*", args[5]), args[5]  # base64 only: nothing to quote
-        cmd = decode_command(args[5])
+        cmd = args[5]
         self.commands.append(cmd)
         if m := _SIZE_RE.match(cmd):
             src, dst = m.groups()
@@ -1706,8 +1704,8 @@ def test_upload_sample_through_vix_channel(vix, fake_guest, ps, sample, fake_clo
     final = upload_sample(chan, path, IN_DIR, sha256=sha, kind="dll", clock=fake_clock)
     assert final == f"{IN_DIR}\\{sha[:12]}.dll"
     assert fake_guest.read(final) == data
-    # The PowerShell command reached the guest unchanged, as -EncodedCommand.
-    assert emu.program_args == [(*PS_PREFIX, encode_command(ps.commands[0]))]
+    # The PowerShell command survived vmrun's argv joining and MSVCRT quoting unchanged.
+    assert emu.program_args == [(*PS_PREFIX, ps.commands[0])]
     assert all(c["guest"] and c["timeout_s"] > 0 for c in runner.calls)
     assert not fake_guest.file_exists(f"{IN_DIR}\\{sha[:12]}.part")
 

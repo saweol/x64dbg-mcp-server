@@ -351,9 +351,8 @@ def test_schtasks_and_shutdown_argv_round_trip(wired, fake_guest):
 
 
 def test_transfer_powershell_commands_round_trip(wired, fake_guest, tmp_path, fake_clock):
-    # transfer.py sends its PowerShell one-liners as -EncodedCommand (spec item 3: prefer
-    # -EncodedCommand for scripts): base64 needs no quoting under any rule, and PowerShell
-    # does not re-parse the text as it does a -Command argument.
+    # transfer.py passes -Command <one argument>; under E3 that argument must reach
+    # powershell.exe unchanged (transfer.py is outside K-vm: its one-liners stay -Command).
     chan, emu, _ = wired
     tps = TransferPowerShell(fake_guest)
     fake_guest.on_run_program = tps
@@ -365,10 +364,24 @@ def test_transfer_powershell_commands_round_trip(wired, fake_guest, tmp_path, fa
     sha = hashlib.sha256(data).hexdigest()
     final = transfer.upload_sample(chan, src, in_dir, sha256=sha, kind="exe", clock=fake_clock)
     assert fake_guest.read(final) == data
-    assert emu.received == [(*ps.PS_BASE_ARGS, "-EncodedCommand", ps.encode_command(tps.commands[0]))]
+    assert emu.received == [(*ps.PS_BASE_ARGS, "-Command", tps.commands[0])]
     assert "'" in tps.commands[0] and " " in tps.commands[0]
-    (call,) = [c for c in emu.command_lines if "powershell.exe" in c]
-    assert "Get-FileHash" not in call  # the script text is not on the command line
+
+
+@pytest.mark.parametrize("command", [
+    "'it''s \"quoted\" & spaced' | Out-File -FilePath 'C:\\mcp\\tmp\\a b.txt'",
+    'Write-Output \\"x\\" "C:\\dir\\"',
+    "Get-Item -LiteralPath 'C:\\'",
+    "Get-Item -LiteralPath C:\\",
+    "Write-Output '한글 \u2019q\u2019'",
+])
+def test_transfer_ps_delivers_any_one_liner_as_a_single_argument(wired, fake_guest, command):
+    # Whatever text transfer._ps gets (inner double quotes, backslash before a quote,
+    # trailing backslash, unicode) reaches powershell.exe as ONE -Command argument,
+    # so PowerShell's re-joining of the remaining arguments is the identity.
+    chan, emu, _ = wired
+    assert transfer._ps(chan, POWERSHELL_EXE, command, 10.0) == 0
+    assert emu.received == [(*ps.PS_BASE_ARGS, "-Command", command)]
 
 
 def test_tar_arguments_with_a_drive_root_round_trip(wired, fake_guest):
