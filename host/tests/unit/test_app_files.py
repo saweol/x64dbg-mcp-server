@@ -117,3 +117,20 @@ def test_download_outside_allowed_roots_is_refused(lab, path):
 def test_download_needs_a_job(lab):
     with pytest.raises(StateViolation):
         lab.gateway().file_download("C:\\mcp\\jobs\\x\\out\\a.bin")
+
+
+def test_downloads_survive_a_later_collection(lab):
+    """collect_artifacts clears artifacts/raw/extra; earlier downloads must not be lost."""
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    guest = f"{GUEST_ROOT}\\{job_id}\\out\\early.bin"
+    lab.guest.write(guest, b"EARLY")
+    downloaded = Path(gw.file_download(guest)["host_path"])
+    col = gw.analysis_collect()
+    kept = [Path(p) for p in col["preserved_downloads"]]
+    assert len(kept) == 1 and kept[0].read_bytes() == b"EARLY"
+    assert kept[0].parent == Path(lab.config.jobs_root) / job_id / "artifacts" / "downloads"
+    assert not downloaded.exists()  # moved, not copied
+    # files the previous collection fetched itself are not mistaken for downloads
+    col2 = gw.analysis_collect()
+    assert col2["preserved_downloads"] == []

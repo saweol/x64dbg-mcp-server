@@ -24,10 +24,18 @@ Long operations (analysis_start/collect/finish, snapshot and power tools) run
 on the profile's ``ops.OperationRunner`` and answer ``{"state": "in_progress"}``
 when they outlast ``wait_s``.
 
+Host layout of a job (``<jobs_root>/<job_id>/``): ``input/sample.bin`` (the
+sample copy that is uploaded), ``screens/`` (screenshots), ``artifacts/``
+(``transfer.collect_artifacts`` output) and ``artifacts/raw/extra/NNNN_<name>``
+for ``file_download``. Because a collection starts by deleting ``raw/extra``,
+earlier downloads are moved to ``artifacts/downloads/`` first.
+
 Thread-safety: every public method may be called from several threads. The
-gateway's own bookkeeping (runtimes, runners, selected backends) is guarded by
-one lock; jobs, runtimes and runners have their own locks. Nothing here holds
-the gateway lock while doing I/O other than building a runtime.
+gateway's own bookkeeping (runtimes, runners, selected backends, the job store
+handle, download slot numbers) is guarded by one lock, which is held only for
+short local work: building a runtime, opening the job store, reserving a
+download file name. Jobs, runtimes and runners have their own locks; no guest,
+VM or backend I/O happens under the gateway lock.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import itertools
+import json
 import logging
 import math
 import os
@@ -232,6 +241,56 @@ class _Steps:
             rec["ok"] = True
         finally:
             rec["ms"] = round((self._clock.monotonic() - t0) * 1000.0, 1)
+
+
+def _collection_owned_extras(art: Path) -> set[str]:
+    """``raw/extra/...`` names the previous collection fetched itself (from its manifest)."""
+    try:
+        doc = json.loads((art / transfer.MANIFEST_NAME).read_text(encoding="utf-8"))
+        return {
+            e["stored_name"]
+            for e in doc.get("entries", [])
+            if isinstance(e, dict) and e.get("source") == "extra" and isinstance(e.get("stored_name"), str)
+        }
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+
+
+def _download_files(art: Path) -> list[Path]:
+    """Files in ``raw/extra`` that file_download stored (not owned by the previous collection)."""
+    extra = art / "raw" / "extra"
+    if extra.is_symlink() or not extra.is_dir():
+        return []
+    owned = _collection_owned_extras(art)
+    return [
+        p
+        for p in sorted(extra.iterdir())
+        if p.is_file()
+        and not p.is_symlink()
+        and not p.name.endswith(".part")
+        and f"raw/extra/{p.name}" not in owned
+    ]
+
+
+def _downloads_pending(art: Path) -> bool:
+    return bool(_download_files(art))
+
+
+def _preserve_downloads(art: Path) -> list[str]:
+    """Move earlier file_download results to ``artifacts/downloads`` (collect_artifacts
+    deletes ``raw/extra`` before it collects). Returns the new host paths."""
+    target_dir = art / "downloads"
+    moved: list[str] = []
+    for src in _download_files(art):
+        _private_dirs(target_dir)
+        dest = target_dir / src.name
+        n = 1
+        while dest.exists() or dest.is_symlink():
+            dest = target_dir / f"{src.stem}.{n}{src.suffix}"
+            n += 1
+        os.replace(src, dest)
+        moved.append(str(dest))
+    return moved
 
 
 def _attach(exc: BaseException, job_id: str | None, steps: _Steps) -> None:
@@ -1606,6 +1665,13 @@ class Gateway:
             roots = [job.guest_root] + [
                 _gjoin(str(PureWindowsPath(b.exe).parent), "db") for b in rt.backends.values() if b.exe
             ]
+            art = Path(job.host_root) / "artifacts"
+            preserved: list[str] = []
+            if _downloads_pending(art):
+                # collect_artifacts starts by deleting raw/extra, where file_download stores its files
+                with steps.step("preserve_downloads") as st:
+                    preserved = _preserve_downloads(art)
+                    st["detail"] = f"{len(preserved)} earlier download(s) moved to artifacts/downloads"
             with steps.step("collect") as st:
                 with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
                     manifest = transfer.collect_artifacts(
@@ -1647,7 +1713,6 @@ class Gateway:
                 log.warning("job %s: could not record the failed collection (%s)", job_id, type(e).__name__)
             _attach(exc, job_id, steps)
             raise
-        art = Path(job.host_root) / "artifacts"
         files = [
             {
                 "source": e.source,
@@ -1672,6 +1737,7 @@ class Gateway:
             "files": files[:MAX_LISTED_FILES],
             "errors": manifest.errors,
             "screenshot": manifest.screenshot,
+            "preserved_downloads": preserved,
             "warnings": steps.warnings,
             "steps": steps.items,
         }
