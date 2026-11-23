@@ -53,6 +53,7 @@ import http.client
 import itertools
 import json
 import logging
+import re
 import selectors
 import socket
 import threading
@@ -84,6 +85,7 @@ MAX_REQUEST_BYTES = PLUGIN_RECV_BUFFER - 2048  # leave room for the request line
 THROTTLED_STATUS = 429  # plugin v1.10: peer locked out after repeated authentication failures
 #: Upper bound for a reported lockout (the plugin prints a u64; its own limit is far lower).
 MAX_RETRY_AFTER_S = 86_400
+_DELTA_SECONDS_RE = re.compile(r"[0-9]+")  # RFC 9110 delay-seconds: ASCII digits only
 _MAX_VERSION_CHARS = 64
 _CONNECT_POLL_S = 0.1  # granularity at which a pending connect() notices cancel_all()
 _READ_CHUNK = 65536
@@ -170,9 +172,13 @@ def _clip(text: Any) -> str:
 
 def _retry_after_s(header: str | None, body: bytes) -> int | None:
     """Seconds of a 429 lockout: the ``Retry-After`` header (delta-seconds), else the
-    ``retry_after_s`` field of the plugin's JSON body; clamped to ``MAX_RETRY_AFTER_S``."""
+    ``retry_after_s`` field of the plugin's JSON body; clamped to ``MAX_RETRY_AFTER_S``.
+
+    The guest controls both. Only ASCII digits count as a header value: ``str.isdigit``
+    also accepts e.g. '\u00b2' (a latin-1 decoded byte 0xB2), which ``int()`` rejects, and
+    ``int()`` parses digits of other scripts."""
     value: Any = None
-    if header is not None and header.strip().isdigit():
+    if header is not None and _DELTA_SECONDS_RE.fullmatch(header.strip()):
         value = int(header.strip())
     else:
         try:

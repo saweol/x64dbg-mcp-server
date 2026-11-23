@@ -8,11 +8,12 @@ Sources, in order of preference for a backend:
    ``data/tools-v1.9.json``, ``data/tools-v1.10.json``).
 
 Builtin choice, per backend: the newest builtin whose version is <= the plugin
-version (else the oldest; an unparsable version counts as unknown). The version
-comes from ``set_server_version`` (the runtime calls it as soon as ``GET /`` or
-``initialize`` reported it), from ``update_from_live``, or from the version of a
-cached live list; before any of these the constructor's ``builtin_json`` is used.
-When a backend's builtin changes, its live list is classified again.
+version, else the oldest. The version comes from ``set_server_version`` (the
+runtime calls it as soon as ``GET /`` or ``initialize`` reported it), from
+``update_from_live``, or from the version of a cached live list; before any of
+these, and for a version that does not parse (e.g. ``1.10.0-dev``), the backend
+keeps its current list (initially the constructor's ``builtin_json``). When a
+backend's builtin changes, its live list is classified again.
 
 The gateway exposes the full list at session start because some MCP clients
 ignore ``notifications/tools/list_changed`` (plan 5.5). Schemas are sanitised so
@@ -23,10 +24,16 @@ trusted for policy. ``readOnlyHint`` decides lock bypass, epoch gating and
 retries, so a live/cached entry is read-only only if it says so AND the backend's
 builtin list marks the same tool read-only; tools unknown to that builtin list are
 mutating. A live list may still mark a builtin read-only tool mutating (the safe
-direction). Descriptions and every string value inside a schema are stripped of
-control/bidi characters (``proxy.sanitize_untrusted_text``); descriptions are
-also capped at ``MAX_DESCRIPTION_CHARS``. Cached ``initialize`` instructions get
-the same treatment (capped at ``MAX_INSTRUCTIONS_CHARS``).
+direction). Which builtin is the reference follows the version the plugin reports,
+which the guest controls. Accepted: every builtin is a shipped, trusted file and
+the lists differ only in tools a newer plugin added (v1.10: GetServerInfo read-only,
+SetArtifactDir mutating), so a guest claiming a newer version changes the flag of
+GetServerInfo only, a tool that reads server information.
+
+Descriptions and every string value inside a schema are stripped of control/bidi
+characters (``proxy.sanitize_untrusted_text``); descriptions are also capped at
+``MAX_DESCRIPTION_CHARS``. Cached ``initialize`` instructions get the same
+treatment (capped at ``MAX_INSTRUCTIONS_CHARS``).
 
 Thread-safety: all public methods may be called concurrently; internal state
 is guarded by one re-entrant lock and cache files are written atomically
@@ -213,13 +220,18 @@ class ToolCatalog:
         """Pick the builtin for ``backend_id`` by ``version``; re-classify its live list on a change.
 
         A version derived from a cache file (``explicit=False``) never overrides one the
-        plugin reported itself. Returns True when the builtin changed.
+        plugin reported itself. An unparsable version is unknown: it is recorded as
+        reported but keeps the current builtin (the constructor default, or what an
+        earlier parsable version chose), as ``update_from_live`` does. Returns True when
+        the builtin changed.
         """
         with self._lock:
             if not explicit and backend_id in self._explicit:
                 return False
             if explicit:
                 self._explicit[backend_id] = version
+            if version_tuple(version) is None:
+                return False
             before = self._backend_builtin(backend_id).rel
             self._backend_rel[backend_id] = builtin_for_version(version)
             after = self._backend_builtin(backend_id).rel

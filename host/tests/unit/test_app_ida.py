@@ -113,6 +113,44 @@ def test_rebase_falls_back_to_the_collected_map_and_never_relaunches(lab):
     assert done["module_map_source"] == "manifest"
 
 
+def test_rebase_warns_when_a_live_job_falls_back_to_the_collected_map(lab):
+    # the job still has its debug session, so the live map was expected: a busy or dead
+    # debugger must not be hidden behind module_map_source alone (the collected map can be
+    # stale after a reload / relaunch: ASLR)
+    gw, res, _ = start(lab)
+    gw.analysis_collect()
+    lab.servers["x64"].on_tool("ListModules", ToolError("busy"))
+    out = gw.ida_rebase(SAMPLE_BASE + 0x20, direction="runtime_to_rva")
+    assert out["module_map_source"] == "manifest"
+    (warning,) = out["warnings"]
+    assert "ListModules" in warning and "analysis_collect" in warning and "stale" in warning
+
+
+def test_export_reports_the_live_map_fallback_too(lab):
+    gw, _, name = start(lab)
+    lab.db_content = x64dbg_db(name)
+    gw.analysis_collect()
+    lab.servers["x64"].on_tool("ListModules", ToolError("busy"))
+    out = gw.ida_export_annotations()
+    assert out["module_map_source"] == "manifest"
+    assert any("ListModules" in w and "stale" in w for w in out["warnings"])
+
+
+def test_rebase_of_a_finished_job_has_no_fallback_warning(lab):
+    # control: without a debug session the collected map is the expected source
+    gw, res, _ = start(lab)
+    gw.analysis_collect()
+    gw.analysis_finish(revert=False)
+    out = gw.ida_rebase(SAMPLE_BASE + 0x20, direction="runtime_to_rva", job_id=res["job_id"])
+    assert out["module_map_source"] == "manifest" and out["warnings"] == []
+
+
+def test_rebase_from_the_live_map_has_no_warnings(lab):
+    gw, _, _ = start(lab)
+    out = gw.ida_rebase(SAMPLE_BASE + 0x20, direction="runtime_to_rva")
+    assert out["module_map_source"] == "live" and out["warnings"] == []
+
+
 def test_rebase_without_any_module_map(lab):
     gw, _, _ = start(lab)
     lab.servers["x64"].on_tool("ListModules", ToolError("Tool requires an active debug session."))
@@ -261,3 +299,51 @@ def test_import_checks_the_job_state_before_anything(lab):
     assert gw._jobs().get(res["job_id"]).state == JobState.ANALYZING
     with pytest.raises(InvalidArgument):
         gw.ida_import_annotations("not a list", module=name)  # type: ignore[arg-type]
+
+
+def test_import_stopped_midway_reports_what_was_applied(lab):
+    # the connection drops on the second operation: one applied, the run stops with the
+    # proxy's error (RESULT_UNKNOWN: a mutating call is never retried) and says where
+    gw, _, name = start(lab)
+    srv = lab.servers["x64"]
+    seen: list[dict] = []
+
+    def apply(args):
+        seen.append(args)
+        if len(seen) == 1:
+            srv.close_without_response("CommentOrLabelAtAddress", times=1)  # the next one drops
+        return "ok"
+
+    srv.on_tool("CommentOrLabelAtAddress", apply)
+    out = gw.ida_import_annotations(ITEMS, module=name, ida_imagebase="0x140000000")
+    assert out["operations"] == 3 and out["applied"] == 1 and out["failed"] == 0
+    assert out["not_attempted"] == 2  # the dropped operation (outcome unknown) and the last one
+    stopped = out["stopped"]
+    assert stopped["code"] == "RESULT_UNKNOWN"
+    assert stopped["operation"] == 2 and stopped["mode"] == "Comment"
+    assert stopped["runtime_address"] == f"0x{SAMPLE_BASE + 0x1000:X}"
+    assert len(seen) == 1  # the third operation was not sent
+
+
+def test_import_lists_at_most_the_failure_cap(lab, monkeypatch):
+    from x64dbg_vm_gateway import app as app_mod
+
+    monkeypatch.setattr(app_mod, "MAX_IMPORT_FAILURES_LISTED", 2)
+    gw, _, name = start(lab)
+    lab.servers["x64"].on_tool("CommentOrLabelAtAddress", ToolError("Failed to set label"))
+    items = [{"rva": f"0x{0x1000 + 0x10 * i:X}", "name": f"f{i}"} for i in range(5)]
+    out = gw.ida_import_annotations(items, module=name)
+    assert out["failed"] == 5 and out["applied"] == 0 and out["not_attempted"] == 0
+    assert len(out["failures"]) == 2 and out["stopped"] is None
+
+
+def test_export_refuses_a_database_over_the_size_limit(lab, monkeypatch):
+    gw, res, name = start(lab)
+    lab.db_content = x64dbg_db(name)
+    gw.analysis_collect()
+    gw.analysis_finish(revert=False)  # the collected copy is used: no guest-side size probe
+    monkeypatch.setattr(ida_sync, "MAX_DB_BYTES", len(lab.db_content) - 1)
+    with pytest.raises(DatabaseFormatError) as ei:
+        gw.ida_export_annotations(res["job_id"])
+    assert "larger than" in ei.value.message
+    assert not (Path(lab.config.jobs_root) / res["job_id"] / "artifacts" / "ida_sync.json").exists()

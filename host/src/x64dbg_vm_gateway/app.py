@@ -186,6 +186,8 @@ IDA_SYNC_FILE = "ida_sync.json"  # x64dbg-ida-sync/1 export under <job>/artifact
 IDA_LIST_MODULES_TIMEOUT_S = 10.0
 #: job states in which the job's debugger still holds the sample (live module map, imports)
 IDA_LIVE_STATES = frozenset({JobState.ANALYZING, JobState.COLLECTED, JobState.COLLECTED_PARTIAL})
+#: job states in which the job's debugger holds (or is loading) the sample
+DEBUGGEE_STATES = IDA_LIVE_STATES | {JobState.LOADING, JobState.COLLECTING}
 IMPORT_TOOL = "CommentOrLabelAtAddress"  # plugin tool: {address, value, mode: Comment|Label}
 MAX_IMPORT_FAILURES_LISTED = 50
 MAX_MANIFEST_BYTES = 64 * 1024 * 1024
@@ -202,7 +204,7 @@ RECOVERY_HINTS = {
     JobState.COLLECTED: "call analysis_finish (or analysis_collect again)",
     JobState.COLLECTED_PARTIAL: "call analysis_collect again, then analysis_finish",
     JobState.DISCARDED: "call analysis_finish to revert the VM",
-    JobState.REVERTING: "the revert was interrupted: call analysis_finish to redo it",
+    JobState.REVERTING: "the revert was interrupted: call analysis_finish (revert=true) to redo it",
 }
 #: The tool that moves a job flagged ``needs_recovery`` on (None: a human must discard it).
 RECOVERY_NEXT_TOOL = {
@@ -619,9 +621,15 @@ class Gateway(GatewayApp):
                 e.details["reload"] = reload
             e.details["reloaded"] = self._reloaded_now(rt, bid, job)
             if e.details["reloaded"]:
+                # claim a pause only when this reload's WaitForPause confirmed it
+                where = (
+                    "is paused at its start"
+                    if reload is not None and reload.get("paused")
+                    else "may not be paused (call GetDebugState, then WaitForPause if it runs)"
+                )
                 e.hint = (
                     f"{e.hint or 'call session_status to acknowledge'}; the sample was reloaded "
-                    "(reload_on_restart) and is paused at its start: addresses may differ (ASLR)"
+                    f"(reload_on_restart) and {where}: addresses may differ (ASLR)"
                 )
             raise
         except CrashLoop as e:
@@ -792,7 +800,7 @@ class Gateway(GatewayApp):
         recovery: list[dict[str, Any]] = [
             {
                 **v,
-                "recovery_hint": RECOVERY_HINTS.get(JobState(j.state), ""),
+                "recovery_hint": self._recovery_hint(j),
                 "next_tool": RECOVERY_NEXT_TOOL.get(JobState(j.state)),
             }
             for j in store.list(name)
@@ -821,6 +829,18 @@ class Gateway(GatewayApp):
             "isolation_warnings": isolation,
             "warnings": warnings,
         }
+
+    @staticmethod
+    def _recovery_hint(job: Job) -> str:
+        hint = RECOVERY_HINTS.get(JobState(job.state), "")
+        lost = job.flags.get("debuggee_lost")
+        if lost and JobState(job.state) in DEBUGGEE_STATES:
+            hint += (
+                f"; the debuggers were restarted while no gateway ran ({_clip(lost, 120)}): the sample "
+                "is no longer loaded and its breakpoints and patches are gone (load it again with "
+                "LoadBinary, or collect what there is)"
+            )
+        return hint
 
     def _route_or_none(self, rt: Runtime, job: Job | None) -> str | None:
         try:
@@ -1227,6 +1247,10 @@ class Gateway(GatewayApp):
         wait = self._wait(wait_s)
 
         def work(progress: Progress) -> dict[str, Any]:
+            if action == "start":
+                running = self._start_running_vm(rt, op, progress)
+                if running is not None:
+                    return running
             with rt.supervisor.paused(), rt.lock.write(timeout_s=WRITE_LOCK_TIMEOUT_S):
                 self._guard_vm_op(rt, op)
                 progress(action)
@@ -1252,6 +1276,19 @@ class Gateway(GatewayApp):
                 }
 
         return self._ops(rt).run("vm_power", action, work, wait_s=wait)
+
+    def _start_running_vm(self, rt: Runtime, op: policy.VmOp, progress: Progress) -> dict[str, Any] | None:
+        """``vm_power start`` of a VM that already runs: only the readiness checks, under the
+        read lock. The write lock would cancel in-flight debugger calls (preempt hooks) and
+        pause supervision for a no-op. None when the VM does not run (a real start follows,
+        under the write lock, which checks the power state again)."""
+        with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+            self._guard_vm_op(rt, op)
+            if rt.vm.power_state() != PowerState.RUNNING:
+                return None
+            progress("start")
+            info = self._ready_vm(rt, progress)
+            return {"action": "start", **info, "resumed": False, "epochs": self._epochs(rt)}
 
     def vm_screenshot(self, profile: str | None = None) -> dict[str, Any]:
         rt = self.runtime(profile)
@@ -1362,14 +1399,12 @@ class Gateway(GatewayApp):
         _private_dirs(extra)
         dest = self._reserve_extra_slot(extra, _safe_name(PureWindowsPath(src).name))
         try:
-            with tempfile.TemporaryDirectory(prefix=".dl-", dir=job.host_root) as scratch:
-                # transfer's bounded fetch: guest-side size probe before the copy, host free-space
-                # check, size check of what arrived, 0600 and an atomic rename onto ``dest``
-                fetcher = transfer._BoundedFetch(  # reuse, see contract change requests
-                    rt.channel, POWERSHELL_EXE, job.guest_root, self._fetch_limits, Path(scratch)
+            # transfer's bounded fetch: guest-side size probe before the copy, host free-space
+            # check, size check of what arrived, 0600 and an atomic rename onto ``dest``
+            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+                digest, size = transfer.fetch_file(
+                    rt.channel, POWERSHELL_EXE, job.guest_root, self._fetch_limits, src, dest
                 )
-                with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-                    digest, size = fetcher.fetch(src, dest)
         except BaseException:
             with contextlib.suppress(OSError):
                 dest.unlink()
@@ -2181,8 +2216,18 @@ class Gateway(GatewayApp):
     def _check_finishable(job: Job, revert: bool) -> None:
         state = JobState(job.state)
         if state == JobState.REVERTING:
+            if job.flags.get("needs_recovery") and revert:
+                return  # interrupted by a gateway restart (it was COLLECTED/DISCARDED): redo it
             if job.flags.get("needs_recovery"):
-                return  # interrupted by a gateway restart (it was COLLECTED/DISCARDED): finish it
+                # the interrupted revert may have half-applied: the VM state is unknown and may
+                # still hold the sample, so the job cannot be closed as "VM left as is"
+                raise StateViolation(
+                    f"job {job.id} was interrupted while reverting the VM; it can only be finished by "
+                    "redoing the revert",
+                    details={"job_id": job.id, "state": state.value, "revert": False},
+                    hint="call analysis_finish with revert=true (the default)",
+                    next_tool="analysis_finish",
+                )
             raise StateViolation(
                 f"job {job.id} is already being finished",
                 details={"job_id": job.id, "state": state.value},
@@ -2237,12 +2282,13 @@ class Gateway(GatewayApp):
                 with steps.step("revert") as st:
                     info = self._revert_and_ready(rt, target, progress, f"analysis_finish {job_id}: reverted")
                     st["detail"] = f"reverted to {target}; guest IP {info['ip']}"
-            # revert=False: COLLECTED/DISCARDED (or an interrupted REVERTING) -> DONE directly
+            # revert=False: COLLECTED/DISCARDED -> DONE directly (never an interrupted REVERTING:
+            # _check_finishable refuses it)
             job = store.transition(
                 job_id,
                 JobState.DONE,
                 reason="VM reverted to the clean snapshot" if revert else "finished; VM left as is",
-                expect_from=JobState.REVERTING if revert or resumed else tuple(policy.REVERT_READY_STATES),
+                expect_from=JobState.REVERTING if revert else tuple(policy.REVERT_READY_STATES),
                 set_flags={"reverted": revert, "kept_snapshot": snapshot},
                 clear_flags=["needs_recovery"],
             )
@@ -2321,25 +2367,29 @@ class Gateway(GatewayApp):
             for key, mod in modules.items()
         }
 
-    def _live_modules(self, rt: Runtime, job: Job) -> dict[str, ida_sync.ModuleInfo] | None:
+    def _live_modules(
+        self, rt: Runtime, job: Job
+    ) -> tuple[dict[str, ida_sync.ModuleInfo] | None, str | None]:
+        """(live module map, None), or (None, why there is none). The reason is None when no
+        live map was expected (the job's debugger no longer holds the sample)."""
         bid = job.backend_id
         if bid not in rt.backends or JobState(job.state) not in IDA_LIVE_STATES:
-            return None
+            return None, None
         try:
             if rt.profile.mode == "vmware" and rt.vm.power_state() != PowerState.RUNNING:
-                return None
+                return None, "the VM is not running"
             with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
                 res = rt.connect(str(bid)).call_tool("ListModules", {}, IDA_LIST_MODULES_TIMEOUT_S)
         except GatewayError as e:
             log.info("job %s: no live module map (%s)", job.id, e.code)
-            return None
+            return None, f"ListModules failed ({e.code})"
         if res.is_error:
-            return None
+            return None, "ListModules returned an error (no debug session?)"
         try:
             modules = ida_sync.parse_module_list("\n".join(sanitize_untrusted_text(t) for t in res.texts))
         except ValueError:
-            return None
-        return modules or None
+            return None, "ListModules output could not be parsed"
+        return (modules, None) if modules else (None, "ListModules listed no modules")
 
     @staticmethod
     def _manifest_doc(job: Job) -> dict[str, Any] | None:
@@ -2366,11 +2416,15 @@ class Gateway(GatewayApp):
         except ValueError:
             return None
 
-    def _ida_modules(self, rt: Runtime, job: Job, *, live_only: bool = False) -> tuple[dict[str, Any], str]:
-        """(module map, "live" | "manifest"). Raises StateViolation when there is none."""
-        live = self._live_modules(rt, job)
+    def _ida_modules(
+        self, rt: Runtime, job: Job, *, live_only: bool = False
+    ) -> tuple[dict[str, Any], str, list[str]]:
+        """(module map, "live" | "manifest", warnings). Raises StateViolation when there is
+        none. A job whose debugger should still hold the sample gets a warning when its live
+        map was unavailable and the collected one is used instead."""
+        live, why = self._live_modules(rt, job)
         if live:
-            return self._with_sample_base(job, live), "live"
+            return self._with_sample_base(job, live), "live", []
         state = JobState(job.state).value
         if live_only:
             raise StateViolation(
@@ -2382,7 +2436,12 @@ class Gateway(GatewayApp):
             )
         saved = self._manifest_modules(job)
         if saved:
-            return self._with_sample_base(job, saved), "manifest"
+            warnings = [] if why is None else [
+                f"the live module map was unavailable ({why}); used the map analysis_collect recorded, "
+                "which is stale if the debugger was restarted or the sample reloaded since (ASLR): "
+                "retry when the debugger is idle, or check the bases with ListModules"
+            ]
+            return self._with_sample_base(job, saved), "manifest", warnings
         raise StateViolation(
             f"no module map for job {job.id}: its debugger has no debug session and no collection "
             "recorded one",
@@ -2404,7 +2463,7 @@ class Gateway(GatewayApp):
             raise InvalidArgument(f"direction must be one of {', '.join(ida_sync.DIRECTIONS)}")
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
-        modules, source = self._ida_modules(rt, job)
+        modules, source, map_warnings = self._ida_modules(rt, job)
         if module is None and direction in ("rva_to_runtime", "ida_to_runtime"):
             module = self._sample_module(job)
             if module is None:
@@ -2417,7 +2476,8 @@ class Gateway(GatewayApp):
                 _clip(str(e), 500), stage="ida_rebase",
                 hint="check the module and the address against the module map (ListModules)",
             ) from None
-        return {**out, "job_id": job.id, "module_map_source": source}
+        return {**out, "warnings": [*out.get("warnings", []), *map_warnings], "job_id": job.id,
+                "module_map_source": source}
 
     def ida_export_annotations(self, job_id: str | None = None) -> dict[str, Any]:
         job = self._resolve_job(job_id)
@@ -2464,7 +2524,8 @@ class Gateway(GatewayApp):
         modules: dict[str, Any] | None = None
         source: str | None = None
         try:
-            modules, source = self._ida_modules(rt, job)
+            modules, source, map_warnings = self._ida_modules(rt, job)
+            steps.warnings.extend(map_warnings)
         except StateViolation as e:
             steps.warnings.append(f"no module map, base_runtime is null: {e.message}")
         doc = ida_sync.export_for_ida(ann, modules)
@@ -2500,13 +2561,9 @@ class Gateway(GatewayApp):
         dest = art / f"{PureWindowsPath(IDA_SYNC_FILE).stem}{PureWindowsPath(src).suffix.lower()}"
         limits = transfer.FetchLimits(max_file_bytes=ida_sync.MAX_DB_BYTES,
                                       min_host_free_bytes=self._fetch_limits.min_host_free_bytes)
-        with tempfile.TemporaryDirectory(prefix=".ida-", dir=job.host_root) as scratch:
-            # transfer's bounded fetch, as file_download uses it (size probe, free space, 0600)
-            fetcher = transfer._BoundedFetch(
-                rt.channel, POWERSHELL_EXE, job.guest_root, limits, Path(scratch)
-            )
-            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-                digest, size = fetcher.fetch(src, dest)
+        # transfer's bounded fetch, as file_download uses it (size probe, free space, 0600)
+        with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+            digest, size = transfer.fetch_file(rt.channel, POWERSHELL_EXE, job.guest_root, limits, src, dest)
         return {"source": "saved", "guest_path": src, "original_path": src, "host_path": str(dest),
                 "size": size, "sha256": digest}
 
@@ -2607,7 +2664,7 @@ class Gateway(GatewayApp):
                 stage="ida_import_annotations", details={"backend": bid},
                 hint="update the plugin (x64dbg-vm-gateway install-plugin)",
             )
-        modules, source = self._ida_modules(rt, job, live_only=True)
+        modules, source, _ = self._ida_modules(rt, job, live_only=True)
         try:
             report = ida_sync.plan_import_report(items, module=module, module_map=modules,
                                                  ida_imagebase=ida_imagebase)
@@ -2634,7 +2691,10 @@ class Gateway(GatewayApp):
             except GatewayError as e:
                 if applied == 0 and failed == 0:
                     raise  # nothing changed yet: the error says it all (e.g. BACKEND_RESTARTED)
+                # where it stopped: this operation's outcome depends on the error (RESULT_UNKNOWN:
+                # maybe applied); it and every later one count as not_attempted
                 stopped = {k: v for k, v in e.to_dict().items() if k != "details"}
+                stopped.update(operation=n, runtime_address=entry["runtime_address"], mode=mode)
                 break
             if not res.is_error:
                 applied += 1
@@ -2668,12 +2728,29 @@ class Gateway(GatewayApp):
         assert view is not None
         return view
 
+    def note_debuggers_restarted(self, profile: str | None, reason: str) -> list[str]:
+        """The profile's debuggers were killed / relaunched, or the guest rebooted, outside a
+        gateway operation (CLI ``install-plugin`` / ``provision``). Epoch bumps live in the
+        process that made them, so the job record keeps it instead: every non-terminal job of
+        the profile whose debugger held the sample gets ``flags.debuggee_lost = reason``,
+        which the recovery hint of the next gateway process reports. Returns their ids."""
+        name = self._profile_name(profile)
+        store = self._jobs()
+        marked: list[str] = []
+        for job in store.list(name):
+            if job.terminal or JobState(job.state) not in DEBUGGEE_STATES:
+                continue
+            store.update(job.id, set_flags={"debuggee_lost": _clip(reason, 200)})
+            marked.append(job.id)
+        return marked
+
     # ── jobs (read-only) ────────────────────────────────────────────
     def list_jobs(self, profile: str | None = None) -> dict[str, Any]:
         """Every known job (oldest first), optionally of one profile, plus unreadable job dirs.
 
         The job store is locked by the serving process, so a second process cannot
-        open it while a gateway runs: clients ask the gateway (this method).
+        open it while a gateway runs: clients ask the gateway (MCP/HTTP tools
+        ``jobs_list`` / ``jobs_show``).
         """
         name = self._profile_name(profile) if profile else None
         store = self._jobs()
@@ -2694,7 +2771,7 @@ class Gateway(GatewayApp):
             **view,
             "history": [dict(h) for h in job.history],
             "needs_recovery": recovering,
-            "recovery_hint": RECOVERY_HINTS.get(state) if recovering else None,
+            "recovery_hint": self._recovery_hint(job) if recovering else None,
             "next_tool": RECOVERY_NEXT_TOOL.get(state) if recovering else None,
         }
 

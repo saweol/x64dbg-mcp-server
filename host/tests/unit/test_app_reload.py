@@ -94,3 +94,22 @@ def test_debugger_restart_without_reload_on_restart_reports_not_reloaded(lab):
     gw.analysis_start(str(lab.sample()))
     lab.servers["x64"].stop()
     assert gw.debugger_restart()["reloaded"] is False
+
+
+def test_reload_without_a_confirmed_pause_does_not_claim_one(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()), reload_on_restart=True)
+    lab.kill_debugger("x64")
+    lab.servers["x64"].on_tool("WaitForPause", ToolError("Timed out waiting for the debuggee to pause"))
+    err = restarted(gw)
+    assert err.details["reloaded"] is True and err.details["reload"]["paused"] is False
+    hint = err.hint or ""
+    assert "reloaded" in hint and "is paused" not in hint and "GetDebugState" in hint
+
+
+def test_reload_with_a_confirmed_pause_says_so(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()), reload_on_restart=True)
+    lab.kill_debugger("x64")
+    err = restarted(gw)
+    assert err.details["reload"]["paused"] is True and "is paused at its start" in (err.hint or "")

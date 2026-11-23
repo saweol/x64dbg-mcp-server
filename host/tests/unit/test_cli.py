@@ -450,6 +450,32 @@ def test_install_plugin_bumps_the_backend_epochs_after_success(cfg_path, wiring,
     rt = fake.runtimes[0]
     assert rt.log == ["supervisor.pause", "lock.write", "install_plugin", "bump:x64", "bump:x32",
                       "invalidate_clients", "lock.release", "supervisor.resume"]
+    # the bump dies with this process: the job store keeps that the debuggee is gone
+    assert fake.called("note_debuggers_restarted") == [
+        {"profile": None, "reason": "plugin reinstalled (debuggers killed and relaunched)"}]
+
+
+def test_provision_reboot_records_the_lost_debuggee(cfg_path, wiring, provision, fake):
+    provision.results["provision_guest"] = {"status": "ok", "rebooted": True}
+    assert run(["--config", str(cfg_path), "--profile", "win10", *PROVISION_ARGS]) == 0
+    assert fake.called("note_debuggers_restarted") == [
+        {"profile": "win10", "reason": "guest rebooted by provision"}]
+
+
+def test_provision_without_a_reboot_records_nothing(cfg_path, wiring, provision, fake):
+    assert run(["--config", str(cfg_path), *PROVISION_ARGS, "--no-reboot"]) == 0
+    assert fake.called("note_debuggers_restarted") == []
+
+
+def test_install_plugin_names_the_jobs_that_lost_their_debuggee(cfg_path, wiring, provision, fake, tmp_path,
+                                                                capsys):
+    fake.results["note_debuggers_restarted"] = [JOB_ID]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    assert run(["--config", str(cfg_path), "--json", "install-plugin", "--dist", str(dist)]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["debuggee_lost_jobs"] == [JOB_ID]
+    assert JOB_ID in captured.err and "no longer loaded" in captured.err
 
 
 def test_failed_install_plugin_keeps_the_epochs_and_releases_everything(
@@ -463,6 +489,7 @@ def test_failed_install_plugin_keeps_the_epochs_and_releases_everything(
     assert "GUEST_OP_FAILED" in capsys.readouterr().err
     assert fake.runtimes[0].log == ["supervisor.pause", "lock.write", "install_plugin", "lock.release",
                                     "supervisor.resume"]
+    assert fake.called("note_debuggers_restarted") == []
 
 
 def test_provision_with_the_real_runtime_runs_paused_and_locked(tmp_path, cfg_path, provision, monkeypatch):
@@ -488,6 +515,26 @@ def test_provision_with_the_real_runtime_runs_paused_and_locked(tmp_path, cfg_pa
         assert seen == {"writer": True, "paused": True, "same": True}
         assert rt.supervisor.epoch("x64") == 1
         assert not rt.lock.state()["writer"] and not rt.supervisor.is_paused()
+    finally:
+        lab.close()
+
+
+def test_install_plugin_marks_the_live_job_in_the_real_store(tmp_path, cfg_path, provision, monkeypatch):
+    from tests.fakes.fake_runtime import make_lab
+
+    lab = make_lab(tmp_path / "lab")
+    try:
+        gw = lab.gateway()
+        job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+        monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.wiring",
+                            types.SimpleNamespace(build_app=lambda *a, **kw: gw))
+        provision.install_plugin = lambda runtime, **kw: {"ok": True}
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist)]) == 0
+        later = lab.gateway()  # the CLI closed its gateway; the next process reads the record
+        flags = later.get_job(job_id)["flags"]
+        assert flags["debuggee_lost"] == "plugin reinstalled (debuggers killed and relaunched)"
     finally:
         lab.close()
 

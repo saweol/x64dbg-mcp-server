@@ -73,6 +73,7 @@ __all__ = [
     "ManifestEntry",
     "collect_artifacts",
     "encrypt_archive",
+    "fetch_file",
     "safe_extract",
     "upload_sample",
 ]
@@ -1010,6 +1011,21 @@ class _BoundedFetch:
             _unlink_quiet(part)
             raise
         return sha256_file(dst), dst.stat().st_size
+
+
+def fetch_file(channel: GuestChannel, powershell: str, guest_job_dir: str, limits: FetchLimits,
+               guest_path: str, dest: Path) -> tuple[str, int]:
+    """Copy one guest file to ``dest`` with the size bounds of :class:`_BoundedFetch` (guest
+    size probe before the copy, host free space, size of what arrived); ``dest`` is written
+    0600 via ``dest.part`` + rename. ``guest_job_dir`` holds the probe's result file. The
+    probe's scratch directory is created next to ``dest`` and removed. Returns (sha256, size).
+
+    Raises TransferError (``details["reason"]``: ``too-large`` / ``host-disk-space``),
+    guest errors from the channel, or OSError for host file-system failures.
+    """
+    with tempfile.TemporaryDirectory(prefix=".fetch-", dir=dest.parent) as scratch:
+        fetcher = _BoundedFetch(channel, powershell, guest_job_dir, limits, Path(scratch))
+        return fetcher.fetch(guest_path, dest)
 
 
 def _screenshot_record(screenshot: str | os.PathLike[str] | None, job: Path) -> dict[str, Any] | None:

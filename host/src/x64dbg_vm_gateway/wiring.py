@@ -58,12 +58,14 @@ from .contracts import (
     SystemClock,
     ToolCallResult,
     ToolInfo,
+    VersionReportingClient,
     VmProvider,
     VmrunRunner,
 )
 from .errors import (
     BackendAuthError,
     BackendError,
+    BackendThrottled,
     CancelledByVmOp,
     ConfigError,
     GuestOperationError,
@@ -358,6 +360,7 @@ class Runtime:
     _token_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False, repr=False)
     _resolved: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # backend -> url
     _catalog_epoch: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _probe_refused: set[str] = field(default_factory=set, init=False, repr=False)  # see _learn_version
 
     # ── backends ────────────────────────────────────────────────────
     def backend(self, backend_id: str) -> BackendConfig:
@@ -549,24 +552,35 @@ class Runtime:
             launch_task=cfg.launch_task,
         )
         client = self.client_factory(endpoint, clock=self.clock)
-        listen = getattr(client, "on_server_version", None)
-        if callable(listen):
+        if isinstance(client, VersionReportingClient):
             # GET / (health checks) and initialize report the plugin version: the catalog then
             # uses the builtin list of that version for this backend (catalog module docstring)
-            listen(lambda version, _bid=cfg.id: self.catalog.set_server_version(_bid, version))
+            client.on_server_version(
+                lambda version, _bid=cfg.id: self.catalog.set_server_version(_bid, version)
+            )
         return client
 
     def _learn_version(self, backend_id: str, client: BackendClient) -> None:
-        """First contact: ask ``GET /`` for the plugin version (once, until the plugin has
-        reported one), so the tool flags are those of that version before the first call.
-        Later changes arrive through the client's version listener (health checks). Best
-        effort: a backend that does not answer is reported by the call or check that follows;
-        asking only once also keeps a wrong token from adding failed logins (v1.10 lockout)."""
-        probe = getattr(client, "server_info", None)
-        if not callable(probe) or self.catalog.reported_version(backend_id) is not None:
+        """First contact: ask ``GET /`` for the plugin version (until the plugin has reported
+        one), so the tool flags are those of that version before the first call. Later
+        changes arrive through the client's version listener (health checks). Best effort: a
+        backend that does not answer is reported by the call or check that follows, and is
+        asked again by the next client. A probe the plugin refused (401: wrong token, 429:
+        locked out) is never repeated by this process: on v1.10 each one is a failed login
+        that prolongs the lockout, and clients are rebuilt after every revert."""
+        if not isinstance(client, VersionReportingClient):
             return
+        if self.catalog.reported_version(backend_id) is not None:
+            return
+        with self._mutex:
+            if backend_id in self._probe_refused:
+                return
         try:
-            probe(timeout_s=VERSION_PROBE_TIMEOUT_S)  # the client's version listener does the rest
+            client.server_info(timeout_s=VERSION_PROBE_TIMEOUT_S)  # its version listener does the rest
+        except (BackendAuthError, BackendThrottled) as e:
+            with self._mutex:
+                self._probe_refused.add(backend_id)
+            log.debug("backend %s: version probe refused (%s); not asking again", backend_id, e.code)
         except (BackendError, CancelledByVmOp) as e:
             log.debug("backend %s: version probe failed (%s)", backend_id, e.code)
 

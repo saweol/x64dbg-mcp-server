@@ -9,6 +9,7 @@ import pytest
 
 from tests.fakes.fake_runtime import make_lab
 from x64dbg_vm_gateway.contracts import JobState
+from x64dbg_vm_gateway.errors import StateViolation
 
 
 @pytest.fixture
@@ -117,3 +118,25 @@ def test_interrupted_revert_crashing_again_is_flagged_again(lab):
     (rec,) = gw3.session_status()["needs_recovery"]
     assert rec["job_id"] == job_id and rec["next_tool"] == "analysis_finish"
     assert gw3.analysis_finish(job_id)["state"] == JobState.DONE
+
+
+def test_interrupted_revert_cannot_be_finished_without_reverting(lab):
+    # The interrupted revert may have half-applied: the VM state is unknown and may still hold
+    # the sample. revert=False would close the job as "VM left as is" without redoing it.
+    gw1 = lab.gateway()
+    job_id = gw1.analysis_start(str(lab.sample()))["job_id"]
+    gw1.analysis_collect()
+    crash_in(gw1, job_id, JobState.REVERTING)
+    gw2 = lab.gateway()
+    before = reverts(lab)
+    with pytest.raises(StateViolation) as ei:
+        gw2.analysis_finish(job_id, revert=False)
+    err = ei.value
+    assert err.next_tool == "analysis_finish" and "revert=true" in (err.hint or "")
+    assert err.details["state"] == JobState.REVERTING
+    job = gw2._jobs().get(job_id)
+    assert job.state == JobState.REVERTING and job.flags.get("needs_recovery") is True
+    assert reverts(lab) == before
+    # still recoverable the documented way
+    fin = gw2.analysis_finish(job_id)
+    assert fin["state"] == JobState.DONE and fin["reverted"] is True and fin["resumed"] is True

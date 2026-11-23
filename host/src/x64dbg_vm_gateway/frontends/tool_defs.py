@@ -85,6 +85,8 @@ LOCAL_TIERS: Mapping[str, RiskTier] = MappingProxyType({
     "ida_rebase": RiskTier.OBSERVE,
     "ida_export_annotations": RiskTier.GUEST_MUTATE,
     "ida_import_annotations": RiskTier.GUEST_MUTATE,
+    "jobs_list": RiskTier.OBSERVE,
+    "jobs_show": RiskTier.OBSERVE,
 })
 """Tiers of gateway tools that ``policy.GATEWAY_TOOL_TIERS`` does not list."""
 
@@ -213,6 +215,23 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "there is none) and return {host_path}. Use it when the debugger stops answering, to look for a "
         "modal dialog or a crash window in the guest. Read-only for the VM (only writes the image file).",
         _obj({"profile": _PROFILE}),
+    ),
+    _def(
+        "jobs_list", "List analysis jobs",
+        "List every analysis job the gateway knows, oldest first, finished ones included, optionally of one "
+        "profile: job_id, state, sample (name, sha256, arch), backend, epoch, host and guest job "
+        "directories, manifest path and flags; corrupt lists job directories whose state is unreadable. "
+        "Use it to find an earlier job's results or id (e.g. for ida_export_annotations). Read-only.",
+        _obj({"profile": _str("Only jobs of this gateway profile. Omit for every profile.")}),
+        method="list_jobs",
+    ),
+    _def(
+        "jobs_show", "Show analysis job",
+        "Show one analysis job: everything jobs_list reports plus its state history and, when an "
+        "interrupted job needs attention after a gateway restart, needs_recovery with a recovery_hint and "
+        "the next_tool to call. Read-only.",
+        _obj({"job_id": _str("Job id (YYYYMMDD-HHMMSS-xxxxxx).")}, ("job_id",)),
+        method="get_job",
     ),
     # VM control
     _def(
@@ -365,7 +384,8 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "Convert an address between x64dbg runtime addresses (ASLR), module RVAs and IDA addresses "
         "(ida = ida_imagebase + rva): runtime_to_ida, ida_to_runtime, runtime_to_rva, rva_to_runtime. The "
         "module map is a live ListModules of the job's debugger while the sample is loaded, else the map "
-        "analysis_collect recorded (result: module_map_source). For runtime_* directions the module is "
+        "analysis_collect recorded (result: module_map_source; warnings says when the recorded map stood in "
+        "for an unavailable live one, which may be stale). For runtime_* directions the module is "
         "found by address; rva_to_runtime / ida_to_runtime need module (default: the sample). "
         "ida_imagebase is the IDB image base (idaapi.get_imagebase()): required for ida_to_runtime; for "
         "runtime_to_ida it defaults to the module's PE image base when the gateway knows it (the sample's). "

@@ -169,7 +169,7 @@ guard for all of them.
 
 | Tier | Gateway tools |
 |---|---|
-| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `ida_rebase` |
+| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `ida_rebase`, `jobs_list`, `jobs_show` |
 | guest-mutating | `file_upload`, `debugger_select`, `debugger_restart`, `debugger_call`, `analysis_start`, `analysis_collect`, `ida_export_annotations`, `ida_import_annotations` |
 | host/VM-destructive | `vm_snapshot_take`, `vm_snapshot_revert`, `vm_snapshot_delete`, `vm_power`, `file_download`, `analysis_finish` |
 
@@ -179,18 +179,26 @@ Errors come back as `isError` results with
 Further behaviour worth knowing:
 
 - `vm_power start` is allowed during an analysis (to resume a VM that host sleep suspended);
-  `stop`, `suspend` and `reset` are refused until the job is collected or discarded.
+  `stop`, `suspend` and `reset` are refused until the job is collected or discarded. `start` of a
+  VM that already runs only re-checks readiness and does not interrupt running debugger calls.
+- A job whose revert was interrupted by a gateway restart (state `REVERTING`) can only be finished
+  with `analysis_finish(revert=true)`, which redoes the revert.
 - A v1.10 plugin that locked the gateway out after failed logins answers HTTP 429: calls fail with
   `BACKEND_THROTTLED` (`details.retry_after_s`), the backend shows as `THROTTLED` in
   `session_status`, and it is never restarted for that.
 - With `analysis_start(reload_on_restart=true)` a relaunched debugger gets the sample again before
   `BACKEND_RESTARTED` is reported; `details.reloaded` says whether it is loaded.
 - `ida_rebase`, `ida_export_annotations` (writes `<job>/artifacts/ida_sync.json`) and
-  `ida_import_annotations` connect the session to IDA; see `ida/README.md`.
+  `ida_import_annotations` connect the session to IDA; see `ida/README.md`. When the debugger
+  should still hold the sample but its live module map is unavailable, the map recorded by
+  `analysis_collect` is used and `warnings` says so.
+- `jobs_list` / `jobs_show` list the jobs of the serving gateway (a second process cannot open
+  its job store).
 - While a gateway serves a jobs root, CLI commands that need it (`discard`, `status`, `doctor`,
   `provision`, `install-plugin`) stop with `LOCK_TIMEOUT` naming the gateway's pid. `provision` and
   `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
-  after a plugin install.
+  after a plugin install. A job whose debugger held the sample is marked `flags.debuggee_lost`
+  (the CLI names it), and the next gateway's recovery hint says the sample is no longer loaded.
 
 ## Remote access (M3)
 

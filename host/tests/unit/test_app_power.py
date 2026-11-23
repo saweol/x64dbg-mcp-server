@@ -3,6 +3,8 @@ suspends the VM), stopping/suspending/resetting keeps the revert rules."""
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from tests.fakes.fake_runtime import make_lab
@@ -34,6 +36,60 @@ def test_start_of_a_running_vm_while_analyzing_is_a_no_op(lab):
     starts = len([c for c in lab.vm.calls if c[0] == "start"])
     assert gw.vm_power("start")["power"] == "running"
     assert len([c for c in lab.vm.calls if c[0] == "start"]) == starts
+
+
+def test_start_of_a_running_vm_does_not_preempt_debugger_calls(lab):
+    # Nothing is started, so nothing may be cancelled: a write lock would run the preempt
+    # hooks (CANCELLED_BY_VM_OP for in-flight calls) and pause supervision for a no-op.
+    gw = lab.gateway()
+    res = gw.analysis_start(str(lab.sample()))
+    rt = gw.runtime()
+    preempted: list[int] = []
+    rt.lock.add_preempt_hook(lambda: preempted.append(1))
+    holding, release = threading.Event(), threading.Event()
+
+    def in_flight_call() -> None:  # a debugger call holds the read lock meanwhile
+        with rt.lock.read(timeout_s=5):
+            holding.set()
+            release.wait(10)
+
+    worker = threading.Thread(target=in_flight_call, daemon=True)
+    worker.start()
+    try:
+        assert holding.wait(5)
+        writes: list[int] = []
+        real_write = rt.lock.write
+
+        def write(*args, **kwargs):
+            writes.append(1)
+            return real_write(*args, **kwargs)
+
+        rt.lock.write = write  # type: ignore[method-assign]
+        out = gw.vm_power("start", wait_s=5)
+    finally:
+        release.set()
+        worker.join(5)
+    assert out["power"] == "running" and out["started"] is False and out["resumed"] is False
+    assert out["epochs"]["x64"] == res["epoch"]
+    assert writes == [] and preempted == []
+    assert not rt.supervisor.is_paused()
+
+
+def test_start_of_a_stopped_vm_still_takes_the_write_lock(lab):
+    # control: a real start changes the VM and must exclude everything else
+    gw = lab.gateway()
+    lab.vm.power = PowerState.OFF
+    rt = gw.runtime()
+    writes: list[int] = []
+    real_write = rt.lock.write
+
+    def write(*args, **kwargs):
+        writes.append(1)
+        return real_write(*args, **kwargs)
+
+    rt.lock.write = write  # type: ignore[method-assign]
+    out = gw.vm_power("start")
+    assert out["started"] is True and writes == [1]
 
 
 @pytest.mark.parametrize("action", ["stop", "suspend", "reset"])

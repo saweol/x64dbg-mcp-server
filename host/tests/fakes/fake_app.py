@@ -261,6 +261,9 @@ class FakeApp:
     def open(self) -> None:
         self._record("open", None)
 
+    def note_debuggers_restarted(self, profile: str | None, reason: str) -> list[str]:
+        return self._record("note_debuggers_restarted", [], profile=profile, reason=reason)
+
     def runtime(self, profile: str | None = None) -> FakeRuntime:
         rt = FakeRuntime(profile)
         with self._lock:

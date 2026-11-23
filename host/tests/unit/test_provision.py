@@ -351,14 +351,90 @@ def test_guest_script_turns_x64dbg_database_compression_off() -> None:
 
 
 def test_ini_helper_creates_or_updates_and_keeps_other_content() -> None:
-    body = _function_body(GUEST_SCRIPT.read_text(), "Set-IniValue")
-    assert "ReadAllLines" in body and "WriteAllLines" in body  # rewrites the file line by line
-    assert "-ieq $header" in body  # section header compared case-insensitively ([engine] too)
-    assert "-ieq $Key" in body  # existing key replaced in place, case-insensitively
+    # static shape only; test_ini_helper_behaviour runs it where pwsh is installed
+    text = GUEST_SCRIPT.read_text()
+    read = _function_body(text, "Read-IniText")
+    assert "ReadAllBytes" in read and "GetEncoding(28591)" in read  # byte-preserving (Latin-1)
+    assert "0xEF" in read and "UnicodeEncoding" in read  # UTF-8 BOM kept, UTF-16 stays UTF-16
+    find = _function_body(text, "Find-IniKey")
+    assert "-ieq $header" in find and "-ieq $Key" in find  # case-insensitive section and key
+    body = _function_body(text, "Set-IniValue")
     assert ".Insert(" in body  # a missing key goes into the existing section
-    assert "$lines.Add($header)" in body  # a missing section is appended
-    assert "0xEF" in body and "UTF8Encoding($bom)" in body  # a UTF-8 BOM is kept as it was
     assert "return $false" in body  # an ini that already has the value is not rewritten
+    assert "WriteAllBytes($tmp" in body and "File]::Replace($tmp, $Path" in body  # temp + swap
+    assert "[NullString]::Value" in body  # no backup file ('' would be an invalid path)
+
+
+def test_summary_reports_the_value_read_back() -> None:
+    text = GUEST_SCRIPT.read_text()
+    assert "(Get-IniValue $ini 'Engine' 'DisableDatabaseCompression') -eq '1'" in text
+    assert "db_compression = $compression" in text and "'unverified'" in text
+
+
+_INI_RUNNER = """\
+param([string]$Dir)
+$ErrorActionPreference = 'Stop'
+__FUNCTIONS__
+$out = [ordered]@{}
+foreach ($name in @(Get-ChildItem -LiteralPath $Dir -Name | Sort-Object)) {
+    $path = Join-Path $Dir $name
+    $changed = Set-IniValue $path 'Engine' 'DisableDatabaseCompression' '1'
+    $value = Get-IniValue $path 'Engine' 'DisableDatabaseCompression'
+    $out[$name] = [ordered]@{ changed = $changed; value = $value; other = (Get-IniValue $path 'Gui' 'Path') }
+}
+$missing = Join-Path $Dir 'sub-missing.ini'
+$out['missing-before'] = (Get-IniValue $missing 'Engine' 'DisableDatabaseCompression')
+$out['missing'] = Set-IniValue $missing 'Engine' 'DisableDatabaseCompression' '1'
+$out | ConvertTo-Json -Depth 4 -Compress
+"""
+
+_KEY = "DisableDatabaseCompression"
+_CP949 = "C:\\\uc554\ud638".encode("cp949")  # C:\<two Korean syllables> in the ANSI code page
+_INI_CASES: dict[str, tuple[bytes, bytes | None]] = {
+    # name: (before, expected after; None: unchanged)
+    "a-no-section.ini": (b"[Gui]\nPath=x\n",
+                         b"[Gui]\r\nPath=x\r\n\r\n[Engine]\r\n" + _KEY.encode() + b"=1\r\n"),
+    "b-other-keys.ini": (b"[Engine]\r\nA=1\r\n\r\n[Gui]\r\nPath=x\r\n",
+                         b"[Engine]\r\nA=1\r\n" + _KEY.encode() + b"=1\r\n\r\n[Gui]\r\nPath=x\r\n"),
+    "c-other-case.ini": (b"[engine]\r\n disabledatabasecompression = 0\r\nB=2\r\n",
+                         b"[engine]\r\n" + _KEY.encode() + b"=1\r\nB=2\r\n"),
+    "d-already-set.ini": (b"[Engine]\n" + _KEY.encode() + b"=1\n", None),
+    "e-utf8-bom.ini": (b"\xef\xbb\xbf[Gui]\r\nPath=C:\\\xec\x95\x94\xed\x98\xb8\r\n",
+                       b"\xef\xbb\xbf[Gui]\r\nPath=C:\\\xec\x95\x94\xed\x98\xb8\r\n\r\n[Engine]\r\n"
+                       + _KEY.encode() + b"=1\r\n"),
+    "f-ansi.ini": (b"[Gui]\r\nPath=" + _CP949 + b"\r\n",
+                   b"[Gui]\r\nPath=" + _CP949 + b"\r\n\r\n[Engine]\r\n" + _KEY.encode() + b"=1\r\n"),
+    "g-utf16.ini": ("\ufeff[Gui]\r\nPath=x\r\n".encode("utf-16-le"),
+                    "\ufeff[Gui]\r\nPath=x\r\n\r\n[Engine]\r\nDisableDatabaseCompression=1\r\n".encode("utf-16-le")),
+}
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) is not installed")
+def test_ini_helper_behaviour(tmp_path: Path) -> None:
+    """Set-IniValue / Get-IniValue executed (PowerShell 7; the guest runs 5.1, same .NET APIs):
+    create, add section, insert key, replace a differently cased key in place, leave an ini
+    that already has it untouched, keep UTF-8 (BOM), ANSI and UTF-16 content byte for byte."""
+    text = GUEST_SCRIPT.read_text()
+    functions = "\n".join(_function_body(text, name) + "\n}\n"
+                          for name in ("Read-IniText", "Find-IniKey", "Get-IniValue", "Set-IniValue"))
+    runner = tmp_path / "run.ps1"
+    runner.write_text(_INI_RUNNER.replace("__FUNCTIONS__", functions), encoding="utf-8")
+    inis = tmp_path / "inis"
+    inis.mkdir()
+    for name, (before, _after) in _INI_CASES.items():
+        (inis / name).write_bytes(before)
+    res = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner), "-Dir", str(inis)],
+                         capture_output=True, text=True, timeout=50, check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+    out = json.loads(res.stdout.strip().splitlines()[-1])
+    for name, (before, after) in _INI_CASES.items():
+        assert (inis / name).read_bytes() == (before if after is None else after), name
+        assert out[name]["changed"] is (after is not None), name
+        assert out[name]["value"] == "1", name
+    assert out["a-no-section.ini"]["other"] == "x"
+    assert out["missing-before"] is None and out["missing"] is True
+    assert (inis / "sub-missing.ini").read_bytes() == b"[Engine]\r\n" + _KEY.encode() + b"=1\r\n"
+    assert not list(inis.glob("*.gw-new"))  # the temp file was swapped in, not left behind
 
 
 def test_provision_summary_reports_the_settings_ini(rt: FakeRuntime, timeline: Timeline,

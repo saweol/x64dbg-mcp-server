@@ -311,6 +311,8 @@ def test_scope_denies_calls_with_forbidden(app, scope, tool, args):
     ("read", "session_status", {}),
     ("read", "GetDebugState", {}),
     ("read", "ida_rebase", {"address": "0x1", "direction": "runtime_to_rva"}),
+    ("read", "jobs_list", {"profile": "lab"}),
+    ("read", "jobs_show", {"job_id": "20261123-101010-abcdef"}),
     ("analyze", "SetBreakpoint", {"address": "0x1"}),
     ("analyze", "analysis_start", {"sample_path": "/s/a.exe"}),
     ("admin", "vm_snapshot_delete", {"name": "gw-job-x"}),

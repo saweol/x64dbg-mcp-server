@@ -102,8 +102,10 @@ class GatewayApp(Protocol):
         """direction in {"runtime_to_ida", "ida_to_runtime", "runtime_to_rva", "rva_to_runtime"}.
 
         ``ida_sync.rebase`` result plus ``job_id`` and ``module_map_source`` ("live":
-        ListModules of the job's debugger; "manifest": the collected map). Raises
-        InvalidArgument for a bad address/module/direction, StateViolation without a map."""
+        ListModules of the job's debugger; "manifest": the collected map). ``warnings``
+        also says when the collected map stood in for an unavailable live one while the
+        debugger should still hold the sample. Raises InvalidArgument for a bad
+        address/module/direction, StateViolation without a map."""
         ...
 
     def ida_export_annotations(self, job_id: str | None = None) -> JSON:
@@ -118,8 +120,11 @@ class GatewayApp(Protocol):
                                job_id: str | None = None) -> JSON:
         """Items ``{rva | ida_address, name?, comment?}`` (ida_sync.plan_import_report) are
         set in the live debugger with CommentOrLabelAtAddress. {"applied", "failed",
-        "not_attempted", "operations", "items", "failures", "skipped", "warnings", ...}.
-        Long operation (may answer in_progress)."""
+        "not_attempted", "operations", "items", "failures", "skipped", "warnings", "stopped",
+        ...}. ``stopped`` (else None) is the error that ended the run after something was
+        applied, plus the 1-based ``operation`` it hit, its ``runtime_address`` and ``mode``;
+        that operation and the later ones count as ``not_attempted``. Long operation (may
+        answer in_progress)."""
         ...
 
     # ── jobs (read-only views of the serving gateway's job store) ───

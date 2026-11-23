@@ -17,8 +17,10 @@ EXPECTED = {
     "session_status", "gateway_doctor", "vm_snapshots_list", "vm_snapshot_take", "vm_snapshot_revert",
     "vm_snapshot_delete", "vm_power", "vm_screenshot", "file_upload", "file_download", "debugger_select",
     "debugger_restart", "debugger_call", "analysis_start", "analysis_collect", "analysis_finish",
-    "ida_rebase", "ida_export_annotations", "ida_import_annotations",
+    "ida_rebase", "ida_export_annotations", "ida_import_annotations", "jobs_list", "jobs_show",
 }
+#: tools whose GatewayApp method has another name
+METHODS = {"gateway_doctor": "doctor", "jobs_list": "list_jobs", "jobs_show": "get_job"}
 
 
 def test_exactly_the_gateway_tools_are_defined():
@@ -57,9 +59,17 @@ def test_schema_matches_the_gateway_app_method_signature(tool):
 
 
 def test_method_mapping():
-    assert TOOLS_BY_NAME["gateway_doctor"].method == "doctor"
-    for name in EXPECTED - {"gateway_doctor"}:
-        assert TOOLS_BY_NAME[name].method == name
+    for name in EXPECTED:
+        assert TOOLS_BY_NAME[name].method == METHODS.get(name, name)
+
+
+def test_job_views_are_read_only_tools():
+    # a second process cannot open the job store a serving gateway holds: its clients read
+    # the jobs through these tools (J-integ review)
+    for name in ("jobs_list", "jobs_show"):
+        tool = TOOLS_BY_NAME[name]
+        assert tool.tier is RiskTier.OBSERVE and tool.annotations["readOnlyHint"] is True
+    assert TOOLS_BY_NAME["jobs_show"].input_schema["required"] == ["job_id"]
 
 
 @pytest.mark.parametrize("tool", GATEWAY_TOOLS, ids=lambda t: t.name)

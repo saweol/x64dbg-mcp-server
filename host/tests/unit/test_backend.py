@@ -360,6 +360,23 @@ def test_unknown_retry_after_is_none(client, server):
     assert ei.value.details["retry_after_s"] is None
 
 
+@pytest.mark.parametrize("header", ["²", "١", "７", "1¹", "-3", "+3", "3.5"])
+def test_retry_after_header_takes_ascii_digits_only(header):
+    # http.client decodes headers as latin-1, so a guest can send b"\xb2" ('²'): str.isdigit()
+    # accepts it but int() raises ValueError (it escaped as an internal error); int() also
+    # parses other scripts' digits ('١', '７'). Such a header is ignored: the JSON body decides.
+    body = json.dumps({"retry_after_s": 5}).encode()
+    assert backend_mod._retry_after_s(header, body) == 5
+    assert backend_mod._retry_after_s(header, b"") is None
+
+
+def test_non_ascii_retry_after_on_the_wire_still_maps_to_throttled(client, server):
+    server.lock_out("²", body=False)  # type: ignore[arg-type]  # the header goes out as b"\xb2"
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert ei.value.details["retry_after_s"] is None
+
+
 def test_huge_retry_after_is_clamped(client, server):
     server.lock_out(18446744073709551615)  # the plugin prints a u64
     with pytest.raises(BackendThrottled) as ei:
@@ -642,3 +659,19 @@ def test_cancel_before_an_immediately_completing_connect_is_not_lost(client, ser
     with pytest.raises(CancelledByVmOp):
         client.call_tool("GetDebugState", {}, timeout_s=5)
     assert server.tool_calls("GetDebugState") == []
+
+
+def test_http_client_offers_the_optional_version_contract(client):
+    # wiring picks the builtin tool list per backend through this optional protocol
+    assert isinstance(client, contracts.VersionReportingClient)
+    assert isinstance(client, contracts.BackendClient)
+
+
+def test_a_minimal_backend_client_is_not_version_reporting():
+    class Minimal:
+        endpoint = BackendEndpoint(id="x64", arch="x64", url="http://127.0.0.1:1/", token=Secret("t" * 32))
+
+        def server_info(self, timeout_s: float = 2.0) -> dict:  # no on_server_version
+            return {}
+
+    assert not isinstance(Minimal(), contracts.VersionReportingClient)

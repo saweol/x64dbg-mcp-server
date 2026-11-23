@@ -73,3 +73,28 @@ def test_get_job_of_an_interrupted_job_says_how_to_recover(lab):
     job = lab.gateway().get_job(job_id)
     assert job["needs_recovery"] is True
     assert "analysis_collect" in job["recovery_hint"] and job["next_tool"] == "analysis_collect"
+
+
+# ── debuggers restarted outside a gateway (CLI install-plugin / provision) ──
+def test_debuggers_restarted_by_the_cli_are_recorded_on_the_live_job(lab):
+    # the CLI's epoch bump dies with its process: the job record keeps that the debuggee is gone
+    gw1 = lab.gateway()
+    job_id = gw1.analysis_start(str(lab.sample()))["job_id"]
+    assert gw1.note_debuggers_restarted(None, "plugin reinstalled") == [job_id]
+    assert gw1.get_job(job_id)["flags"]["debuggee_lost"] == "plugin reinstalled"
+    gw1.close()
+    gw2 = lab.gateway()  # the next gateway process
+    (rec,) = gw2.session_status()["needs_recovery"]
+    assert rec["job_id"] == job_id and rec["state"] == JobState.ANALYZING
+    assert "plugin reinstalled" in rec["recovery_hint"] and "no longer loaded" in rec["recovery_hint"]
+    shown = gw2.get_job(job_id)
+    assert shown["needs_recovery"] is True and "no longer loaded" in shown["recovery_hint"]
+
+
+def test_jobs_without_a_debuggee_are_not_marked(lab):
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    gw.analysis_collect()
+    gw.analysis_finish()
+    assert gw.note_debuggers_restarted("lab", "guest rebooted by provision") == []
+    assert "debuggee_lost" not in gw.get_job(job_id)["flags"]

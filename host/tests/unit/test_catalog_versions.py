@@ -64,6 +64,33 @@ def test_a_backend_uses_the_builtin_of_its_version(cat):
     assert cat.tool("GetServerInfo", "x64") is None
 
 
+@pytest.mark.parametrize("version", ["1.10.0-dev", "1.10-rc1", "garbage", "", None])
+def test_an_unparsable_reported_version_keeps_the_current_builtin(tmp_path, version):
+    # same rule as update_from_live: an unparsable version is "unknown", it does not pick the
+    # oldest list over the constructor default (or over what a parsable version chose)
+    cat = ToolCatalog(V110, cache_dir=tmp_path / "cache")
+    assert cat.builtin_version("x64") == "1.10"
+    cat.set_server_version("x64", version)
+    assert cat.builtin_version("x64") == "1.10"
+    assert cat.is_read_only("GetServerInfo", "x64") is True
+    old = ToolCatalog(V19, cache_dir=tmp_path / "cache19")
+    old.set_server_version("x32", "1.10")
+    assert old.set_server_version("x32", version) is False
+    assert old.builtin_version("x32") == "1.10"
+
+
+def test_an_unparsable_reported_version_still_counts_as_reported(cat):
+    # the plugin answered GET /: the first-contact probe need not be sent again
+    cat.set_server_version("x64", "1.10.0-dev")
+    assert cat.reported_version("x64") == "1.10.0-dev"
+
+
+def test_an_unparsable_live_version_keeps_the_current_builtin_too(tmp_path):
+    cat = ToolCatalog(V110, cache_dir=tmp_path / "cache")
+    cat.update_from_live("x64", "1.10.0-dev", v110_live_tools())
+    assert cat.builtin_version("x64") == "1.10" and cat.is_read_only("GetServerInfo", "x64") is True
+
+
 def test_live_v110_list_on_a_v19_default_catalog_keeps_the_v110_read_only_flags(cat):
     cat.update_from_live("x64", "1.10", v110_live_tools())
     assert cat.is_read_only("GetServerInfo", "x64") is True
@@ -139,5 +166,48 @@ def test_the_first_contact_probe_is_sent_once_per_process(tmp_path):
         rt.invalidate_clients(drop_tokens=True, reason="test: revert")
         rt.connect("x64")
         assert len([r for r in srv.requests if r.method == "GET"]) == probes
+    finally:
+        lab.close()
+
+
+def _gets(srv) -> int:
+    return len([r for r in srv.requests if r.method == "GET"])
+
+
+@pytest.mark.parametrize("refusal", ["wrong_token", "locked_out"])
+def test_a_refused_first_contact_probe_is_not_sent_again(tmp_path, refusal):
+    # A refused probe never records a version, so a guard on "version known" alone re-sent it
+    # on every client rebuild (revert, IP change), each one a failed login on v1.10.
+    lab = make_lab(tmp_path, plugin_version="1.10")
+    try:
+        rt = lab.runtime()
+        srv = lab.servers["x64"]
+        if refusal == "wrong_token":
+            srv.token = "another-token-the-gateway-does-not-have"  # noqa: S105 - fake credential
+        else:
+            srv.lock_out(60)
+        rt.connect("x64")
+        assert _gets(srv) == 1 and rt.catalog.reported_version("x64") is None
+        for _ in range(3):
+            rt.invalidate_clients(drop_tokens=True, reason="test: revert")
+            rt.connect("x64")
+        assert _gets(srv) == 1
+    finally:
+        lab.close()
+
+
+def test_a_probe_that_found_no_server_is_sent_again(tmp_path):
+    # control: a debugger that was not up yet is not a failed login; the next client asks again
+    lab = make_lab(tmp_path, plugin_version="1.10")
+    try:
+        rt = lab.runtime()
+        srv = lab.servers["x64"]
+        srv.stop()
+        rt.connect("x64")
+        assert rt.catalog.reported_version("x64") is None
+        srv.restart()
+        rt.invalidate_clients(drop_tokens=True, reason="test: revert")
+        rt.connect("x64")
+        assert _gets(srv) == 1 and rt.catalog.reported_version("x64") == "1.10"
     finally:
         lab.close()
