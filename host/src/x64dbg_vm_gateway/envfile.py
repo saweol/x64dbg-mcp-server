@@ -76,7 +76,8 @@ def resolve_environ(
     config: GatewayConfig, environ: Mapping[str, str] | None = None, *, system: str | None = None
 ) -> dict[str, str]:
     """The mapping ``*_env`` names are resolved in: ``environ`` (default ``os.environ``)
-    over the values of ``config.env_file`` (the real environment wins). A relative
+    over the values of ``config.env_file`` (the real environment wins, except a variable
+    set to the empty string, which counts as unset). A relative
     env file path is relative to the config file's directory."""
     base = dict(os.environ if environ is None else environ)
     if not config.env_file:
@@ -84,4 +85,6 @@ def resolve_environ(
     path = Path(config.env_file).expanduser()
     if not path.is_absolute() and config.config_path:
         path = Path(config.config_path).expanduser().parent / path
-    return {**read_env_file(path, system=system), **base}
+    # An empty variable in the real environment counts as unset (resolve_secret treats it so),
+    # so it must not hide the env file's value.
+    return {**read_env_file(path, system=system), **{k: v for k, v in base.items() if v != ""}}

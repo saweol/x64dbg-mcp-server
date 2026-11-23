@@ -290,9 +290,11 @@ def cmd_serve(args: argparse.Namespace, out: _Output) -> int:
             )
         from . import http_server
 
-        http_server.check_http_config(config.http, os.environ)  # fail before touching the VM
+        # http.token_envs are *_env names: the real environment over gateway.env_file
+        environ = envfile.resolve_environ(config, os.environ)
+        http_server.check_http_config(config.http, environ)  # fail before touching the VM
         with _app(args, config) as app:
-            http_server.serve_http(app, config.http, environ=os.environ, jobs_root=config.jobs_root_path)
+            http_server.serve_http(app, config.http, environ=environ, jobs_root=config.jobs_root_path)
         return EXIT_OK
     from . import mcp_server
 

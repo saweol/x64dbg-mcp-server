@@ -829,3 +829,37 @@ def test_provision_real_environment_wins_over_the_env_file(tmp_path, wiring, pro
     assert rc == 0
     _, _, kw = provision.calls[0]
     assert kw["user"] == "shelluser" and kw["password"].reveal() == "from-shell"
+
+
+def test_serve_http_takes_the_access_tokens_from_the_env_file(tmp_path, wiring, fake, monkeypatch):
+    # review (F4): http.token_envs are *_env names too, resolved through gateway.env_file
+    from x64dbg_vm_gateway.frontends import http_server
+
+    env = tmp_path / "gw.env"
+    env.write_text("GW_ADMIN=admin-token-from-file-" + "y" * 20 + "\n", encoding="utf-8")
+    env.chmod(0o600)
+    path = write_config(tmp_path, http_enabled=True)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        'default_profile = "win10"', f'default_profile = "win10"\nenv_file = "{env.as_posix()}"', 1),
+        encoding="utf-8")
+    monkeypatch.delenv("GW_ADMIN", raising=False)
+    seen: list[Any] = []
+
+    def fake_serve(app: Any, http_cfg: Any, *, environ: Any = None, jobs_root: Any = None) -> None:
+        seen.append(http_server.resolve_tokens(http_cfg, environ))
+
+    monkeypatch.setattr(http_server, "serve_http", fake_serve)
+    assert run(["--config", str(path), "serve", "--transport", "http"]) == 0
+    assert seen[0]["admin"].reveal().startswith("admin-token-from-file-")
+
+
+def test_provision_an_empty_shell_variable_does_not_hide_the_env_file(
+    tmp_path, wiring, provision, monkeypatch
+):
+    # review (F7): GW_QS_PW="" exported in the shell must not mask the value in the env file
+    monkeypatch.setenv("GW_QS_USER", "")
+    monkeypatch.setenv("GW_QS_PW", "")
+    cfg = _env_file_config(tmp_path)
+    assert run(["--config", str(cfg), "provision", "--x64dbg-root", "C:\\x", "--no-reboot"]) == 0
+    _, _, kw = provision.calls[0]
+    assert kw["user"] == "labuser" and kw["password"].reveal() == "from-env-file"

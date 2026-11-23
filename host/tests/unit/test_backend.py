@@ -29,10 +29,12 @@ from x64dbg_vm_gateway.errors import (
 TOKEN = "s3cr3t-token-value-XYZ"
 
 
-@pytest.fixture(params=["keep-alive", "connection-close"])
+@pytest.fixture(params=["no-connection-header", "connection-close"])
 def server(request):
-    # "connection-close" is the framing plugin v1.10 sends on every response (the real-VM
-    # E2E found the client failing on it with EBADF after the body was read).
+    # The fake closes the socket after every response either way; the params differ in the
+    # "Connection: close" response header, which plugin v1.10 sends on every response and which
+    # makes http.client close the socket once the body is read (the real-VM E2E found the
+    # client failing with EBADF on it).
     srv = FakePluginServer(token=TOKEN, connection_close=request.param == "connection-close").start()
     yield srv
     srv.stop()

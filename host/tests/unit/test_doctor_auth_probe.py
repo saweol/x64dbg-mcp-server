@@ -36,18 +36,37 @@ def test_doctor_sends_no_unauthenticated_request_when_the_token_is_known(lab):
     assert unauthenticated == [], [(r.method, r.path, r.authorization is not None) for r in unauthenticated]
 
 
-def test_doctor_still_proves_reachability_when_the_token_cannot_be_read(lab):
+def test_doctor_without_a_token_checks_the_port_without_a_failed_login(lab):
+    # No usable token: an HTTP probe without one would still count as a failed login (review),
+    # so reachability is a plain TCP connect and the token check reports the real problem.
     lab.write_guest_token_config("x64", b"\x00" * 101)  # corrupt guest config: no usable token
-    c = _checks(lab.gateway().doctor())
-    reach = c["backend:x64:reachable"]
-    assert reach["ok"] is True and "answers" in reach["detail"], reach
-    assert c["backend:x64:token"]["ok"] is False
+    srv = lab.servers["x64"]
+    srv.clear_log()
+    gw = lab.gateway()
+    for _ in range(6):
+        c = _checks(gw.doctor())
+        reach = c["backend:x64:reachable"]
+        assert reach["ok"] is True and "accepts connections" in reach["detail"], reach
+        assert c["backend:x64:token"]["ok"] is False
+    assert [r for r in srv.requests if not r.authorized] == []
+
+
+def test_doctor_without_a_token_reports_a_closed_port(lab):
+    lab.write_guest_token_config("x64", b"\x00" * 101)
+    lab.servers["x64"].stop()
+    reach = _checks(lab.gateway().doctor())["backend:x64:reachable"]
+    assert reach["ok"] is False and "does not accept connections" in reach["detail"], reach
 
 
 def test_doctor_reports_a_rejected_token_as_reachable_and_the_token_check_fails(lab):
     gw = lab.gateway()
     gw.doctor()
-    lab.servers["x64"].token = "rotated-on-the-plugin"  # the plugin now expects another token
+    srv = lab.servers["x64"]
+    srv.token = "rotated-on-the-plugin"  # the plugin now expects another token
+    srv.clear_log()
     c = _checks(gw.doctor())
     assert c["backend:x64:reachable"]["ok"] is True, c["backend:x64:reachable"]
     assert c["backend:x64:token"]["ok"] is False, c["backend:x64:token"]
+    assert "rejects the token" in c["backend:x64:token"]["detail"]
+    # one rejected request proves it: the token check does not spend a second failed login (review)
+    assert len([r for r in srv.requests if not r.authorized]) == 1, [(r.method, r.path) for r in srv.requests]

@@ -92,10 +92,12 @@ import logging
 import math
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -110,12 +112,10 @@ from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
 from .contracts import (
     TERMINAL_JOB_STATES,
-    BackendEndpoint,
     Clock,
     JobState,
     PowerState,
     SampleInfo,
-    Secret,
     SystemClock,
     ToolCallResult,
     ToolInfo,
@@ -196,6 +196,8 @@ ORPHAN_POLL_S = 1.0
 WRITE_LOCK_TIMEOUT_S = 120.0
 READ_LOCK_TIMEOUT_S = 60.0
 STATUS_LOCK_TIMEOUT_S = 5.0
+#: gateway_doctor's TCP-only reachability check (used while no token is available)
+DOCTOR_TCP_TIMEOUT_S = 3.0
 KILL_EXIT_TIMEOUT_S = 10.0
 LOAD_WAIT_MS = 30_000
 LIST_MODULES_TIMEOUT_S = 30.0
@@ -465,6 +467,19 @@ def _stray_vmx_pids(listed: bool, pids: list[int], orphans: list[int]) -> tuple[
     if len(pids) > 1:
         return list(pids), True
     return [], False
+
+
+def _tcp_accepts(url: str, *, timeout_s: float) -> bool:
+    """True if ``url``'s host:port accepts a TCP connection. Nothing is sent, so the plugin
+    has no request to count as a failed login."""
+    parts = urllib.parse.urlsplit(url)
+    if not parts.hostname or parts.port is None:
+        return False
+    try:
+        with socket.create_connection((parts.hostname, parts.port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
 
 
 def _bad_instance_report(problem: str) -> VmrunError:
@@ -1262,27 +1277,29 @@ class Gateway(GatewayApp):
     def _doctor_backend(
         self, rt: Runtime, bid: str, check: Callable[..., bool], skipped: Callable[[str, str], None]
     ) -> None:
-        cfg = rt.backend(bid)
+        token_rejected: list[BackendAuthError] = []
 
         def reachable() -> tuple[bool, str, str | None]:
             url = rt.backend_url(bid)
             # Plugin v1.10 counts every request without a valid token as a failed login
-            # (5 per window -> HTTP 429 for 300 s), so probe with the gateway's token when it
-            # can be obtained; only without one does a tokenless probe (401 = it answers) run.
+            # (5 per window -> HTTP 429 for 300 s): probe with the gateway's token, and
+            # without one only open a TCP connection (no request, so nothing is counted).
             try:
                 probe = rt.connect(bid, wait=False)
-                tokenless = False
-            except GatewayError:
-                probe = rt.client_factory(
-                    BackendEndpoint(id=bid, arch=cfg.arch, url=url, token=Secret("")), clock=self._clock
+            except (GatewayError, OSError) as e:
+                why = e.code if isinstance(e, GatewayError) else type(e).__name__
+                accepts = _tcp_accepts(url, timeout_s=DOCTOR_TCP_TIMEOUT_S)
+                return (
+                    accepts,
+                    f"{url} {'accepts' if accepts else 'does not accept'} connections (TCP only: no token "
+                    f"yet, {why}; an HTTP probe without one would count as a failed login)",
+                    None if accepts else "is x64dbg running with the plugin started? (debugger_restart)",
                 )
-                tokenless = True
             try:
                 alive = probe.health_l1()
-            except BackendAuthError:
-                detail = ("bearer token required" if tokenless
-                          else "it rejects the gateway's token: see the token check")
-                return True, f"{url} answers ({detail})", None
+            except BackendAuthError as e:
+                token_rejected.append(e)
+                return True, f"{url} answers (it rejects the gateway's token: see the token check)", None
             except BackendThrottled as e:
                 retry = e.details.get("retry_after_s")
                 return (
@@ -1298,17 +1315,22 @@ class Gateway(GatewayApp):
             )
 
         def token() -> tuple[bool, str, str | None]:
-            client = rt.connect(bid)
-            try:
-                info = client.initialize(timeout_s=10.0)
-            except BackendAuthError as e:
-                raise BackendAuthError(
+            def rejected() -> BackendAuthError:
+                return BackendAuthError(
                     f"backend {bid} rejects the token",
                     hint=(
                         "the token in mcp_config.json / the token env var does not match the running plugin; "
                         "restart the debugger or run: x64dbg-vm-gateway provision"
                     ),
-                ) from e
+                )
+
+            if token_rejected:  # the reachability probe already spent one failed login on it
+                raise rejected() from token_rejected[0]
+            client = rt.connect(bid)
+            try:
+                info = client.initialize(timeout_s=10.0)
+            except BackendAuthError as e:
+                raise rejected() from e
             server = info.get("serverInfo") if isinstance(info.get("serverInfo"), dict) else {}
             return True, _clip(f"{server.get('name', '?')} v{server.get('version', '?')}"), None
 

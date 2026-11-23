@@ -52,11 +52,13 @@ planned actions) is scrubbed of it before it reaches a summary or an exception;
 host-supplied values (root, user, ...) are returned as given. Bearer tokens are
 only handed to the injectable ``info_probe``.
 
-Verification status: the guest-side PowerShell (provision.ps1 beyond the
-version verified in Phase 0, the discovery script and the ps.py wrappers) is
-covered only by unit tests that emulate the guest, plus a syntax check that runs
-where ``pwsh`` is installed. It has not been run on Windows PowerShell 5.1:
-exercise it on the spike VM (tests/vm) before relying on it.
+Verification status (spike VM: Windows 10, PowerShell 5.1, Korean locale):
+provision_guest (provision.ps1, boot-time reboot detection, clean snapshot),
+install_plugin (backup listing, plugins_backup) and discover_x64dbg ran there
+successfully; the real-VM suites are tests/vm. Elsewhere the guest-side PowerShell
+is covered by unit tests that emulate the guest, plus a syntax check that runs
+where ``pwsh`` is installed. Windows PowerShell 5.1 differs from 7 in ways that
+matter here (see tests/unit/test_ps51_json_lists.py).
 
 These functions do not take the VM-operation lock or pause the supervisor; the
 caller (CLI / app) must do that around them.
