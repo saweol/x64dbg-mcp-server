@@ -56,7 +56,7 @@ def test_a_backend_uses_the_builtin_of_its_version(cat):
     assert cat.is_read_only("GetServerInfo", "x64") is True
     assert cat.tool("SetArtifactDir", "x64") is not None
     assert cat.is_read_only("SetArtifactDir", "x64") is False
-    assert len(cat.tools("x64")) == 82
+    assert len(cat.tools("x64")) == _v110_tool_count()
     # another backend keeps the default
     assert cat.tool("GetServerInfo", "x32") is None and len(cat.tools("x32")) == 80
     # a downgrade goes back
@@ -211,3 +211,10 @@ def test_a_probe_that_found_no_server_is_sent_again(tmp_path):
         assert _gets(srv) == 1 and rt.catalog.reported_version("x64") == "1.10"
     finally:
         lab.close()
+
+
+def _v110_tool_count() -> int:
+    import json
+    from importlib import resources
+    data = resources.files("x64dbg_vm_gateway").joinpath("data/tools-v1.10.json").read_text()
+    return len(json.loads(data)["tools"])

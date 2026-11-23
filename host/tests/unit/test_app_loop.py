@@ -129,7 +129,7 @@ def test_plugin_v110_features_are_used_when_the_live_tool_list_has_them(tmp_path
         assert f"{digest[:12]}.dd64" in names  # collected with the out dir
         assert col["state"] == JobState.COLLECTED
         # the live tool list replaced the builtin one
-        assert len(gw.list_mirrored_tools()) == 82
+        assert len(gw.list_mirrored_tools()) == _v110_tool_count()
     finally:
         lab.close()
 
@@ -285,3 +285,10 @@ def test_gateway_subclasses_the_facade_with_matching_signatures():
         want = [(p.name, p.kind, p.default) for p in inspect.signature(proto).parameters.values()]
         got = [(p.name, p.kind, p.default) for p in inspect.signature(impl).parameters.values()]
         assert got == want, name
+
+
+def _v110_tool_count() -> int:
+    import json
+    from importlib import resources
+    data = resources.files("x64dbg_vm_gateway").joinpath("data/tools-v1.10.json").read_text()
+    return len(json.loads(data)["tools"])
