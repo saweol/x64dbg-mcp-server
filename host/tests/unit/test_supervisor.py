@@ -518,6 +518,100 @@ def test_bump_epoch(fake_vm, fake_guest, fake_clock, client):
     assert hist[-1]["epoch"] == 1 and hist[-1]["reason"] == "vm revert"
 
 
+# ── hang handling details ───────────────────────────────────────────
+def _make_hung(sup, fake_clock) -> None:
+    for _ in range(4):
+        sup.check("x64")
+        fake_clock.advance(15)
+
+
+def test_kill_failure_for_already_exited_process_is_tolerated(fake_vm, fake_guest, fake_clock, client):
+    p = fake_guest.add_process(EXE)
+    client.l2 = False
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    _make_hung(sup, fake_clock)
+    real_kill = fake_guest.kill_process
+
+    def kill_exits_first(pid: int) -> None:
+        fake_guest.processes = [x for x in fake_guest.processes if x.pid != pid]  # exited meanwhile
+        raise GuestOperationError(f"no such process: {pid}")
+
+    fake_guest.kill_process = kill_exits_first  # type: ignore[method-assign]
+    relaunch_brings_up(fake_guest, client)
+    assert sup.ensure_alive("x64", reason="hang") == 1
+    fake_guest.kill_process = real_kill  # type: ignore[method-assign]
+    assert p not in fake_guest.processes
+
+
+def test_kill_failure_with_process_still_present_aborts(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    client.l2 = False
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    _make_hung(sup, fake_clock)
+    fake_guest.fail_next("kill_process", GuestOperationError("access denied"))
+    relaunch_brings_up(fake_guest, client)
+    with pytest.raises(GuestOperationError):
+        sup.ensure_alive("x64", reason="hang")
+    assert fake_guest.calls_of("run_program") == []  # no second instance next to the hung one
+    assert sup.epoch("x64") == 0
+
+
+def test_hang_hook_called_before_kill(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    client.l2 = False
+    seen: list[tuple[str, HealthState, int]] = []
+
+    def hook(backend_id: str, report: HealthReport) -> None:
+        seen.append((backend_id, report.state, len(fake_guest.calls_of("kill_process"))))
+        raise RuntimeError("screenshot failed")  # must not break recovery
+
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, hang_hook=hook)
+    _make_hung(sup, fake_clock)
+    relaunch_brings_up(fake_guest, client)
+    assert sup.ensure_alive("x64", reason="hang") == 1
+    assert seen == [("x64", HealthState.HUNG, 0)]
+
+
+def test_loading_wait_is_bounded_even_if_clock_stalls(fake_vm, fake_guest, client):
+    class StalledClock:
+        def monotonic(self) -> float:
+            return 5.0
+
+        def sleep(self, seconds: float) -> None:
+            pass
+
+        def now_iso(self) -> str:
+            return "2026-11-23T00:00:00+00:00"
+
+    fake_guest.add_process(EXE)
+    client.down()
+    relaunch_brings_up(fake_guest, client)
+    sup = make_sup(fake_vm, fake_guest, StalledClock(), client, boot_grace_s=10, poll_interval_s=1,
+                   relaunch_ready_timeout_s=5)
+    # loading never ends by the clock; the bounded wait gives up and treats it as hung
+    assert sup.ensure_alive("x64", reason="stuck") == 1
+    assert fake_guest.calls_of("kill_process")
+
+
+def test_ready_wait_is_bounded_even_if_clock_stalls(fake_vm, fake_guest, client):
+    class StalledClock:
+        def monotonic(self) -> float:
+            return 5.0
+
+        def sleep(self, seconds: float) -> None:
+            pass
+
+        def now_iso(self) -> str:
+            return "2026-11-23T00:00:00+00:00"
+
+    client.down()
+    fake_guest.on_run_program = lambda exe, args, **kw: 0  # never comes up
+    sup = make_sup(fake_vm, fake_guest, StalledClock(), client, poll_interval_s=1, relaunch_ready_timeout_s=5)
+    with pytest.raises(BackendUnavailable):
+        sup.ensure_alive("x64", reason="dead")
+    assert client.l1_calls < 20
+
+
 # ── integration with the real HTTP client and fake plugin server ────
 def test_relaunch_against_fake_plugin_server(fake_vm, fake_guest, fake_clock):
     srv = FakePluginServer(token="tok-int").start()

@@ -114,10 +114,13 @@ class Supervisor:
         poll_interval_s: float = 2.0,
         l1_timeout_s: float = 2.0,
         l2_timeout_s: float = 5.0,
+        hang_hook: Callable[[str, HealthReport], None] | None = None,
     ) -> None:
         """``clients`` is read on every use (not copied), so a token refresher may
         replace an entry; ``backends`` supplies exe/launch_task (falling back to the
-        client's endpoint fields)."""
+        client's endpoint fields). ``hang_hook(backend_id, report)`` runs before a
+        HUNG debugger is killed (e.g. to save a screenshot into the job directory);
+        its exceptions are logged and ignored."""
         if relaunch_mode not in RELAUNCH_MODES:
             raise ConfigError(f"relaunch_mode must be one of {RELAUNCH_MODES}, got {relaunch_mode!r}")
         self._vm = vm
@@ -135,6 +138,9 @@ class Supervisor:
         self._poll_s = poll_interval_s
         self._l1_timeout_s = l1_timeout_s
         self._l2_timeout_s = l2_timeout_s
+        self._hang_hook = hang_hook
+        # LOADING turns HUNG after boot_grace_s; this caps the polls in case the clock stalls
+        self._max_loading_polls = int(boot_grace_s / max(poll_interval_s, 0.01)) + 2
         # real-time bound for waiting on another caller's relaunch
         self._relaunch_lock_timeout_s = boot_grace_s + relaunch_ready_timeout_s + 120.0
 
@@ -336,16 +342,16 @@ class Supervisor:
 
     def _on_auth(self, backend_id: str, allow_refresh: bool) -> HealthReport:
         epoch = self.epoch(backend_id)
-        refresh = False
-        if allow_refresh and self._token_refresher is not None:
+        refresher = self._token_refresher if allow_refresh else None
+        if refresher is not None:
             with self._lock:
-                if self._auth_refreshed_epoch.get(backend_id) != epoch:
+                if self._auth_refreshed_epoch.get(backend_id) == epoch:
+                    refresher = None  # already refreshed once in this epoch
+                else:
                     self._auth_refreshed_epoch[backend_id] = epoch
-                    refresh = True
-        if refresh:
-            assert self._token_refresher is not None
+        if refresher is not None:
             try:
-                self._token_refresher(backend_id)
+                refresher(backend_id)
             except Exception as e:  # noqa: BLE001 - user callback; reported, never fatal
                 code = e.code if isinstance(e, GatewayError) else type(e).__name__
                 log.warning("backend %s: token refresh failed (%s)", backend_id, code)
@@ -411,8 +417,14 @@ class Supervisor:
                 was_up = self._seen_up_epoch.get(backend_id) == current
             report = self.check(backend_id)
             waited_for_boot = False
-            while report.state is HealthState.LOADING:  # bounded: turns HUNG after boot_grace_s
+            polls = 0
+            while report.state is HealthState.LOADING:  # turns HUNG after boot_grace_s
                 waited_for_boot = True
+                if polls >= self._max_loading_polls:
+                    report = HealthReport(HealthState.HUNG, {
+                        **report.details, "reason": "still loading after the maximum number of polls"})
+                    break
+                polls += 1
                 self._clock.sleep(self._poll_s)
                 self._raise_if_paused(backend_id)
                 report = self.check(backend_id)
@@ -435,6 +447,7 @@ class Supervisor:
                 )
             self._count_restart(backend_id, job_id)
             if state is HealthState.HUNG:
+                self._run_hang_hook(backend_id, report)
                 self._kill(backend_id)
             log.warning("backend %s: relaunching debugger (%s; reason: %s)", backend_id, state.value, reason)
             self._launch(backend_id)
@@ -460,23 +473,48 @@ class Supervisor:
             raise BackendUnavailable(f"cannot determine the health of backend {backend_id}",
                                      stage="supervisor", details=details)
 
+    def _run_hang_hook(self, backend_id: str, report: HealthReport) -> None:
+        if self._hang_hook is None:
+            return
+        try:
+            self._hang_hook(backend_id, report)
+        except Exception as e:  # noqa: BLE001 - diagnostics only; never blocks recovery
+            log.warning("backend %s: hang hook failed (%s)", backend_id, type(e).__name__)
+
     def _kill(self, backend_id: str) -> None:
-        assert self._guest is not None
+        """Kill every guest process running the backend's debugger image.
+
+        A kill that fails because the process already exited is ignored; if the
+        process is still there the error propagates (relaunching next to a hung
+        instance would only collide on the port).
+        """
+        guest = self._guest
+        if guest is None:
+            return
         image = self._image_name(backend_id)
         if image is None:
             return
-        for p in self._guest.list_processes():
-            if p.image_name == image:
-                log.warning("backend %s: killing hung debugger pid %d", backend_id, p.pid)
-                self._guest.kill_process(p.pid)
+        for p in guest.list_processes():
+            if p.image_name != image:
+                continue
+            log.warning("backend %s: killing hung debugger pid %d", backend_id, p.pid)
+            try:
+                guest.kill_process(p.pid)
+            except GatewayError:
+                if any(q.pid == p.pid for q in guest.list_processes()):
+                    raise
+                log.info("backend %s: pid %d had already exited", backend_id, p.pid)
 
     def _launch(self, backend_id: str) -> None:
-        assert self._guest is not None
+        guest = self._guest
+        if guest is None:
+            raise BackendUnavailable(f"backend {backend_id}: no guest channel to relaunch with",
+                                     stage="relaunch", details={"backend": backend_id})
         if self._mode == "task":
             task = self._cfg(backend_id, "launch_task")
             if not task:
                 raise ConfigError(f"backend {backend_id}: relaunch_mode 'task' needs launch_task")
-            rc = self._guest.run_program(SCHTASKS_EXE, ["/run", "/tn", task], wait=True, timeout_s=60.0)
+            rc = guest.run_program(SCHTASKS_EXE, ["/run", "/tn", task], wait=True, timeout_s=60.0)
             if rc not in (0, None):
                 raise BackendUnavailable(
                     f"relaunching backend {backend_id}: schtasks /run failed",
@@ -487,11 +525,14 @@ class Supervisor:
             exe = self._exe(backend_id)
             if not exe:
                 raise ConfigError(f"backend {backend_id}: relaunch needs the guest path of the debugger exe")
-            self._guest.run_program(exe, (), wait=False, interactive=True, active_window=True)
+            guest.run_program(exe, (), wait=False, interactive=True, active_window=True)
 
     def _wait_ready(self, backend_id: str) -> None:
         deadline = self._clock.monotonic() + self._ready_timeout_s
+        max_polls = int(self._ready_timeout_s / max(self._poll_s, 0.01)) + 2  # in case the clock stalls
+        polls = 0
         while True:
+            polls += 1
             self._raise_if_paused(backend_id)
             client = self._client(backend_id)
             try:
@@ -507,7 +548,7 @@ class Supervisor:
                                            stage="relaunch", details=dict(report.details)) from None
             except (BackendError, CancelledByVmOp, OSError):
                 pass
-            if self._clock.monotonic() >= deadline:
+            if self._clock.monotonic() >= deadline or polls >= max_polls:
                 raise BackendUnavailable(
                     f"backend {backend_id} did not become ready within {self._ready_timeout_s:g}s "
                     "after relaunch",
