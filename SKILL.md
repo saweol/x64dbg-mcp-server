@@ -174,7 +174,7 @@ State-changing tools run one at a time (new in v1.10). If one is still running (
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `SetBreakpoint` | `target` (address or symbol) | Set INT3 breakpoint |
-| `SetHardwareBreakpoint` | `address`, `type` (r/w/x), `size?` | Set hardware BP (DR0-DR3) |
+| `SetHardwareBreakpoint` | `address`, `type` (r/w/x), `size?` (1/2/4/8, 8 on x64 only) | Set hardware BP (DR0-DR3); address must be aligned to `size` |
 | `SetConditionalBreakpoint` | `address`, `condition`, `log?` | Set BP with condition expression |
 | `SetMemoryBreakpoint` | `address`, `type` (r/w/x), `singleshoot?` | Set memory breakpoint |
 | `SetExceptionBreakpoint` | `exceptionCode`, `chance` (1/2/3), `action` | Configure exception BP (break/ignore) |
@@ -278,6 +278,7 @@ State-changing tools run one at a time (new in v1.10). If one is still running (
 | Go idle while user interacts with GUI | Call `WaitForEvent` with longer timeout (60-120s) to watch for events |
 | Retry a tool that returned `BUSY` in a tight loop | `BUSY` means it did not run: `PauseDebug` or `WaitForPause` first, then retry once |
 | Dump to a guessed relative path | `GetServerInfo` to see `artifact_dir`, or `SetArtifactDir` first |
+| Type a decimal number into `ExecuteDebuggerCommand` (`savedata f,rsp,4096`) | x64dbg reads bare numbers as **hex**: write `0x1000` or `.4096`. Tool parameters that end up in an x64dbg command (`size`, `threadId`, `pid`) are plain JSON integers; the tools write them in the form x64dbg expects |
 
 ---
 
@@ -287,6 +288,7 @@ Use `EvalExpression` to resolve anything:
 - Symbols: `kernel32:CreateFileA`, `ntdll:NtAllocateVirtualMemory`
 - Registers: `cip`, `rax`, `esp+4`, `[rsp+0x28]`
 - Arithmetic: `rax+0x10`, `modulebase+0x1000`
+- Numbers are **hex by default** (`10` is 16); prefix `.` for decimal (`.10`)
 - Labels: any label set with `CommentOrLabelAtAddress`
 
 ---

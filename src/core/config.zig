@@ -582,7 +582,9 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
             // Row 1: IP Address
             _ = createCtrl("STATIC\x00", "IP Address:\x00", 0, 20, 24, 85, 20, 0);
             edit_ip = createCtrl("EDIT\x00", null, WS_TABSTOP | ES_AUTOHSCROLL, 112, 20, 190, 24, IDC_IP);
-            const ip_hint = createCtrl("STATIC\x00", "(0.0.0.0, 127.0.0.1, etc.)\x00", 0, 310, 24, 120, 20, 0);
+            // Only suggest what starts without the file-only keys; the notes
+            // below explain AllowExternal + AllowedClients.
+            const ip_hint = createCtrl("STATIC\x00", netpolicy.BIND_ADDRESS_HINT ++ "\x00", 0, 310, 24, 120, 20, 0);
             if (ip_hint != null and ui_font_small != null)
                 _ = SendMessageA(ip_hint, WM_SETFONT, @intFromPtr(ui_font_small.?), 1);
 

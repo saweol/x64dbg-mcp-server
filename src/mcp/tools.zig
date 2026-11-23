@@ -809,7 +809,7 @@ fn schemaModuleName(w: *JsonWriter) void {
 }
 
 fn schemaSetHardwareBreakpoint(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Address for the hardware breakpoint.\"},\"type\":{\"type\":\"string\",\"description\":\"Type: r (read), w (write), x (execute, default).\",\"default\":\"x\"},\"size\":{\"type\":\"integer\",\"description\":\"Size: 1, 2, 4, or 8 (default 1).\",\"default\":1}},\"required\":[\"address\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Address for the hardware breakpoint.\"},\"type\":{\"type\":\"string\",\"description\":\"Type: r (read/write), w (write), x (execute, default). Only the first letter counts, so 'read', 'write' and 'execute' also work.\",\"default\":\"x\"},\"size\":{\"type\":\"integer\",\"enum\":[1,2,4,8],\"description\":\"Size in bytes: 1, 2, 4, or 8 (8 on x64 only; default 1). The address must be aligned to it.\",\"default\":1}},\"required\":[\"address\"]}");
 }
 
 fn schemaSetMemoryBreakpoint(w: *JsonWriter) void {
@@ -2219,9 +2219,9 @@ fn switchThread(params: ?std.json.Value, out: []u8) ToolResult {
     const tid = getParamInt(params, "threadId") orelse
         return errResult(out, "Error: threadId is required.");
     var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "switchthread .{d}\x00", .{tid}) catch
+    const cmd = cmdline.buildIdCommand(&cmd_buf, "switchthread", tid) catch
         return errResult(out, "Error: invalid threadId.");
-    const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
+    const ok = bridge.cmdExec(cmd.ptr);
     return fmtResult(out, "{s}", .{if (ok) "Thread switched." else "Failed to switch thread."});
 }
 
@@ -2230,9 +2230,9 @@ fn attachProcess(params: ?std.json.Value, out: []u8) ToolResult {
     const pid = getParamInt(params, "pid") orelse
         return errResult(out, "Error: pid is required.");
     var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "attach .{d}\x00", .{pid}) catch
+    const cmd = cmdline.buildIdCommand(&cmd_buf, "attach", pid) catch
         return errResult(out, "Error: invalid pid.");
-    const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
+    const ok = bridge.cmdExec(cmd.ptr);
     Sleep(500);
     return fmtResult(out, "{s}", .{if (ok) "Attach command sent." else "Failed to attach."});
 }
@@ -2384,9 +2384,15 @@ fn setHardwareBreakpoint(params: ?std.json.Value, out: []u8) ToolResult {
     const size = getParamInt(params, "size") orelse 1;
     const addr = resolveAddr(addr_str);
     var cmd_buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "bphws {s}, {s}, {d}\x00", .{ addr_str, bp_type, size }) catch
-        return errResult(out, "Error: input too long.");
-    if (!bridge.cmdExec(@ptrCast(cmd.ptr)))
+    const cmd = cmdline.buildHardwareBp(&cmd_buf, addr_str, bp_type, size, @sizeOf(usize) == 8) catch |err| return switch (err) {
+        error.InvalidNumber => if (@sizeOf(usize) == 8)
+            errResult(out, "Error: size must be 1, 2, 4 or 8.")
+        else
+            errResult(out, "Error: size must be 1, 2 or 4 (8-byte hardware breakpoints need x64)."),
+        error.InvalidArgument => errResult(out, "Error: type must start with r (read/write), w (write) or x / e (execute)."),
+        error.BufferTooSmall => errResult(out, "Error: input too long."),
+    };
+    if (!bridge.cmdExec(cmd.ptr))
         return errResult(out, "Error: Failed to set hardware breakpoint.");
     if (addr != 0 and !waitBpType(addr, BP_HARDWARE, true, BP_VERIFY_TIMEOUT_MS))
         return fmtErr(out, "Error: hardware breakpoint was not created at '{s}'.", .{addr_str});
@@ -3258,8 +3264,10 @@ fn dumpMemory(params: ?std.json.Value, out: []u8) ToolResult {
         return fmtErr(out, "Error: invalid filePath: {s}.", .{pathutil.describe(err)});
 
     var cmd_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
-    const cmd = cmdline.buildSaveData(&cmd_buf, resolved, addr_str, size) catch
-        return errResult(out, "Error: input too long or filePath cannot be quoted.");
+    const cmd = cmdline.buildSaveData(&cmd_buf, resolved, addr_str, size) catch |err| return switch (err) {
+        error.InvalidNumber => errResult(out, "Error: size must be a positive number of bytes."),
+        error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long or filePath cannot be quoted."),
+    };
     const ok = bridge.cmdExec(cmd.ptr);
     return fmtResult(out, "{s} \"{s}\".", .{ if (ok) "Memory dumped to" else "Failed to dump memory to", resolved });
 }
@@ -3271,10 +3279,11 @@ fn allocateMemory(params: ?std.json.Value, out: []u8) ToolResult {
         return errResult(out, "Error: size is required.");
     if (size <= 0 or size > 0x10000000) return errResult(out, "Error: Invalid size (1 to 256MB).");
     const prot_str = getParamStr(params, "protection") orelse "rw";
+    // "alloc 4096" would allocate 0x4096 bytes: buildAlloc writes hex.
     var cmd_buf: [128]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "alloc {d}\x00", .{size}) catch
-        return errResult(out, "Error: input too long.");
-    const ok = bridge.cmdExecDirect(@ptrCast(cmd.ptr));
+    const cmd = cmdline.buildAlloc(&cmd_buf, size) catch
+        return errResult(out, "Error: Invalid size (1 to 256MB).");
+    const ok = bridge.cmdExecDirect(cmd.ptr);
     if (!ok) return errResult(out, "Error: alloc command failed.");
     const result_val = bridge.valFromString("$result\x00");
     if (result_val == 0) return errResult(out, "Error: Allocation returned null.");
@@ -3597,10 +3606,11 @@ fn suspendThread(params: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging()) return errResult(out, "Error: No active debug session.");
     const tid = getParamInt(params, "threadId") orelse
         return errResult(out, "Error: threadId is required.");
+    // x64dbg reads a bare number as hex; buildIdCommand writes ".<decimal>".
     var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "suspendthread {d}\x00", .{tid}) catch
-        return errResult(out, "Error: input too long.");
-    const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
+    const cmd = cmdline.buildIdCommand(&cmd_buf, "suspendthread", tid) catch
+        return errResult(out, "Error: invalid threadId.");
+    const ok = bridge.cmdExec(cmd.ptr);
     return fmtResult(out, "{s}", .{if (ok) "Thread suspended." else "Error: Failed to suspend thread."});
 }
 
@@ -3610,9 +3620,9 @@ fn resumeThread(params: ?std.json.Value, out: []u8) ToolResult {
     const tid = getParamInt(params, "threadId") orelse
         return errResult(out, "Error: threadId is required.");
     var cmd_buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "resumethread {d}\x00", .{tid}) catch
-        return errResult(out, "Error: input too long.");
-    const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
+    const cmd = cmdline.buildIdCommand(&cmd_buf, "resumethread", tid) catch
+        return errResult(out, "Error: invalid threadId.");
+    const ok = bridge.cmdExec(cmd.ptr);
     return fmtResult(out, "{s}", .{if (ok) "Thread resumed." else "Error: Failed to resume thread."});
 }
 
@@ -3677,8 +3687,12 @@ fn dumpModule(params: ?std.json.Value, out: []u8) ToolResult {
         var addr_buf: [24]u8 = undefined;
         const addr_expr = std.fmt.bufPrint(&addr_buf, "0x{X}", .{mod_base}) catch return errResult(out, "Error: expression too long.");
         var save_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
-        const save_cmd = cmdline.buildSaveData(&save_buf, resolved, addr_expr, @intCast(mod_size)) catch
-            return errResult(out, "Error: path too long.");
+        const size = std.math.cast(i64, mod_size) orelse
+            return fmtErr(out, "Error: Could not determine size of \"{s}\".", .{mod_name});
+        const save_cmd = cmdline.buildSaveData(&save_buf, resolved, addr_expr, size) catch |err| return switch (err) {
+            error.InvalidNumber => fmtErr(out, "Error: Could not determine size of \"{s}\".", .{mod_name}),
+            error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long or filePath cannot be quoted."),
+        };
         const save_ok = bridge.cmdExec(save_cmd.ptr);
         if (!save_ok) return errResult(out, "Error: Failed to dump module.");
         return fmtResult(out, "Module dumped to \"{s}\".", .{resolved});
@@ -3930,9 +3944,11 @@ fn setExceptionBreakpoint(params: ?std.json.Value, out: []u8) ToolResult {
         _ = bridge.cmdExec(@ptrCast(cmd.ptr));
         return fmtResult(out, "Exception {s} set to pass to application (ignore).", .{code});
     } else {
-        const cmd = std.fmt.bufPrint(&cmd_buf, "SetExceptionBPX {s}, {d}\x00", .{ code, chance }) catch
-            return errResult(out, "Error: input too long.");
-        const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
+        const cmd = cmdline.buildSetExceptionBpx(&cmd_buf, code, chance) catch |err| return switch (err) {
+            error.InvalidNumber => errResult(out, "Error: chance must be 1 (first-chance), 2 (second-chance) or 3 (both)."),
+            error.BufferTooSmall => errResult(out, "Error: input too long."),
+        };
+        const ok = bridge.cmdExec(cmd.ptr);
         return fmtResult(out, "{s}", .{if (ok) "Exception breakpoint set." else "Failed to set exception breakpoint."});
     }
 }
@@ -4033,7 +4049,7 @@ fn setBreakpointFastResume(params: ?std.json.Value, out: []u8) ToolResult {
         return errResult(out, "Error: address is required.");
     const enable = getParamBool(params, "enable") orelse true;
     var cmd_buf: [256]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "SetBreakpointFastResume {s}, {d}\x00", .{ addr, @as(u8, if (enable) 1 else 0) }) catch
+    const cmd = std.fmt.bufPrint(&cmd_buf, "SetBreakpointFastResume {s}, {s}\x00", .{ addr, if (enable) "1" else "0" }) catch
         return errResult(out, "Error: input too long.");
     const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
     return fmtResult(out, "{s}", .{if (ok) "Breakpoint fast resume set." else "Failed to set fast resume."});

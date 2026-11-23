@@ -10,11 +10,13 @@
 //     budget, see netpolicy.recvTimeoutMs), routes it (http.route: auth
 //     lockout -> 429, bad token -> 401, then method and path), dispatches it
 //     and closes the socket. SSE connections keep their thread and only
-//     write frames that were queued in `sse_hub`. Loopback peers are never
-//     locked out (see netpolicy.AuthLimiter).
+//     write frames that were queued in `sse_hub`. Remote peers are locked
+//     out per IP; loopback peers share one much shorter lockout and are
+//     never refused at accept time either (see netpolicy.AuthLimiter).
 //   - notifyEvent() runs on the x64dbg callback thread. It only touches the
-//     locked pending-event ring and enqueues SSE frames; it never writes to a
-//     socket, so a stalled SSE client cannot block the debugger.
+//     locked pending-event ring and copies SSE frames into each client's
+//     preallocated buffer; it never allocates and never writes to a socket,
+//     so a stalled SSE client cannot block the debugger.
 //   - State-changing tool handlers are serialised by `tool_lock`
 //     (see mcp/toolpolicy.zig for the exemptions). Long waits inside a
 //     locked handler poll requestAbandoned() so a client that disconnected
@@ -52,6 +54,8 @@ const SEND_TIMEOUT_MS: u32 = 10_000;
 const SSE_SEND_TIMEOUT_MS: u32 = 5_000;
 const SSE_KEEPALIVE_MS: u64 = 5_000;
 const SSE_POLL_MS: u32 = 50;
+/// Bytes copied out of the SSE hub per send() on the SSE connection thread.
+const SSE_CHUNK_SIZE = 16 * 1024;
 const RECV_BUF_SIZE = 65536;
 const LISTEN_BACKLOG = 64;
 const BIND_RETRY_INTERVAL_MS: u32 = 1_000;
@@ -99,6 +103,9 @@ var lifecycle_lock: sync.RwLock = .{};
 var tool_lock: sync.RwLock = .{};
 
 var client_slots: netpolicy.ClientSlots = .{};
+// page_allocator is only used for each SSE client's outbound buffer, once
+// per SSE connection; queueing a frame (notifyEvent on the debugger
+// callback thread) copies into that buffer and never allocates.
 var sse_hub = ssehub.Hub.init(std.heap.page_allocator, .{});
 
 var auth_lock: sync.RwLock = .{};
@@ -548,24 +555,25 @@ fn releaseWinsock(started: bool) void {
 
 // ── Auth lockout ───────────────────────────────────────────────────
 
-fn isLockedOut(ip: netpolicy.Ipv4) bool {
+/// Milliseconds left of the peer's auth lockout (0 = not locked out).
+fn lockoutRemainingMs(ip: netpolicy.Ipv4) u64 {
     auth_lock.lock();
     defer auth_lock.unlock();
-    return auth_limiter.isLocked(ip, GetTickCount64());
+    return auth_limiter.lockRemainingMs(ip, GetTickCount64());
 }
 
-fn recordAuthFailure(ip: netpolicy.Ipv4) void {
+fn recordAuthFailure(ip: netpolicy.Ipv4, failure: netpolicy.Failure) void {
     var locked = false;
-    var lockout_s: u64 = 0;
+    var lockout_ms: u64 = 0;
     {
         auth_lock.lock();
         defer auth_lock.unlock();
-        locked = auth_limiter.recordFailure(ip, GetTickCount64());
-        lockout_s = auth_limiter.lockout_ms / 1000;
+        locked = auth_limiter.recordFailure(ip, GetTickCount64(), failure);
+        lockout_ms = auth_limiter.lockoutMsFor(ip);
     }
     if (locked) {
         var ip_buf: [16]u8 = undefined;
-        logMsg("Too many failed authentication attempts from {s}; blocked for {d} s.", .{ fmtIp(ip, &ip_buf), lockout_s });
+        logMsg("Too many failed authentication attempts from {s}; blocked for {d} s.", .{ fmtIp(ip, &ip_buf), netpolicy.retryAfterSeconds(lockout_ms) });
     }
 }
 
@@ -662,7 +670,8 @@ fn handleClient(sock: SOCKET) void {
     const body = req_buf[req.header_end + 4 ..][0..req.body_len];
     const rl = http.parseRequestLine(head) orelse return sendStatus(sock, "400 Bad Request");
 
-    const locked = isLockedOut(peer_ip);
+    const lock_ms = lockoutRemainingMs(peer_ip);
+    const locked = lock_ms > 0;
     const r = http.route(.{
         .method = rl.method,
         .path = rl.path,
@@ -671,9 +680,15 @@ fn handleClient(sock: SOCKET) void {
         .sse_enabled = sse_enabled.load(.acquire),
     });
     switch (r) {
-        .locked_out => return sendJsonStatus(sock, "429 Too Many Requests", "", "{\"error\":\"Too many failed authentication attempts\"}"),
+        .locked_out => {
+            var resp_buf: [http.LOCKED_OUT_RESPONSE_MAX]u8 = undefined;
+            sendAll(sock, http.lockedOutResponse(&resp_buf, netpolicy.retryAfterSeconds(lock_ms))) catch {};
+            return;
+        },
         .unauthorized => {
-            recordAuthFailure(peer_ip);
+            // Only a request that sent credentials counts against a loopback
+            // peer (see http.authFailureKind and netpolicy.AuthLimiter).
+            recordAuthFailure(peer_ip, http.authFailureKind(head));
             return sendJsonStatus(sock, "401 Unauthorized", "WWW-Authenticate: Bearer\r\n", "{\"error\":\"Unauthorized\"}");
         },
         else => recordAuthSuccess(peer_ip),
@@ -780,10 +795,14 @@ fn handleSseConnect(sock: SOCKET) void {
     defer logMsg("SSE client disconnected.", .{});
 
     var last_write = GetTickCount64();
+    var chunk: [SSE_CHUNK_SIZE]u8 = undefined;
     while (running.load(.acquire) and sse_hub.isAlive(h)) {
-        while (sse_hub.pop(h)) |frame| {
-            defer sse_hub.free(frame);
-            sendAll(sock, frame) catch {
+        // Drain everything queued; an empty read means the stream is at a
+        // frame boundary, so the keepalive below never splits a frame.
+        while (true) {
+            const bytes = sse_hub.read(h, &chunk);
+            if (bytes.len == 0) break;
+            sendAll(sock, bytes) catch {
                 sse_hub.markDead(h);
                 return;
             };

@@ -677,12 +677,18 @@
      },
      "type": {
       "type": "string",
-      "description": "Type: r (read), w (write), x (execute, default).",
+      "description": "Type: r (read/write), w (write), x (execute, default). Only the first letter counts, so 'read', 'write' and 'execute' also work.",
       "default": "x"
      },
      "size": {
       "type": "integer",
-      "description": "Size: 1, 2, 4, or 8 (default 1).",
+      "enum": [
+       1,
+       2,
+       4,
+       8
+      ],
+      "description": "Size in bytes: 1, 2, 4, or 8 (8 on x64 only; default 1). The address must be aligned to it.",
       "default": 1
      }
     },
