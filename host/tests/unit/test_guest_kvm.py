@@ -22,6 +22,7 @@ import pytest
 from tests.fakes.fake_guest import FakeGuest
 from tests.fakes.fake_powershell import GuestPowerShell as TransferPowerShell
 from tests.fakes.fake_vmrun import FakeVmrunRunner
+from tests.fakes.win_cmdline import command_line_to_argv, vmrun_command_line
 from tests.unit.test_ps import GuestPowerShell
 from x64dbg_vm_gateway import provision, ps, transfer
 from x64dbg_vm_gateway.contracts import VmrunResult
@@ -31,69 +32,7 @@ from x64dbg_vm_gateway.guest import POWERSHELL_EXE, VixChannel, escape_for_vmrun
 PROGRAM = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
 
 
-# ── reference model of vmrun + Windows argument parsing ─────────────
-def vmrun_command_line(program: str, args: list[str]) -> str:
-    """The guest command line vmrun 1.17.0 builds: every element wrapped in quotes, nothing escaped."""
-    return " ".join(f'"{a}"' for a in [program, *args])
-
-
-def command_line_to_argv(cmdline: str) -> list[str]:
-    """Reference CommandLineToArgvW / MSVCRT (2008+) parser.
-
-    argv[0]: up to the closing quote when it starts with one (no escapes), else up
-    to the first blank. Later arguments: blanks outside quotes separate; 2n
-    backslashes + quote -> n backslashes and the quote toggles quoting; 2n+1
-    backslashes + quote -> n backslashes and a literal quote; backslashes not
-    followed by a quote are literal; inside quotes ``""`` is a literal quote.
-    """
-    argv: list[str] = []
-    i, n = 0, len(cmdline)
-    if cmdline.startswith('"'):
-        end = cmdline.find('"', 1)
-        end = n if end < 0 else end
-        argv.append(cmdline[1:end])
-        i = end + 1
-    else:
-        while i < n and cmdline[i] not in " \t":
-            i += 1
-        argv.append(cmdline[:i])
-    while True:
-        while i < n and cmdline[i] in " \t":
-            i += 1
-        if i >= n:
-            return argv
-        arg: list[str] = []
-        quoted = False
-        while i < n:
-            ch = cmdline[i]
-            if ch == "\\":
-                j = i
-                while j < n and cmdline[j] == "\\":
-                    j += 1
-                count = j - i
-                if j < n and cmdline[j] == '"':
-                    arg.append("\\" * (count // 2))
-                    if count % 2:
-                        arg.append('"')
-                        j += 1
-                    i = j
-                else:
-                    arg.append("\\" * count)
-                    i = j
-                continue
-            if ch == '"':
-                if quoted and i + 1 < n and cmdline[i + 1] == '"':
-                    arg.append('"')
-                    i += 2
-                    continue
-                quoted = not quoted
-                i += 1
-                continue
-            if ch in " \t" and not quoted:
-                break
-            arg.append(ch)
-            i += 1
-        argv.append("".join(arg))
+# ── reference model of vmrun + Windows argument parsing: tests/fakes/win_cmdline.py
 
 
 def round_trip(args: list[str]) -> list[str]:

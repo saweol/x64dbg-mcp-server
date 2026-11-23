@@ -22,6 +22,7 @@ import pytest
 
 from tests.fakes.fake_guest import FakeGuest
 from tests.fakes.fake_vmrun import FakeVmrunRunner
+from tests.fakes.win_cmdline import command_line_to_argv, vmrun_command_line
 from x64dbg_vm_gateway import transfer
 from x64dbg_vm_gateway.contracts import VmrunResult
 from x64dbg_vm_gateway.errors import (
@@ -1603,33 +1604,6 @@ def test_collect_leaves_no_part_or_temp_files_after_partial_run(fake_guest, ps, 
 
 
 # ── end-to-end through VixChannel + FakeVmrunRunner (review F14) ────
-def _msvcrt_unquote(token: str) -> str:
-    """Undo ``subprocess.list2cmdline`` for one argument (MSVCRT / CommandLineToArgvW rules)."""
-    out: list[str] = []
-    i, n = 0, len(token)
-    while i < n:
-        ch = token[i]
-        if ch == "\\":
-            j = i
-            while j < n and token[j] == "\\":
-                j += 1
-            count = j - i
-            if j < n and token[j] == '"':
-                out.append("\\" * (count // 2))
-                if count % 2:
-                    out.append('"')
-                    j += 1
-            else:
-                out.append("\\" * count)
-            i = j
-        elif ch == '"':
-            i += 1  # quote toggles; the token never contains separators we need to honour
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
 class VmrunGuestEmulator:
     """FakeVmrunRunner handler that answers guest commands from a FakeGuest + GuestPowerShell.
 
@@ -1673,7 +1647,10 @@ class VmrunGuestEmulator:
                 raise self._not_found() from None
         elif command == "runProgramInGuest":
             rest = [p for p in params if p not in self._FLAGS]
-            program, args = rest[0], tuple(_msvcrt_unquote(a) for a in rest[1:])
+            # what the guest program receives: vmrun quotes every element without escaping
+            # (E3, measured), Windows splits the line (reference parser, not production code)
+            program = rest[0]
+            args = tuple(command_line_to_argv(vmrun_command_line(program, list(rest[1:])))[1:])
             self.program_args.append(args)
             code = g.run_program(program, args)
             if code:
@@ -1691,11 +1668,11 @@ def vix(fake_guest, ps) -> tuple[VixChannel, VmrunGuestEmulator, FakeVmrunRunner
     return VixChannel(runner), emu, runner
 
 
-def test_msvcrt_unquote_inverts_list2cmdline():
-    import subprocess
-
-    for s in ["plain", "a b", "", 'say "hi"', "C:\\a b\\", "x\\\\\"y", "(Get-Item 'C:\\a [1]').Length"]:
-        assert _msvcrt_unquote(subprocess.list2cmdline([s])) == s
+def test_emulator_reproduces_the_measured_vmrun_command_line():
+    # E3 on the spike VM: ("a b", 'c"d', "plain", "e\\f") unescaped -> a b / cd plain e\\f
+    line = vmrun_command_line("C:\\ps.exe", ["a b", 'c"d', "plain", "e\\f"])
+    assert line == '"C:\\ps.exe" "a b" "c"d" "plain" "e\\f"'
+    assert command_line_to_argv(line)[1:] == ["a b", "cd plain e\\f"]
 
 
 def test_upload_sample_through_vix_channel(vix, fake_guest, ps, sample, fake_clock):
