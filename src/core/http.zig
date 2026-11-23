@@ -132,6 +132,56 @@ pub fn pathOnly(path: []const u8) []const u8 {
     return path[0..q];
 }
 
+/// What the server does with a complete request.
+pub const Route = enum {
+    /// 429: the peer is locked out after repeated authentication failures.
+    locked_out,
+    /// 401: missing or wrong bearer token (counts as an auth failure).
+    unauthorized,
+    /// 405: anything but GET/POST, including OPTIONS (no CORS).
+    method_not_allowed,
+    /// 404: `.well-known` discovery, or an SSE endpoint while EnableSse=false.
+    not_found,
+    /// GET (except /sse): server name/version JSON.
+    server_info,
+    /// GET /sse
+    sse_connect,
+    /// POST /messages
+    sse_message,
+    /// Any other POST: Streamable HTTP JSON-RPC.
+    json_rpc,
+};
+
+pub const RouteInput = struct {
+    method: []const u8,
+    /// Request target, possibly with a query string.
+    path: []const u8,
+    /// The bearer token matched.
+    authorized: bool,
+    /// The peer is currently locked out (never true for loopback peers).
+    locked_out: bool,
+    sse_enabled: bool,
+};
+
+/// Routes a request. The order is part of the security contract: lockout,
+/// then authentication (for every method, so nothing is revealed before
+/// auth), then the method, then the path.
+pub fn route(in: RouteInput) Route {
+    if (in.locked_out) return .locked_out;
+    if (!in.authorized) return .unauthorized;
+    const is_get = std.mem.eql(u8, in.method, "GET");
+    const is_post = std.mem.eql(u8, in.method, "POST");
+    if (!is_get and !is_post) return .method_not_allowed;
+    if (std.mem.indexOf(u8, in.path, ".well-known") != null) return .not_found;
+    const p = pathOnly(in.path);
+    if (is_get) {
+        if (std.mem.eql(u8, p, "/sse")) return if (in.sse_enabled) .sse_connect else .not_found;
+        return .server_info;
+    }
+    if (std.mem.eql(u8, p, "/messages")) return if (in.sse_enabled) .sse_message else .not_found;
+    return .json_rpc;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -215,6 +265,54 @@ test "bearerToken extracts the token" {
     try testing.expectEqual(@as(?[]const u8, null), bearerToken("GET / HTTP/1.1\r\nAuthorization: Bearer"));
     try testing.expectEqual(@as(?[]const u8, null), bearerToken("GET / HTTP/1.1\r\nAuthorization: Bearerabc"));
     try testing.expectEqual(@as(?[]const u8, null), bearerToken("GET / HTTP/1.1\r\nHost: x"));
+}
+
+fn expectRoute(want: Route, method: []const u8, path: []const u8, authorized: bool, locked_out: bool, sse_enabled: bool) !void {
+    const got = route(.{ .method = method, .path = path, .authorized = authorized, .locked_out = locked_out, .sse_enabled = sse_enabled });
+    if (got != want) {
+        std.debug.print("{s} {s} auth={} locked={} sse={}: want {s}, got {s}\n", .{ method, path, authorized, locked_out, sse_enabled, @tagName(want), @tagName(got) });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "route: lockout and authentication come before everything else" {
+    // A locked-out peer gets 429 even with the right token.
+    try expectRoute(.locked_out, "POST", "/", true, true, true);
+    try expectRoute(.locked_out, "OPTIONS", "/", false, true, true);
+    // Every method is authenticated, including OPTIONS (no CORS preflight).
+    try expectRoute(.unauthorized, "OPTIONS", "/", false, false, true);
+    try expectRoute(.unauthorized, "GET", "/", false, false, true);
+    try expectRoute(.unauthorized, "POST", "/", false, false, true);
+    try expectRoute(.unauthorized, "GET", "/.well-known/oauth-authorization-server", false, false, true);
+    // SSE being disabled does not reveal anything before auth.
+    try expectRoute(.unauthorized, "GET", "/sse", false, false, false);
+}
+
+test "route: OPTIONS and other methods get 405 only after auth" {
+    try expectRoute(.method_not_allowed, "OPTIONS", "/", true, false, true);
+    try expectRoute(.method_not_allowed, "PUT", "/", true, false, true);
+    try expectRoute(.method_not_allowed, "DELETE", "/sse", true, false, true);
+    try expectRoute(.method_not_allowed, "get", "/", true, false, true);
+}
+
+test "route: well-known paths are 404" {
+    try expectRoute(.not_found, "GET", "/.well-known/oauth-authorization-server", true, false, true);
+    try expectRoute(.not_found, "POST", "/.well-known/x", true, false, true);
+}
+
+test "route: SSE endpoints honour EnableSse" {
+    try expectRoute(.sse_connect, "GET", "/sse", true, false, true);
+    try expectRoute(.sse_connect, "GET", "/sse?x=1", true, false, true);
+    try expectRoute(.not_found, "GET", "/sse", true, false, false);
+    try expectRoute(.sse_message, "POST", "/messages?sessionId=ab12", true, false, true);
+    try expectRoute(.not_found, "POST", "/messages?sessionId=ab12", true, false, false);
+}
+
+test "route: Streamable HTTP" {
+    try expectRoute(.server_info, "GET", "/", true, false, true);
+    try expectRoute(.server_info, "GET", "/mcp", true, false, false);
+    try expectRoute(.json_rpc, "POST", "/", true, false, true);
+    try expectRoute(.json_rpc, "POST", "/mcp", true, false, false);
 }
 
 test "queryParam and pathOnly" {

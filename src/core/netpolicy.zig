@@ -5,8 +5,10 @@
 //! - startup validation of bind address / AllowExternal / token length
 //! - constant-time bearer token comparison
 //! - per-IP authentication failure lockout driven by an injected clock
-//! - bounded concurrent client slots
+//!   (loopback peers are exempt)
+//! - connection admission (allowlist, then bounded concurrent client slots)
 //! - request receive deadlines (header / total budget)
+//! - bounded retry of a bind() that fails with "address in use"
 //!
 //! Thread-safety: the parsing and evaluation functions are pure. `AuthLimiter`
 //! is NOT thread-safe (callers wrap it in a lock). `ClientSlots` is lock-free
@@ -171,6 +173,9 @@ pub const StartupPlan = struct {
     warn_short_token: bool,
     /// An AllowedClients entry is 0.0.0.0/0.
     warn_allow_all: bool,
+    /// The token contains spaces or non-ASCII bytes. It still works, but
+    /// some HTTP clients cannot put it in an Authorization header.
+    warn_unusual_token: bool,
 };
 
 pub const StartupDiag = struct {
@@ -209,6 +214,27 @@ pub fn planStartup(input: StartupInput, diag: *StartupDiag) StartupError!Startup
         .allowlist = allowlist,
         .warn_short_token = short,
         .warn_allow_all = allowlist.allowsAll(),
+        .warn_unusual_token = !isPortableToken(input.token),
+    };
+}
+
+/// True when every byte is printable ASCII other than space.
+fn isPortableToken(token: []const u8) bool {
+    for (token) |c| if (c < 0x21 or c > 0x7E) return false;
+    return true;
+}
+
+/// Short, static explanation of a StartupError (for the config dialog).
+pub fn describeStartupError(err: StartupError) []const u8 {
+    return switch (err) {
+        error.InvalidIpAddress => "IpAddress is not a valid IPv4 address.",
+        error.ExternalBindNotAllowed => "Binding a non-loopback address requires \"AllowExternal\": true in mcp_config.json.",
+        error.AllowedClientsRequired => "Binding a non-loopback address requires a non-empty \"AllowedClients\" list in mcp_config.json.",
+        error.InvalidAllowedClient => "An AllowedClients entry is not a valid IPv4 address or CIDR range.",
+        error.TooManyAllowedClients => "AllowedClients has more than 64 entries.",
+        error.MissingToken => "AuthToken is empty.",
+        error.TokenTooLong => "AuthToken is longer than 64 characters.",
+        error.TokenTooShort => "\"AllowExternal\": true requires an AuthToken of at least 32 characters.",
     };
 }
 
@@ -233,6 +259,12 @@ pub fn tokenEql(expected: []const u8, presented: []const u8) bool {
 /// Per-IP authentication failure tracking with temporary lockout.
 /// `max_failures` failures within `window_ms` lock the address for
 /// `lockout_ms`. Time is injected (milliseconds from any monotonic clock).
+///
+/// Loopback peers are exempt: every local process, and any web page the
+/// user visits (through the browser), shares 127.0.0.1, so counting their
+/// failures would let them lock the legitimate local client out. Locally
+/// the bearer token (128-bit when generated) is the boundary; a short
+/// loopback token only produces a startup warning.
 /// Not thread-safe.
 pub const AuthLimiter = struct {
     pub const CAPACITY = 128;
@@ -256,6 +288,7 @@ pub const AuthLimiter = struct {
     }
 
     pub fn isLocked(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) bool {
+        if (isLoopback(ip)) return false;
         const i = self.indexOf(ip) orelse return false;
         return self.entries[i].locked_until > now_ms;
     }
@@ -263,6 +296,7 @@ pub const AuthLimiter = struct {
     /// Records a failed authentication. Returns true when this failure
     /// started a lockout.
     pub fn recordFailure(self: *AuthLimiter, ip: Ipv4, now_ms: u64) bool {
+        if (isLoopback(ip)) return false;
         const e = self.findOrClaim(ip, now_ms);
         e.last_seen = now_ms;
         if (e.locked_until > now_ms) return false; // already locked
@@ -337,6 +371,54 @@ pub const ClientSlots = struct {
 
     pub fn count(self: *const ClientSlots) u32 {
         return self.active.load(.acquire);
+    }
+};
+
+pub const Admission = enum { accept, not_allowed, at_capacity };
+
+/// Decides on a freshly accepted connection before a thread is spent on it:
+/// first the allowlist, then the MaxClients cap. A slot is taken only for
+/// `.accept` (the caller releases it when the connection ends).
+///
+/// The auth lockout is deliberately not checked here: a locked-out peer is
+/// answered with HTTP 429 after its request has been read (see
+/// http.route), so a client can tell "locked out" from "server down"
+/// instead of seeing a connection reset.
+pub fn admit(allowlist: *const Allowlist, peer: Ipv4, slots: *ClientSlots, max_clients: u32) Admission {
+    if (!allowlist.permits(peer)) return .not_allowed;
+    if (!slots.tryAcquire(max_clients)) return .at_capacity;
+    return .accept;
+}
+
+/// How long a bind() that fails with "address in use" keeps being retried
+/// once nothing of ours holds the port any more.
+pub const BIND_RETRY_GRACE_MS: u64 = 30_000;
+/// Absolute limit on bind retries (longest `run` timeout plus a margin).
+pub const BIND_RETRY_MAX_MS: u64 = 660_000;
+
+/// Retry policy for a bind() that fails with WSAEADDRINUSE.
+///
+/// With SO_EXCLUSIVEADDRUSE the port stays busy while connections accepted
+/// by a previous server instance are still open (for example a long `run`
+/// that started before the configuration dialog restarted the server), so
+/// retrying continues while such connections exist and for
+/// BIND_RETRY_GRACE_MS after the last one closed. When the port is held by
+/// another process (a second x64dbg instance) the server gives up after the
+/// grace period instead of claiming to run forever. Time is injected.
+/// Not thread-safe (used by the accept thread only).
+pub const BindRetry = struct {
+    start_ms: u64,
+    last_busy_ms: u64,
+
+    pub fn init(now_ms: u64) BindRetry {
+        return .{ .start_ms = now_ms, .last_busy_ms = now_ms };
+    }
+
+    /// `open_connections`: connections of ours still being served.
+    pub fn shouldRetry(self: *BindRetry, now_ms: u64, open_connections: u32) bool {
+        if (open_connections > 0) self.last_busy_ms = now_ms;
+        if (now_ms -| self.start_ms >= BIND_RETRY_MAX_MS) return false;
+        return now_ms -| self.last_busy_ms < BIND_RETRY_GRACE_MS;
     }
 };
 
@@ -589,6 +671,88 @@ test "AuthLimiter keeps locked entries when the table overflows" {
         _ = lim.recordFailure(ip, 1 + i);
     }
     try testing.expect(lim.isLocked(victim, 1000));
+}
+
+test "AuthLimiter never locks out loopback peers" {
+    // Every local process (and any web page, via the browser) shares
+    // 127.0.0.1; counting their failures would let them lock the real
+    // client out of the default loopback setup.
+    var lim = AuthLimiter.init(2, 60_000, 300_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    for (0..50) |i| try testing.expect(!lim.recordFailure(lo, i));
+    try testing.expect(!lim.isLocked(lo, 100));
+    try testing.expect(!lim.isLocked(.{ 127, 1, 2, 3 }, 100));
+    try testing.expect(!lim.recordFailure(.{ 127, 9, 9, 9 }, 101));
+    try testing.expect(!lim.recordFailure(.{ 127, 9, 9, 9 }, 102));
+    // Loopback failures take no table slot.
+    for (lim.entries) |e| try testing.expect(!e.used);
+    // Remote peers are still locked out.
+    const remote = Ipv4{ 192, 168, 10, 9 };
+    _ = lim.recordFailure(remote, 200);
+    try testing.expect(lim.recordFailure(remote, 201));
+    try testing.expect(lim.isLocked(remote, 202));
+}
+
+test "admit checks the allowlist before taking a client slot" {
+    var bad: usize = 0;
+    const list = try Allowlist.fromStrings(&.{"192.168.10.0/24"}, &bad);
+    var slots: ClientSlots = .{};
+    try testing.expectEqual(Admission.not_allowed, admit(&list, .{ 10, 0, 0, 1 }, &slots, 2));
+    try testing.expectEqual(@as(u32, 0), slots.count());
+    try testing.expectEqual(Admission.accept, admit(&list, .{ 192, 168, 10, 5 }, &slots, 2));
+    try testing.expectEqual(Admission.accept, admit(&list, .{ 127, 0, 0, 1 }, &slots, 2));
+    try testing.expectEqual(@as(u32, 2), slots.count());
+    try testing.expectEqual(Admission.at_capacity, admit(&list, .{ 192, 168, 10, 6 }, &slots, 2));
+    // A rejected peer still does not consume a slot when the table is full.
+    try testing.expectEqual(Admission.not_allowed, admit(&list, .{ 8, 8, 8, 8 }, &slots, 2));
+    try testing.expectEqual(@as(u32, 2), slots.count());
+    slots.release();
+    try testing.expectEqual(Admission.accept, admit(&list, .{ 192, 168, 10, 6 }, &slots, 2));
+}
+
+test "BindRetry gives up after the grace period when nothing of ours holds the port" {
+    var r = BindRetry.init(1000);
+    try testing.expect(r.shouldRetry(1000, 0));
+    try testing.expect(r.shouldRetry(1000 + BIND_RETRY_GRACE_MS - 1, 0));
+    try testing.expect(!r.shouldRetry(1000 + BIND_RETRY_GRACE_MS, 0));
+}
+
+test "BindRetry waits while connections of the previous instance are open" {
+    var r = BindRetry.init(0);
+    // A long `run` of the previous instance keeps the port busy.
+    try testing.expect(r.shouldRetry(10_000, 1));
+    try testing.expect(r.shouldRetry(200_000, 1));
+    // Once it has closed, the grace period starts again.
+    try testing.expect(r.shouldRetry(200_000 + BIND_RETRY_GRACE_MS - 1, 0));
+    try testing.expect(!r.shouldRetry(200_000 + BIND_RETRY_GRACE_MS, 0));
+}
+
+test "BindRetry has a hard cap" {
+    var r = BindRetry.init(0);
+    try testing.expect(r.shouldRetry(BIND_RETRY_MAX_MS - 1, 3));
+    try testing.expect(!r.shouldRetry(BIND_RETRY_MAX_MS, 3));
+}
+
+test "planStartup warns about tokens some HTTP clients cannot send" {
+    var diag: StartupDiag = .{};
+    const plain = try planStartup(.{ .ip_address = "127.0.0.1", .allow_external = false, .allowed_clients = &.{}, .token = token32 }, &diag);
+    try testing.expect(!plain.warn_unusual_token);
+    const spaced = try planStartup(.{ .ip_address = "127.0.0.1", .allow_external = false, .allowed_clients = &.{}, .token = "my token" }, &diag);
+    try testing.expect(spaced.warn_unusual_token);
+    const utf8 = try planStartup(.{ .ip_address = "127.0.0.1", .allow_external = false, .allowed_clients = &.{}, .token = "caf\xc3\xa9" }, &diag);
+    try testing.expect(utf8.warn_unusual_token);
+}
+
+test "describeStartupError explains every startup error" {
+    const errs = [_]StartupError{
+        error.InvalidIpAddress,     error.ExternalBindNotAllowed, error.AllowedClientsRequired,
+        error.InvalidAllowedClient, error.TooManyAllowedClients,  error.MissingToken,
+        error.TokenTooLong,         error.TokenTooShort,
+    };
+    for (errs, 0..) |a, i| {
+        try testing.expect(describeStartupError(a).len > 0);
+        for (errs[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, describeStartupError(a), describeStartupError(b)));
+    }
 }
 
 test "ClientSlots caps concurrent clients" {

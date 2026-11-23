@@ -151,8 +151,6 @@ const CF_TEXT: u32 = 1;
 const GMEM_MOVEABLE: u32 = 0x0002;
 const WHITE_BRUSH: c_int = 0;
 
-extern "advapi32" fn SystemFunction036(buf: [*]u8, len: u32) callconv(.winapi) u8;
-
 // ── DPI awareness (runtime-resolved for Win7/8 compat) ─────────────
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
@@ -202,14 +200,16 @@ fn sd(design: c_int, dpi: u32) c_int {
     return @intCast(@divTrunc(@as(i64, design) * dpi, USER_DEFAULT_SCREEN_DPI));
 }
 
-fn generateToken(buf: *[32]u8) void {
-    var raw: [16]u8 = undefined;
-    _ = SystemFunction036(&raw, 16);
-    const hex = "0123456789abcdef";
-    for (raw, 0..) |b, i| {
-        buf[i * 2] = hex[b >> 4];
-        buf[i * 2 + 1] = hex[b & 0x0f];
-    }
+/// RtlGenRandom (SystemFunction036); false when it fails.
+fn osRandom(buf: []u8) bool {
+    std.os.windows.RtlGenRandom(buf) catch return false;
+    return true;
+}
+
+/// Generates a 32-character hex token. False when the OS random source
+/// failed; the caller must then not store any token.
+fn generateToken(buf: *[cfgjson.GENERATED_TOKEN_LEN]u8) bool {
+    return cfgjson.generateToken(osRandom, buf);
 }
 
 // ── Config data ────────────────────────────────────────────────────
@@ -315,10 +315,16 @@ fn readConfigFile(allocator: std.mem.Allocator) ReadError![]u8 {
     return buf[0..got];
 }
 
-fn generateTokenInto(owned: *cfgjson.Owned) void {
-    var tok: [32]u8 = undefined;
-    generateToken(&tok);
-    owned.config.auth_token = owned.dupe(&tok) catch "";
+/// Stores a freshly generated token in `owned`. False (token left as it
+/// was) when no random token could be generated.
+fn generateTokenInto(owned: *cfgjson.Owned) bool {
+    var tok: [cfgjson.GENERATED_TOKEN_LEN]u8 = undefined;
+    if (!generateToken(&tok)) {
+        logLine("Could not generate a random AuthToken (RtlGenRandom failed).", .{});
+        return false;
+    }
+    owned.config.auth_token = owned.dupe(&tok) catch return false;
+    return true;
 }
 
 fn logLine(comptime fmt: []const u8, args: anytype) void {
@@ -339,8 +345,9 @@ pub fn load() Loaded {
     const text = readConfigFile(config_allocator) catch |err| switch (err) {
         error.FileNotFound => {
             var owned = cfgjson.initDefault(config_allocator, defaultPort());
-            generateTokenInto(&owned);
-            if (!saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
+            // Without a token the server refuses to start (MissingToken), so
+            // do not write a file that would look configured.
+            if (generateTokenInto(&owned) and !saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
             return .{ .owned = owned, .status = .created };
         },
         error.TooLarge => {
@@ -364,8 +371,7 @@ pub fn load() Loaded {
         return invalidLoaded(if (diag.reason.len > 0) diag.reason else "the file is not valid");
     };
     if (owned.config.auth_token.len == 0) {
-        generateTokenInto(&owned);
-        if (!saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
+        if (generateTokenInto(&owned) and !saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
     }
     return .{ .owned = owned, .status = .ok };
 }
@@ -665,11 +671,12 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
             }
             if (id == IDC_GENERATE and notify == BN_CLICKED) {
                 if (edit_token != null) {
-                    var tok: [32]u8 = undefined;
-                    generateToken(&tok);
-                    var tok_z: [33]u8 = undefined;
-                    @memcpy(tok_z[0..32], tok[0..32]);
-                    tok_z[32] = 0;
+                    var tok_z: [cfgjson.GENERATED_TOKEN_LEN + 1]u8 = undefined;
+                    if (!generateToken(tok_z[0..cfgjson.GENERATED_TOKEN_LEN])) {
+                        _ = MessageBoxA(hwnd, "Could not generate a random token (the Windows random source failed). The current token is unchanged.\x00", "MCP Server Configuration\x00", 0x10);
+                        return 0;
+                    }
+                    tok_z[cfgjson.GENERATED_TOKEN_LEN] = 0;
                     _ = SendMessageA(edit_token, WM_SETTEXT, 0, @bitCast(@intFromPtr(&tok_z)));
                 }
                 return 0;
@@ -830,7 +837,7 @@ fn onSave(hwnd: HWND) void {
     }
     // The server refuses to start on an unparsable address (fail closed), so
     // catch typos here instead of silently binding nothing.
-    const parsed_ip = netpolicy.parseIpv4(ip) catch {
+    _ = netpolicy.parseIpv4(ip) catch {
         _ = MessageBoxA(hwnd, "IP address must be a dotted IPv4 address such as 127.0.0.1.\x00", "Validation Error\x00", 0x30);
         return;
     };
@@ -853,6 +860,15 @@ fn onSave(hwnd: HWND) void {
     else
         0;
 
+    // The token box is read-only, but validate anyway: never save a file
+    // that the loader would reject (that would stop the server from
+    // starting on the next x64dbg launch).
+    const tok = tok_buf[0..tok_len];
+    if (tok_len > 0 and !cfgjson.isValidToken(tok)) {
+        _ = MessageBoxA(hwnd, "Auth token must be 1-64 characters without control characters or leading/trailing spaces. Click Generate for a new one.\x00", "Validation Error\x00", 0x30);
+        return;
+    }
+
     if (dialog_cfg == null) dialog_cfg = load();
     const loaded = &dialog_cfg.?;
     const cfg = &loaded.owned.config;
@@ -860,18 +876,29 @@ fn onSave(hwnd: HWND) void {
     cfg.port = port;
     cfg.auto_start = auto_start;
     if (tok_len > 0) {
-        cfg.auth_token = loaded.owned.dupe(tok_buf[0..tok_len]) catch return;
-    } else {
-        generateTokenInto(&loaded.owned);
-    }
-
-    if (!netpolicy.isLoopback(parsed_ip) and !(cfg.allow_external and cfg.allowed_clients.len > 0)) {
-        _ = MessageBoxA(hwnd, "Binding a non-loopback address requires \"AllowExternal\": true and a non-empty \"AllowedClients\" list in mcp_config.json.\r\nThe settings are saved, but the server will refuse to start until those keys are set.\x00", "MCP Server Configuration\x00", 0x30);
+        cfg.auth_token = loaded.owned.dupe(tok) catch return;
+    } else if (!generateTokenInto(&loaded.owned)) {
+        _ = MessageBoxA(hwnd, "Could not generate a random token (the Windows random source failed). Nothing was saved.\x00", "MCP Server Configuration\x00", 0x10);
+        return;
     }
 
     if (!save(cfg)) {
         _ = MessageBoxA(hwnd, "Could not write mcp_config.json next to the x64dbg executable.\x00", "MCP Server Configuration\x00", 0x10);
         return;
+    }
+
+    // Same check the server runs at start: warn now instead of letting the
+    // user find a "Refusing to start" line in the log later.
+    var diag: netpolicy.StartupDiag = .{};
+    if (netpolicy.planStartup(.{
+        .ip_address = cfg.ip_address,
+        .allow_external = cfg.allow_external,
+        .allowed_clients = cfg.allowed_clients,
+        .token = cfg.auth_token,
+    }, &diag)) |_| {} else |err| {
+        var msg_buf: [512]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&msg_buf, "{s}\r\nThe settings are saved, but the server will refuse to start until this is fixed in mcp_config.json.", .{netpolicy.describeStartupError(err)}) catch "The settings are saved, but the server will refuse to start (see the log).";
+        _ = MessageBoxA(hwnd, text.ptr, "MCP Server Configuration\x00", 0x30);
     }
 
     mcp.stop();

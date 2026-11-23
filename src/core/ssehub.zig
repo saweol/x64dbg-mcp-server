@@ -11,6 +11,10 @@
 //! Slots carry a generation number so a stale handle held by an exiting
 //! thread can never remove or kill a newer client that reused the slot.
 //!
+//! Session ids are 64 random bits as 16 lowercase hex digits (unique among
+//! live clients), so one client cannot guess another client's id and push
+//! frames into its stream through POST /messages.
+//!
 //! Thread-safety: all methods are internally locked. Frames returned by
 //! `pop` are owned by the caller and must be released with `free`.
 
@@ -20,7 +24,7 @@ const sync = @import("sync.zig");
 const Allocator = std.mem.Allocator;
 
 pub const MAX_CLIENTS = 8;
-pub const SESSION_ID_MAX = 10;
+pub const SESSION_ID_MAX = 16;
 
 pub const Limits = struct {
     max_queued_frames: usize = 64,
@@ -43,12 +47,19 @@ const Slot = struct {
 pub const Hub = struct {
     allocator: Allocator,
     limits: Limits,
+    /// Source of session ids; only used under `lock`.
+    random: std.Random,
     lock: sync.RwLock = .{},
     slots: [MAX_CLIENTS]Slot = [_]Slot{.{}} ** MAX_CLIENTS,
-    next_session: u32 = 1,
 
+    /// Session ids come from the OS CSPRNG (std.crypto.random).
     pub fn init(allocator: Allocator, limits: Limits) Hub {
-        return .{ .allocator = allocator, .limits = limits };
+        return initWithRandom(allocator, limits, std.crypto.random);
+    }
+
+    /// Like init, with an explicit random source (tests).
+    pub fn initWithRandom(allocator: Allocator, limits: Limits, random: std.Random) Hub {
+        return .{ .allocator = allocator, .limits = limits, .random = random };
     }
 
     /// Frees every queued frame. No other thread may use the hub afterwards.
@@ -62,12 +73,10 @@ pub const Hub = struct {
         defer self.lock.unlock();
         for (&self.slots, 0..) |*s, i| {
             if (s.state != .free) continue;
+            self.newSessionId(&s.session_buf);
+            s.session_len = SESSION_ID_MAX;
             s.state = .active;
             s.gen +%= 1;
-            const id = self.next_session;
-            self.next_session +%= 1;
-            if (self.next_session == 0) self.next_session = 1;
-            s.session_len = (std.fmt.bufPrint(&s.session_buf, "{d}", .{id}) catch unreachable).len;
             return .{ .idx = @intCast(i), .gen = s.gen };
         }
         return null;
@@ -167,6 +176,28 @@ pub const Hub = struct {
 
     // ── internals (caller holds the lock) ──
 
+    /// Writes a random id that no live client uses.
+    fn newSessionId(self: *Hub, out: *[SESSION_ID_MAX]u8) void {
+        while (true) {
+            var raw: [SESSION_ID_MAX / 2]u8 = undefined;
+            self.random.bytes(&raw);
+            const hex = "0123456789abcdef";
+            for (raw, 0..) |b, i| {
+                out[i * 2] = hex[b >> 4];
+                out[i * 2 + 1] = hex[b & 0x0f];
+            }
+            if (!self.sessionInUse(out)) return;
+        }
+    }
+
+    fn sessionInUse(self: *Hub, id: []const u8) bool {
+        for (&self.slots) |*s| {
+            if (s.state == .free) continue;
+            if (std.mem.eql(u8, s.session_buf[0..s.session_len], id)) return true;
+        }
+        return false;
+    }
+
     fn slotFor(self: *Hub, h: Handle) ?*Slot {
         if (h.idx >= MAX_CLIENTS) return null;
         const s = &self.slots[h.idx];
@@ -235,6 +266,54 @@ test "add assigns unique session ids up to MAX_CLIENTS" {
     for (0..MAX_CLIENTS) |i| for (i + 1..MAX_CLIENTS) |j| {
         try testing.expect(!std.mem.eql(u8, ids[i][0..lens[i]], ids[j][0..lens[j]]));
     };
+}
+
+fn isLowerHex(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    return true;
+}
+
+test "session ids are random 64-bit hex values, not counters" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    var prev: [SESSION_ID_MAX]u8 = undefined;
+    var prev_len: usize = 0;
+    for (0..4) |_| {
+        const h = hub.add().?;
+        var buf: [SESSION_ID_MAX]u8 = undefined;
+        const sid = hub.sessionId(h, &buf).?;
+        try testing.expectEqual(@as(usize, 16), sid.len);
+        try testing.expect(isLowerHex(sid));
+        try testing.expect(!std.mem.eql(u8, sid, "1") and !std.mem.eql(u8, sid, "2"));
+        if (prev_len > 0) try testing.expect(!std.mem.eql(u8, prev[0..prev_len], sid));
+        @memcpy(prev[0..sid.len], sid);
+        prev_len = sid.len;
+        hub.remove(h);
+    }
+}
+
+test "session ids stay unique when the random source repeats itself" {
+    // Returns the same 8 bytes twice, then different ones.
+    const Repeating = struct {
+        calls: usize = 0,
+        fn fill(self: *@This(), buf: []u8) void {
+            const v: u8 = if (self.calls < 2) 0xAB else @intCast(self.calls);
+            @memset(buf, v);
+            self.calls += 1;
+        }
+    };
+    var src: Repeating = .{};
+    var hub = Hub.initWithRandom(testing.allocator, .{}, std.Random.init(&src, Repeating.fill));
+    defer hub.deinit();
+    const a = hub.add().?;
+    const b = hub.add().?;
+    var ba: [SESSION_ID_MAX]u8 = undefined;
+    var bb: [SESSION_ID_MAX]u8 = undefined;
+    const ida = hub.sessionId(a, &ba).?;
+    const idb = hub.sessionId(b, &bb).?;
+    try testing.expectEqualStrings("abababababababab", ida);
+    try testing.expect(!std.mem.eql(u8, ida, idb));
+    try testing.expect(src.calls >= 3);
 }
 
 test "broadcast queues SSE frames for every live client in FIFO order" {

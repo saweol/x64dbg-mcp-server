@@ -40,7 +40,7 @@ Built with [Zig](https://ziglang.org/) — zero dependencies, single-binary outp
 - **Zero Dependencies:** Pure native plugin, no runtime or framework needed.
 - **x32 and x64:** Single codebase, builds both architectures from one command.
 - **Dual Transport:** Streamable HTTP + SSE — compatible with any MCP client (new and legacy). SSE can be switched off.
-- **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request (compared in constant time, with per-IP lockout after repeated failures).
+- **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request (compared in constant time, with a per-IP lockout of remote clients after repeated failures).
 - **Hardened Networking:** Loopback by default, fail-closed bind, client IP allowlist, request timeouts, bounded client threads, exclusive port binding.
 - **Config Dialog:** Change IP/port/token from the Plugins menu, auto-restarts the server on save.
 - **Auto-Start:** MCP server starts automatically when x64dbg launches.
@@ -150,7 +150,7 @@ AI: [calls StepOver x3, GetCallStack]
 | `StepOut` | Run until return (Ctrl+F9) |
 | `PauseDebug` | Pause the target (F12) |
 | `StopDebug` | Terminate debug session |
-| `RestartDebug` | Restart debug session |
+| `RestartDebug` | Restart debug session (reuses `LoadBinary`'s arguments / working directory) |
 | `SetBreakpoint` | Set INT3 breakpoint at address/symbol |
 | `SetHardwareBreakpoint` | Set hardware breakpoint (DR0-DR3, read/write/execute) |
 | `SetConditionalBreakpoint` | Set breakpoint with condition expression and optional log |
@@ -207,7 +207,7 @@ AI: [calls StepOver x3, GetCallStack]
 | `TraceOver` | Trace N instructions stepping over calls |
 | `SetBreakpointCommand` | Set a command to execute when a breakpoint is hit |
 | `SetBreakpointFastResume` | Enable/disable fast resume (auto-continue) on a breakpoint |
-| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file |
+| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file (`filePath` omitted or `""` = default location) |
 
 
 ## Configuration
@@ -223,7 +223,7 @@ Changes take effect immediately — the server auto-restarts on save. Config is 
 
 A Bearer token is auto-generated on first run and required on every request, for every HTTP method (including `OPTIONS`, which is answered with `405` once authenticated; the server sends no CORS headers because MCP clients are not browsers). The MCP server has full debugger control and can read/write process memory — all requests without a valid token receive `401 Unauthorized`. Click **Generate** in the config dialog to rotate the token, or **Copy** to copy it to clipboard. Clients must include the token as an `Authorization: Bearer <token>` header.
 
-Tokens are compared in constant time. After `AuthMaxFailures` failed attempts within 60 seconds an IP address is blocked for `AuthLockoutSeconds` (connections are dropped, and an in-flight request gets `429`).
+Tokens are compared in constant time. After `AuthMaxFailures` failed attempts within 60 seconds a **non-loopback** IP address is locked out for `AuthLockoutSeconds`: every request from it is answered with `429 Too Many Requests` (even one with the correct token) until the lockout expires, so a client can tell "locked out" (`429`) from "wrong token" (`401`) and "server down" (connection refused). Loopback clients (`127.0.0.0/8`) are never locked out: every local process, and any web page open in a local browser, shares that address, so counting their failures would let them lock your MCP client out. Locally the token itself is the boundary (generated tokens are 128-bit). A remote client such as a gateway should stop after a `401` instead of retrying with the same token.
 
 ### mcp_config.json
 
@@ -234,13 +234,13 @@ The dialog edits the first four keys; all other keys are **file-only** (edit the
 | `IpAddress` | `"127.0.0.1"` | IPv4 address to bind. Must be a valid dotted IPv4 address — an invalid value makes the server refuse to start (it no longer falls back to `0.0.0.0`). |
 | `Port` | `9094` (x64) / `9095` (x32) | TCP port, 1–65535. |
 | `AutoStart` | `true` | Start the server when the plugin loads. |
-| `AuthToken` | generated | 1–64 printable ASCII characters (no spaces, quotes or backslashes). |
+| `AuthToken` | generated | 1–64 characters, no control characters and no leading/trailing space (those can never match an `Authorization` header). Generated tokens are 32 hex characters. Tokens with inner spaces or non-ASCII characters (accepted by v1.9) still load, but the server logs a warning because some HTTP clients cannot send them. |
 | `AllowExternal` | `false` | Must be `true` to bind any non-loopback address. Then the token must be at least 32 characters. |
 | `AllowedClients` | `[]` | IPv4 addresses or CIDR ranges (`"192.168.56.0/24"`, `"10.0.0.5"`) allowed to connect, max 64. Required (non-empty) for a non-loopback bind. Loopback clients are always allowed. |
 | `MaxClients` | `16` | Maximum concurrent connections (1–256); extra connections are closed immediately. |
 | `EnableSse` | `true` | Serve the legacy SSE transport (`/sse`, `/messages`). Set `false` when exposing the server; Streamable HTTP keeps working. |
 | `ArtifactDir` | `""` | Absolute directory (drive or UNC path) for relative `filePath` arguments of `DumpMemory`, `DumpModule` and `SaveDatabase`. |
-| `AuthMaxFailures` | `5` | Failed authentications per IP (within 60 s) before a lockout, 1–1000. |
+| `AuthMaxFailures` | `5` | Failed authentications per non-loopback IP (within 60 s) before a lockout, 1–1000. |
 | `AuthLockoutSeconds` | `300` | Lockout duration in seconds, 1–86400. |
 
 If `mcp_config.json` exists but cannot be parsed (invalid JSON, a duplicate key, a wrong type or an out-of-range value), the plugin logs the offending key, leaves the file untouched and does not start the server. Fix the file, or open the dialog and press **Save** to replace it.
@@ -264,10 +264,11 @@ The server speaks plain HTTP. Prefer an SSH tunnel to `127.0.0.1`. If you must l
 Hardening that applies to every bind:
 
 - The request line and headers must arrive within 5 seconds and the whole request within 10 seconds of connecting; responses use a 10 second send timeout.
-- At most `MaxClients` connections are served at once; the peer address is checked against `AllowedClients` and the lockout table **before** a thread is created for it.
-- The port is bound with `SO_EXCLUSIVEADDRUSE`, so another process cannot share it. If the port is still busy when the server restarts (another process, or connections of the previous instance that are still open), the server keeps retrying once per second and logs this.
+- At most `MaxClients` connections are served at once; the peer address is checked against `AllowedClients` **before** a thread is created for it (rejected peers get a connection reset). Locked-out peers are answered with `429` after their request has been read.
+- The port is bound with `SO_EXCLUSIVEADDRUSE`, so another process cannot share it. If the port is busy when the server (re)starts, it retries once per second while connections of the previous server instance are still open and for 30 seconds after that (11 minutes at most), then logs that the port is in use and stops; start it again from the plugin menu (or with the `StartMCPServer` command) once the port is free. A port owned by another process (for example a second x64dbg) therefore fails after about 30 seconds instead of looking "running".
+- SSE session ids are random 64-bit values, so one SSE client cannot address another client's stream.
 - SSE notifications are queued per client; a client that stops reading is dropped after a 5 second send timeout and never blocks the debugger thread.
-- State-changing tools are serialised. While one runs (for example a blocking `run`), another state-changing call waits up to 10 seconds and then returns `BUSY` without executing. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked.
+- State-changing tools are serialised (**new in v1.10**: v1.9 let them interleave). While one runs, another state-changing call waits up to 10 seconds and then returns `BUSY` without executing. A blocking `run` or `ExecuteDebuggerCommand` holds the lock until the target pauses, its timeout expires, or its HTTP client disconnects; so, for example, `SetBreakpoint` while a `run` is waiting returns `BUSY` — call `PauseDebug` (or `WaitForPause`) and retry. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked.
 
 ### Artifact directory
 

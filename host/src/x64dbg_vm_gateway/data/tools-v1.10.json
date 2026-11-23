@@ -1529,7 +1529,7 @@
     "properties": {
      "filePath": {
       "type": "string",
-      "description": "Optional database file path. Relative paths resolve against ArtifactDir; absolute paths are used as-is. Omit to use the default database location."
+      "description": "Optional database file path. Relative paths resolve against ArtifactDir; absolute paths are used as-is. Omit it, or pass an empty string, to use the default database location."
      }
     },
     "required": []

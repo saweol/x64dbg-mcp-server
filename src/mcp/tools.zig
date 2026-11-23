@@ -725,7 +725,7 @@ fn schemaSetArtifactDir(w: *JsonWriter) void {
 }
 
 fn schemaSaveDatabase(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\",\"description\":\"Optional database file path. Relative paths resolve against ArtifactDir; absolute paths are used as-is. Omit to use the default database location.\"}},\"required\":[]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\",\"description\":\"Optional database file path. Relative paths resolve against ArtifactDir; absolute paths are used as-is. Omit it, or pass an empty string, to use the default database location.\"}},\"required\":[]}");
 }
 
 fn schemaExecuteDebuggerCommand(w: *JsonWriter) void {
@@ -1148,7 +1148,7 @@ fn loadBinary(params: ?std.json.Value, out: []u8) ToolResult {
         error.Unrepresentable => errResult(out, quote_error_text),
         error.BufferTooSmall => errResult(out, "Error: filePath/arguments/workingDir too long."),
     };
-    main.launch_state.setPending(path, args, workdir) catch
+    main.launch_state.setPending(path, args, workdir, main.tickMs()) catch
         return errResult(out, "Error: filePath/arguments/workingDir too long.");
 
     const seq_before = main.initDebugSeq();
@@ -1156,14 +1156,25 @@ fn loadBinary(params: ?std.json.Value, out: []u8) ToolResult {
         main.launch_state.clearPending();
         return errResult(out, "Error: x64dbg rejected the init command.");
     }
-    return waitForNewSession(out, seq_before, timeout_ms);
+    return waitForNewSession(out, seq_before, timeout_ms, args, workdir);
+}
+
+/// Note appended to a LoadBinary result when x64dbg started the session but
+/// the arguments / working directory were not recorded for RestartDebug
+/// (e.g. x64dbg reported a different executable name).
+fn launchNote(args: []const u8, workdir: []const u8) []const u8 {
+    if (args.len == 0 and workdir.len == 0) return "";
+    var cur: launch.Launch = .{};
+    main.launch_state.snapshot(&cur);
+    if (std.mem.eql(u8, cur.args(), args) and std.mem.eql(u8, cur.workdir(), workdir)) return "";
+    return " Note: x64dbg reported a different executable name, so RestartDebug will not reuse these arguments / working directory.";
 }
 
 /// Waits until a debug session started after `seq_before` is active and
 /// paused (the system breakpoint, normally). Replaces the old fixed
 /// Sleep(500), which raced with slow loads and could report the previous
 /// session as the new one.
-fn waitForNewSession(out: []u8, seq_before: u32, timeout_ms: i64) ToolResult {
+fn waitForNewSession(out: []u8, seq_before: u32, timeout_ms: i64, args: []const u8, workdir: []const u8) ToolResult {
     const start: i64 = @intCast(GetTickCount64());
     var started = false;
     while (true) {
@@ -1174,7 +1185,7 @@ fn waitForNewSession(out: []u8, seq_before: u32, timeout_ms: i64) ToolResult {
                 const pid = bridge.valFromString("$pid");
                 if (pid != 0) {
                     const cip = bridge.valFromString("cip");
-                    return fmtResult(out, "SUCCESS: Binary loaded. PID {d}, paused at 0x{X} after {d}ms. Use 'run' to continue.", .{ pid, cip, elapsed });
+                    return fmtResult(out, "SUCCESS: Binary loaded. PID {d}, paused at 0x{X} after {d}ms. Use 'run' to continue.{s}", .{ pid, cip, elapsed, launchNote(args, workdir) });
                 }
             }
         }
@@ -1182,10 +1193,12 @@ fn waitForNewSession(out: []u8, seq_before: u32, timeout_ms: i64) ToolResult {
         Sleep(LOAD_POLL_MS);
     }
     if (started) {
-        return fmtResult(out, "LOADED_NOT_PAUSED: the debug session started but the target did not pause within {d}ms (system breakpoint disabled in x64dbg's event options?). Call WaitForPause or PauseDebug.", .{timeout_ms});
+        return fmtResult(out, "LOADED_NOT_PAUSED: the debug session started but the target did not pause within {d}ms (system breakpoint disabled in x64dbg's event options?). Call WaitForPause or PauseDebug.{s}", .{ timeout_ms, launchNote(args, workdir) });
     }
-    main.launch_state.clearPending();
-    return fmtErr(out, "Error: no new debug session became active within {d}ms. Check filePath and the x64dbg log.", .{timeout_ms});
+    // The pending launch is kept: a slow load may still start the session,
+    // and it then keeps its arguments for RestartDebug (it expires after
+    // launch.PENDING_TTL_MS).
+    return fmtErr(out, "Error: no new debug session became active within {d}ms. Check filePath and the x64dbg log, or call WaitForPause if the load is just slow.", .{timeout_ms});
 }
 
 // ── ExecuteDebuggerCommand ──────────────────────────────────────────
@@ -1239,6 +1252,9 @@ fn executeDebuggerCommand(params: ?std.json.Value, out: []u8) ToolResult {
         while (@as(i64, @intCast(GetTickCount64())) - start < timeout) {
             if (!bridge.isDebugging())
                 return result(out, "Command executed. TARGET_EXITED — debug session ended.");
+            // Nobody is waiting for the answer any more: release the tool lock.
+            if (mcp.requestAbandoned())
+                return result(out, "Command executed. ABANDONED: the client disconnected; stopped waiting. Target still RUNNING.");
             if (!bridge.isRunning()) {
                 const elapsed = @as(i64, @intCast(GetTickCount64())) - start;
                 var pos: usize = 0;
@@ -1482,6 +1498,9 @@ fn runTarget(params: ?std.json.Value, out: []u8) ToolResult {
     while (@as(i64, @intCast(GetTickCount64())) - start < timeout_ms) {
         if (!bridge.isDebugging())
             return result(out, "TARGET_EXITED. The debug session ended while running.");
+        // Nobody is waiting for the answer any more: release the tool lock.
+        if (mcp.requestAbandoned())
+            return result(out, "ABANDONED: the client disconnected; stopped waiting. Target still RUNNING.");
 
         if (!bridge.isRunning()) {
             const elapsed = @as(i64, @intCast(GetTickCount64())) - start;
@@ -1620,7 +1639,7 @@ fn restartDebug(_: ?std.json.Value, out: []u8) ToolResult {
         error.Unrepresentable => errResult(out, quote_error_text),
         error.BufferTooSmall => errResult(out, "Error: debuggee path/arguments too long."),
     };
-    main.launch_state.setPending(cur.path(), cur.args(), cur.workdir()) catch
+    main.launch_state.setPending(cur.path(), cur.args(), cur.workdir(), main.tickMs()) catch
         return errResult(out, "Error: debuggee path/arguments too long.");
 
     if (!bridge.cmdExec(cmd.ptr)) {
@@ -1630,7 +1649,9 @@ fn restartDebug(_: ?std.json.Value, out: []u8) ToolResult {
 
     // A successful restart must result in a different process ID.
     // Allow up to 5 seconds for the old debuggee to terminate and the
-    // replacement process to reach its initial debug break.
+    // replacement process to reach its initial debug break. On timeout the
+    // pending launch is kept (the session may still start; see
+    // core/launch.zig), so a late session keeps its arguments.
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 100) {
         Sleep(100);
@@ -4021,7 +4042,8 @@ fn setBreakpointFastResume(params: ?std.json.Value, out: []u8) ToolResult {
 // ── SaveDatabase ─────────────────────────────────────────────────
 fn saveDatabase(params: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging()) return errResult(out, "Error: No active debug session.");
-    const file_path = getParamStr(params, "filePath") orelse {
+    // "" means "the default location", like omitting filePath.
+    const file_path = (if (params) |p| json.getOptionalStringField(p, "filePath") else null) orelse {
         const ok = bridge.cmdExec("dbsave\x00");
         return fmtResult(out, "{s}", .{if (ok) "Database saved." else "Failed to save database."});
     };

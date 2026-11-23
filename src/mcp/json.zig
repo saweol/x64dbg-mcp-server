@@ -138,6 +138,13 @@ pub fn getStringField(parsed: std.json.Value, field: []const u8) ?[]const u8 {
     };
 }
 
+/// Like getStringField, but an empty string counts as absent (for optional
+/// arguments where "" means "use the default").
+pub fn getOptionalStringField(parsed: std.json.Value, field: []const u8) ?[]const u8 {
+    const s = getStringField(parsed, field) orelse return null;
+    return if (s.len == 0) null else s;
+}
+
 pub fn getIntField(parsed: std.json.Value, field: []const u8) ?i64 {
     if (parsed != .object) return null;
     const obj = parsed.object;
@@ -385,4 +392,15 @@ test "getAddrField returns null when the buffer is too small" {
     defer parsed.deinit();
     var buf: [4]u8 = undefined;
     try std.testing.expect(getAddrField(parsed.value, "address", &buf) == null);
+}
+
+test "getOptionalStringField treats an empty string as absent" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"a":"x","empty":"","n":1}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("x", getOptionalStringField(parsed.value, "a").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), getOptionalStringField(parsed.value, "empty"));
+    try std.testing.expectEqual(@as(?[]const u8, null), getOptionalStringField(parsed.value, "missing"));
+    try std.testing.expectEqual(@as(?[]const u8, null), getOptionalStringField(parsed.value, "n"));
 }

@@ -138,7 +138,7 @@ pub fn parse(backing: Allocator, text_in: []const u8, default_port: u16, diag: *
         } else if (std.mem.eql(u8, name, key.auth_token)) {
             const tok = try getString(v, key.auth_token, MAX_TOKEN_LEN, diag);
             if (tok.len > 0 and !isValidToken(tok))
-                return invalid(diag, key.auth_token, "must be 1-64 printable ASCII characters without spaces, quotes or backslashes");
+                return invalid(diag, key.auth_token, "must be 1-64 characters without control characters or leading/trailing spaces");
             cfg.auth_token = tok;
         } else if (std.mem.eql(u8, name, key.allow_external)) {
             cfg.allow_external = try getBool(v, key.allow_external, diag);
@@ -246,12 +246,34 @@ fn writeField(w: anytype, name: []const u8, value: []const u8) !void {
     try w.writeAll(",\n");
 }
 
-/// True when `token` is acceptable as AuthToken: 1..64 printable ASCII
-/// characters excluding space, double quote and backslash.
+/// True when `token` is acceptable as AuthToken: 1..64 bytes, no control
+/// characters, and no leading or trailing space (the server trims those
+/// from the Authorization header, so such a token could never match).
+/// Inner spaces, quotes, backslashes and non-ASCII text are accepted for
+/// compatibility with v1.9, which took any 1-64 character token; the
+/// server logs a warning for them (see netpolicy.planStartup).
 pub fn isValidToken(token: []const u8) bool {
     if (token.len == 0 or token.len > MAX_TOKEN_LEN) return false;
     for (token) |c| {
-        if (c < 0x21 or c > 0x7E or c == '"' or c == '\\') return false;
+        if (c < 0x20 or c == 0x7F) return false;
+    }
+    return token[0] != ' ' and token[token.len - 1] != ' ';
+}
+
+/// Length of a token made by generateToken (128 bits as hex).
+pub const GENERATED_TOKEN_LEN = 32;
+
+/// Fills `out` with a hex token built from 16 bytes of `fill`, which must
+/// return false when the random source failed. Returns false (and leaves
+/// `out` unspecified) in that case, so a token is never derived from
+/// uninitialised memory.
+pub fn generateToken(fill: *const fn ([]u8) bool, out: *[GENERATED_TOKEN_LEN]u8) bool {
+    var raw: [GENERATED_TOKEN_LEN / 2]u8 = undefined;
+    if (!fill(&raw)) return false;
+    const hex = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0x0f];
     }
     return true;
 }
@@ -353,7 +375,11 @@ test "rejects wrong types and out-of-range values, naming the key" {
     try expectInvalid("{\"AllowExternal\":\"yes\"}", "AllowExternal");
     try expectInvalid("{\"IpAddress\":127}", "IpAddress");
     try expectInvalid("{\"IpAddress\":\"" ++ "1" ** 64 ++ "\"}", "IpAddress");
-    try expectInvalid("{\"AuthToken\":\"has space\"}", "AuthToken");
+    // Leading/trailing blanks are trimmed from the Authorization header, so
+    // such a token could never authenticate.
+    try expectInvalid("{\"AuthToken\":\" lead\"}", "AuthToken");
+    try expectInvalid("{\"AuthToken\":\"trail \"}", "AuthToken");
+    try expectInvalid("{\"AuthToken\":\"tab\\there\"}", "AuthToken");
     try expectInvalid("{\"AuthToken\":\"" ++ "a" ** 65 ++ "\"}", "AuthToken");
     try expectInvalid("{\"AllowedClients\":\"10.0.0.0/8\"}", "AllowedClients");
     try expectInvalid("{\"AllowedClients\":[1]}", "AllowedClients");
@@ -476,13 +502,63 @@ test "serialize has no fixed-size limit" {
     try testing.expectEqualStrings(o.config.artifact_dir, again.config.artifact_dir);
 }
 
-test "isValidToken" {
+test "isValidToken accepts every token that can authenticate" {
     try testing.expect(isValidToken("abc"));
     try testing.expect(isValidToken("A-Z_0.9~!"));
+    // v1.9 accepted any 1-64 character token; these still authenticate
+    // (bearerToken only trims the ends) and must keep loading.
+    try testing.expect(isValidToken("a b"));
+    try testing.expect(isValidToken("a\"b"));
+    try testing.expect(isValidToken("a\\b"));
+    try testing.expect(isValidToken("caf\xc3\xa9"));
+    try testing.expect(isValidToken("a" ** 64));
     try testing.expect(!isValidToken(""));
-    try testing.expect(!isValidToken("a b"));
-    try testing.expect(!isValidToken("a\"b"));
+    try testing.expect(!isValidToken(" ab"));
+    try testing.expect(!isValidToken("ab "));
+    try testing.expect(!isValidToken("ab\t"));
     try testing.expect(!isValidToken("tab\there"));
-    try testing.expect(!isValidToken("caf\xc3\xa9"));
+    try testing.expect(!isValidToken("del\x7f"));
     try testing.expect(!isValidToken("a" ** 65));
+}
+
+test "a hand-edited v1.9 token with a space or non-ASCII text still loads" {
+    var o = try parseOk("{\"IpAddress\":\"127.0.0.1\",\"Port\":9094,\"AutoStart\":true,\"AuthToken\":\"my secret token\"}");
+    defer o.deinit();
+    try testing.expectEqualStrings("my secret token", o.config.auth_token);
+    var u = try parseOk("{\"AuthToken\":\"caf\xc3\xa9-token\"}");
+    defer u.deinit();
+    try testing.expectEqualStrings("caf\xc3\xa9-token", u.config.auth_token);
+}
+
+test "every token the dialog can save parses back" {
+    const tokens = [_][]const u8{ "0123456789abcdef0123456789abcdef", "a b", "q\"uote", "back\\slash", "caf\xc3\xa9", "~" ** 64 };
+    for (tokens) |tok| {
+        try testing.expect(isValidToken(tok));
+        var o = initDefault(testing.allocator, 9094);
+        defer o.deinit();
+        o.config.auth_token = try o.dupe(tok);
+        const text = try serialize(testing.allocator, &o.config);
+        defer testing.allocator.free(text);
+        var again = try parseOk(text);
+        defer again.deinit();
+        try testing.expectEqualStrings(tok, again.config.auth_token);
+    }
+}
+
+fn fillFails(_: []u8) bool {
+    return false;
+}
+
+fn fillCounting(buf: []u8) bool {
+    for (buf, 0..) |*b, i| b.* = @intCast(i * 17 % 256);
+    return true;
+}
+
+test "generateToken never derives a token from a failed random source" {
+    var tok: [GENERATED_TOKEN_LEN]u8 = [_]u8{'?'} ** GENERATED_TOKEN_LEN;
+    try testing.expect(!generateToken(fillFails, &tok));
+    try testing.expect(generateToken(fillCounting, &tok));
+    try testing.expectEqualStrings("00112233445566778899aabbccddeeff", &tok);
+    try testing.expect(isValidToken(&tok));
+    try testing.expect(tok.len >= netpolicy.MIN_EXTERNAL_TOKEN_LEN);
 }

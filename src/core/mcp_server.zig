@@ -4,17 +4,21 @@
 //   - start()/stop() are called from the x64dbg GUI thread, the config
 //     dialog thread or a plugin command; `lifecycle_lock` serialises them.
 //   - One accept thread (serverLoop) admits connections. The peer address is
-//     checked against the allowlist and the auth lockout table, and the
-//     MaxClients cap is enforced, BEFORE a per-connection thread is created.
+//     checked against the allowlist and the MaxClients cap is enforced
+//     BEFORE a per-connection thread is created (netpolicy.admit).
 //   - Each connection thread reads one request (5 s header / 10 s total
-//     budget, see netpolicy.recvTimeoutMs), authenticates it, dispatches it
+//     budget, see netpolicy.recvTimeoutMs), routes it (http.route: auth
+//     lockout -> 429, bad token -> 401, then method and path), dispatches it
 //     and closes the socket. SSE connections keep their thread and only
-//     write frames that were queued in `sse_hub`.
+//     write frames that were queued in `sse_hub`. Loopback peers are never
+//     locked out (see netpolicy.AuthLimiter).
 //   - notifyEvent() runs on the x64dbg callback thread. It only touches the
 //     locked pending-event ring and enqueues SSE frames; it never writes to a
 //     socket, so a stalled SSE client cannot block the debugger.
 //   - State-changing tool handlers are serialised by `tool_lock`
-//     (see mcp/toolpolicy.zig for the exemptions).
+//     (see mcp/toolpolicy.zig for the exemptions). Long waits inside a
+//     locked handler poll requestAbandoned() so a client that disconnected
+//     does not keep the lock for the rest of the wait.
 //   - `settings` is written by applyConfig() under `settings_lock` and read
 //     by connection threads under the shared lock.
 
@@ -300,6 +304,8 @@ pub fn start() void {
             logMsg("WARNING: AuthToken is shorter than {d} characters. Generate a new one in the configuration dialog.", .{netpolicy.MIN_EXTERNAL_TOKEN_LEN});
         if (plan.warn_allow_all)
             logMsg("WARNING: AllowedClients contains 0.0.0.0/0 - any IPv4 address may connect.", .{});
+        if (plan.warn_unusual_token)
+            logMsg("WARNING: AuthToken contains spaces or non-ASCII characters; some MCP clients cannot send it. Generate a new one in the configuration dialog.", .{});
         sse_enabled.store(settings.enable_sse, .release);
         ip_len = settings.ip_len;
         @memcpy(ip_buf[0..ip_len], settings.ip_buf[0..ip_len]);
@@ -405,7 +411,9 @@ fn serverLoop() void {
     // With SO_EXCLUSIVEADDRUSE the port stays busy while connections of a
     // previous server instance are still open (e.g. a long `run` call that
     // started before a configuration change) or, per the Winsock docs, in
-    // TIME_WAIT. Keep retrying until the port is free or stop() is called.
+    // TIME_WAIT. Retry while that can be the reason and give up otherwise
+    // (another process owns the port), see netpolicy.BindRetry.
+    var retry = netpolicy.BindRetry.init(GetTickCount64());
     var last_retry_log: u64 = 0;
     while (ws2.bind(sock, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) != 0) {
         const err = ws2.WSAGetLastError();
@@ -417,8 +425,13 @@ fn serverLoop() void {
             return;
         }
         const now = GetTickCount64();
+        if (!retry.shouldRetry(now, client_slots.count())) {
+            running.store(false, .release);
+            logMsg("Port {d} is still in use after {d} s (another process, e.g. a second x64dbg, owns it). Server stopped; start it again from the plugin menu (or with the StartMCPServer command) once the port is free.", .{ port, (now -| retry.start_ms) / 1000 });
+            return;
+        }
         if (last_retry_log == 0 or now -| last_retry_log >= BIND_RETRY_LOG_MS) {
-            logMsg("Port {d} is in use (another process, or connections of the previous server instance are still open); retrying every {d} s until it is free.", .{ port, BIND_RETRY_INTERVAL_MS / 1000 });
+            logMsg("Port {d} is in use (another process, or connections of the previous server instance are still open); retrying every {d} s.", .{ port, BIND_RETRY_INTERVAL_MS / 1000 });
             last_retry_log = now;
         }
         Sleep(BIND_RETRY_INTERVAL_MS);
@@ -478,7 +491,9 @@ fn gracefulClose(sock: SOCKET) void {
     _ = ws2.closesocket(sock);
 }
 
-/// Decides on a freshly accepted connection before any thread is spent on it.
+/// Decides on a freshly accepted connection before any thread is spent on it
+/// (netpolicy.admit: allowlist, then MaxClients). Locked-out peers are
+/// admitted and answered with 429 by handleClient.
 fn admit(client: SOCKET, peer: *const ws2.sockaddr.in, peer_len: i32) void {
     if (peer_len < @sizeOf(ws2.sockaddr.in) or peer.family != ws2.AF.INET) {
         abortiveClose(client);
@@ -486,27 +501,24 @@ fn admit(client: SOCKET, peer: *const ws2.sockaddr.in, peer_len: i32) void {
     }
     const ip = netpolicy.fromNetworkU32(peer.addr);
 
-    var permitted = false;
-    var max_clients: u32 = 0;
-    {
+    const decision: netpolicy.Admission = blk: {
         settings_lock.lockShared();
         defer settings_lock.unlockShared();
-        if (settings.plan) |*plan| permitted = plan.allowlist.permits(ip);
-        max_clients = settings.max_clients;
-    }
-    if (!permitted) {
-        logDenied(ip, "not in AllowedClients");
-        abortiveClose(client);
-        return;
-    }
-    if (isLockedOut(ip)) {
-        abortiveClose(client);
-        return;
-    }
-    if (!client_slots.tryAcquire(max_clients)) {
-        logDenied(ip, "MaxClients reached");
-        abortiveClose(client);
-        return;
+        const plan = if (settings.plan) |*p| p else break :blk .not_allowed;
+        break :blk netpolicy.admit(&plan.allowlist, ip, &client_slots, settings.max_clients);
+    };
+    switch (decision) {
+        .accept => {},
+        .not_allowed => {
+            logDenied(ip, "not in AllowedClients");
+            abortiveClose(client);
+            return;
+        },
+        .at_capacity => {
+            logDenied(ip, "MaxClients reached");
+            abortiveClose(client);
+            return;
+        },
     }
     const h = CreateThread(null, CLIENT_STACK_RESERVE, clientThreadProc, @ptrCast(client), STACK_SIZE_PARAM_IS_A_RESERVATION, null);
     if (h == null) {
@@ -610,6 +622,31 @@ fn readRequest(sock: SOCKET, buf: []u8) ReadResult {
     }
 }
 
+/// Connection whose request this thread is currently serving.
+threadlocal var request_sock: ?SOCKET = null;
+
+/// True when the client of the request served on the calling thread has
+/// closed or reset its connection. Long waits in tool handlers (run,
+/// ExecuteDebuggerCommand) poll this so a client that gave up does not keep
+/// the mutating-tool lock for the rest of the wait. Never blocks; always
+/// false on threads that are not serving a request.
+pub fn requestAbandoned() bool {
+    const sock = request_sock orelse return false;
+    var fds: ws2.fd_set = .{ .fd_count = 1, .fd_array = undefined };
+    fds.fd_array[0] = sock;
+    const tv: ws2.timeval = .{ .sec = 0, .usec = 0 };
+    if (ws2.select(0, &fds, null, null, &tv) != 1) return false;
+    var b: [1]u8 = undefined;
+    const n = ws2.recv(sock, &b, 1, ws2.MSG.PEEK);
+    // Extra bytes (a pipelined request) are not abandonment.
+    if (n > 0) return false;
+    if (n == 0) return true; // orderly close
+    return switch (ws2.WSAGetLastError()) {
+        .WSAECONNRESET, .WSAECONNABORTED, .WSAENETRESET, .WSAESHUTDOWN => true,
+        else => false,
+    };
+}
+
 fn handleClient(sock: SOCKET) void {
     const peer_ip = peerAddress(sock) orelse return;
     setSockTimeout(sock, ws2.SO.SNDTIMEO, SEND_TIMEOUT_MS);
@@ -625,40 +662,38 @@ fn handleClient(sock: SOCKET) void {
     const body = req_buf[req.header_end + 4 ..][0..req.body_len];
     const rl = http.parseRequestLine(head) orelse return sendStatus(sock, "400 Bad Request");
 
-    // Authenticate every method (including OPTIONS) before doing anything.
-    if (isLockedOut(peer_ip)) {
-        return sendJsonStatus(sock, "429 Too Many Requests", "", "{\"error\":\"Too many failed authentication attempts\"}");
+    const locked = isLockedOut(peer_ip);
+    const r = http.route(.{
+        .method = rl.method,
+        .path = rl.path,
+        .authorized = !locked and authorized(head),
+        .locked_out = locked,
+        .sse_enabled = sse_enabled.load(.acquire),
+    });
+    switch (r) {
+        .locked_out => return sendJsonStatus(sock, "429 Too Many Requests", "", "{\"error\":\"Too many failed authentication attempts\"}"),
+        .unauthorized => {
+            recordAuthFailure(peer_ip);
+            return sendJsonStatus(sock, "401 Unauthorized", "WWW-Authenticate: Bearer\r\n", "{\"error\":\"Unauthorized\"}");
+        },
+        else => recordAuthSuccess(peer_ip),
     }
-    if (!authorized(head)) {
-        recordAuthFailure(peer_ip);
-        return sendJsonStatus(sock, "401 Unauthorized", "WWW-Authenticate: Bearer\r\n", "{\"error\":\"Unauthorized\"}");
-    }
-    recordAuthSuccess(peer_ip);
 
-    const path = rl.path;
-    const route = http.pathOnly(path);
-    const is_get = std.mem.eql(u8, rl.method, "GET");
-    const is_post = std.mem.eql(u8, rl.method, "POST");
-    if (!is_get and !is_post) {
+    request_sock = sock;
+    defer request_sock = null;
+    switch (r) {
+        .locked_out, .unauthorized => unreachable, // answered above
         // Includes OPTIONS: MCP clients are not browsers, so no CORS.
-        return sendAll(sock, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        .method_not_allowed => sendAll(sock, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {},
+        .not_found => sendStatus(sock, "404 Not Found"),
+        .server_info => sendServerInfo(sock),
+        .sse_connect => handleSseConnect(sock),
+        .sse_message => {
+            const session_id = http.queryParam(rl.path, "sessionId") orelse http.headerValue(head, "Mcp-Session-Id");
+            handleSseMessage(sock, body, session_id);
+        },
+        .json_rpc => handleJsonRpc(sock, body),
     }
-    if (std.mem.indexOf(u8, path, ".well-known") != null) return sendStatus(sock, "404 Not Found");
-
-    if (is_get) {
-        if (std.mem.eql(u8, route, "/sse")) {
-            if (!sse_enabled.load(.acquire)) return sendStatus(sock, "404 Not Found");
-            return handleSseConnect(sock);
-        }
-        return sendServerInfo(sock);
-    }
-
-    if (std.mem.eql(u8, route, "/messages")) {
-        if (!sse_enabled.load(.acquire)) return sendStatus(sock, "404 Not Found");
-        const session_id = http.queryParam(path, "sessionId") orelse http.headerValue(head, "Mcp-Session-Id");
-        return handleSseMessage(sock, body, session_id);
-    }
-    handleJsonRpc(sock, body);
 }
 
 fn handleJsonRpc(sock: SOCKET, body: []const u8) void {
@@ -885,7 +920,7 @@ fn buildToolsListResult(w: *JsonWriter) void {
     w.endObject();
 }
 
-const BUSY_TEXT = "BUSY: another state-changing tool is still running (for example run, ExecuteDebuggerCommand or LoadBinary). It was not executed. Call PauseDebug or WaitForPause, then retry.";
+const BUSY_TEXT = "BUSY: another state-changing tool is still running (for example run, ExecuteDebuggerCommand or LoadBinary; a blocking run holds it until the target pauses or its timeoutMs expires). This call was not executed. Call PauseDebug or WaitForPause, then retry.";
 
 fn buildToolsCallResult(w: *JsonWriter, root: std.json.Value) void {
     const params_obj = json_mod.getObjectField(root, "params");

@@ -62,6 +62,12 @@ pub fn initDebugSeq() u32 {
 
 const HWND = ?*anyopaque;
 extern "user32" fn MessageBoxA(hWnd: HWND, lpText: [*:0]const u8, lpCaption: [*:0]const u8, uType: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+/// Clock for launch_state (milliseconds, monotonic).
+pub fn tickMs() u64 {
+    return GetTickCount64();
+}
 
 // ── Plugin exports ──────────────────────────────────────────────────
 
@@ -360,7 +366,7 @@ fn logAndPush(msg: []const u8) void {
 fn cbInitDebug(_: bridge.CBTYPE, info: *anyopaque) callconv(.c) void {
     const cb: *bridge.PLUG_CB_INITDEBUG = @ptrCast(@alignCast(info));
     const path = std.mem.span(cb.szFileName);
-    launch_state.onInitDebug(path);
+    launch_state.onInitDebug(path, GetTickCount64());
     _ = init_debug_seq.fetchAdd(1, .acq_rel);
 
     logAndPush("[x64dbg-MCP Server] Debug session started.\x00");

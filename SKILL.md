@@ -136,7 +136,7 @@ WaitForEvent (timeoutMs: 120000)  — keep watching
 
 Every tool response includes a `[state]` line showing current debugger status and any `[event:*]` lines with queued events. You always know where you are.
 
-State-changing tools run one at a time. If one is still running (typically a blocking `run`), another state-changing call waits up to 10 s and then returns `BUSY` **without executing**. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked — use `PauseDebug` to interrupt a long `run`.
+State-changing tools run one at a time (new in v1.10). If one is still running (typically a blocking `run`, which holds the lock until the target pauses, its `timeoutMs` expires or its client disconnects), another state-changing call — even `SetBreakpoint` — waits up to 10 s and then returns `BUSY` **without executing**. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked — use `PauseDebug` to interrupt a long `run`.
 
 ### State & Control (always available)
 | Tool | Parameters | Description |
@@ -150,7 +150,7 @@ State-changing tools run one at a time. If one is still running (typically a blo
 | `PauseDebug` | — | Pause the target (F12) |
 | `WaitForPause` | `timeoutMs?` (default 30000, max 120000) | Block until target pauses (breakpoint/exception) |
 | `StopDebug` | — | Terminate debug session |
-| `RestartDebug` | — | Restart debug session (reuses LoadBinary's arguments / working directory) |
+| `RestartDebug` | — | Restart debug session (reuses LoadBinary's arguments / working directory, also when the load finished after LoadBinary timed out) |
 | `ExecuteDebuggerCommand` | `command` | Run any x64dbg command string. Blocks if target becomes RUNNING |
 | `EvalExpression` | `expression` | Evaluate expression (address, register, symbol, arithmetic) |
 | `Echo` | `message` | Echo input back (connectivity test) |
@@ -242,7 +242,7 @@ State-changing tools run one at a time. If one is still running (typically a blo
 | `DumpModule` | `module`, `filePath` | Dump entire module to file (relative path → artifact_dir) |
 | `GetPEB` | — | Read Process Environment Block fields |
 | `GetSEHChain` | — | Walk Structured Exception Handler chain (x32) |
-| `SaveDatabase` | `filePath?` | Save the x64dbg database (.dd64/.dd32); with `filePath`, to that file (relative → artifact_dir) |
+| `SaveDatabase` | `filePath?` | Save the x64dbg database (.dd64/.dd32); with `filePath`, to that file (relative → artifact_dir); omitted or `""` = default location |
 
 ### Bookmarks & Comments (requires debug session)
 | Tool | Parameters | Description |
