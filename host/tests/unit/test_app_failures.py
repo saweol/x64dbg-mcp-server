@@ -7,7 +7,6 @@ import threading
 import time
 
 import pytest
-from x64dbg_vm_gateway.wiring import PROVISION_HINT
 
 from tests.fakes.fake_runtime import GUEST_ROOT, make_lab
 from x64dbg_vm_gateway.contracts import IsolationReport, JobState
@@ -19,7 +18,7 @@ from x64dbg_vm_gateway.errors import (
     PathNotAllowed,
     StateViolation,
 )
-from x64dbg_vm_gateway.jobs import JobStore
+from x64dbg_vm_gateway.wiring import PROVISION_HINT
 
 
 @pytest.fixture
@@ -30,8 +29,8 @@ def lab(tmp_path):
 
 
 def jobs(lab):
-    with JobStore(lab.config.jobs_root) as store:
-        return store.list()
+    """Jobs as the (latest) gateway sees them; a second JobStore could not open the locked root."""
+    return lab.gateways[-1].list_jobs()
 
 
 def wait_until(pred, timeout_s: float = 10.0) -> None:
@@ -111,7 +110,8 @@ def test_corrupt_guest_token_config_fails_the_job_with_a_provision_hint(lab):
     job_id = err.details["job_id"]
     assert [s["name"] for s in err.details["steps"]][-1] == "debugger"
     (job,) = jobs(lab)
-    assert job.id == job_id and job.state == JobState.FAILED and job.error["code"] == "BACKEND_AUTH"
+    assert job["job_id"] == job_id and job["state"] == JobState.FAILED
+    assert job["error"]["code"] == "BACKEND_AUTH"
     # the profile is free again
     assert gw.session_status()["job"] is None
 
@@ -152,6 +152,7 @@ def test_slow_start_returns_in_progress_and_is_idempotent(lab):
         op = status["operation"]
         assert op["op_id"] == first["op_id"] and op["state"] == "running" and op["stage"] == "upload"
         assert op["job_id"] and status["job"]["state"] == JobState.UPLOADING
+        job_id = op["job_id"]
         # another sample, or a VM operation, must wait
         with pytest.raises(StateViolation) as ei:
             gw.analysis_start(str(lab.sample("other.exe")), wait_s=0.05)
@@ -164,7 +165,7 @@ def test_slow_start_returns_in_progress_and_is_idempotent(lab):
     assert gw.session_status()["operation"]["state"] == "done"
     # the repeated call now gets the final result of the same run
     final = gw.analysis_start(sample, wait_s=5)
-    assert final["state"] == JobState.ANALYZING and final["job_id"] == first["job_id"]
+    assert final["state"] == JobState.ANALYZING and final["job_id"] == job_id
     assert len(jobs(lab)) == 1
 
 
@@ -182,8 +183,8 @@ def test_upload_integrity_failure_marks_the_job_failed(lab):
     with pytest.raises(IntegrityError) as ei:
         gw.analysis_start(str(lab.sample()))
     (job,) = jobs(lab)
-    assert job.state == JobState.FAILED and job.error["code"] == "INTEGRITY_MISMATCH"
-    assert ei.value.details["job_id"] == job.id
+    assert job["state"] == JobState.FAILED and job["error"]["code"] == "INTEGRITY_MISMATCH"
+    assert ei.value.details["job_id"] == job["job_id"]
     # a new job may start right away
     assert gw.analysis_start(str(lab.sample("again.exe")))["state"] == JobState.ANALYZING
 
