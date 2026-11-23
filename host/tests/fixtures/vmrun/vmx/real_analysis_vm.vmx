@@ -2,8 +2,10 @@
 config.version = "8"
 displayName = "analysis_vm"
 # Isolation-relevant keys copied verbatim from the real analysis_vm.vmx on
-# 2026-11-23 (grep of sharedFolder*, isolation.tools.hgfs*, ethernet0.*,
-# checkpoint.vmState*). Note: ethernet0.connectionType is absent (= bridged).
+# 2026-11-23 ~19:01 KST (grep of sharedFolder*, isolation.tools.hgfs*,
+# ethernet0.*, checkpoint.vmState*). Note: ethernet0.connectionType is absent
+# (= bridged). The live file was changed later that day (19:21) to
+# isolation.tools.hgfs.disable = "TRUE"; this fixture keeps the earlier state.
 ethernet0.present = "TRUE"
 checkpoint.vmState = ""
 checkpoint.vmState.readOnly = "FALSE"

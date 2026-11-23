@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from x64dbg_vm_gateway.vmrun import NullProvider, VmrunCli, VmrunProvider
 
 from tests.fakes.fake_vm import FakeClock
 from tests.fakes.fake_vmrun import FakeVmrunRunner
@@ -41,6 +40,7 @@ from x64dbg_vm_gateway.errors import (
     VmrunError,
     VmrunTimeout,
 )
+from x64dbg_vm_gateway.vmrun import NullProvider, VmrunCli, VmrunProvider
 
 FIX = Path(__file__).resolve().parent.parent / "fixtures" / "vmrun"
 RAW = FIX / "raw"
@@ -256,6 +256,16 @@ def test_real_captured_errors_are_generic_vmrun_errors(name):
         make_cli(FakePopen(Script(out, err, rc))).run("x")
     assert type(ei.value) is VmrunError
     assert ei.value.details["stdout"] == out.decode().strip()
+
+
+def test_words_inside_the_vmx_path_do_not_steer_classification():
+    # control: the same text with a neutral path is a generic error; a path containing
+    # "snapshot not found"/"not powered on" must not turn it into a specific class.
+    for vmx in ("/vm/x.vmx", "/vm/snapshot not found/not powered on/x.vmx"):
+        text = f"Error: Cannot open VM: {vmx}, The virtual machine cannot be found\n".encode()
+        with pytest.raises(VmrunError) as ei:
+            make_cli(FakePopen(Script(text, rc=255)), vmx=vmx).run("revertToSnapshot", "s")
+        assert type(ei.value) is VmrunError, vmx
 
 
 def test_error_line_with_zero_exit_code_is_still_an_error():
@@ -681,6 +691,7 @@ def test_real_vmrun_read_only_roundtrip():
     assert isinstance(prov.tools_state(), ToolsState)
     ip = prov.guest_ip()
     assert ip is None or ip.count(".") == 3
+    assert isinstance(prov.isolation_report(), IsolationReport)  # reads the vmx file only
 
     bad = VmrunCli(path, "/nonexistent/x.vmx", "ws", None)
     with pytest.raises(VmrunError) as ei:

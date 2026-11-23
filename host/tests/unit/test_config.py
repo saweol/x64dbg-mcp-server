@@ -189,7 +189,7 @@ def test_invalid_toml_raises_config_error(tmp_path):
     ],
 )
 def test_default_config_path_per_os(system, environ, expected):
-    assert str(default_config_path(system=system, environ=environ)) == expected
+    assert default_config_path(system=system, environ=environ) == Path(expected)
 
 
 # ── validation: each rule names the offending dotted key ────────────
