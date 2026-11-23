@@ -1,0 +1,64 @@
+{
+  "_about": "vmrun error texts and the error code VmrunCli must map them to. source: 'captured' = printed by vmrun 1.17.0 on this host (see captures.json); 'task' = quoted in the feature spec as real output; 'vix-unverified' = VIX/VMware wording known from documentation/forums that could NOT be captured safely (it needs a real VM state change) - treat these as best-effort until Phase 0 captures them.",
+  "cases": [
+    {"source": "captured", "command": "checkToolsState", "guest": false, "stream": "stdout",
+     "text": "Error: Cannot open VM: /nonexistent/x.vmx, The virtual machine cannot be found", "code": "VMRUN_ERROR"},
+    {"source": "captured", "command": "revertToSnapshot", "guest": false, "stream": "stdout",
+     "text": "Error: Cannot open VM: /nonexistent/x.vmx, The virtual machine cannot be found", "code": "VMRUN_ERROR"},
+    {"source": "captured", "command": "listProcessesInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: Cannot open VM: /nonexistent/x.vmx, The virtual machine cannot be found", "code": "VMRUN_ERROR"},
+    {"source": "captured", "command": "noSuchCommand", "guest": false, "stream": "stdout",
+     "text": "Error: Unrecognized command: noSuchCommand", "code": "VMRUN_ERROR"},
+    {"source": "task", "command": "start", "guest": false, "stream": "stdout",
+     "text": "Error: The virtual machine should not be powered on. It is already running.", "code": "VMRUN_ERROR"},
+
+    {"source": "vix-unverified", "command": "listProcessesInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: The virtual machine is not powered on: /vm/x.vmx", "code": "VM_NOT_RUNNING"},
+    {"source": "vix-unverified", "command": "stop", "guest": false, "stream": "stdout",
+     "text": "Error: The virtual machine needs to be powered on", "code": "VM_NOT_RUNNING"},
+    {"source": "vix-unverified", "command": "suspend", "guest": false, "stream": "stderr",
+     "text": "Error: The virtual machine is not running", "code": "VM_NOT_RUNNING"},
+
+    {"source": "vix-unverified", "command": "copyFileFromHostToGuest", "guest": true, "stream": "stdout",
+     "text": "Error: The VMware Tools are not running in the virtual machine: /vm/x.vmx", "code": "TOOLS_NOT_RUNNING"},
+    {"source": "vix-unverified", "command": "runProgramInGuest", "guest": true, "stream": "stderr",
+     "text": "Error: VMware Tools are not running in the guest", "code": "TOOLS_NOT_RUNNING"},
+
+    {"source": "vix-unverified", "command": "listProcessesInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: Invalid user name or password for the guest OS", "code": "GUEST_AUTH"},
+    {"source": "vix-unverified", "command": "listProcessesInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: Authentication failure or insufficient permissions in guest operating system", "code": "GUEST_AUTH"},
+    {"source": "vix-unverified", "command": "runProgramInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: The user name or password is incorrect", "code": "GUEST_AUTH"},
+    {"source": "vix-unverified", "command": "captureScreen", "guest": true, "stream": "stdout",
+     "text": "Error: Guest login failure", "code": "GUEST_AUTH"},
+
+    {"source": "vix-unverified", "command": "revertToSnapshot", "guest": false, "stream": "stdout",
+     "text": "Error: A snapshot with the name does not exist", "code": "SNAPSHOT_NOT_FOUND"},
+    {"source": "vix-unverified", "command": "deleteSnapshot", "guest": false, "stream": "stdout",
+     "text": "Error: Snapshot not found: gw-job-1", "code": "SNAPSHOT_NOT_FOUND"},
+
+    {"source": "vix-unverified", "command": "start", "guest": false, "stream": "stdout",
+     "text": "Error: Failed to lock the file", "code": "VM_LOCKED"},
+    {"source": "vix-unverified", "command": "revertToSnapshot", "guest": false, "stream": "stdout",
+     "text": "Error: Cannot open VM: /vm/x.vmx, The file is locked", "code": "VM_LOCKED"},
+    {"source": "vix-unverified", "command": "snapshot", "guest": false, "stream": "stdout",
+     "text": "Error: This virtual machine appears to be in use.", "code": "VM_LOCKED"},
+    {"source": "vix-unverified", "command": "snapshot", "guest": false, "stream": "stdout",
+     "text": "Error: Another operation is already in progress", "code": "VM_LOCKED"},
+
+    {"source": "vix-unverified", "command": "copyFileFromGuestToHost", "guest": true, "stream": "stdout",
+     "text": "Error: A file was not found", "code": "GUEST_OP_FAILED"},
+    {"source": "vix-unverified", "command": "killProcessInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: No such process", "code": "GUEST_OP_FAILED"},
+    {"source": "vix-unverified", "command": "createDirectoryInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: The directory already exists", "code": "GUEST_OP_FAILED"},
+    {"source": "vix-unverified", "command": "runScriptInGuest", "guest": true, "stream": "stdout",
+     "text": "Error: Insufficient permissions in the guest operating system", "code": "GUEST_OP_FAILED"},
+
+    {"source": "vix-unverified", "command": "start", "guest": false, "stream": "stdout",
+     "text": "Error: A file was not found", "code": "VMRUN_ERROR"},
+    {"source": "vix-unverified", "command": "start", "guest": false, "stream": "stdout",
+     "text": "Error: Insufficient permissions in the host operating system", "code": "VMRUN_ERROR"}
+  ]
+}

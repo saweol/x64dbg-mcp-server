@@ -1,0 +1,18 @@
+.encoding = "UTF-8"
+config.version = "8"
+displayName = "analysis_vm"
+# Isolation-relevant keys copied verbatim from the real analysis_vm.vmx on
+# 2026-11-23 (grep of sharedFolder*, isolation.tools.hgfs*, ethernet0.*,
+# checkpoint.vmState*). Note: ethernet0.connectionType is absent (= bridged).
+ethernet0.present = "TRUE"
+checkpoint.vmState = ""
+checkpoint.vmState.readOnly = "FALSE"
+isolation.tools.hgfs.disable = "FALSE"
+sharedFolder0.present = "TRUE"
+sharedFolder0.enabled = "TRUE"
+sharedFolder0.readAccess = "TRUE"
+sharedFolder0.writeAccess = "TRUE"
+sharedFolder0.hostPath = "/srv/vm-share"
+sharedFolder0.guestName = "shared"
+sharedFolder0.expiration = "never"
+sharedFolder.maxNum = "1"

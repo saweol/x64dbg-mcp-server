@@ -1,0 +1,22 @@
+.encoding = "UTF-8"
+# Synthetic: mixed key case, a disabled share, a read-only share, several NICs.
+
+SharedFolder0.Present = "true"
+SHAREDFOLDER0.ENABLED = "FALSE"
+sharedFolder0.writeAccess = "TRUE"
+sharedfolder1.present = "TRUE"
+sharedFolder1.enabled = "TRUE"
+sharedFolder1.writeAccess = "FALSE"
+
+Ethernet0.Present = "TRUE"
+ethernet0.connectionType = "NAT"
+ethernet0.startConnected = "FALSE"
+ethernet1.present = "TRUE"
+ethernet1.connectionType = "custom"
+ethernet1.vnet = "vmnet2"
+ethernet2.present = "FALSE"
+ethernet2.connectionType = "bridged"
+ethernet3.present = "TRUE"
+ethernet3.connectionType = "hostonly"
+not a key value line
+checkpoint.vmState = "mixed-0001.vmss"
