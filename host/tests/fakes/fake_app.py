@@ -252,6 +252,10 @@ class FakeApp:
         return self._record("discard_job", {"job_id": job_id, "state": "DISCARDED"}, job_id=job_id,
                             actor=actor)
 
+    def warm_up(self, timeout_s: float | None = None) -> JSON:
+        """No-op (not recorded): nothing to learn in memory (``mcp_server.WarmUpApp``)."""
+        return {"profile": None, "backends": {}}
+
     def close(self) -> None:
         with self._lock:
             self.calls.append(("close", {}))

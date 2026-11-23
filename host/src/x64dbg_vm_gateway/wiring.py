@@ -16,8 +16,21 @@ Backend endpoints are resolved lazily. Until :meth:`Runtime.connect` resolved
 a backend (guest IP + token), its entry in ``Runtime.clients`` is an
 :class:`UnresolvedClient` placeholder, so the supervisor and the proxy (which
 share that dict) always find every configured backend id. The placeholder
-reports itself unhealthy and refuses calls with ``VmNotReady``; callers must
-``connect`` before asking the supervisor to recover a backend.
+refuses calls with ``VmNotReady`` and is marked ``unresolved``: the supervisor
+resolves clients itself through ``Runtime.connect`` (its ``resolve`` hook, bounded
+by the supervisor caller's remaining budget, at most ``SUPERVISOR_RESOLVE_TIMEOUT_S``)
+and never probes a placeholder.
+
+Token reads after a revert: ``connect(timeout_s=...)`` re-reads the guest token
+while VMware Tools are not running (guest operations fail with ToolsNotRunning
+for a while after a revert, even when ``checkToolsState`` already says running),
+every ``TOKEN_RETRY_POLL_S``, until ``timeout_s``. Without ``timeout_s`` (status
+polling, mirrored calls) and with ``wait=False`` it reads once.
+
+VM observations: ``Runtime.vm_state`` (:class:`VmStateCache`) answers power and
+Tools queries for status polling from observations younger than
+``VM_STATE_TTL_S``; every write hold of ``Runtime.lock`` (any VM operation) drops
+them. VM operations use ``Runtime.vm``, which always asks the VM.
 
 Thread-safety: ``Runtime`` guards its caches (guest IP, tokens, resolved
 clients) with one re-entrant lock that is held only for in-memory work, never
@@ -39,7 +52,8 @@ import re
 import stat
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,10 +68,12 @@ from .contracts import (
     Clock,
     GuestChannel,
     GuestCredentials,
+    PowerState,
     Secret,
     SystemClock,
     ToolCallResult,
     ToolInfo,
+    ToolsState,
     VersionReportingClient,
     VmProvider,
     VmrunRunner,
@@ -69,6 +85,7 @@ from .errors import (
     CancelledByVmOp,
     ConfigError,
     GuestOperationError,
+    ToolsNotRunning,
     VmNotReady,
 )
 from .guest import VixChannel
@@ -89,8 +106,12 @@ __all__ = [
     "MAX_GUEST_CONFIG_BYTES",
     "MIN_TOKEN_LEN",
     "PROVISION_HINT",
+    "SUPERVISOR_RESOLVE_TIMEOUT_S",
+    "TOKEN_RETRY_POLL_S",
+    "VM_STATE_TTL_S",
     "Runtime",
     "UnresolvedClient",
+    "VmStateCache",
     "build_app",
     "build_runtime",
     "builtin_catalog_for",
@@ -113,6 +134,13 @@ GUEST_IP_TIMEOUT_S = 120.0
 TOKEN_READ_WAIT_S = 180.0
 #: ``GET /`` timeout when a new client first learns the plugin version (``Runtime.connect``).
 VERSION_PROBE_TIMEOUT_S = 2.0
+#: Interval of the token re-reads while VMware Tools are not running (``connect(timeout_s=...)``).
+TOKEN_RETRY_POLL_S = 2.0
+#: Bound of the supervisor's own resolution (``Runtime.connect`` as its ``resolve`` hook) when
+#: its caller gives no budget; a smaller remaining budget of the caller wins.
+SUPERVISOR_RESOLVE_TIMEOUT_S = 20.0
+#: How long status polling may answer from an earlier VM power / Tools observation (E6).
+VM_STATE_TTL_S = 3.0
 _CONNECT_ATTEMPTS = 3
 BUILTIN_V1_9 = "data/tools-v1.9.json"
 BUILTIN_V1_10 = "data/tools-v1.10.json"
@@ -277,9 +305,90 @@ def make_catalog(profile: ProfileConfig, cache_dir: Path | str | None = None) ->
     return probe if choice == BUILTIN_V1_9 else ToolCatalog(choice, cache_dir=cdir)
 
 
+# ── VM observations for status polling (E6) ─────────────────────────
+class VmStateCache:
+    """Short-lived VM power / VMware Tools observations for status polling.
+
+    ``power_state()`` / ``tools_state()`` answer from an observation younger than
+    ``ttl_s`` (``clock`` time) and ask ``vm`` otherwise. ``invalidate()`` drops the
+    observations; while ``changing()`` is held (a VM operation runs) every query asks
+    the VM and nothing is kept, and a query that started before an invalidation is
+    not kept either (generation counter). Thread-safe; the lock is never held across
+    a VM query.
+    """
+
+    def __init__(self, vm: VmProvider, clock: Clock, ttl_s: float = VM_STATE_TTL_S) -> None:
+        self._vm = vm
+        self._clock = clock
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        self._gen = 0
+        self._busy = 0
+        self._seen: dict[str, tuple[float, Any]] = {}
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._gen += 1
+            self._seen.clear()
+
+    @contextmanager
+    def changing(self) -> Iterator[None]:
+        """The VM may change while this is held (a VM operation): nothing is cached."""
+        with self._lock:
+            self._busy += 1
+            self._gen += 1
+            self._seen.clear()
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._busy -= 1
+                self._gen += 1
+                self._seen.clear()
+
+    def _get(self, key: str, fetch: Callable[[], Any]) -> Any:
+        started = self._clock.monotonic()
+        with self._lock:
+            seen = self._seen.get(key)
+            if self._busy == 0 and seen is not None and started - seen[0] < self._ttl_s:
+                return seen[1]
+            gen = self._gen
+        value = fetch()
+        with self._lock:
+            if self._busy == 0 and gen == self._gen:
+                self._seen[key] = (started, value)
+        return value
+
+    def power_state(self) -> PowerState:
+        return self._get("power", self._vm.power_state)  # type: ignore[no-any-return]
+
+    def tools_state(self) -> ToolsState:
+        return self._get("tools", self._vm.tools_state)  # type: ignore[no-any-return]
+
+
+class _ObservedVmOpLock(VmOpLock):
+    """``VmOpLock`` whose write holds (VM operations) mark the VM as changing for the
+    runtime's ``VmStateCache``."""
+
+    def __init__(self, observations: VmStateCache) -> None:
+        super().__init__()
+        self._observations = observations
+
+    @contextmanager
+    def write(self, timeout_s: float | None = VmOpLock.DEFAULT_WRITE_TIMEOUT_S) -> Iterator[None]:
+        with super().write(timeout_s), self._observations.changing():
+            yield
+
+
 # ── placeholder client ──────────────────────────────────────────────
 class UnresolvedClient:
-    """``BackendClient`` stand-in until the backend's URL and token are known."""
+    """``BackendClient`` stand-in until the backend's URL and token are known.
+
+    ``unresolved = True`` marks it (``supervisor.is_unresolved_client``): the supervisor
+    never probes it, because its ``health_l1() == False`` would read as a refused
+    plugin (E4: a healthy x64dbg was classified LOADING -> HUNG and killed)."""
+
+    unresolved = True
 
     def __init__(self, endpoint: BackendEndpoint, reason: str = "not connected yet") -> None:
         self.endpoint = endpoint
@@ -353,6 +462,8 @@ class Runtime:
     hang_listener: Callable[[str, HealthReport], None] | None = field(default=None, repr=False)
     #: crash-loop limit of the supervisor (relaunches per job / per backend window)
     restart_limit: int = 3
+    #: short-lived power / Tools observations for status polling (None: always ask ``vm``)
+    vm_state: VmStateCache | None = field(default=None, repr=False)
     _mutex: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _ip: str | None = field(default=None, init=False, repr=False)
     _tokens: dict[str, Secret] = field(default_factory=dict, init=False, repr=False)
@@ -422,12 +533,15 @@ class Runtime:
         with self._mutex:
             return self._token_locks.setdefault(backend_id, threading.Lock())
 
-    def _token(self, cfg: BackendConfig, *, wait: bool = True) -> tuple[Secret, int]:
+    def _token(self, cfg: BackendConfig, *, wait: bool = True,
+               timeout_s: float | None = None) -> tuple[Secret, int]:
         """The backend's token and the token generation it belongs to.
 
         Reads it (env or guest copy) outside the runtime mutex; one reader per
         backend at a time. ``wait=False`` raises VmNotReady instead of waiting for
-        another thread's read. A read that raced with ``drop_tokens`` /
+        another thread's read. ``timeout_s`` (with ``wait``) bounds that wait and
+        re-reads the guest copy while VMware Tools are not running (see the module
+        docstring). A read that raced with ``drop_tokens`` /
         ``invalidate_clients(drop_tokens=True)`` is returned but not cached; callers
         compare the generation before publishing anything built from it.
         """
@@ -435,8 +549,10 @@ class Runtime:
             cached, gen = self._tokens.get(cfg.id), self._token_gen
         if cached is not None:
             return cached, gen
+        deadline = None if timeout_s is None or not wait else self.clock.monotonic() + max(0.0, timeout_s)
         lock = self._token_lock(cfg.id)
-        acquired = lock.acquire(timeout=TOKEN_READ_WAIT_S) if wait else lock.acquire(blocking=False)
+        lock_wait = TOKEN_READ_WAIT_S if timeout_s is None else min(TOKEN_READ_WAIT_S, max(0.0, timeout_s))
+        acquired = lock.acquire(timeout=lock_wait) if wait else lock.acquire(blocking=False)
         if not acquired:
             raise VmNotReady(
                 f"backend {cfg.id}: its token is being read from the guest",
@@ -447,15 +563,24 @@ class Runtime:
                 retryable=True,
             )
         try:
-            with self._mutex:  # another thread may have read it while we waited
-                cached, gen = self._tokens.get(cfg.id), self._token_gen
-            if cached is not None:
-                return cached, gen
-            token = self._load_token(cfg)
-            with self._mutex:
-                if gen == self._token_gen:
-                    self._tokens[cfg.id] = token
-            return token, gen
+            while True:
+                with self._mutex:  # another thread may have read it while we waited
+                    cached, gen = self._tokens.get(cfg.id), self._token_gen
+                if cached is not None:
+                    return cached, gen
+                try:
+                    token = self._load_token(cfg)
+                except ToolsNotRunning:
+                    now = self.clock.monotonic()
+                    if deadline is None or now >= deadline:
+                        raise
+                    log.info("backend %s: VMware Tools not running yet; reading the token again", cfg.id)
+                    self.clock.sleep(min(TOKEN_RETRY_POLL_S, deadline - now))
+                    continue
+                with self._mutex:
+                    if gen == self._token_gen:
+                        self._tokens[cfg.id] = token
+                return token, gen
         finally:
             lock.release()
 
@@ -584,17 +709,21 @@ class Runtime:
         except (BackendError, CancelledByVmOp) as e:
             log.debug("backend %s: version probe failed (%s)", backend_id, e.code)
 
-    def connect(self, backend_id: str, *, wait: bool = True) -> BackendClient:
+    def connect(self, backend_id: str, *, wait: bool = True, timeout_s: float | None = None) -> BackendClient:
         """Return a usable client for ``backend_id``, resolving URL and token if needed.
 
         The guest IP lookup and the token read run outside the runtime mutex; the
         client is published only if neither the tokens nor the guest IP changed
         meanwhile (else it resolves again). ``wait=False`` refuses with VmNotReady
         instead of waiting for another thread's token read (status polling).
+        ``timeout_s`` (with ``wait``) bounds the wait for another thread's read and
+        keeps re-reading the guest token while VMware Tools are not running (right
+        after a revert); without it the token is read once.
 
         Raises VmNotReady (no guest IP, endpoint keeps changing, read in progress),
         BackendAuthError (token unavailable or unusable), ConfigError, or
-        guest-channel errors while reading the token.
+        guest-channel errors while reading the token (ToolsNotRunning once
+        ``timeout_s`` is used up).
         """
         cfg = self.backend(backend_id)
         for _ in range(_CONNECT_ATTEMPTS):
@@ -602,7 +731,8 @@ class Runtime:
             with self._mutex:
                 if self._resolved.get(backend_id) == url:
                     return self.clients[backend_id]
-            token, gen = self._token(cfg, wait=wait)  # may copy from the guest (no mutex held)
+            # may copy from the guest (no mutex held)
+            token, gen = self._token(cfg, wait=wait, timeout_s=timeout_s)
             with self._mutex:
                 current = self._url_for(cfg, self._ip)
                 if gen != self._token_gen or current != url:
@@ -738,7 +868,8 @@ def build_runtime(
         bid: _placeholder(cfg, "not connected yet") for bid, cfg in backends.items()
     }
     catalog = make_catalog(prof, cache_dir)
-    lock = VmOpLock()
+    observations = VmStateCache(vm, clk)
+    lock = _ObservedVmOpLock(observations)
     holder: dict[str, Runtime] = {}
 
     def refresher(backend_id: str) -> None:
@@ -747,7 +878,16 @@ def build_runtime(
     def hang_hook(backend_id: str, report: HealthReport) -> None:
         holder["rt"]._on_hang(backend_id, report)
 
+    def resolve(backend_id: str, timeout_s: float | None = None) -> BackendClient:
+        # The supervisor probes resolved clients only (never the UnresolvedClient placeholder).
+        # Its caller's remaining budget bounds the token re-reads; 0 means one read, no waiting.
+        bound = SUPERVISOR_RESOLVE_TIMEOUT_S
+        if timeout_s is not None:
+            bound = min(bound, max(0.0, timeout_s))
+        return holder["rt"].connect(backend_id, wait=True, timeout_s=bound)
+
     sup_opts = dict(supervisor_options or {})
+    sup_opts.setdefault("resolve", resolve)
     supervisor = Supervisor(
         vm=sup_vm,
         guest=channel,
@@ -775,6 +915,7 @@ def build_runtime(
         environ=env,
         client_factory=client_factory or HttpBackendClient,
         restart_limit=int(sup_opts.get("max_restarts_per_job", _SUPERVISOR_MAX_RESTARTS)),
+        vm_state=observations,
     )
     holder["rt"] = rt
     lock.add_preempt_hook(rt.cancel_backend_calls)

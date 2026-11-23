@@ -33,7 +33,10 @@ Rules applied to every ``Proxy.call``:
     by those (seconds, not the boot wait). BACKEND_THROTTLED (HTTP 429, the
     plugin's auth-failure lockout) is surfaced as it is: never retried, no health
     check, no relaunch; a health check that finds the backend THROTTLED after
-    another failure does not relaunch it either.
+    another failure does not relaunch it either. Nor does one that finds it
+    UNRESOLVED (the supervisor could not obtain a client, e.g. a VM revert dropped
+    the token while the call was in flight and VMware Tools are not back yet): the
+    supervisor never judges a backend it cannot reach.
 (e) Epoch gating: after a relaunch / VM revert, the first mutating call fails with
     BACKEND_RESTARTED without reaching the backend until ``ack()`` is called. The
     epoch read by the gate is the reference for the failure path, so a relaunch
@@ -44,8 +47,9 @@ Rules applied to every ``Proxy.call``:
     result holds gateway metadata only (``{"gateway": {backend, epoch, retried}}``),
     never the unsanitised backend payload.
 
-Supervisor surface used (``SupervisorLike``): ``check``, ``ensure_alive`` (with
-the ``max_wait_s`` extension), ``epoch``, ``is_paused`` (calls are refused while
+Supervisor surface used (``SupervisorLike``): ``check`` and ``ensure_alive`` (both
+with the ``max_wait_s`` extension: recovery gives them what is left of the call
+budget), ``epoch``, ``is_paused`` (calls are refused while
 a VM operation holds supervision) and ``note_up`` (a successful call proves the
 backend was up in that epoch; used for external-restart detection).
 
@@ -204,7 +208,7 @@ def plan_call(tool: str, arguments: Mapping[str, Any] | None, *, max_call_s: flo
 
 # ── proxy ───────────────────────────────────────────────────────────
 class SupervisorLike(Protocol):
-    def check(self, backend_id: str) -> HealthReport: ...
+    def check(self, backend_id: str, *, max_wait_s: float | None = None) -> HealthReport: ...
     def ensure_alive(self, backend_id: str, *, job_id: str | None = None, reason: str,
                      max_wait_s: float | None = None) -> int: ...
     def epoch(self, backend_id: str) -> int: ...
@@ -376,7 +380,8 @@ class Proxy:
         state: HealthState = HealthState.UNKNOWN
         recovery_error: GatewayError | None = None
         try:
-            report = self._sup.check(backend_id)
+            # the health check may resolve the client (token re-read): within the call budget
+            report = self._sup.check(backend_id, max_wait_s=max(0.0, deadline - self._clock.monotonic()))
             state = report.state
             if state in (HealthState.DEAD, HealthState.HUNG):
                 remaining = max(0.0, deadline - self._clock.monotonic())

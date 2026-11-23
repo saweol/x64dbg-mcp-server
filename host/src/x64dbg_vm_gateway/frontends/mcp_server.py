@@ -24,6 +24,12 @@ tool list, and a "work" pool for everything else. Long VM operations therefore
 cannot starve ``session_status`` or ``tools/list``, and in HTTP mode one scope's
 calls cannot starve another scope's.
 
+Start-up: ``run_stdio`` (and ``http_server.serve_http``) call ``warm_up(app)`` before the
+server is built, so the first ``tools/list`` already carries the tools of the live plugin
+build (the app resolves the backends and reads their version, bounded by its own budget,
+``app.WARM_UP_TIMEOUT_S``; see ``app.Gateway.warm_up``). An app that warms up satisfies
+``WarmUpApp`` (``app.Gateway`` does; a test pins it), one without it is served as before.
+
 Mirrored tools: ``tools/list`` asks the app every time and remembers the answer;
 ``tools/call`` looks the tool (and its ``read_only`` flag, which decides the
 scope check and the pool) up in that answer and asks the app again only when the
@@ -55,7 +61,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import anyio
 import anyio.to_thread
@@ -82,8 +88,8 @@ from .tool_defs import (
 
 log = logging.getLogger(__name__)
 
-__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "ToolCallRecord", "allowed_tiers", "build_server",
-           "run_stdio"]
+__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "ToolCallRecord", "WarmUpApp", "allowed_tiers",
+           "build_server", "run_stdio", "warm_up"]
 
 SERVER_NAME = "x64dbg-vm-gateway"
 SCOPES: tuple[str, ...] = ("read", "analyze", "admin")
@@ -364,6 +370,39 @@ class _Handlers:
             log.warning("audit hook failed for tool %s", _log_name(name), exc_info=True)
 
 
+@runtime_checkable
+class WarmUpApp(Protocol):
+    """An app that can learn the live plugin versions before it is served (E5).
+
+    Kept beside the front-end that calls it (``app_api.GatewayApp`` predates it);
+    ``app.Gateway`` satisfies it, which a unit test checks, so renaming the method is a
+    test failure rather than a silently skipped warm-up.
+    """
+
+    def warm_up(self) -> Any:
+        """Bounded by the app's own budget; returns a report (never needed here)."""
+        ...
+
+
+def warm_up(app: GatewayApp) -> None:
+    """Let the app learn the live plugin versions before the first ``tools/list`` (E5).
+
+    Clients such as Claude Code do not reliably re-read the list after
+    ``notifications/tools/list_changed``, so the list answered at start-up must already
+    match the plugin build in the guest. ``WarmUpApp.warm_up`` is bounded by the app and
+    never fatal here: serving starts whatever happens (an app without it, or one that
+    fails, is logged as a warning).
+    """
+    if not isinstance(app, WarmUpApp):
+        log.warning("app %s has no warm_up; serving the cached / builtin tool list",
+                    type(app).__name__)
+        return
+    try:
+        app.warm_up()
+    except Exception:
+        log.warning("warm-up failed; serving the cached / builtin tool list", exc_info=True)
+
+
 def _instructions(app: GatewayApp) -> str:
     try:
         text = app.instructions()
@@ -401,5 +440,6 @@ async def _serve_stdio(server: Server[Any]) -> None:
 
 
 def run_stdio(app: GatewayApp) -> None:
-    """Serve ``app`` over stdin/stdout until the client closes the stream."""
+    """Serve ``app`` over stdin/stdout until the client closes the stream (after ``warm_up``)."""
+    warm_up(app)
     anyio.run(_serve_stdio, build_server(app))
