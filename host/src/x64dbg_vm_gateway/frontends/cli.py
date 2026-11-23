@@ -15,8 +15,11 @@ Global options (before or after the command): ``--config PATH``, ``--profile NAM
 ``--json`` (machine-readable stdout), ``-v/--verbose``.
 
 Exit codes: 0 success, 1 failure (gateway errors print code, message and hint),
-2 usage error. Diagnostics go to stderr; stdout carries only results (and,
-for ``serve --transport stdio``, nothing but the MCP stream).
+2 usage error. Diagnostics and interactive prompts go to stderr; stdout carries
+only results (and, for ``serve --transport stdio``, nothing but the MCP stream).
+Output never fails on a stream whose encoding cannot represent it (a
+redirected stdout on Windows uses the ANSI code page): JSON falls back to
+ASCII escapes, which is the same data, and text to backslash escapes.
 
 The orchestrator (``wiring.build_app``) and the provisioning module are
 imported lazily inside the commands, so importing this module stays cheap and
@@ -35,10 +38,11 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, TextIO
 
 from .. import config as gw_config
 from .. import platform as gw_platform
@@ -78,8 +82,42 @@ def _safe(text: Any) -> str:
     return sanitize_untrusted_text(str(text), max_len=10_000)
 
 
-def _dumps(value: Any) -> str:
-    return json.dumps(value, indent=2, ensure_ascii=False, default=str)
+def _dumps(value: Any, *, ascii_only: bool = False) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=ascii_only, default=str)
+
+
+def _encodable(stream: TextIO, text: str) -> bool:
+    try:
+        text.encode(getattr(stream, "encoding", None) or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _emit(stream: TextIO, text: str, end: str = "\n") -> None:
+    """Write ``text``; characters the stream cannot encode become backslash escapes."""
+    text += end
+    if not _encodable(stream, text):
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        try:
+            text = text.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace")
+        except LookupError:
+            text = text.encode("ascii", errors="backslashreplace").decode("ascii")
+    stream.write(text)
+
+
+def _emit_json(stream: TextIO, value: Any) -> None:
+    text = _dumps(value)
+    if not _encodable(stream, text):
+        text = _dumps(value, ascii_only=True)  # \uXXXX escapes: the same JSON data
+    _emit(stream, text)
+
+
+def _prompt(text: str) -> str:
+    """Ask on stderr (stdout carries only results) and read one line; EOFError at end of input."""
+    _emit(sys.stderr, text, end="")
+    sys.stderr.flush()
+    return input()
 
 
 class _Output:
@@ -88,23 +126,23 @@ class _Output:
 
     def data(self, value: Any, human: Callable[[Any], str] | None = None) -> None:
         if self.json_mode or human is None:
-            print(_dumps(value))
+            _emit_json(sys.stdout, value)
         else:
-            print(human(value))
+            _emit(sys.stdout, human(value))
 
     def note(self, text: str) -> None:
-        print(text, file=sys.stderr)
+        _emit(sys.stderr, text)
 
     def error(self, err: GatewayError) -> None:
         if self.json_mode:
-            print(_dumps({"ok": False, "error": err.to_dict()}))
+            _emit_json(sys.stdout, {"ok": False, "error": err.to_dict()})
             return
         lines = [f"error [{err.code}]: {_safe(err.message)}"]
         if err.hint:
             lines.append(f"  hint: {_safe(err.hint)}")
         if err.next_tool:
             lines.append(f"  next: {err.next_tool}")
-        print("\n".join(lines), file=sys.stderr)
+        _emit(sys.stderr, "\n".join(lines))
 
 
 # ── shared helpers ──────────────────────────────────────────────────
@@ -154,7 +192,7 @@ def _require_windows_abs(path: str, flag: str) -> str:
 
 def _confirm(prompt: str) -> bool:
     try:
-        answer = input(prompt)
+        answer = _prompt(prompt)
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -262,6 +300,8 @@ def _scan_jobs(root: Path, profile: str | None) -> list[dict[str, Any]]:
             row = _job_row(_read_job(job_dir / "state.json"))
         except (OSError, ValueError) as e:
             reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+            # Shown under every --profile filter on purpose: its profile is unknown, and the
+            # job store likewise lets such a job block every profile until a human resolves it.
             rows.append({"id": job_dir.name, "profile": None, "state": "CORRUPT", "updated_at": None,
                          "sample": None, "sha256": None, "error": reason})
             continue
@@ -451,18 +491,18 @@ def _ask(prompt: str, default: str | None = None, *, required: bool = True,
     while True:
         suffix = f" [{default}]" if default else ""
         try:
-            raw = input(f"{prompt}{suffix}: ")
+            raw = _prompt(f"{prompt}{suffix}: ")
         except EOFError:
             raise UsageError("init cancelled (end of input)") from None
         value = raw.strip() or (default or "")
         if not value:
             if not required:
                 return ""
-            print("  a value is required", file=sys.stderr)
+            _emit(sys.stderr, "  a value is required")
             continue
         problem = check(value) if check else None
         if problem:
-            print(f"  {problem}", file=sys.stderr)
+            _emit(sys.stderr, f"  {problem}")
             continue
         return value
 
@@ -576,17 +616,23 @@ def _config_target(args: argparse.Namespace) -> Path:
 
 
 def _write_private(path: Path, text: str, *, replace: bool) -> None:
+    """Create ``path`` (0600). ``replace``: write a fresh temp file and rename it over ``path``."""
     parent = path.parent
     if not parent.exists():
         parent.mkdir(parents=True, exist_ok=True)
         gw_platform.secure_dir(parent)
     data = text.encode("utf-8")
-    target = parent / f".{path.name}.{os.getpid()}.tmp" if replace else path
-    try:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise ConfigError(f"{path} already exists; refusing to overwrite it", stage="init",
-                          hint="pass --force to replace it", details={"path": str(path)}) from None
+    if replace:
+        # A unique name (0600, O_EXCL): a leftover of a crashed run cannot block this one.
+        fd, temp_name = tempfile.mkstemp(dir=parent, prefix=f".{path.name}.", suffix=".tmp")
+        target = Path(temp_name)
+    else:
+        target = path
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise ConfigError(f"{path} already exists; refusing to overwrite it", stage="init",
+                              hint="pass --force to replace it", details={"path": str(path)}) from None
     try:
         try:
             view = memoryview(data)
@@ -748,7 +794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.handler(args, out))
     except UsageError as e:
-        print(f"{PROG} {args.command}: error: {e}", file=sys.stderr)
+        _emit(sys.stderr, f"{PROG} {args.command}: error: {e}")
         return EXIT_USAGE
     except GatewayError as e:
         out.error(e)

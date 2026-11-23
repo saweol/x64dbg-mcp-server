@@ -4,6 +4,7 @@ the CLI never builds a real gateway."""
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -203,17 +204,30 @@ def test_discard_asks_and_aborts(cfg_path, wiring, fake, monkeypatch, capsys):
     assert fake.called("discard_job") == []
 
 
+def _input_like_the_builtin(answers: list[str]) -> Any:
+    """Stand-in for input(): like the real one it writes its prompt argument to stdout."""
+    it = iter(answers)
+
+    def _input(prompt: str = "") -> str:
+        sys.stdout.write(prompt)
+        return next(it)
+
+    return _input
+
+
 def test_discard_asks_and_confirms(cfg_path, wiring, fake, monkeypatch, capsys):
-    prompts: list[str] = []
-
-    def answer(prompt: str = "") -> str:
-        prompts.append(prompt)
-        return "yes"
-
-    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr("builtins.input", _input_like_the_builtin(["yes"]))
     assert run(["--config", str(cfg_path), "discard", JOB_ID]) == 0
-    assert JOB_ID in prompts[0]
+    assert JOB_ID in capsys.readouterr().err  # the question goes to stderr
     assert fake.called("discard_job") == [{"job_id": JOB_ID, "actor": "human-cli"}]
+
+
+def test_discard_prompt_keeps_json_stdout_clean(cfg_path, wiring, fake, monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", _input_like_the_builtin(["y"]))
+    assert run(["--config", str(cfg_path), "--json", "discard", JOB_ID]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["state"] == "DISCARDED"
+    assert JOB_ID in captured.err
 
 
 def test_discard_eof_aborts(cfg_path, wiring, fake, monkeypatch, capsys):
@@ -276,6 +290,16 @@ def test_jobs_show_invalid_and_missing(cfg_path, tmp_path, capsys):
     assert "INVALID_JOB_ID" in capsys.readouterr().err
     assert run(["--config", str(cfg_path), "jobs", "show", JOB_ID]) == 1
     assert "JOB_NOT_FOUND" in capsys.readouterr().err
+
+
+def test_jobs_list_profile_filter_keeps_corrupt_rows(cfg_path, tmp_path, capsys):
+    """A corrupt job's profile is unknown, so it is shown under every profile filter
+    (the job store likewise lets it block every profile)."""
+    _make_job(tmp_path)
+    (tmp_path / "jobs" / "20261123-111111-000000").mkdir()
+    assert run(["--config", str(cfg_path), "--json", "--profile", "other", "jobs", "list"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["id"], r["state"]) for r in rows] == [("20261123-111111-000000", "CORRUPT")]
 
 
 def test_jobs_show_requires_id(cfg_path):
@@ -434,6 +458,15 @@ def test_init_refuses_to_overwrite_without_force(tmp_path, vmrun_found, capsys):
     assert gw_config.load_config(path, environ={}).profile().vmx == "/vms/w10/w10.vmx"
 
 
+def test_init_force_is_not_blocked_by_a_stale_temp_file(tmp_path, vmrun_found, capsys):
+    """A crashed earlier init may leave its temp file behind; PIDs repeat (containers)."""
+    path = tmp_path / "config.toml"
+    path.write_text("# mine\n", encoding="utf-8")
+    (tmp_path / f".config.toml.{os.getpid()}.tmp").write_text("stale", encoding="utf-8")
+    assert run(["--config", str(path), *INIT_ARGS, "--force"]) == 0, capsys.readouterr().err
+    assert gw_config.load_config(path, environ={}).profile().vmx == "/vms/w10/w10.vmx"
+
+
 def test_init_default_path(tmp_path, vmrun_found, monkeypatch):
     target = tmp_path / "xdg" / "x64dbg-vm-gateway" / "config.toml"
     monkeypatch.setattr(gw_config, "default_config_path", lambda **kw: target)
@@ -500,6 +533,16 @@ def test_init_interactive(tmp_path, vmrun_found, monkeypatch, capsys):
     assert prof.backends[0].exe.startswith("C:\\tools\\x64dbg\\release\\")
 
 
+def test_init_interactive_prompts_keep_json_stdout_clean(tmp_path, vmrun_found, monkeypatch, capsys):
+    answers = ["", "lab", "/vms/lab/lab.vmx", "", "analyst", "", "C:\\tools\\x64dbg\\release", ""]
+    monkeypatch.setattr("builtins.input", _input_like_the_builtin(answers))
+    path = tmp_path / "c.toml"
+    assert run(["--config", str(path), "--json", "init"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["path"] == str(path)
+    assert "Profile name" in captured.err
+
+
 def test_init_interactive_eof_is_usage_error(tmp_path, vmrun_found, monkeypatch):
     def eof(_prompt: str = "") -> str:
         raise EOFError
@@ -507,3 +550,47 @@ def test_init_interactive_eof_is_usage_error(tmp_path, vmrun_found, monkeypatch)
     monkeypatch.setattr("builtins.input", eof)
     assert run(["--config", str(tmp_path / "c.toml"), "init"]) == 2
     assert not (tmp_path / "c.toml").exists()
+
+
+# ── output encoding ─────────────────────────────────────────────────
+def _narrow_stream(encoding: str = "cp1252") -> io.TextIOWrapper:
+    """Like a redirected stdout/stderr on a Windows host: the locale code page, strict errors."""
+    return io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors="strict", write_through=True)
+
+
+def _text_of(stream: io.TextIOWrapper) -> str:
+    return stream.buffer.getvalue().decode(stream.encoding)  # type: ignore[attr-defined]
+
+
+def test_json_output_survives_a_narrow_stdout_encoding(cfg_path, wiring, fake, monkeypatch):
+    status = {"vm": {"power": "running"}, "snapshots": ["깨끗한-스냅샷", "\U0001F600"]}
+    fake.results["session_status"] = status
+    out = _narrow_stream()
+    monkeypatch.setattr(sys, "stdout", out)
+    assert run(["--config", str(cfg_path), "--json", "status"]) == 0
+    assert json.loads(_text_of(out)) == status  # lossless: escaped JSON is still the same data
+
+
+def test_human_output_survives_a_narrow_stdout_encoding(cfg_path, wiring, fake, monkeypatch):
+    fake.results["doctor"] = {"ok": True, "checks": [{"name": "vmx", "ok": True, "detail": "경로 OK"}]}
+    out = _narrow_stream()
+    monkeypatch.setattr(sys, "stdout", out)
+    assert run(["--config", str(cfg_path), "doctor"]) == 0
+    assert "vmx" in _text_of(out)
+
+
+def test_error_output_survives_a_narrow_stderr_encoding(cfg_path, wiring, fake, monkeypatch):
+    fake.fail["session_status"] = StateViolation("작업이 아직 수집되지 않았습니다", hint="analysis_collect")
+    err = _narrow_stream()
+    monkeypatch.setattr(sys, "stderr", err)
+    assert run(["--config", str(cfg_path), "status"]) == 1
+    text = _text_of(err)
+    assert "STATE_VIOLATION" in text and "analysis_collect" in text
+
+
+def test_lone_surrogates_do_not_break_json_output(cfg_path, wiring, fake, monkeypatch):
+    fake.results["session_status"] = {"warning": "bad \ud800 text"}
+    out = _narrow_stream("utf-8")
+    monkeypatch.setattr(sys, "stdout", out)
+    assert run(["--config", str(cfg_path), "--json", "status"]) == 0
+    assert json.loads(_text_of(out)) == {"warning": "bad \ud800 text"}

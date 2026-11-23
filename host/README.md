@@ -160,10 +160,12 @@ backend tool that is not listed.
 5. `analysis_finish` - reverts to the clean snapshot (refused until collection succeeded);
    `keep_snapshot=true` keeps the infected state as `gw-job-<id>`.
 
-Long operations (`analysis_start`, `vm_snapshot_revert`, `vm_power`) return
-`{"state": "in_progress", ...}` after `wait_s`; poll `session_status`. After a debugger restart
-the next mutating call fails with `BACKEND_RESTARTED`; call `session_status` (which acknowledges
-it) and re-check addresses.
+Long operations (`analysis_start`, `vm_snapshot_revert`, `vm_power`, `analysis_finish`) return
+`{"state": "in_progress", ...}` after `wait_s` (at most 3600 s; the work continues in the
+background); poll `session_status`. After a debugger restart the next mutating call fails with
+`BACKEND_RESTARTED`; call `session_status` (which acknowledges it) and re-check addresses. The
+acknowledgement is gateway-wide: whichever client session calls `session_status` first clears the
+guard for all of them.
 
 | Tier | Gateway tools |
 |---|---|
@@ -210,6 +212,13 @@ x64dbg-vm-gateway serve --transport http
   set are disabled.
 - Requests are checked in this order: client allowlist (403), per-client rate limit (429),
   bearer token (401). `X-Forwarded-For` is ignored.
+- The rate limit is keyed by client address (IPv6: by /64) and runs before the token check, so
+  token guessing is throttled. The trade-off: any process that sends requests from the same
+  address, including bad-token requests from another local user on `127.0.0.1`, uses up the
+  same bucket and can get a legitimate client there answered with 429. On a multi-user host any
+  local user can do this to loopback clients; give remote clients addresses of their own.
+- A `read` token cannot change the guest or the VM, but its `session_status` calls also
+  acknowledge a debugger restart for every other session (see "The analysis loop").
 - A session belongs to the scope that opened it; using its id with another token returns 404.
 - Every tool call and every denied request is appended to
   `<jobs_root>/_audit/http-YYYYMMDD.jsonl` (time, client, scope, tool, outcome; never arguments or

@@ -4,7 +4,11 @@ Each ``GatewayToolDef`` binds an MCP tool name to one ``app_api.GatewayApp``
 method. The JSON input schema mirrors the method signature parameter for
 parameter (a unit test enforces this), so ``check_arguments`` can hand the
 validated arguments to the method as keyword arguments unchanged. Arguments the
-client omits are not invented here; the method's own defaults apply.
+client omits are not invented here; the method's own defaults apply. JSON
+``null`` for an optional parameter counts as omitted (clients often send it).
+Numbers must be finite everywhere in the arguments (the wire accepts ``NaN`` and
+``Infinity``) and ``wait_s`` is capped at ``MAX_WAIT_S`` so a call cannot hold a
+worker thread indefinitely.
 
 Descriptions are written for the model that calls the tools: when to use the
 tool, what it changes and what cannot be undone. Read-only tools say
@@ -22,6 +26,7 @@ Thread-safety: everything here is immutable after import.
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -36,6 +41,7 @@ __all__ = [
     "GATEWAY_TOOLS",
     "GATEWAY_TOOL_NAMES",
     "LOCAL_TIERS",
+    "MAX_WAIT_S",
     "TOOLS_BY_NAME",
     "Forbidden",
     "GatewayToolDef",
@@ -127,8 +133,11 @@ def _obj(properties: Mapping[str, Any], required: tuple[str, ...] = ()) -> dict[
     return schema
 
 
-def _str(description: str, **extra: Any) -> dict[str, Any]:
-    return {"type": "string", "minLength": 1, "description": description, **extra}
+def _str(description: str, *, allow_empty: bool = False) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "string", "description": description}
+    if not allow_empty:
+        schema["minLength"] = 1
+    return schema
 
 
 def _bool(description: str) -> dict[str, Any]:
@@ -145,9 +154,13 @@ _BACKEND_ID = _str("Debugger backend: 'x64' (x64dbg) or 'x32' (x32dbg), or a cus
                    "profile.")
 
 
+MAX_WAIT_S = 3600.0
+"""Upper bound of every ``wait_s``: the work continues in the background anyway."""
+
+
 def _wait_s(what: str) -> dict[str, Any]:
-    return {"type": "number", "minimum": 0,
-            "description": f"Seconds to wait for {what} before returning "
+    return {"type": "number", "minimum": 0, "maximum": MAX_WAIT_S,
+            "description": f"Seconds (at most {MAX_WAIT_S:g}) to wait for {what} before returning "
                            "{state: 'in_progress', op_id, stage}; then poll session_status. "
                            "Omit for the gateway default."}
 
@@ -173,8 +186,9 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "(analysis_start / vm_snapshot_revert / vm_power started with wait_s) and recovery or isolation "
         "warnings. Call it at the start of a session, to poll an operation that returned "
         "state='in_progress', and after any BACKEND_RESTARTED error: calling it acknowledges the restart so "
-        "mutating debugger tools are accepted again (re-check addresses afterwards). Read-only apart from "
-        "that acknowledgement.",
+        "mutating debugger tools are accepted again (re-check addresses afterwards). The acknowledgement is "
+        "gateway-wide: a call from any client session, read-scope HTTP clients included, clears the restart "
+        "guard for every session. Read-only apart from that acknowledgement.",
         _obj({"profile": _PROFILE}),
     ),
     _def(
@@ -220,7 +234,6 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "Returns state='in_progress' if not done within wait_s.",
         _obj({"name": _str("Snapshot to revert to. Omit for the profile's clean snapshot."),
               "profile": _PROFILE, "wait_s": _wait_s("the revert and readiness checks")}),
-        idempotent=True,
     ),
     _def(
         "vm_snapshot_delete", "Delete VM snapshot",
@@ -239,7 +252,6 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         _obj({"action": {"type": "string", "enum": ["start", "stop", "suspend", "reset"],
                          "description": "Power action."},
               "profile": _PROFILE, "wait_s": _wait_s("the power change")}, ("action",)),
-        idempotent=True,
     ),
     # files
     _def(
@@ -308,7 +320,7 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
             "snapshot": _str("Snapshot to start from. Omit for the profile's clean snapshot."),
             "arch": {"type": "string", "enum": ["auto", "x64", "x32"],
                      "description": "Debugger architecture; 'auto' reads the PE header."},
-            "args": _str("Command line arguments for the sample."),
+            "args": _str("Command line arguments for the sample.", allow_empty=True),
             "cwd": _str("Working directory for the sample (guest path)."),
             "load": _bool("Load the sample into the debugger (default true). false only uploads it."),
             "revert": _bool("Revert to the snapshot first (default true)."),
@@ -397,20 +409,41 @@ def _clip(text: str) -> str:
     return text if len(text) <= _MAX_ERROR_CHARS else text[: _MAX_ERROR_CHARS - 3] + "..."
 
 
+def _non_finite_numbers(value: Any) -> list[dict[str, str]]:
+    """Paths of NaN/Infinity floats anywhere inside ``value`` (iterative: no recursion limit)."""
+    problems: list[dict[str, str]] = []
+    stack: list[tuple[tuple[str, ...], Any]] = [((), value)]
+    while stack and len(problems) < _MAX_ERRORS:
+        path, item = stack.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            problems.append({"path": _clip("/".join(path)) or "(root)",
+                             "message": f"{item!r} is not a finite number"})
+        elif isinstance(item, Mapping):
+            stack.extend(((*path, str(k)), v) for k, v in reversed(list(item.items())))
+        elif isinstance(item, list | tuple):
+            stack.extend(((*path, str(i)), v) for i, v in reversed(list(enumerate(item))))
+    return problems
+
+
 def check_arguments(tool: GatewayToolDef, arguments: Mapping[str, Any] | None) -> dict[str, Any]:
     """Validate ``arguments`` against the tool's schema and return them as method kwargs.
 
-    Raises InvalidArguments listing (at most ``_MAX_ERRORS``) schema violations.
+    ``None`` values of optional parameters are dropped first (the method default
+    applies). Raises InvalidArguments listing (at most ``_MAX_ERRORS``) schema
+    violations and non-finite numbers.
     """
     args: Any = {} if arguments is None else arguments
     if not isinstance(args, Mapping):
         raise InvalidArguments(f"arguments for {tool.name} must be a JSON object",
                                details={"tool": tool.name})
-    args = dict(args)
+    required = frozenset(tool.input_schema.get("required", ()))
+    args = {k: v for k, v in args.items() if v is not None or k in required}
     errors = sorted(_VALIDATORS[tool.name].iter_errors(args), key=lambda e: list(e.absolute_path))
-    if errors:
-        problems = [{"path": "/".join(str(p) for p in e.absolute_path) or "(root)",
-                     "message": _clip(e.message)} for e in errors[:_MAX_ERRORS]]
+    problems = [{"path": "/".join(str(p) for p in e.absolute_path) or "(root)", "message": _clip(e.message)}
+                for e in errors]
+    problems += _non_finite_numbers(args)
+    if problems:
+        problems = problems[:_MAX_ERRORS]
         first = problems[0]
         raise InvalidArguments(
             f"invalid arguments for {tool.name}: {first['path']}: {first['message']}",

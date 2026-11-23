@@ -17,7 +17,21 @@ message or traceback (both go to the server log only).
 
 Every app call runs in a worker thread (``anyio.to_thread``) because the core is
 synchronous and may block for minutes (VM operations); the event loop stays
-responsive and concurrent calls proceed independently.
+responsive and concurrent calls proceed independently. Each server has two
+thread pools of its own instead of anyio's shared default limiter: a small
+"status" pool for the OBSERVE-tier gateway tools and for fetching the mirrored
+tool list, and a "work" pool for everything else. Long VM operations therefore
+cannot starve ``session_status`` or ``tools/list``, and in HTTP mode one scope's
+calls cannot starve another scope's.
+
+Mirrored tools: ``tools/list`` asks the app every time and remembers the answer;
+``tools/call`` looks the tool (and its ``read_only`` flag, which decides the
+scope check and the pool) up in that answer and asks the app again only when the
+answer is older than ``_MIRROR_TTL_S`` or the name is missing from it (at most
+once per ``_MIRROR_MISS_REFRESH_S``). If that refresh fails the previous answer
+keeps serving. ``read_only`` is taken as the app reports it; ``catalog.ToolCatalog``
+(which the app is expected to serve the list from) already treats tools unknown
+to the builtin list, and guest claims the builtin list contradicts, as mutating.
 
 Scopes (remote HTTP mode, plan 6.1): ``build_server(app, scope=...)`` limits
 both ``tools/list`` and ``tools/call`` to the scope's risk tiers:
@@ -37,12 +51,15 @@ from __future__ import annotations
 import functools
 import json
 import logging
-from collections.abc import Callable, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import anyio
 import anyio.to_thread
+from anyio.lowlevel import RunVar
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -84,6 +101,13 @@ _FALLBACK_INSTRUCTIONS = (
     "the host."
 )
 _LOG_NAME_CHARS = 100
+
+# Worker threads per server (read when a server first runs in an event loop).
+_STATUS_THREADS = 8   # OBSERVE-tier gateway tools and mirrored tool list fetches
+_WORK_THREADS = 40    # everything else: VM operations, transfers, backend calls
+# Mirrored tool lookups for tools/call (read at call time).
+_MIRROR_TTL_S = 30.0
+_MIRROR_MISS_REFRESH_S = 1.0
 
 
 def allowed_tiers(scope: str | None) -> frozenset[RiskTier]:
@@ -173,32 +197,104 @@ def _mirrored_tool(info: ToolInfo) -> types.Tool:
     )
 
 
+def _visible_mirrored(tools: Iterable[ToolInfo]) -> list[ToolInfo]:
+    """Mirrored tools as offered: gateway names win, the first of duplicate names wins."""
+    seen = set(GATEWAY_TOOL_NAMES)
+    out: list[ToolInfo] = []
+    for info in tools:
+        if info.name in seen:
+            if info.name in GATEWAY_TOOL_NAMES:
+                log.warning("mirrored tool %s collides with a gateway tool and is hidden",
+                            _log_name(info.name))
+            continue
+        seen.add(info.name)
+        out.append(info)
+    return out
+
+
+class _MirrorIndex:
+    """The app's mirrored tools as last fetched, by name (see the module docstring). Thread-safe."""
+
+    def __init__(self, app: GatewayApp, clock: Callable[[], float] = time.monotonic) -> None:
+        self._app = app
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._by_name: dict[str, ToolInfo] | None = None
+        self._fetched_at = 0.0
+
+    def fetch(self) -> list[ToolInfo]:
+        """Blocking: ask the app, remember and return the visible tools."""
+        tools = _visible_mirrored(self._app.list_mirrored_tools())
+        self._store({t.name: t for t in tools})
+        return tools
+
+    def peek(self, name: str) -> tuple[ToolInfo | None, bool]:
+        """(remembered entry or None, True if it may be used without asking the app)."""
+        with self._lock:
+            if self._by_name is None:
+                return None, False
+            age = self._clock() - self._fetched_at
+            info = self._by_name.get(name)
+        if age >= _MIRROR_TTL_S or (info is None and age >= _MIRROR_MISS_REFRESH_S):
+            return info, False
+        return info, True
+
+    def lookup(self, name: str) -> ToolInfo | None:
+        """Blocking: refresh from the app, falling back to the remembered list if that fails."""
+        try:
+            self.fetch()
+        except Exception:
+            with self._lock:
+                stale = self._by_name
+            if stale is None:
+                raise
+            log.warning("refreshing the mirrored tool list failed; using the previous list", exc_info=True)
+            self._store(stale)  # do not retry on every call
+        with self._lock:
+            return self._by_name.get(name) if self._by_name is not None else None
+
+    def _store(self, by_name: dict[str, ToolInfo]) -> None:
+        with self._lock:
+            self._by_name = by_name
+            self._fetched_at = self._clock()
+
+
+class _Pools:
+    """The server's two thread limiters, created per event loop (a limiter belongs to one loop)."""
+
+    def __init__(self) -> None:
+        self._var: RunVar[tuple[anyio.CapacityLimiter, anyio.CapacityLimiter]] = RunVar(
+            f"x64dbg-vm-gateway-pools-{id(self):x}")
+
+    def get(self, *, status: bool) -> anyio.CapacityLimiter:
+        try:
+            pools = self._var.get()
+        except LookupError:
+            pools = (anyio.CapacityLimiter(_STATUS_THREADS), anyio.CapacityLimiter(_WORK_THREADS))
+            self._var.set(pools)
+        return pools[0] if status else pools[1]
+
+
 class _Handlers:
     def __init__(self, app: GatewayApp, scope: str | None, audit: AuditHook | None) -> None:
         self.app = app
         self.scope = scope
         self.tiers = allowed_tiers(scope)
         self.audit = audit
+        self.mirrors = _MirrorIndex(app)
+        self.pools = _Pools()
 
     # ── tools/list ──────────────────────────────────────────────────
     async def list_tools(self, ctx: Any, params: Any) -> types.ListToolsResult:
         tools = [_gateway_tool(t) for t in GATEWAY_TOOLS if t.tier in self.tiers]
         try:
-            mirrored = await anyio.to_thread.run_sync(self.app.list_mirrored_tools)
+            mirrored = await anyio.to_thread.run_sync(self.mirrors.fetch, limiter=self.pools.get(status=True))
         except Exception:
             # Keep session_status / gateway_doctor reachable so the problem can be diagnosed.
             log.exception("listing mirrored backend tools failed; offering gateway tools only")
             mirrored = []
-        seen = set(GATEWAY_TOOL_NAMES)
-        for info in mirrored:
-            if info.name in seen:
-                if info.name in GATEWAY_TOOL_NAMES:
-                    log.warning("mirrored tool %s collides with a gateway tool and is hidden",
-                                _log_name(info.name))
-                continue
-            seen.add(info.name)
-            if tier_for_mirror(read_only=info.read_only) in self.tiers:
-                tools.append(_mirrored_tool(info))
+        tools.extend(_mirrored_tool(info) for info in mirrored
+                     if tier_for_mirror(read_only=info.read_only) in self.tiers)
         return types.ListToolsResult(tools=tools)
 
     # ── tools/call ──────────────────────────────────────────────────
@@ -210,8 +306,7 @@ class _Handlers:
             if spec is not None:
                 result = await self._call_gateway(spec, arguments)
             else:
-                value = await anyio.to_thread.run_sync(self._call_mirrored_blocking, name, arguments)
-                result = _texts_result(value)
+                result = await self._call_mirrored(name, arguments)
             outcome = "TOOL_ERROR" if result.is_error else "OK"
         except GatewayError as err:
             result, outcome = _error_result(err), err.code
@@ -230,12 +325,15 @@ class _Handlers:
         self._require_tier(spec.name, spec.tier)
         kwargs = check_arguments(spec, arguments)
         method = getattr(self.app, spec.method)
-        value = await anyio.to_thread.run_sync(functools.partial(method, **kwargs))
+        value = await anyio.to_thread.run_sync(functools.partial(method, **kwargs),
+                                               limiter=self.pools.get(status=spec.tier is RiskTier.OBSERVE))
         return _texts_result(value) if spec.returns_texts else _json_result(value)
 
-    def _call_mirrored_blocking(self, name: str, arguments: Mapping[str, Any] | None) -> Any:
-        """Runs in a worker thread: look the tool up, check the scope, call the backend."""
-        info = next((t for t in self.app.list_mirrored_tools() if t.name == name), None)
+    async def _call_mirrored(self, name: str, arguments: Mapping[str, Any] | None) -> types.CallToolResult:
+        info, usable = self.mirrors.peek(name)
+        if not usable:
+            info = await anyio.to_thread.run_sync(self.mirrors.lookup, name,
+                                                  limiter=self.pools.get(status=True))
         if info is None:
             raise UnknownTool(
                 f"unknown tool {name[:_LOG_NAME_CHARS]!r}",
@@ -244,7 +342,9 @@ class _Handlers:
                 details={"tool": name[:_LOG_NAME_CHARS]},
             )
         self._require_tier(name, tier_for_mirror(read_only=info.read_only))
-        return self.app.call_mirrored(name, dict(arguments or {}))
+        call = functools.partial(self.app.call_mirrored, name, dict(arguments or {}))
+        value = await anyio.to_thread.run_sync(call, limiter=self.pools.get(status=False))
+        return _texts_result(value)
 
     def _require_tier(self, name: str, tier: RiskTier) -> None:
         if tier not in self.tiers:
@@ -279,6 +379,11 @@ def build_server(app: GatewayApp, *, scope: str | None = None, audit: AuditHook 
     ``scope`` (``read``/``analyze``/``admin``) restricts the offered and callable
     tools; ``None`` means unrestricted (stdio). ``audit`` is called once per
     ``tools/call`` with a ``ToolCallRecord``; its failures are logged, never raised.
+
+    The server instructions are read from ``app.instructions()`` once, here: the
+    SDK serves a static string, so backend instructions that change later (plugin
+    reinstall, revert to an older snapshot) reach clients only after the server
+    is rebuilt, i.e. after ``serve`` is restarted.
     """
     handlers = _Handlers(app, scope, audit)
     return Server(

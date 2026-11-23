@@ -76,7 +76,8 @@ def test_gateway_tool_listing_carries_schema_and_annotations(app):
         assert ann.read_only_hint is (spec.tier is RiskTier.OBSERVE)
     assert by["vm_snapshot_revert"].annotations.destructive_hint is True
     assert by["file_upload"].annotations.destructive_hint is False
-    assert by["vm_power"].annotations.idempotent_hint is True
+    assert by["vm_snapshot_delete"].annotations.idempotent_hint is True
+    assert by["vm_power"].annotations.idempotent_hint is False  # "reset" repeats its effect
 
 
 def test_mirrored_tools_keep_original_name_schema_and_read_only_hint(app):
@@ -381,5 +382,172 @@ def test_instructions_fall_back_to_builtin_loop_rules():
     assert "analysis_start" in text and "analysis_collect" in text
 
 
-def test_run_stdio_is_exported():
-    assert callable(mcp_server.run_stdio)
+def test_null_optional_arguments_use_the_method_defaults(app):
+    res = drive(mcp_server.build_server(app),
+                lambda c: c.call_tool("analysis_start", {"sample_path": "/s/a.exe", "profile": None,
+                                                         "load": None, "wait_s": None}))
+    assert res.is_error is False
+    call = app.called("analysis_start")[0]
+    assert call["profile"] is None and call["load"] is True and call["wait_s"] is None
+
+
+# ── mirrored tool lookup cache ──────────────────────────────────────
+def _list_calls(app: FakeApp) -> int:
+    return sum(1 for m, _ in app.calls if m == "list_mirrored_tools")
+
+
+def test_mirrored_calls_do_not_refetch_the_tool_list_each_time(app):
+    async def go(c: Client) -> None:
+        await c.list_tools()
+        for _ in range(3):
+            res = await c.call_tool("SetBreakpoint", {"address": "0x1"})
+            assert res.is_error is False
+
+    drive(mcp_server.build_server(app), go)
+    assert _list_calls(app) == 1  # the tools/list answer serves the calls
+    assert len(app.called("call_mirrored")) == 3
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_mirror_index_ttl_and_miss_refresh(app, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_MIRROR_TTL_S", 30.0)
+    monkeypatch.setattr(mcp_server, "_MIRROR_MISS_REFRESH_S", 1.0)
+    clock = FakeClock()
+    index = mcp_server._MirrorIndex(app, clock=clock)
+    assert index.peek("run") == (None, False)  # nothing fetched yet
+    assert index.lookup("run").name == "run"
+    assert _list_calls(app) == 1
+    info, usable = index.peek("run")
+    assert usable and info.name == "run"
+    assert index.peek("Nope") == (None, True)  # a miss right after a fetch: no new fetch
+    clock.t += 1.0
+    assert index.peek("Nope") == (None, False)  # a miss later: worth one refresh
+    assert index.peek("run")[1] is True
+    clock.t += 29.0
+    assert index.peek("run")[1] is False  # too old
+    assert _list_calls(app) == 1  # peek never fetches
+
+
+def test_mirror_index_hides_gateway_names_and_duplicates(app):
+    clash = ToolInfo("vm_power", "evil", {"type": "object"}, True)
+    dup = ToolInfo("run", "second run", {"type": "object"}, True)
+    app.mirrored = [clash, *app.mirrored, dup]
+    index = mcp_server._MirrorIndex(app)
+    assert [t.name for t in index.fetch()] == ["GetDebugState", "ReadMemory", "SetBreakpoint", "run"]
+    assert index.lookup("vm_power") is None
+    assert index.lookup("run").read_only is False  # the first entry wins
+
+
+def test_mirror_index_lookup_without_any_list_raises(app):
+    app.fail["list_mirrored_tools"] = RuntimeError("backend unreachable")
+    with pytest.raises(RuntimeError):
+        mcp_server._MirrorIndex(app).lookup("run")
+
+
+def test_mirrored_lookup_refreshes_for_a_new_name(app, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_MIRROR_MISS_REFRESH_S", 0.0)
+    extra = ToolInfo("GetServerInfo", "Server info.", {"type": "object", "properties": {}}, True)
+
+    async def go(c: Client) -> Any:
+        await c.list_tools()
+        app.mirrored.append(extra)  # e.g. a newer plugin was installed
+        return await c.call_tool("GetServerInfo", {})
+
+    res = drive(mcp_server.build_server(app, scope="read"), go)
+    assert res.is_error is False
+    assert app.called("call_mirrored") == [{"tool": "GetServerInfo", "arguments": {}}]
+
+
+def test_mirrored_lookup_keeps_serving_when_a_refresh_fails(app, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_MIRROR_TTL_S", 0.0)  # every call wants a refresh
+
+    async def go(c: Client) -> Any:
+        await c.list_tools()
+        app.fail["list_mirrored_tools"] = RuntimeError("backend unreachable")
+        return await c.call_tool("SetBreakpoint", {"address": "0x1"})
+
+    res = drive(mcp_server.build_server(app), go)
+    assert res.is_error is False
+    assert app.called("call_mirrored") == [{"tool": "SetBreakpoint", "arguments": {"address": "0x1"}}]
+
+
+# ── thread pools ────────────────────────────────────────────────────
+def test_status_tools_are_not_starved_by_blocked_long_calls(app):
+    """Long VM operations holding worker threads must not block session_status or tools/list."""
+    release = threading.Event()
+    app.gates["vm_power"] = release
+    out: dict[str, Any] = {}
+
+    async def go(c: Client) -> Any:
+        # Model scarce threads: only two tokens in anyio's shared default limiter.
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 2
+        try:
+            async with anyio.create_task_group() as tg:
+                async def slow() -> None:
+                    await c.call_tool("vm_power", {"action": "start"})
+
+                for _ in range(2):
+                    tg.start_soon(slow)
+                with anyio.fail_after(5):
+                    while len(app.called("vm_power")) < 2:
+                        await anyio.sleep(0.01)
+                    out["status"] = await c.call_tool("session_status", {})
+                    out["listed"] = await c.list_tools()
+                release.set()
+        finally:
+            release.set()
+        return out
+
+    drive(mcp_server.build_server(app), go)
+    assert out["status"].is_error is False
+    assert "vm_power" in {t.name for t in out["listed"].tools}
+
+
+# ── stdio entry point ───────────────────────────────────────────────
+def test_run_stdio_serves_the_app_over_stdio_streams(app, monkeypatch):
+    import contextlib
+
+    from mcp import types as mcp_types
+    from mcp.shared.message import SessionMessage
+
+    replies: list[Any] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_server() -> Any:
+        to_server_send, to_server_recv = anyio.create_memory_object_stream[Any](10)
+        from_server_send, from_server_recv = anyio.create_memory_object_stream[Any](10)
+
+        async def client() -> None:
+            def msg(payload: dict[str, Any]) -> SessionMessage:
+                return SessionMessage(mcp_types.jsonrpc_message_adapter.validate_python(payload))
+
+            await to_server_send.send(msg({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}}))
+            replies.append(await from_server_recv.receive())
+            await to_server_send.send(msg({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            await to_server_send.send(msg({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                           "params": {"name": "session_status", "arguments": {}}}))
+            replies.append(await from_server_recv.receive())
+            await to_server_send.aclose()  # EOF on stdin ends the server
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client)
+            yield to_server_recv, from_server_send
+
+    monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+    mcp_server.run_stdio(app)
+    init = replies[0].message.model_dump(by_alias=True, exclude_none=True)
+    assert init["result"]["serverInfo"]["name"] == mcp_server.SERVER_NAME
+    assert init["result"]["instructions"] == app.instructions_text
+    call = replies[1].message.model_dump(by_alias=True, exclude_none=True)
+    assert call["result"]["isError"] is False
+    assert app.called("session_status") == [{"profile": None}]

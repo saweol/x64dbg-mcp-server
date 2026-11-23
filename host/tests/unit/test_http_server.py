@@ -4,6 +4,7 @@ TestClient, so no port is opened."""
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import stat
@@ -191,6 +192,78 @@ def test_repeated_denials_are_not_written_one_line_each(app, tmp_path):
     assert 1 <= len(audit_lines(tmp_path)) <= 2
 
 
+def test_ipv6_clients_share_a_rate_bucket_per_64(app, tmp_path):
+    """Rotating addresses inside one /64 must not yield fresh buckets."""
+    clock = FakeMonotonic()
+    asgi = build(app, tmp_path, cfg(allow_clients=("2001:db8::/48",)), clock=clock, rate_per_s=1.0, burst=1)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    with TestClient(asgi, base_url=BASE, client=("2001:db8:0:1::1", 1)) as c:
+        assert c.post("/mcp", headers=headers(None), json=body).status_code == 401
+    with TestClient(asgi, base_url=BASE, client=("2001:db8:0:1::2", 1)) as c:
+        assert c.post("/mcp", headers=headers(None), json=body).status_code == 429
+    with TestClient(asgi, base_url=BASE, client=("2001:db8:0:2::1", 1)) as c:
+        assert c.post("/mcp", headers=headers(None), json=body).status_code == 401  # another /64
+
+
+def test_ipv6_denials_are_collapsed_per_64(app, tmp_path):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    asgi = build(app, tmp_path)
+    for i in range(1, 31):
+        with TestClient(asgi, base_url=BASE, client=(f"2001:db8::{i:x}", 1)) as c:
+            assert c.post("/mcp", headers=headers(None), json=body).status_code == 403
+    lines = audit_lines(tmp_path)
+    assert 1 <= len(lines) <= 2
+    assert lines[0]["client"] == "2001:db8::1"  # the real address is still recorded
+
+
+def test_non_finite_numbers_from_the_wire_never_reach_the_app(app, tmp_path):
+    with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
+        sid = open_session(c, ADMIN_TOKEN)
+        for token in ("NaN", "Infinity", "1e18"):
+            raw = ('{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"vm_power",'
+                   '"arguments":{"action":"start","wait_s":' + token + '}}}')
+            r = c.post("/mcp", headers=headers(ADMIN_TOKEN, sid), content=raw)
+            assert r.status_code == 200, r.text
+            res = sse_json(r.text)["result"]
+            assert res["isError"] is True
+            assert json.loads(res["content"][0]["text"])["code"] == "INVALID_ARGUMENTS"
+    assert app.called("vm_power") == []
+
+
+# ── host header checks (DNS rebinding) ──────────────────────────────
+INIT_BODY = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": PROTO, "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "1"}}}
+
+
+def test_loopback_bind_rejects_a_foreign_host_header(app, tmp_path):
+    with TestClient(build(app, tmp_path), base_url="http://evil.example:9100", client=LOCAL) as c:
+        r = c.post("/mcp", headers=headers(ADMIN_TOKEN), json=INIT_BODY)
+    assert r.status_code in (400, 403, 421)
+    assert "mcp-session-id" not in r.headers
+
+
+def test_loopback_bind_rejects_a_foreign_origin(app, tmp_path):
+    with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
+        h = headers(ADMIN_TOKEN)
+        h["Origin"] = "http://evil.example"
+        r = c.post("/mcp", headers=h, json=INIT_BODY)
+    assert r.status_code in (400, 403, 421)
+    assert "mcp-session-id" not in r.headers
+
+
+def test_remote_bind_serves_clients_under_any_host_name(app, tmp_path):
+    asgi = build(app, tmp_path, cfg(bind=ANY_ADDR, tls_cert="/c.pem", tls_key="/k.pem",
+                                    allow_clients=("10.0.0.0/24",)))
+    with TestClient(asgi, base_url="https://lab-host.example:9100", client=("10.0.0.7", 5000)) as c:
+        sid = open_session(c, ANALYZE_TOKEN)
+        res = rpc(c, ANALYZE_TOKEN, sid, "tools/call", {"name": "session_status", "arguments": {}})
+        assert res["result"]["isError"] is False
+    line = [ln for ln in audit_lines(tmp_path) if ln.get("tool")][-1]
+    assert (line["tool"], line["outcome"], line["scope"], line["client"]) == (
+        "session_status", "OK", "analyze", "10.0.0.7")
+
+
 # ── scopes over HTTP ────────────────────────────────────────────────
 def test_read_token_sees_only_read_tools_and_is_forbidden_to_mutate(app, tmp_path):
     with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
@@ -343,6 +416,36 @@ def test_serve_http_runs_uvicorn_with_tls_and_no_proxy_headers(app, tmp_path, mo
     assert kw["host"] == ANY_ADDR and kw["port"] == 9443
     assert kw["ssl_certfile"] == str(cert) and kw["ssl_keyfile"] == str(key)
     assert kw["proxy_headers"] is False
+
+
+def test_serve_http_connection_limit_covers_every_session(app, tmp_path, monkeypatch):
+    """Each session may hold a GET event stream plus a POST connection; uvicorn answers
+    503 (unaudited) beyond limit_concurrency, so it must exceed sessions x 2."""
+    seen: dict[str, Any] = {}
+
+    class FakeServer:
+        def __init__(self, config: Any) -> None:
+            pass
+
+        def run(self) -> None:
+            pass
+
+    def fake_config(asgi: Any, **kw: Any) -> None:
+        seen.update(kw)
+
+    monkeypatch.setattr(http_server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(http_server.uvicorn, "Config", fake_config)
+    http_server.serve_http(app, cfg(), environ=ENV, jobs_root=tmp_path)
+    sessions = http_server.MAX_SESSIONS_PER_SCOPE * len(TOKEN_ENVS)
+    assert seen["limit_concurrency"] >= 2 * sessions
+
+
+def test_audit_location_must_be_given_explicitly():
+    """No silent fallback to the default jobs root: the caller passes the configured one."""
+    serve = inspect.signature(http_server.serve_http).parameters["jobs_root"]
+    build_app = inspect.signature(http_server.build_asgi_app).parameters["audit_dir"]
+    assert serve.default is inspect.Parameter.empty and serve.kind is inspect.Parameter.KEYWORD_ONLY
+    assert build_app.default is inspect.Parameter.empty and build_app.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_serve_http_refuses_missing_tls_files(app, tmp_path):

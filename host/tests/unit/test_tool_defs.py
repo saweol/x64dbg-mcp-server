@@ -96,10 +96,18 @@ def test_annotations_follow_the_tier(tool):
 
 
 def test_idempotent_hints():
-    for name in ("vm_snapshot_revert", "vm_snapshot_delete", "vm_power", "debugger_select"):
+    for name in ("vm_snapshot_delete", "debugger_select", "ida_import_annotations"):
         assert TOOLS_BY_NAME[name].annotations["idempotentHint"] is True
-    for name in ("vm_snapshot_take", "debugger_restart", "debugger_call", "analysis_start", "file_upload"):
+    # vm_power includes "reset" and a second revert bumps the epoch and discards changes again:
+    # repeating either has additional effects, so neither may claim idempotence.
+    for name in ("vm_power", "vm_snapshot_revert", "vm_snapshot_take", "debugger_restart", "debugger_call",
+                 "analysis_start", "file_upload"):
         assert TOOLS_BY_NAME[name].annotations.get("idempotentHint", False) is False
+
+
+def test_session_status_says_its_acknowledgement_is_gateway_wide():
+    d = TOOLS_BY_NAME["session_status"].description
+    assert "gateway-wide" in d and "read-scope" in d
 
 
 @pytest.mark.parametrize("tool", GATEWAY_TOOLS, ids=lambda t: t.name)
@@ -176,3 +184,64 @@ def test_frontend_error_codes():
     assert tool_defs.UnknownTool("x").code == "UNKNOWN_TOOL"
     assert tool_defs.Forbidden("x").code == "FORBIDDEN"
     assert tool_defs.InternalError("x").code == "INTERNAL"
+
+
+# ── numbers: finite and bounded ─────────────────────────────────────
+@pytest.mark.parametrize("wait_s", [float("inf"), float("-inf"), float("nan"), 1e18,
+                                    tool_defs.MAX_WAIT_S + 1])
+@pytest.mark.parametrize("name,base", [
+    ("vm_power", {"action": "start"}),
+    ("vm_snapshot_revert", {}),
+    ("analysis_start", {"sample_path": "/s/a.exe"}),
+    ("analysis_finish", {}),
+])
+def test_wait_s_must_be_finite_and_bounded(name, base, wait_s):
+    with pytest.raises(tool_defs.InvalidArguments) as ei:
+        tool_defs.check_arguments(TOOLS_BY_NAME[name], {**base, "wait_s": wait_s})
+    assert any(e["path"] == "wait_s" for e in ei.value.details["errors"])
+
+
+def test_wait_s_upper_bound_is_accepted():
+    kw = tool_defs.check_arguments(TOOLS_BY_NAME["vm_power"],
+                                   {"action": "start", "wait_s": tool_defs.MAX_WAIT_S})
+    assert kw["wait_s"] == tool_defs.MAX_WAIT_S
+    assert TOOLS_BY_NAME["vm_power"].input_schema["properties"]["wait_s"]["maximum"] == tool_defs.MAX_WAIT_S
+
+
+@pytest.mark.parametrize("name,args,path", [
+    ("debugger_call", {"tool": "run", "arguments": {"timeoutMs": float("nan")}}, "arguments/timeoutMs"),
+    ("ida_import_annotations", {"items": [{"address": float("inf")}], "module": "a.exe"}, "items/0/address"),
+])
+def test_non_finite_numbers_are_rejected_anywhere(name, args, path):
+    with pytest.raises(tool_defs.InvalidArguments) as ei:
+        tool_defs.check_arguments(TOOLS_BY_NAME[name], args)
+    assert any(e["path"] == path for e in ei.value.details["errors"])
+
+
+# ── null for optional parameters ────────────────────────────────────
+@pytest.mark.parametrize("name,args,expected", [
+    ("session_status", {"profile": None}, {}),
+    ("vm_snapshot_revert", {"name": None, "wait_s": 30}, {"wait_s": 30}),
+    ("analysis_collect", {"job_id": None, "extra_guest_paths": None, "extract": None}, {}),
+    ("debugger_call", {"tool": "GetServerInfo", "arguments": None, "backend_id": None},
+     {"tool": "GetServerInfo"}),
+    ("analysis_start", {"sample_path": "/s/a.exe", "args": None, "load": None}, {"sample_path": "/s/a.exe"}),
+])
+def test_null_optional_arguments_mean_omitted(name, args, expected):
+    """JSON null for an optional parameter is treated as "omitted": the method default applies."""
+    assert tool_defs.check_arguments(TOOLS_BY_NAME[name], args) == expected
+
+
+@pytest.mark.parametrize("name,args", [
+    ("vm_power", {"action": None}),
+    ("vm_snapshot_take", {"name": None}),
+    ("analysis_start", {"sample_path": None}),
+])
+def test_null_for_required_arguments_is_still_rejected(name, args):
+    with pytest.raises(tool_defs.InvalidArguments):
+        tool_defs.check_arguments(TOOLS_BY_NAME[name], args)
+
+
+def test_analysis_start_accepts_an_empty_command_line():
+    kw = tool_defs.check_arguments(TOOLS_BY_NAME["analysis_start"], {"sample_path": "/s/a.exe", "args": ""})
+    assert kw["args"] == ""

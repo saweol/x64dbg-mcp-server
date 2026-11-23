@@ -5,8 +5,11 @@ Request pipeline (pure ASGI, outermost first):
 1. Client allowlist: the peer address must fall inside ``http.allow_clients``
    (CIDRs); an empty list means loopback only. ``X-Forwarded-For`` is never
    trusted (uvicorn runs with ``proxy_headers=False``). -> 403
-2. Per-client token bucket (``rate_per_s`` refill, ``burst`` capacity). It runs
-   before authentication so token guessing is throttled too. -> 429
+2. Per-client token bucket (``rate_per_s`` refill, ``burst`` capacity), keyed
+   by the peer address (IPv6: its /64, which one client usually controls). It
+   runs before authentication so token guessing is throttled too; the price is
+   that a process sending bad requests from the same address (or /64) also
+   throttles a legitimate client there. -> 429
 3. ``Authorization: Bearer <token>`` -> scope. Tokens come from the environment
    variables named in ``http.token_envs`` ({scope: ENV_NAME}); only SHA-256
    digests are kept and compared with ``hmac.compare_digest`` over every scope
@@ -26,8 +29,10 @@ otherwise drive the VM.
 Audit log: one JSON line per ``tools/call`` and per denied request in
 ``<jobs_root>/_audit/http-YYYYMMDD.jsonl`` (UTC date; dir 0700, file 0600):
 ``time, event, client, scope, tool, outcome``. Arguments, results and tokens
-are never written. Repeated denials of one client are collapsed to one line
-per minute with a ``suppressed`` count so a flood cannot fill the disk.
+are never written. Repeated denials of one client (IPv6: one /64) are collapsed
+to one line per minute with a ``suppressed`` count so a flood cannot fill the
+disk. The caller must name the audit location (``jobs_root`` / ``audit_dir``):
+there is no fallback that could silently write somewhere else.
 
 State: everything lives in the objects built by ``build_asgi_app``; the ASGI
 app can be started (lifespan) more than once because the session managers are
@@ -62,7 +67,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..app_api import GatewayApp
-from ..config import GatewayConfig, HttpServerConfig, _is_loopback_host, resolve_secret
+from ..config import HttpServerConfig, _is_loopback_host, resolve_secret
 from ..contracts import Secret
 from ..errors import ConfigError
 from ..platform import secure_dir, secure_file
@@ -74,6 +79,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_BURST",
     "DEFAULT_RATE_PER_S",
+    "LIMIT_CONCURRENCY",
+    "MAX_SESSIONS_PER_SCOPE",
     "MCP_PATH",
     "MIN_TOKEN_CHARS",
     "AuditLog",
@@ -88,6 +95,9 @@ MIN_TOKEN_CHARS = 16
 DEFAULT_RATE_PER_S = 10.0
 DEFAULT_BURST = 40
 MAX_SESSIONS_PER_SCOPE = 64
+# uvicorn answers 503 (before the app, so unaudited) beyond this many connections or
+# tasks. A session may hold a GET event stream and a POST connection at once.
+LIMIT_CONCURRENCY = 2 * MAX_SESSIONS_PER_SCOPE * len(SCOPES) + 16
 SCOPE_KEY = "x64dbg_vm_gateway.scope"  # ASGI scope entry set by the guard for the router
 
 _DENIAL_LOG_INTERVAL_S = 60.0
@@ -164,6 +174,13 @@ def parse_client_ip(host: Any) -> IpAddress | None:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         return ip.ipv4_mapped
     return ip
+
+
+def client_key(ip: IpAddress) -> str:
+    """Rate-limit / denial-collapsing key: the IPv4 address, or the IPv6 /64 it lies in."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
 
 
 def _client_label(host: Any) -> str | None:
@@ -336,19 +353,20 @@ class _Guard:
         host = (scope.get("client") or (None, None))[0]
         ip = parse_client_ip(host)
         label = _client_label(host) or "unknown"
+        key = client_key(ip) if ip is not None else label
         if not self.client_filter.allows(ip):
-            self._audit_denial(label, "FORBIDDEN")
+            self._audit_denial(key, label, "FORBIDDEN")
             await _deny(scope, receive, send, 403, "FORBIDDEN", "client address is not allowed")
             return
-        wait_s = self.limiter.take(str(ip))
+        wait_s = self.limiter.take(key)
         if wait_s > 0:
-            self._audit_denial(label, "RATE_LIMITED")
+            self._audit_denial(key, label, "RATE_LIMITED")
             await _deny(scope, receive, send, 429, "RATE_LIMITED", "too many requests",
                         {"Retry-After": str(max(1, math.ceil(wait_s)))})
             return
         granted = self._authenticate(scope)
         if granted is None:
-            self._audit_denial(label, "UNAUTHORIZED")
+            self._audit_denial(key, label, "UNAUTHORIZED")
             await _deny(scope, receive, send, 401, "UNAUTHORIZED", "missing or invalid bearer token",
                         {"WWW-Authenticate": 'Bearer realm="x64dbg-vm-gateway"'})
             return
@@ -374,8 +392,8 @@ class _Guard:
                 granted = scope_name
         return granted
 
-    def _audit_denial(self, client: str, outcome: str) -> None:
-        suppressed = self.throttle.admit(client, outcome)
+    def _audit_denial(self, key: str, client: str, outcome: str) -> None:
+        suppressed = self.throttle.admit(key, outcome)
         if suppressed is None:
             return
         self.audit.write({"event": "http_denied", "client": client, "scope": None, "tool": None,
@@ -434,26 +452,25 @@ def _security_settings(bind: str) -> TransportSecuritySettings | None:
     )
 
 
-def _default_audit_dir() -> Path:
-    return GatewayConfig().jobs_root_path / "_audit"
-
-
 def build_asgi_app(
     app: GatewayApp,
     http_cfg: HttpServerConfig,
     *,
+    audit_dir: Path | str,
     environ: Mapping[str, str] | None = None,
-    audit_dir: Path | str | None = None,
     rate_per_s: float = DEFAULT_RATE_PER_S,
     burst: int = DEFAULT_BURST,
     clock: Callable[[], float] | None = None,
     now: Callable[[], datetime] | None = None,
     json_response: bool = False,
 ) -> Starlette:
-    """Build the guarded ASGI app (no socket is opened). Raises ConfigError on unsafe settings."""
+    """Build the guarded ASGI app (no socket is opened). Raises ConfigError on unsafe settings.
+
+    ``audit_dir`` receives the audit files (``serve_http`` uses ``<jobs_root>/_audit``).
+    """
     tokens = check_http_config(http_cfg, environ)
     monotonic = clock or time.monotonic
-    audit = AuditLog(audit_dir if audit_dir is not None else _default_audit_dir(), now=now)
+    audit = AuditLog(audit_dir, now=now)
 
     def audit_tool_call(record: ToolCallRecord) -> None:
         audit.write({"event": "tool_call", "client": _client_label(record.client), "scope": record.scope,
@@ -477,11 +494,14 @@ def build_asgi_app(
     )
 
 
-def serve_http(app: GatewayApp, http_cfg: HttpServerConfig, *, environ: Mapping[str, str] | None = None,
-               jobs_root: Path | str | None = None) -> None:
-    """Serve ``app`` over streamable HTTP until interrupted (blocking)."""
-    root = Path(jobs_root).expanduser() if jobs_root is not None else GatewayConfig().jobs_root_path
-    asgi = build_asgi_app(app, http_cfg, environ=environ, audit_dir=root / "_audit")
+def serve_http(app: GatewayApp, http_cfg: HttpServerConfig, *, jobs_root: Path | str,
+               environ: Mapping[str, str] | None = None) -> None:
+    """Serve ``app`` over streamable HTTP until interrupted (blocking).
+
+    ``jobs_root`` is the configured jobs root (``GatewayConfig.jobs_root_path``);
+    the audit log goes to ``<jobs_root>/_audit``.
+    """
+    asgi = build_asgi_app(app, http_cfg, environ=environ, audit_dir=Path(jobs_root).expanduser() / "_audit")
     for key, value in (("http.tls_cert", http_cfg.tls_cert), ("http.tls_key", http_cfg.tls_key)):
         if value is not None and not Path(value).expanduser().is_file():
             raise ConfigError(f"config key {key}: file not found: {value}", stage="http",
@@ -500,7 +520,7 @@ def serve_http(app: GatewayApp, http_cfg: HttpServerConfig, *, environ: Mapping[
         lifespan="on",
         timeout_keep_alive=5,
         timeout_graceful_shutdown=10,
-        limit_concurrency=128,
+        limit_concurrency=LIMIT_CONCURRENCY,
         log_level="info",
     )
     uvicorn.Server(config).run()
