@@ -8,6 +8,7 @@ import struct
 from pathlib import Path
 
 import pytest
+
 from x64dbg_vm_gateway.pe import (
     COMIMAGE_FLAGS_32BITREQUIRED,
     COMIMAGE_FLAGS_ILONLY,

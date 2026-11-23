@@ -107,6 +107,10 @@ class StateViolation(GatewayError):
     code = "STATE_VIOLATION"
 
 
+class JobNotFound(StateViolation):
+    code = "JOB_NOT_FOUND"
+
+
 class IsolationRequired(GatewayError):
     code = "ISOLATION_REQUIRED"
 
@@ -135,6 +139,12 @@ class UnsafeArchiveError(TransferError):
 
 class PathNotAllowed(GatewayError):
     code = "PATH_NOT_ALLOWED"
+
+
+class InvalidJobId(PathNotAllowed):
+    """Malformed job id (also a path-safety violation, hence the subclass)."""
+
+    code = "INVALID_JOB_ID"
 
 
 # ── backend (x64dbg plugin) ─────────────────────────────────────────

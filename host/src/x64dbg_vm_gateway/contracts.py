@@ -57,14 +57,14 @@ class SystemClock:
 
 
 # ── VM ──────────────────────────────────────────────────────────────
-class PowerState(str, enum.Enum):
+class PowerState(enum.StrEnum):
     RUNNING = "running"
     OFF = "off"
     SUSPENDED = "suspended"
     UNKNOWN = "unknown"
 
 
-class ToolsState(str, enum.Enum):
+class ToolsState(enum.StrEnum):
     RUNNING = "running"
     INSTALLED = "installed"  # installed but not running
     NOT_INSTALLED = "not_installed"
@@ -86,7 +86,10 @@ class IsolationReport:
 
     @property
     def isolated(self) -> bool:
-        if self.shared_folders_enabled:
+        """Fail closed: unknown shared-folder state or no NIC information is NOT isolated."""
+        if self.shared_folders_enabled is None or self.shared_folders_enabled:
+            return False
+        if not self.network_types:
             return False
         return all(t in ("hostonly", "none", "disconnected") for t in self.network_types)
 
@@ -129,6 +132,12 @@ class VmrunRunner(Protocol):
       ``Error: ...`` text (VmNotRunning, ToolsNotRunning, GuestAuthFailed,
       SnapshotNotFound, VmLocked, GuestOperationError, VmrunTimeout, VmrunError).
       It never returns a result with a non-zero returncode.
+    - The raw vmrun text is kept in ``exc.message`` / ``details['stdout'|'stderr']``
+      so callers can recognise guest-level outcomes such as
+      'Guest program exited with non-zero exit code: N' or 'The file does not exist.'
+      (both map to GuestOperationError; vmrun exits 255 for them).
+    - Usage mistakes detected before vmrun starts: ConfigError (vmx=True but no vmx
+      path configured) and GuestAuthFailed (guest=True but no credentials).
     """
 
     def run(self, command: str, *params: str, guest: bool = False,
@@ -164,7 +173,10 @@ class GuestChannel(Protocol):
     """Operations inside the guest OS. Guest paths are Windows paths (str).
 
     All methods raise errors.GuestOperationError / GuestAuthFailed / ToolsNotRunning
-    / VmrunTimeout on failure.
+    / VmrunTimeout on failure. Host-side problems in copy_to_guest/copy_from_guest
+    (missing host source, missing host destination folder, destination that is a
+    symlink or a directory) raise errors.TransferError. Invalid arguments raise
+    TypeError/ValueError, and guest paths failing validation raise PathNotAllowed.
     """
 
     def run_program(
@@ -228,6 +240,11 @@ class BackendClient(Protocol):
 
     Raises errors.BackendUnavailable (refused/reset), BackendAuthError (401),
     BackendTimeout, BackendProtocolError. Must never retry by itself.
+    ``health_l1``/``health_l2`` return False for unreachable, slow or malformed
+    backends but RAISE BackendAuthError on HTTP 401 so AUTH can be told apart from DEAD.
+    Implementations may additionally offer ``update_token(token: Secret)`` and
+    ``server_info(timeout_s) -> dict`` (HttpBackendClient does); callers must
+    feature-test them with ``getattr`` because they are not part of this Protocol.
     ``cancel_all()`` must unblock every in-flight call within ~1s (used when a
     VM operation preempts backend traffic).
     """
@@ -244,7 +261,7 @@ class BackendClient(Protocol):
 
 
 # ── jobs ────────────────────────────────────────────────────────────
-class JobState(str, enum.Enum):
+class JobState(enum.StrEnum):
     CREATED = "CREATED"
     PREPARING_VM = "PREPARING_VM"
     VM_READY = "VM_READY"
@@ -273,3 +290,6 @@ class SampleInfo:
     arch: str | None  # "x64" | "x32" | None
     guest_path: str | None = None
     original_name: str | None = None
+    # IL-only i386 .NET image (AnyCPU): runs as a 64-bit process on 64-bit Windows,
+    # so it must be routed to x64dbg even though the PE Machine field says x32.
+    dotnet_anycpu: bool = False

@@ -69,8 +69,9 @@ from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import Any
 
+from . import errors as _errors
 from .contracts import TERMINAL_JOB_STATES, Clock, JobState, SampleInfo, SystemClock
-from .errors import LockTimeout, PathNotAllowed, StateViolation
+from .errors import InvalidJobId, LockTimeout, StateViolation
 
 __all__ = [
     "CORRUPT_KINDS",
@@ -176,7 +177,7 @@ def validate_job_id(job_id: object) -> str:
     trailing newline, upper-case hex) is rejected as a path-traversal attempt.
     """
     if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
-        raise PathNotAllowed("invalid job id", details={"job_id": _clip(repr(job_id), 80)})
+        raise InvalidJobId("invalid job id", details={"job_id": _clip(repr(job_id), 80)})
     return job_id
 
 
@@ -398,8 +399,7 @@ class CorruptJob:
         }
 
 
-class JobNotFound(StateViolation):
-    """No (valid) job with this id. Wire code stays STATE_VIOLATION (errors.py owns codes)."""
+JobNotFound = _errors.JobNotFound  # re-exported for callers importing it from jobs
 
 
 # ── process liveness ────────────────────────────────────────────────
