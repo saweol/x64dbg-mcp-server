@@ -27,9 +27,28 @@ otherwise                                                  HEALTHY
 Without a VM provider / guest channel (endpoint mode) only the HTTP rows apply
 and relaunching is impossible.
 
-Epochs: an integer per backend, incremented whenever the debugger is relaunched
-(``ensure_alive``) or the VM is reverted (``bump_epoch``). The proxy uses it to
-refuse mutating calls after state loss until the client acknowledges.
+Epochs: an integer per backend, incremented whenever debuggee state is lost:
+``ensure_alive`` bumps it as soon as a relaunch has been issued (after a HUNG
+debugger was killed, or for a DEAD one right before the launch), *before*
+waiting for readiness, so a relaunch that later fails, times out or is
+interrupted by a VM operation can never leave a fresh debugger behind the old
+epoch. ``bump_epoch`` covers losses caused elsewhere (VM revert). The proxy uses
+the epoch to refuse mutating calls after state loss until the client acknowledges.
+
+External restarts: when ``ensure_alive`` waits through LOADING and the backend
+comes back HEALTHY although it had been up in the current epoch (seen by
+``check()`` or reported by ``note_up``), the debugger restarted outside the
+gateway and the epoch is bumped - unless the LOADING process ids are the ones
+recorded while this epoch's instance was healthy (a transient L1 failure of the
+same process). Without recorded ids the bump is conservative.
+
+Crash loops: relaunches are counted per job (``max_restarts_per_job``); calls
+without a job id are counted per backend within ``crash_loop_window_s`` and the
+count is reset by ``bump_epoch`` (VM revert).
+
+Bounded waits: ``ensure_alive(max_wait_s=...)`` bounds the wait for another
+relaunch, the LOADING wait and the readiness wait (the launch itself is always
+issued); the guest commands (list/kill/run) are bounded by their own timeouts.
 
 Thread-safety: all public methods may be called from any thread. Bookkeeping is
 guarded by one re-entrant lock that is never held across guest/HTTP I/O; a
@@ -115,6 +134,8 @@ class Supervisor:
         l1_timeout_s: float = 2.0,
         l2_timeout_s: float = 5.0,
         hang_hook: Callable[[str, HealthReport], None] | None = None,
+        crash_loop_window_s: float = 600.0,
+        kill_exit_timeout_s: float = 10.0,
     ) -> None:
         """``clients`` is read on every use (not copied), so a token refresher may
         replace an entry; ``backends`` supplies exe/launch_task (falling back to the
@@ -139,6 +160,8 @@ class Supervisor:
         self._l1_timeout_s = l1_timeout_s
         self._l2_timeout_s = l2_timeout_s
         self._hang_hook = hang_hook
+        self._crash_window_s = crash_loop_window_s
+        self._kill_exit_timeout_s = kill_exit_timeout_s
         # LOADING turns HUNG after boot_grace_s; this caps the polls in case the clock stalls
         self._max_loading_polls = int(boot_grace_s / max(poll_interval_s, 0.01)) + 2
         # real-time bound for waiting on another caller's relaunch
@@ -152,6 +175,9 @@ class Supervisor:
         self._seen_up_epoch: dict[str, int] = {}  # backend -> last epoch in which L1 answered
         self._auth_refreshed_epoch: dict[str, int] = {}
         self._restarts: dict[str, int] = {}  # job_id -> relaunch attempts
+        self._jobless_restarts: dict[str, list[float]] = {}  # backend -> monotonic times of relaunches
+        self._ready_epoch: dict[str, int] = {}  # backend -> epoch whose relaunch reached readiness
+        self._known_pids: dict[str, tuple[int, frozenset[int]]] = {}  # backend -> (epoch, pids while up)
         self._relaunch_locks: dict[str, threading.Lock] = {}
 
     # ── helpers ─────────────────────────────────────────────────────
@@ -253,9 +279,39 @@ class Supervisor:
         return new
 
     def bump_epoch(self, backend_id: str, reason: str) -> int:
-        """Increment the epoch after state loss caused elsewhere (e.g. VM revert)."""
+        """Increment the epoch after state loss caused elsewhere (e.g. VM revert).
+
+        Also resets the job-less crash-loop count: the guest starts from a clean state.
+        """
         self._client(backend_id)
+        with self._lock:
+            self._jobless_restarts.pop(backend_id, None)
         return self._bump(backend_id, reason, seen_up=False)
+
+    def note_up(self, backend_id: str, epoch: int) -> None:
+        """Record that the backend answered a call in ``epoch`` (the proxy calls this on success).
+
+        Ignored when ``epoch`` is no longer current. Used by the external-restart
+        detection in ``ensure_alive``.
+        """
+        self._client(backend_id)
+        with self._lock:
+            if self._epochs.get(backend_id, 0) == epoch:
+                self._seen_up_epoch[backend_id] = epoch
+
+    def _record_pids(self, backend_id: str, epoch: int) -> None:
+        """Remember which debugger process ids serve ``epoch`` (best effort, no raise)."""
+        guest, image = self._guest, self._image_name(backend_id)
+        if guest is None or image is None:
+            return
+        try:
+            pids = frozenset(p.pid for p in guest.list_processes() if p.image_name == image)
+        except GatewayError as e:
+            log.debug("backend %s: could not list guest processes (%s)", backend_id, e.code)
+            return
+        with self._lock:
+            if self._epochs.get(backend_id, 0) == epoch:
+                self._known_pids[backend_id] = (epoch, pids)
 
     # ── restart accounting ──────────────────────────────────────────
     def restarts(self, job_id: str) -> int:
@@ -266,21 +322,43 @@ class Supervisor:
         with self._lock:
             self._restarts.pop(job_id, None)
 
-    def _count_restart(self, backend_id: str, job_id: str | None) -> None:
-        if job_id is None:
-            return
+    def _recent_jobless(self, backend_id: str, now: float) -> list[float]:
+        """Job-less relaunch times still inside the crash-loop window (lock held by caller)."""
+        return [t for t in self._jobless_restarts.get(backend_id, []) if now - t < self._crash_window_s]
+
+    def jobless_restarts(self, backend_id: str) -> int:
+        """Relaunches without a job id inside the current crash-loop window."""
+        now = self._clock.monotonic()
         with self._lock:
-            done = self._restarts.get(job_id, 0)
+            return len(self._recent_jobless(backend_id, now))
+
+    def _count_restart(self, backend_id: str, job_id: str | None) -> None:
+        with self._lock:
+            now = self._clock.monotonic()
+            recent = self._recent_jobless(backend_id, now)
+            done = len(recent) if job_id is None else self._restarts.get(job_id, 0)
             if done >= self._max_restarts:
+                details: dict[str, Any] = {"job_id": job_id, "backend": backend_id,
+                                           "debugger_killed_by_target": done,
+                                           "max_restarts_per_job": self._max_restarts}
+                if job_id is None:
+                    details["window_s"] = self._crash_window_s
+                    who = f"backend {backend_id} (no job, last {self._crash_window_s:g}s)"
+                    next_tool = "session_status"
+                    hint = "the debugger keeps dying; revert the VM (resets the count) or wait for the window"
+                else:
+                    who, next_tool = f"job {job_id}", "analysis_collect"
+                    hint = "collect what is available; the sample may be terminating the debugger"
                 raise CrashLoop(
-                    f"debugger for job {job_id} was relaunched {done} time(s); giving up "
+                    f"debugger for {who} was relaunched {done} time(s); giving up "
                     "(crash loop or debugger-detecting sample)",
-                    stage="supervisor", next_tool="analysis_collect",
-                    hint="collect what is available; the sample may be terminating the debugger",
-                    details={"job_id": job_id, "backend": backend_id, "debugger_killed_by_target": done,
-                             "max_restarts_per_job": self._max_restarts},
+                    stage="supervisor", next_tool=next_tool, hint=hint, details=details,
                 )
-            self._restarts[job_id] = done + 1
+            if job_id is None:
+                recent.append(now)
+                self._jobless_restarts[backend_id] = recent
+            else:
+                self._restarts[job_id] = done + 1
 
     # ── classification ──────────────────────────────────────────────
     def check(self, backend_id: str) -> HealthReport:
@@ -316,8 +394,15 @@ class Supervisor:
 
         epoch = self.epoch(backend_id)
         with self._lock:
-            self._tr(backend_id).loading_since = None
+            tr = self._tr(backend_id)
+            was_loading = tr.loading_since is not None
+            tr.loading_since = None
             self._seen_up_epoch[backend_id] = epoch
+            known = self._known_pids.get(backend_id)
+        if not was_loading and (known is None or known[0] != epoch):
+            # Once per epoch: evidence for restart detection. Not right after LOADING, where
+            # the process that answers may already be a restarted instance.
+            self._record_pids(backend_id, epoch)
         try:
             l2 = client.health_l2(timeout_s=self._l2_timeout_s)
         except BackendAuthError:
@@ -393,48 +478,76 @@ class Supervisor:
                             reason=f"process present but HTTP refused for {elapsed:.0f}s")
 
     # ── recovery ────────────────────────────────────────────────────
-    def ensure_alive(self, backend_id: str, *, job_id: str | None = None, reason: str) -> int:
+    def ensure_alive(self, backend_id: str, *, job_id: str | None = None, reason: str,
+                     max_wait_s: float | None = None) -> int:
         """Make sure the backend is HEALTHY, relaunching it if needed; return the epoch.
+
+        ``max_wait_s`` (default: unbounded apart from the configured timeouts) bounds
+        the waits: for another caller's relaunch, for a LOADING debugger, and for
+        readiness after a launch. A launch is always issued once decided; when the
+        budget runs out before the new debugger is ready, BackendUnavailable is
+        raised with ``details['relaunch_pending'] = True`` and the epoch has
+        already been bumped.
 
         Raises CancelledByVmOp (paused), VmNotReady (VM/Tools down), BackendAuthError,
         BackendUnavailable (endpoint mode, relaunch failed or not ready in time),
-        CrashLoop (too many relaunches for ``job_id``), ConfigError, LockTimeout, and
-        guest-channel errors from kill/run.
+        CrashLoop (too many relaunches for ``job_id`` / for the backend without a job),
+        ConfigError, LockTimeout, and guest-channel errors from kill/run.
         """
         self._client(backend_id)
         self._raise_if_paused(backend_id)
+        budget_end = None if max_wait_s is None else self._clock.monotonic() + max(0.0, max_wait_s)
         entry_epoch = self.epoch(backend_id)
         lock = self._relaunch_lock(backend_id)
-        if not lock.acquire(timeout=self._relaunch_lock_timeout_s):
+        lock_wait = self._relaunch_lock_timeout_s
+        if max_wait_s is not None:
+            lock_wait = max(0.01, min(lock_wait, max_wait_s))
+        if not lock.acquire(timeout=lock_wait):
+            # another caller holds the relaunch lock: a relaunch is in progress, not failed
             raise LockTimeout(f"timed out waiting for another relaunch of backend {backend_id}",
-                              stage="supervisor", details={"backend": backend_id})
+                              stage="supervisor", hint="call session_status in a few seconds",
+                              details={"backend": backend_id, "waited_s": lock_wait,
+                                       "relaunch_pending": True})
         try:
             current = self.epoch(backend_id)
-            if current != entry_epoch:
-                return current  # another caller relaunched while we waited
+            with self._lock:
+                relaunched_ok = self._ready_epoch.get(backend_id) == current
+            if current != entry_epoch and relaunched_ok:
+                return current  # another caller relaunched successfully while we waited
             self._raise_if_paused(backend_id)
             with self._lock:
                 was_up = self._seen_up_epoch.get(backend_id) == current
             report = self.check(backend_id)
             waited_for_boot = False
+            loading_pids: set[int] = set()
             polls = 0
             while report.state is HealthState.LOADING:  # turns HUNG after boot_grace_s
                 waited_for_boot = True
+                loading_pids.update(report.details.get("pids") or ())
                 if polls >= self._max_loading_polls:
                     report = HealthReport(HealthState.HUNG, {
                         **report.details, "reason": "still loading after the maximum number of polls"})
                     break
+                if budget_end is not None and self._clock.monotonic() >= budget_end:
+                    raise BackendUnavailable(
+                        f"backend {backend_id} is still loading", stage="supervisor",
+                        details={**report.details, "state": HealthState.LOADING.value,
+                                 "max_wait_s": max_wait_s},
+                        hint="the debugger is starting; call session_status in a few seconds",
+                    )
                 polls += 1
                 self._clock.sleep(self._poll_s)
                 self._raise_if_paused(backend_id)
                 report = self.check(backend_id)
             state = report.state
             if state is HealthState.HEALTHY:
-                if waited_for_boot and was_up:
+                if waited_for_boot and was_up and not self._same_instance(backend_id, current, loading_pids):
                     # The debugger answered earlier in this epoch, then went away and came back
                     # by itself (external restart): its debuggee state is gone.
-                    return self._bump(backend_id, f"debugger restarted outside the gateway: {reason}",
-                                      seen_up=True)
+                    new = self._bump(backend_id, f"debugger restarted outside the gateway: {reason}",
+                                     seen_up=True)
+                    self._record_pids(backend_id, new)
+                    return new
                 return self.epoch(backend_id)
             self._raise_for_state(backend_id, report)
             # DEAD or HUNG from here on
@@ -445,16 +558,33 @@ class Supervisor:
                     hint="endpoint mode cannot relaunch the debugger; restart x64dbg on the remote "
                          "machine manually, then call session_status",
                 )
+            launch = self._launch_spec(backend_id)  # validate config before any side effect
             self._count_restart(backend_id, job_id)
+            killed: frozenset[int] = frozenset()
             if state is HealthState.HUNG:
                 self._run_hang_hook(backend_id, report)
-                self._kill(backend_id)
+                killed = self._kill(backend_id)
+            # From here the old debuggee state is gone (killed, or the debugger was dead).
+            new = self._bump(backend_id, f"relaunch after {state.value}: {reason}", seen_up=False)
+            if killed:
+                self._wait_exit(backend_id, killed)
             log.warning("backend %s: relaunching debugger (%s; reason: %s)", backend_id, state.value, reason)
-            self._launch(backend_id)
-            self._wait_ready(backend_id)
-            return self._bump(backend_id, f"relaunch after {state.value}: {reason}", seen_up=True)
+            self._launch(backend_id, launch)
+            self._wait_ready(backend_id, budget_end)
+            with self._lock:
+                self._ready_epoch[backend_id] = new
+                if self._epochs.get(backend_id, 0) == new:
+                    self._seen_up_epoch[backend_id] = new
+            self._record_pids(backend_id, new)
+            return self.epoch(backend_id)
         finally:
             lock.release()
+
+    def _same_instance(self, backend_id: str, epoch: int, loading_pids: set[int]) -> bool:
+        """True if the LOADING process ids are the ones recorded while ``epoch`` was healthy."""
+        with self._lock:
+            known = self._known_pids.get(backend_id)
+        return known is not None and known[0] == epoch and bool(loading_pids) and loading_pids <= known[1]
 
     def _raise_for_state(self, backend_id: str, report: HealthReport) -> None:
         state = report.state
@@ -481,55 +611,101 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 - diagnostics only; never blocks recovery
             log.warning("backend %s: hang hook failed (%s)", backend_id, type(e).__name__)
 
-    def _kill(self, backend_id: str) -> None:
-        """Kill every guest process running the backend's debugger image.
+    def _kill(self, backend_id: str) -> frozenset[int]:
+        """Kill every guest process running the backend's debugger image; return the pids killed.
 
         A kill that fails because the process already exited is ignored; if the
         process is still there the error propagates (relaunching next to a hung
         instance would only collide on the port).
         """
         guest = self._guest
-        if guest is None:
-            return
         image = self._image_name(backend_id)
-        if image is None:
-            return
+        if guest is None or image is None:
+            return frozenset()
+        killed: set[int] = set()
         for p in guest.list_processes():
             if p.image_name != image:
                 continue
             log.warning("backend %s: killing hung debugger pid %d", backend_id, p.pid)
             try:
                 guest.kill_process(p.pid)
+                killed.add(p.pid)
             except GatewayError:
                 if any(q.pid == p.pid for q in guest.list_processes()):
                     raise
                 log.info("backend %s: pid %d had already exited", backend_id, p.pid)
+        return frozenset(killed)
 
-    def _launch(self, backend_id: str) -> None:
+    def _wait_exit(self, backend_id: str, pids: frozenset[int]) -> None:
+        """Wait (bounded) until the killed processes are gone from the guest.
+
+        TerminateProcess is asynchronous and the plugin binds with SO_REUSEADDR, so
+        a new instance started too early could share the port with the dying one.
+        """
         guest = self._guest
         if guest is None:
-            raise BackendUnavailable(f"backend {backend_id}: no guest channel to relaunch with",
-                                     stage="relaunch", details={"backend": backend_id})
+            return
+        interval = min(self._poll_s, 0.5)
+        deadline = self._clock.monotonic() + self._kill_exit_timeout_s
+        max_polls = int(self._kill_exit_timeout_s / max(interval, 0.01)) + 2  # in case the clock stalls
+        polls = 0
+        alive = set(pids)
+        while True:
+            try:
+                alive = {p.pid for p in guest.list_processes()} & set(pids)
+            except GatewayError as e:
+                log.debug("backend %s: process listing failed while waiting for exit (%s)",
+                          backend_id, e.code)
+            if not alive:
+                return
+            polls += 1
+            if self._clock.monotonic() >= deadline or polls >= max_polls:
+                raise BackendUnavailable(
+                    f"killed debugger of backend {backend_id} did not exit within "
+                    f"{self._kill_exit_timeout_s:g}s; not relaunching next to it",
+                    stage="relaunch", details={"backend": backend_id, "pids": sorted(alive),
+                                               "timeout_s": self._kill_exit_timeout_s},
+                    hint="take a screenshot (vm_screenshot); the process may be stuck in the kernel",
+                )
+            self._clock.sleep(interval)
+
+    def _launch_spec(self, backend_id: str) -> tuple[str, list[str], dict[str, Any]]:
+        """Validate the relaunch configuration; return (exe, args, run_program kwargs)."""
         if self._mode == "task":
             task = self._cfg(backend_id, "launch_task")
             if not task:
                 raise ConfigError(f"backend {backend_id}: relaunch_mode 'task' needs launch_task")
-            rc = guest.run_program(SCHTASKS_EXE, ["/run", "/tn", task], wait=True, timeout_s=60.0)
+            return SCHTASKS_EXE, ["/run", "/tn", task], {"wait": True, "timeout_s": 60.0}
+        exe = self._exe(backend_id)
+        if not exe:
+            raise ConfigError(f"backend {backend_id}: relaunch needs the guest path of the debugger exe")
+        return exe, [], {"wait": False, "interactive": True, "active_window": True}
+
+    def _launch(self, backend_id: str, spec: tuple[str, list[str], dict[str, Any]]) -> None:
+        guest = self._guest
+        if guest is None:
+            raise BackendUnavailable(f"backend {backend_id}: no guest channel to relaunch with",
+                                     stage="relaunch", details={"backend": backend_id})
+        exe, args, kwargs = spec
+        if self._mode == "task":
+            rc = guest.run_program(exe, args, **kwargs)
             if rc not in (0, None):
                 raise BackendUnavailable(
                     f"relaunching backend {backend_id}: schtasks /run failed",
-                    stage="relaunch", details={"backend": backend_id, "exit_code": rc, "task": task},
+                    stage="relaunch", details={"backend": backend_id, "exit_code": rc, "task": args[-1]},
                     hint="check that the scheduled task exists in the guest (guest/provision.ps1)",
                 )
         else:
-            exe = self._exe(backend_id)
-            if not exe:
-                raise ConfigError(f"backend {backend_id}: relaunch needs the guest path of the debugger exe")
-            guest.run_program(exe, (), wait=False, interactive=True, active_window=True)
+            guest.run_program(exe, tuple(args), **kwargs)
 
-    def _wait_ready(self, backend_id: str) -> None:
-        deadline = self._clock.monotonic() + self._ready_timeout_s
-        max_polls = int(self._ready_timeout_s / max(self._poll_s, 0.01)) + 2  # in case the clock stalls
+    def _wait_ready(self, backend_id: str, budget_end: float | None = None) -> None:
+        """Poll L1+L2 until ready, bounded by relaunch_ready_timeout_s and ``budget_end``."""
+        now = self._clock.monotonic()
+        deadline = now + self._ready_timeout_s
+        by_budget = budget_end is not None and budget_end < deadline
+        if by_budget:
+            deadline = budget_end  # type: ignore[assignment]
+        max_polls = int(max(0.0, deadline - now) / max(self._poll_s, 0.01)) + 2  # in case the clock stalls
         polls = 0
         while True:
             polls += 1
@@ -549,6 +725,13 @@ class Supervisor:
             except (BackendError, CancelledByVmOp, OSError):
                 pass
             if self._clock.monotonic() >= deadline or polls >= max_polls:
+                if by_budget:
+                    raise BackendUnavailable(
+                        f"backend {backend_id} was relaunched but is not ready yet",
+                        stage="relaunch", details={"backend": backend_id, "relaunch_pending": True,
+                                                   "timeout_s": self._ready_timeout_s},
+                        hint="the debugger is starting; call session_status in a few seconds",
+                    )
                 raise BackendUnavailable(
                     f"backend {backend_id} did not become ready within {self._ready_timeout_s:g}s "
                     "after relaunch",

@@ -17,15 +17,25 @@ HTTP 401                                  BackendAuthError
 socket timeout / overall deadline         BackendTimeout
 malformed JSON, oversized body, JSON      BackendProtocolError
 nesting > 64, non-200 status, other
-JSON-RPC errors
+JSON-RPC errors, request body too large
 JSON-RPC -32602 with ``{"error": msg}``     ToolCallResult(is_error=True, texts=[msg])
 call aborted by cancel_all()              CancelledByVmOp
 ========================================  ==========================================
 
+Request size: the plugin reads a request into one 64 KiB buffer (headers
+included, ``mcp_server.zig`` ``wsRecv``) and silently truncates the rest, which
+it then reports as a JSON parse error with ``id: null``. Bodies larger than
+``max_request_bytes`` are therefore rejected before anything is sent.
+
+Untrusted text: JSON-RPC error messages come from the guest; the copy placed in
+exception ``details`` is stripped of control/bidi characters and clipped.
+
 Thread-safety: an instance may be used from many threads at once. The only
-shared mutable state is the in-flight registry and the request-id counter, both
-guarded by a lock. The bearer token is never written to logs, exception
-messages, ``details`` or reprs.
+shared mutable state is the in-flight registry, the endpoint (replaced by
+``update_token``) and the request-id counter, all guarded by a lock. The bearer
+token is validated up front (printable ASCII, surrounding whitespace stripped)
+so it can never reach an exception message via header encoding, and it is never
+written to logs, exception messages, ``details`` or reprs.
 """
 
 from __future__ import annotations
@@ -40,7 +50,7 @@ import selectors
 import socket
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -55,16 +65,21 @@ from .errors import (
     CancelledByVmOp,
     ConfigError,
 )
+from .proxy import sanitize_untrusted_text
 
 log = logging.getLogger(__name__)
 
 MAX_JSON_DEPTH = 64
 MCP_PROTOCOL_VERSION = "2024-11-05"
+PLUGIN_RECV_BUFFER = 65536  # mcp_server.zig RecvResult.buf: request line + headers + body
+MAX_REQUEST_BYTES = PLUGIN_RECV_BUFFER - 2048  # leave room for the request line and headers
 _CONNECT_POLL_S = 0.1  # granularity at which a pending connect() notices cancel_all()
 _READ_CHUNK = 65536
 _MAX_ERROR_TEXT = 500  # untrusted text copied into exception details is truncated
 # connect_ex() results that mean "in progress" (POSIX and Windows)
 _CONNECT_PENDING = {0, errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK, 10035}
+# Socket constructor used for backend connections (a seam for tests; never reassigned at runtime).
+_socket_factory: Callable[..., socket.socket] = socket.socket
 
 
 class _Cancelled(Exception):
@@ -137,19 +152,37 @@ def _json_depth_exceeds(obj: Any, limit: int) -> bool:
 
 
 def _clip(text: Any) -> str:
-    s = str(text)
-    return s if len(s) <= _MAX_ERROR_TEXT else s[:_MAX_ERROR_TEXT] + "...[clipped]"
+    """Untrusted (guest-provided) text for exception details: controls/bidi removed, clipped."""
+    return sanitize_untrusted_text(str(text), _MAX_ERROR_TEXT)
+
+
+def _validated_token(backend_id: str, token: Secret | str) -> Secret:
+    """Return the token as a Secret, stripped of surrounding whitespace.
+
+    Raises ConfigError (without echoing the value) when the token contains
+    anything but printable ASCII: CR/LF would be rejected by http.client with a
+    ValueError that quotes the whole header (token included), and non-latin-1
+    characters cannot be encoded into a header at all.
+    """
+    value = token.reveal() if isinstance(token, Secret) else str(token)
+    value = value.strip(" \t\r\n")
+    if any(not (0x20 <= ord(ch) <= 0x7E) for ch in value):
+        raise ConfigError(
+            f"backend {backend_id!r}: the bearer token contains control or non-ASCII characters",
+            hint="check token_source / the token env var or mcp_config.json (the value is not shown)",
+        )
+    return Secret(value)
 
 
 class HttpBackendClient:
     """Synchronous BackendClient over stdlib sockets + http.client.
 
-    ``clock`` is used only to measure call durations reported in log lines and
-    ``ToolCallResult.raw['_gateway']``; socket deadlines always use real time.
+    ``clock`` is used only to measure call durations reported in log lines;
+    socket deadlines always use real time.
     """
 
     def __init__(self, endpoint: BackendEndpoint, *, max_response_bytes: int = 1_048_576,
-                 clock: Clock | None = None) -> None:
+                 clock: Clock | None = None, max_request_bytes: int = MAX_REQUEST_BYTES) -> None:
         parts = urlsplit(endpoint.url)
         if parts.scheme != "http":
             raise ConfigError(f"backend {endpoint.id!r}: only http:// endpoints are supported "
@@ -160,14 +193,15 @@ class HttpBackendClient:
             port = parts.port or 80
         except ValueError as e:
             raise ConfigError(f"backend {endpoint.id!r}: invalid port in endpoint URL") from e
-        if max_response_bytes <= 0:
-            raise ConfigError("max_response_bytes must be positive")
-        self._endpoint = endpoint
+        if max_response_bytes <= 0 or max_request_bytes <= 0:
+            raise ConfigError("max_response_bytes and max_request_bytes must be positive")
+        self._endpoint = dataclasses.replace(endpoint, token=_validated_token(endpoint.id, endpoint.token))
         self._host = parts.hostname
         self._port = port
         self._path = parts.path or "/"
         self._display = f"http://{self._host}:{self._port}{self._path}"  # never includes userinfo
         self._max_bytes = max_response_bytes
+        self._max_request_bytes = max_request_bytes
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._lock = threading.Lock()
         self._inflight: set[_InFlight] = set()
@@ -180,10 +214,13 @@ class HttpBackendClient:
             return self._endpoint
 
     def update_token(self, token: Secret | str) -> None:
-        """Replace the bearer token (used by the supervisor's token refresher)."""
-        value = token.reveal() if isinstance(token, Secret) else str(token)
+        """Replace the bearer token (used by the supervisor's token refresher).
+
+        Raises ConfigError (and keeps the old token) if the new one is not printable ASCII.
+        """
+        value = _validated_token(self._endpoint.id, token)
         with self._lock:
-            self._endpoint = dataclasses.replace(self._endpoint, token=Secret(value))
+            self._endpoint = dataclasses.replace(self._endpoint, token=value)
 
     def __repr__(self) -> str:
         return f"HttpBackendClient(id={self._endpoint.id!r}, url={self._display!r}, token='***')"
@@ -214,7 +251,7 @@ class HttpBackendClient:
         infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
         last: OSError | None = None
         for family, socktype, proto, _canon, addr in infos:
-            sock = socket.socket(family, socktype, proto)
+            sock = _socket_factory(family, socktype, proto)
             try:
                 call.attach(sock)
                 sock.setblocking(False)
@@ -223,6 +260,10 @@ class HttpBackendClient:
                     raise OSError(rc, f"connect failed (errno {rc})")
                 if rc != 0:
                     _wait_connected(sock, call, deadline)
+                # A cancel that landed before the socket was connected could not shut it down
+                # (ENOTCONN); only the flag recorded it. Once connected, shutdown() works.
+                if call.cancelled:
+                    raise _Cancelled()
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 return sock
             except (TimeoutError, _Cancelled):
@@ -252,7 +293,18 @@ class HttpBackendClient:
             }
             if body is not None:
                 headers["Content-Type"] = "application/json"
-            conn.request(method, self._path, body=body, headers=headers)
+            try:
+                conn.request(method, self._path, body=body, headers=headers)
+                encode_failed = False
+            except ValueError:  # header value rejected/unencodable; its message quotes the header
+                encode_failed = True
+            if encode_failed:
+                # raised outside the handler so no __context__ links back to the ValueError
+                raise BackendProtocolError(
+                    f"backend {endpoint.id}: the HTTP request could not be encoded "
+                    "(invalid characters in the bearer token or endpoint)",
+                    stage="backend_call", details=self._details(),
+                )
             sock.settimeout(max(0.001, deadline - time.monotonic()))
             resp = conn.getresponse()
             status = resp.status
@@ -267,6 +319,10 @@ class HttpBackendClient:
                 sock.settimeout(remaining)
                 chunk = resp.read(min(_READ_CHUNK, self._max_bytes + 1 - total))
                 if not chunk:
+                    if resp.length:
+                        # http.client returns b"" (no IncompleteRead) when the peer closes
+                        # before Content-Length bytes arrived: the connection was lost.
+                        raise http.client.IncompleteRead(b"".join(chunks), resp.length)
                     break
                 chunks.append(chunk)
                 total += len(chunk)
@@ -365,6 +421,14 @@ class HttpBackendClient:
                 f"arguments for {method} are not JSON-serialisable",
                 stage="backend_call", details=self._details(method=method),
             ) from None
+        if len(body) > self._max_request_bytes:
+            raise BackendProtocolError(
+                f"request for {method} is too large ({len(body)} bytes; the plugin accepts at most "
+                f"{self._max_request_bytes}); it was not sent",
+                stage="backend_call", hint="split the data into smaller chunks",
+                details=self._details(method=method, size=len(body),
+                                      max_request_bytes=self._max_request_bytes),
+            )
         t0 = self._clock.monotonic()
         try:
             status, data = self._exchange("POST", body, timeout_s)
@@ -379,6 +443,9 @@ class HttpBackendClient:
         if not isinstance(msg, dict):
             raise BackendProtocolError(f"backend {self._endpoint.id}: JSON-RPC response is not an object",
                                        stage="backend_call", details=self._details(method=method))
+        if msg.get("id") is None and isinstance(msg.get("error"), dict):
+            # e.g. -32700 for a body the plugin could not parse: report the error itself
+            raise self._rpc_error(method, msg["error"])
         if msg.get("id") != rid:
             raise BackendProtocolError(
                 f"backend {self._endpoint.id}: JSON-RPC response id does not match the request",
@@ -474,9 +541,14 @@ class HttpBackendClient:
             ann = t.get("annotations")
             read_only = bool(ann.get("readOnlyHint")) if isinstance(ann, dict) else False
             desc = t.get("description")
+            schema = t.get("inputSchema")
+            if not isinstance(schema, dict):
+                # keep the ToolInfo contract (dict); ToolCatalog applies the stricter checks
+                log.warning("backend %s: tool %s has a non-object inputSchema; using {'type': 'object'}",
+                            self._endpoint.id, _clip(t["name"]))
+                schema = {"type": "object"}
             out.append(ToolInfo(name=t["name"], description=desc if isinstance(desc, str) else "",
-                                input_schema=t.get("inputSchema"),  # type: ignore[arg-type]  # catalog sanitises
-                                read_only=read_only))
+                                input_schema=schema, read_only=read_only))
         return out
 
     def call_tool(self, name: str, arguments: Mapping[str, Any] | None, timeout_s: float) -> ToolCallResult:

@@ -10,6 +10,16 @@ The gateway exposes the full list at session start because some MCP clients
 ignore ``notifications/tools/list_changed`` (plan 5.5). Schemas are sanitised so
 the mirrored ``inputSchema`` is always a JSON-Schema object.
 
+Trust: live lists and cache files come from the guest (or from disk) and are not
+trusted for policy. ``readOnlyHint`` decides lock bypass, epoch gating and
+retries, so a live/cached entry is read-only only if it says so AND the builtin
+list marks the same tool read-only; tools unknown to the builtin list are
+mutating. A live list may still mark a builtin read-only tool mutating (the safe
+direction). Descriptions and every string value inside a schema are stripped of
+control/bidi characters (``proxy.sanitize_untrusted_text``); descriptions are
+also capped at ``MAX_DESCRIPTION_CHARS``. Cached ``initialize`` instructions get
+the same treatment (capped at ``MAX_INSTRUCTIONS_CHARS``).
+
 Thread-safety: all public methods may be called concurrently; internal state
 is guarded by one re-entrant lock and cache files are written atomically
 (temp file + fsync + ``os.replace``).
@@ -30,10 +40,14 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ToolInfo
+from .proxy import sanitize_untrusted_text
 
 log = logging.getLogger(__name__)
 
 CACHE_FORMAT = 1
+MAX_DESCRIPTION_CHARS = 4000  # builtin descriptions are < 300 chars
+MAX_INSTRUCTIONS_CHARS = 20_000  # the plugin's initialize instructions are a few KB
+_MAX_SCHEMA_DEPTH = 64
 # Read-only tools that must still never be retried: WaitForEvent drains the
 # plugin's pending-event queue, so a blind retry can lose events.
 NON_RETRYABLE_READ_ONLY = frozenset({"WaitForEvent"})
@@ -67,7 +81,26 @@ def _schema_problem(schema: Any) -> str | None:
         json.dumps(schema)
     except (TypeError, ValueError):
         return "inputSchema is not JSON-serialisable"
+    except RecursionError:
+        return "inputSchema is nested too deeply"
     return None
+
+
+def _clean_schema_strings(obj: Any, depth: int = 0) -> Any:
+    """Copy of a JSON value with control/bidi characters removed from every string value.
+
+    Keys are left as they are (property names must match the arguments the
+    client sends). Raises ValueError when nested deeper than ``_MAX_SCHEMA_DEPTH``.
+    """
+    if depth > _MAX_SCHEMA_DEPTH:
+        raise ValueError("schema nested too deeply")
+    if isinstance(obj, str):
+        return sanitize_untrusted_text(obj, max_len=len(obj))
+    if isinstance(obj, dict):
+        return {k: _clean_schema_strings(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_schema_strings(v, depth + 1) for v in obj]
+    return copy.deepcopy(obj)
 
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
@@ -102,7 +135,9 @@ class ToolCatalog:
         self._lock = threading.RLock()
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()
         self._warnings: list[str] = []
+        self._builtin_ro: dict[str, bool] | None = None  # None while the builtin list itself loads
         self._builtin = self._load_builtin(builtin_json)
+        self._builtin_ro = {t.name: t.read_only for t in self._builtin}
         self._live: dict[str, tuple[str, list[ToolInfo]]] = {}  # backend_id -> (version, tools)
         self._loaded_from_disk: set[str] = set()
         self._instructions: dict[str, str | None] = {}
@@ -126,6 +161,21 @@ class ToolCatalog:
         with self._lock:
             return list(self._warnings)
 
+    def _read_only_policy(self, name: str, claimed: bool, source: str) -> bool:
+        """Effective read-only flag for a live/cached entry (see module docstring)."""
+        if self._builtin_ro is None:  # loading the builtin list: it is the reference
+            return claimed
+        builtin = self._builtin_ro.get(name)
+        if claimed and builtin is False:
+            self._warn(f"{source}: tool {name!r} claims readOnlyHint but the builtin catalog marks it "
+                       "mutating; treated as mutating")
+            return False
+        if claimed and builtin is None:
+            log.info("tool catalog: %s: tool %r is not in the builtin catalog; treated as mutating",
+                     source, name)
+            return False
+        return claimed
+
     def _sanitize(self, tools: list[ToolInfo], *, source: str) -> list[ToolInfo]:
         out: list[ToolInfo] = []
         seen: set[str] = set()
@@ -138,14 +188,19 @@ class ToolCatalog:
                 continue
             seen.add(t.name)
             problem = _schema_problem(t.input_schema)
+            schema: dict[str, Any] = {"type": "object"}
+            if problem is None:
+                try:
+                    schema = _clean_schema_strings(t.input_schema)
+                except (ValueError, RecursionError):
+                    problem = "inputSchema is nested too deeply"
             if problem is not None:
                 self._warn(f"{source}: tool {t.name!r}: {problem}; replaced with {{'type': 'object'}}")
-                schema: dict[str, Any] = {"type": "object"}
-            else:
-                schema = copy.deepcopy(t.input_schema)
+                schema = {"type": "object"}
             desc = t.description if isinstance(t.description, str) else ""
-            out.append(ToolInfo(name=t.name, description=desc, input_schema=schema,
-                                read_only=bool(t.read_only)))
+            desc = sanitize_untrusted_text(desc, max_len=MAX_DESCRIPTION_CHARS)
+            read_only = self._read_only_policy(t.name, bool(t.read_only), source)
+            out.append(ToolInfo(name=t.name, description=desc, input_schema=schema, read_only=read_only))
         return out
 
     def _cache_files(self, backend_id: str) -> list[Path]:
@@ -178,7 +233,7 @@ class ToolCatalog:
                                   input_schema=t.get("inputSchema"), read_only=bool(t.get("read_only")))
                          for t in data["tools"]]
                 version = str(data.get("server_version", ""))
-            except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
                 self._warn(f"ignoring unreadable cache file {p.name}: {type(e).__name__}")
                 continue
             self._live[backend_id] = (version, self._sanitize(tools, source=f"cache {p.name}"))
@@ -256,7 +311,12 @@ class ToolCatalog:
         return self.cache_dir / f"instructions-{_safe_component(backend_id)}.json"
 
     def update_instructions(self, backend_id: str, instructions: str) -> None:
-        """Cache the backend's ``initialize`` instructions (persisted for later sessions)."""
+        """Cache the backend's ``initialize`` instructions (persisted for later sessions).
+
+        The text comes from the guest: control/bidi characters are removed and it is
+        capped at ``MAX_INSTRUCTIONS_CHARS``.
+        """
+        instructions = sanitize_untrusted_text(str(instructions), max_len=MAX_INSTRUCTIONS_CHARS)
         with self._lock:
             self._instructions[backend_id] = instructions
             path = self._instructions_path(backend_id)
@@ -274,9 +334,10 @@ class ToolCatalog:
                 if path.is_file():
                     try:
                         data = json.loads(path.read_text(encoding="utf-8"))
-                        if data.get("backend_id") == backend_id and isinstance(data.get("instructions"), str):
-                            value = data["instructions"]
-                    except (OSError, ValueError, AttributeError) as e:
+                        text = data.get("instructions")
+                        if data.get("backend_id") == backend_id and isinstance(text, str):
+                            value = sanitize_untrusted_text(text, max_len=MAX_INSTRUCTIONS_CHARS)
+                    except (OSError, ValueError, AttributeError, RecursionError) as e:
                         self._warn(f"ignoring unreadable instructions cache {path.name}: {type(e).__name__}")
                 self._instructions[backend_id] = value
             return self._instructions[backend_id]

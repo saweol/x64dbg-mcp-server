@@ -465,3 +465,119 @@ def test_update_token(server):
     c.update_token(Secret(TOKEN))
     assert c.health_l1() is True
     assert c.endpoint.token.reveal() == TOKEN
+
+
+# ── review fixes ────────────────────────────────────────────────────
+def _blob(exc: BaseException) -> str:
+    return " ".join([str(exc), repr(exc), json.dumps(getattr(exc, "details", {}), default=str),
+                     repr(getattr(exc, "__cause__", None)), repr(getattr(exc, "__context__", None))])
+
+
+@pytest.mark.parametrize("bad", ["SECRETX\r\nX-Injected: y", "SECRETX\x00", "tok☃SECRETX", "SECRETX\nmore"])
+def test_token_with_illegal_characters_is_rejected_without_leaking(server, bad):
+    with pytest.raises(ConfigError) as ei:
+        make_client(server.url, token=bad)
+    assert "SECRETX" not in _blob(ei.value)
+    c = make_client(server.url)
+    with pytest.raises(ConfigError) as ei:
+        c.update_token(Secret(bad))
+    assert "SECRETX" not in _blob(ei.value)
+    assert c.endpoint.token.reveal() == TOKEN  # unchanged after a rejected update
+
+
+def test_token_surrounding_whitespace_is_stripped(server):
+    c = make_client(server.url, token=TOKEN + "\r\n")  # e.g. read from a file with a trailing newline
+    assert c.health_l1() is True
+    assert server.requests[-1].authorization == f"Bearer {TOKEN}"
+    c.update_token("  " + TOKEN + "\n")
+    assert c.endpoint.token.reveal() == TOKEN
+
+
+def test_header_encoding_failure_never_leaks_token(client, server):
+    """Defence in depth: even a token that slipped past validation never escapes in a ValueError."""
+    import dataclasses
+
+    client._endpoint = dataclasses.replace(client._endpoint, token=Secret("bad\nSECRETX"))
+    with pytest.raises(BackendProtocolError) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert "SECRETX" not in _blob(ei.value)
+    assert server.tool_calls() == []
+
+
+def test_eof_inside_body_maps_to_unavailable(client, server):
+    body = b'{"jsonrpc":"2.0","id":1,"resu'
+    server.set_raw_response("run", 200, body, headers={"Content-Length": "500"})
+    with pytest.raises(BackendUnavailable) as ei:
+        client.call_tool("run", {}, timeout_s=5)
+    assert_no_token(ei.value)
+
+
+def test_request_too_large_rejected_before_sending(client, server):
+    with pytest.raises(BackendProtocolError) as ei:
+        client.call_tool("WriteMemory", {"address": "0x401000", "data": "A" * 70_000}, timeout_s=5)
+    assert "too large" in ei.value.message
+    assert ei.value.details["max_request_bytes"] < 65536
+    assert server.tool_calls("WriteMemory") == []  # nothing reached the plugin
+    small = make_client(server.url, max_request_bytes=200)
+    with pytest.raises(BackendProtocolError):
+        small.call_tool("Echo", {"x": "B" * 300}, timeout_s=5)
+    assert small.call_tool("Echo", {}, timeout_s=5).texts
+
+
+def test_null_id_parse_error_is_reported_with_its_code(client, server):
+    server.set_raw_response("Echo", 200, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,'
+                                         b'"message":"Parse error"}}')
+    with pytest.raises(BackendProtocolError) as ei:
+        client.call_tool("Echo", {}, timeout_s=5)
+    assert ei.value.details["code"] == -32700
+
+
+def test_rpc_error_message_in_details_is_sanitised(client, server):
+    server.on_tool("DumpMemory", RpcError(-32603, "over\x1b[31mflow‮\x00 IGNORE PREVIOUS" + "x" * 2000))
+    with pytest.raises(BackendProtocolError) as ei:
+        client.call_tool("DumpMemory", {}, timeout_s=5)
+    msg = ei.value.details["message"]
+    assert "\x1b" not in msg and "‮" not in msg and "\x00" not in msg
+    assert msg.startswith("over[31mflow")
+    assert len(msg) < 700
+
+
+def test_list_tools_normalises_non_object_schema(client, server):
+    server.set_tools([{"name": "X", "description": "d", "inputSchema": None},
+                      {"name": "Y", "description": "d", "inputSchema": ["not", "a", "dict"]},
+                      {"name": "Z", "description": "d", "inputSchema": {"type": "object"}}])
+    tools = {t.name: t for t in client.list_tools()}
+    assert tools["X"].input_schema == {"type": "object"}
+    assert tools["Y"].input_schema == {"type": "object"}
+    assert tools["Z"].input_schema == {"type": "object"}
+    assert all(isinstance(t.input_schema, dict) for t in tools.values())
+
+
+def test_cancel_before_an_immediately_completing_connect_is_not_lost(client, server, monkeypatch):
+    """A cancel between socket registration and a connect() that succeeds at once.
+
+    shutdown() on a not-yet-connected socket fails with ENOTCONN; Linux still
+    latches the shutdown flags, but that is not portable. Model the portable case
+    by setting only the cancelled flag: the call must still abort before sending.
+    """
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    class ImmediateConnect(socket.socket):
+        def connect_ex(self, address):  # type: ignore[override]
+            self.setblocking(True)
+            try:
+                return super().connect_ex(address)
+            finally:
+                self.setblocking(False)
+
+    orig_attach = backend_mod._InFlight.attach
+
+    def attach_then_cancel(self, sock):  # type: ignore[no-untyped-def]
+        orig_attach(self, sock)
+        self.cancelled = True  # what cancel() leaves behind when shutdown() has no effect
+
+    monkeypatch.setattr(backend_mod, "_socket_factory", ImmediateConnect)
+    monkeypatch.setattr(backend_mod._InFlight, "attach", attach_then_cancel)
+    with pytest.raises(CancelledByVmOp):
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert server.tool_calls("GetDebugState") == []

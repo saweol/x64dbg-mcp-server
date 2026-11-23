@@ -27,6 +27,7 @@ from x64dbg_vm_gateway.errors import (
     ConfigError,
     CrashLoop,
     GuestOperationError,
+    LockTimeout,
     ToolsNotRunning,
     VmNotReady,
 )
@@ -351,6 +352,41 @@ def test_ensure_alive_loading_after_being_up_bumps_epoch(fake_vm, fake_guest, fa
     assert fake_guest.calls_of("run_program") == []
 
 
+def test_transient_l1_failure_of_the_same_instance_does_not_bump(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    assert sup.check("x64").state is HealthState.HEALTHY  # seen up; its pid is recorded
+    start = fake_clock.monotonic()
+    client.l1 = lambda: fake_clock.monotonic() - start >= 10  # L1 hiccup, same process
+    assert sup.ensure_alive("x64", reason="probe") == 0
+    assert sup.epoch_history("x64") == []
+
+
+def test_external_restart_with_a_new_pid_bumps(fake_vm, fake_guest, fake_clock, client):
+    old = fake_guest.add_process(EXE)
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    assert sup.check("x64").state is HealthState.HEALTHY
+    fake_guest.processes.remove(old)
+    fake_guest.add_process(EXE)  # restarted outside the gateway
+    start = fake_clock.monotonic()
+    client.l1 = lambda: fake_clock.monotonic() - start >= 10
+    assert sup.ensure_alive("x64", reason="probe") == 1
+
+
+def test_note_up_marks_the_epoch_as_seen(fake_vm, fake_guest, fake_clock, client):
+    """A successful proxied call proves the backend was up even if check() never ran."""
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    sup.note_up("x64", 0)
+    fake_guest.add_process(EXE)
+    client.down()
+    start = fake_clock.monotonic()
+    client.l1 = lambda: fake_clock.monotonic() - start >= 10
+    client.l2 = True
+    assert sup.ensure_alive("x64", reason="external restart") == 1  # pids unknown: assume restarted
+    sup.note_up("x64", 0)  # stale epoch: ignored
+    assert sup.epoch("x64") == 1
+
+
 def test_ensure_alive_loading_too_long_kills_and_relaunches(fake_vm, fake_guest, fake_clock, client):
     fake_guest.add_process(EXE)
     client.down()
@@ -367,9 +403,75 @@ def test_ensure_alive_not_ready_in_time(fake_vm, fake_guest, fake_clock, client)
     t0 = fake_clock.monotonic()
     with pytest.raises(BackendUnavailable) as ei:
         sup.ensure_alive("x64", reason="dead")
-    assert sup.epoch("x64") == 0
+    # a relaunch was issued: whatever comes up later is a fresh debugger
+    assert sup.epoch("x64") == 1
     assert 120 <= fake_clock.monotonic() - t0 <= 130
     assert ei.value.details["timeout_s"] == 120
+
+
+def test_launched_but_slow_debugger_keeps_the_bumped_epoch(fake_vm, fake_guest, fake_clock, client):
+    """Review finding: launch ok, readiness times out, debugger finishes booting later."""
+    client.down()
+    fake_guest.on_run_program = lambda exe, args, **kw: (fake_guest.add_process(EXE), 0)[1]
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, relaunch_ready_timeout_s=60)
+    with pytest.raises(BackendUnavailable):
+        sup.ensure_alive("x64", reason="dead")
+    assert sup.epoch("x64") == 1
+    client.up()  # the new debugger finished booting by itself
+    assert sup.check("x64").state is HealthState.HEALTHY
+    # no second relaunch and no double bump: the launch was already accounted for
+    assert sup.ensure_alive("x64", reason="probe") == 1
+    assert len(fake_guest.calls_of("run_program")) == 1
+
+
+def test_kill_then_launch_failure_bumps_epoch(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    client.l2 = False
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    _make_hung(sup, fake_clock)
+    fake_guest.on_run_program = lambda exe, args, **kw: 1  # schtasks /run fails
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="hang")
+    assert ei.value.details["exit_code"] == 1
+    assert fake_guest.calls_of("kill_process")
+    assert sup.epoch("x64") == 1  # the hung debugger and its debuggee state are gone
+
+
+def test_ensure_alive_max_wait_bounds_the_ready_wait(fake_vm, fake_guest, fake_clock, client):
+    client.down()
+    fake_guest.on_run_program = lambda exe, args, **kw: (fake_guest.add_process(EXE), 0)[1]
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, relaunch_ready_timeout_s=120)
+    t0 = fake_clock.monotonic()
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="dead", max_wait_s=10)
+    assert fake_clock.monotonic() - t0 <= 15
+    assert ei.value.details["relaunch_pending"] is True
+    assert sup.epoch("x64") == 1
+    assert len(fake_guest.calls_of("run_program")) == 1
+
+
+def test_ensure_alive_zero_budget_still_issues_the_relaunch(fake_vm, fake_guest, fake_clock, client):
+    client.down()
+    fake_guest.on_run_program = lambda exe, args, **kw: (fake_guest.add_process(EXE), 0)[1]
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="dead", max_wait_s=0)
+    assert ei.value.details["relaunch_pending"] is True
+    assert len(fake_guest.calls_of("run_program")) == 1
+    assert sup.epoch("x64") == 1
+
+
+def test_ensure_alive_max_wait_bounds_the_loading_wait(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    client.down()
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, boot_grace_s=90)
+    t0 = fake_clock.monotonic()
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="loading", max_wait_s=10)
+    assert fake_clock.monotonic() - t0 <= 15
+    assert ei.value.details["state"] == "LOADING"
+    assert fake_guest.calls_of("run_program") == []
+    assert sup.epoch("x64") == 0
 
 
 def test_ensure_alive_schtasks_failure(fake_vm, fake_guest, fake_clock, client):
@@ -386,7 +488,10 @@ def test_task_mode_requires_launch_task(fake_vm, fake_guest, fake_clock, client)
     client.endpoint = BackendEndpoint(id="x64", arch="x64", url="http://h/", token=Secret("t"))
     sup = make_sup(fake_vm, fake_guest, fake_clock, client, backend=cfg(launch_task=None))
     with pytest.raises(ConfigError):
-        sup.ensure_alive("x64", reason="dead")
+        sup.ensure_alive("x64", job_id="j1", reason="dead")
+    # rejected before any side effect: no restart counted, no epoch change
+    assert sup.restarts("j1") == 0
+    assert sup.epoch("x64") == 0
 
 
 def test_invalid_relaunch_mode(fake_vm, fake_guest, fake_clock, client):
@@ -426,6 +531,28 @@ def test_crash_loop_after_max_restarts(fake_vm, fake_guest, fake_clock, client):
     assert sup.restarts("j1") == 0
 
 
+def test_crash_loop_without_job_id(fake_vm, fake_guest, fake_clock, client):
+    """Relaunches without a job are limited per backend within a sliding window."""
+    relaunch_brings_up(fake_guest, client)
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, max_restarts_per_job=3, crash_loop_window_s=600)
+
+    def crash() -> int:
+        client.down()
+        fake_guest.processes.clear()
+        return sup.ensure_alive("x64", reason="crash")
+
+    assert [crash() for _ in range(3)] == [1, 2, 3]
+    with pytest.raises(CrashLoop) as ei:
+        crash()
+    assert ei.value.details["job_id"] is None
+    assert ei.value.details["debugger_killed_by_target"] == 3
+    assert sup.jobless_restarts("x64") == 3
+    fake_clock.advance(601)  # old relaunches leave the window
+    assert crash() == 4
+    sup.bump_epoch("x64", "vm revert")  # a revert starts from a clean state
+    assert sup.jobless_restarts("x64") == 0
+
+
 def test_concurrent_callers_share_one_relaunch(fake_vm, fake_guest, fake_clock, client):
     client.down()
 
@@ -455,6 +582,29 @@ def test_concurrent_callers_share_one_relaunch(fake_vm, fake_guest, fake_clock, 
         t.join(timeout=10)
     assert not errs
     assert results == [1, 1, 1]
+    assert len(fake_guest.calls_of("run_program")) == 1
+
+
+def test_bounded_caller_during_another_relaunch_reports_pending(fake_vm, fake_guest, fake_clock, client):
+    client.down()
+    started = threading.Event()
+
+    def on_run(exe, args, **kw):
+        started.set()
+        time.sleep(0.5)  # real time: hold the relaunch lock
+        fake_guest.add_process(EXE)
+        client.up()
+        return 0
+
+    fake_guest.on_run_program = on_run
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    t = threading.Thread(target=lambda: sup.ensure_alive("x64", reason="dead"))
+    t.start()
+    assert started.wait(5)
+    with pytest.raises(LockTimeout) as ei:
+        sup.ensure_alive("x64", reason="dead", max_wait_s=0.05)
+    t.join(5)
+    assert ei.value.details["relaunch_pending"] is True
     assert len(fake_guest.calls_of("run_program")) == 1
 
 
@@ -495,7 +645,7 @@ def test_pause_during_relaunch_wait_aborts(fake_vm, fake_guest, fake_clock, clie
     fake_guest.on_run_program = on_run
     with pytest.raises(CancelledByVmOp):
         sup.ensure_alive("x64", reason="dead")
-    assert sup.epoch("x64") == 0
+    assert sup.epoch("x64") == 1  # the relaunch had been issued before the VM operation began
 
 
 def test_resume_clears_loading_timer(fake_vm, fake_guest, fake_clock, client):
@@ -541,6 +691,60 @@ def test_kill_failure_for_already_exited_process_is_tolerated(fake_vm, fake_gues
     assert sup.ensure_alive("x64", reason="hang") == 1
     fake_guest.kill_process = real_kill  # type: ignore[method-assign]
     assert p not in fake_guest.processes
+
+
+def _slow_exit(guest, listings_until_exit: int | None) -> None:
+    """kill_process succeeds but the process only disappears after N more listings (None: never)."""
+    pending: dict[int, int] = {}
+    real_list = guest.list_processes
+
+    def kill(pid: int) -> None:
+        guest.calls.append(("kill_process", (pid,), {}))
+        pending[pid] = listings_until_exit if listings_until_exit is not None else 10**9
+
+    def listing():  # type: ignore[no-untyped-def]
+        for pid in list(pending):
+            pending[pid] -= 1
+            if pending[pid] < 0:
+                guest.processes = [x for x in guest.processes if x.pid != pid]
+                del pending[pid]
+        return real_list()
+
+    guest.kill_process = kill
+    guest.list_processes = listing
+
+
+def test_hung_kill_waits_for_the_process_to_exit(fake_vm, fake_guest, fake_clock, client):
+    p = fake_guest.add_process(EXE)
+    client.l2 = False
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    _make_hung(sup, fake_clock)
+    _slow_exit(fake_guest, listings_until_exit=2)
+
+    def on_run(exe, args, **kw):
+        assert all(x.pid != p.pid for x in fake_guest.processes), "old instance must be gone first"
+        fake_guest.add_process(EXE)
+        client.up()
+        return 0
+
+    fake_guest.on_run_program = on_run
+    assert sup.ensure_alive("x64", reason="hang") == 1
+
+
+def test_hung_process_that_never_exits_blocks_the_relaunch(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(EXE)
+    client.l2 = False
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, kill_exit_timeout_s=10)
+    _make_hung(sup, fake_clock)
+    _slow_exit(fake_guest, listings_until_exit=None)
+    relaunch_brings_up(fake_guest, client)
+    t0 = fake_clock.monotonic()
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="hang")
+    assert fake_clock.monotonic() - t0 <= 15
+    assert ei.value.details["pids"]
+    assert fake_guest.calls_of("run_program") == []  # never two instances on one port
+    assert sup.epoch("x64") == 1  # the kill was accepted: the old state is gone
 
 
 def test_kill_failure_with_process_still_present_aborts(fake_vm, fake_guest, fake_clock, client):
