@@ -7,7 +7,8 @@ plus the VM provider, so it is unit-testable with FakeGuest / FakeVm.
   (``<root>\\x64\\x64dbg.exe`` / ``<root>\\x32\\x32dbg.exe``) and reports plugin
   files and ``mcp_config.json`` health without ever returning a token.
 - :func:`provision_guest` runs the packaged ``guest/provision.ps1`` (job root +
-  ACL, plugin configs, elevated ``MCP-x64dbg`` / ``MCP-x32dbg`` logon tasks,
+  ACL, plugin configs, ``[Engine] DisableDatabaseCompression=1`` in each
+  debugger's ini file, elevated ``MCP-x64dbg`` / ``MCP-x32dbg`` logon tasks,
   auto-logon, power settings), optionally reboots and waits until every
   provisioned backend port answers, and optionally (re)takes the clean snapshot.
 - :func:`install_plugin` replaces the plugin DLLs with a new build (backing the
@@ -721,6 +722,9 @@ def _clean_backends(value: Any) -> dict[str, dict[str, Any]]:
             "token_length": _int_or_none(v.get("token_length")),
             "token_generated": v.get("token_generated") is True,
             "plugin": _clean_plugin(v.get("plugin")),
+            # x64dbg's ini next to the exe, where the script turned database compression off
+            "settings_ini": _str_or_none(v.get("settings_ini")),
+            "db_compression": _str_or_none(v.get("db_compression"), 16),
         }
     return out
 

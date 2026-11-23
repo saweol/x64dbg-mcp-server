@@ -31,6 +31,12 @@
   AllowExternal / AllowedClients when allowed_clients is given) are written
   first, every other key of an existing valid config is kept as it was.
 
+  x64dbg settings: [Engine] DisableDatabaseCompression=1 is written into the
+  debugger's ini file next to its exe (x64dbg.ini / x32dbg.ini), creating the
+  file, section or key as needed and keeping every other line, so databases
+  saved to x64dbg's default location are plain JSON (the gateway's
+  ida_export_annotations cannot read LZ4-compressed ones).
+
   Results:
     C:\mcp\provision.log            progress log (no secrets), including the plugin
                                     build found in each plugins folder
@@ -100,6 +106,53 @@ function Read-ConfigObject([string]$ConfigPath) {
         }
     } catch { }
     return $out
+}
+
+function Set-IniValue([string]$Path, [string]$Section, [string]$Key, [string]$Value) {
+    # Sets Key=Value in [Section] of an INI file: creates the file, the section or the key
+    # when missing, replaces the key's line in place when present (section and key are
+    # compared case-insensitively) and keeps every other line as it was, a UTF-8 BOM
+    # included. Returns $false when the file already had exactly that line.
+    $lines = New-Object System.Collections.Generic.List[string]
+    $bom = $false
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $raw = [System.IO.File]::ReadAllBytes($Path)
+        $bom = ($raw.Length -ge 3) -and ($raw[0] -eq 0xEF) -and ($raw[1] -eq 0xBB) -and ($raw[2] -eq 0xBF)
+        foreach ($l in [System.IO.File]::ReadAllLines($Path)) { $lines.Add($l) }
+    }
+    $header = '[' + $Section + ']'
+    $wanted = $Key + '=' + $Value
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -ieq $header) { $start = $i; break }
+    }
+    if ($start -lt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim() -ne '') { $lines.Add('') }
+        $lines.Add($header)
+        $lines.Add($wanted)
+    } else {
+        $end = $lines.Count
+        for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim().StartsWith('[')) { $end = $i; break }
+        }
+        $found = -1
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            $t = $lines[$i].Trim()
+            $eq = $t.IndexOf('=')
+            if ($eq -gt 0 -and $t.Substring(0, $eq).Trim() -ieq $Key) { $found = $i; break }
+        }
+        if ($found -ge 0) {
+            if ($lines[$found] -ceq $wanted) { return $false }
+            $lines[$found] = $wanted
+        } else {
+            # after the section's last non-empty line
+            $insert = $end
+            while ($insert -gt $start + 1 -and $lines[$insert - 1].Trim() -eq '') { $insert-- }
+            $lines.Insert($insert, $wanted)
+        }
+    }
+    [System.IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($bom)))
+    return $true
 }
 
 function Get-PluginInfo([string]$Path) {
@@ -226,6 +279,22 @@ try {
             Write-Utf8NoBom $cfgPath ($cfg | ConvertTo-Json -Compress -Depth 10)
         }
 
+        # x64dbg reads its settings from <exe dir>\<exe name>.ini (x64dbg.ini, x32dbg.ini).
+        # Engine/DisableDatabaseCompression=1 keeps databases saved to x64dbg's default
+        # location plain JSON instead of LZ4 (ida_export_annotations parses them).
+        # ASSUMPTION, to be verified on the real VM: the ini file name (taken from the exe
+        # name, as x64dbg's bridge does) and the section/key names (x64dbg database.cpp).
+        # A debugger running now may write its own settings back when it exits; the reboot
+        # that normally follows provisioning starts it with the new file.
+        $ini = [System.IO.Path]::ChangeExtension($exe, '.ini')
+        $dbgName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+        if (@(Get-Process -Name $dbgName -ErrorAction SilentlyContinue).Count -gt 0) {
+            Write-Log "note: $($a.exe) is running; it may rewrite $ini when it exits"
+        }
+        Invoke-Planned "set [Engine] DisableDatabaseCompression=1 in $ini" {
+            Set-IniValue $ini 'Engine' 'DisableDatabaseCompression' '1' | Out-Null
+        }
+
         Invoke-Planned "register scheduled task $($a.task) -> $exe (user $user, Interactive, Highest, AtLogOn)" {
             $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -239,6 +308,7 @@ try {
         $result.backends[$a.id] = [ordered]@{
             exe = $exe; config = $cfgPath; port = $port; task = $a.task
             token_length = $tokenLength; token_generated = $generated; plugin = $plugin
+            settings_ini = $ini; db_compression = $(if ($dry) { 'unchanged' } else { 'disabled' })
         }
     }
 
