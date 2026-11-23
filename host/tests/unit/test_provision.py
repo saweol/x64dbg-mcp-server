@@ -55,6 +55,7 @@ LOG = "C:\\mcp\\provision.log"
 SHUTDOWN = "C:\\Windows\\System32\\shutdown.exe"
 SCHTASKS = "C:\\Windows\\System32\\schtasks.exe"
 INF = math.inf
+ANY_ADDR = "0.0.0.0"  # noqa: S104 - plugin bind address inside the guest
 
 
 def _profile(**kw) -> ProfileConfig:
@@ -157,7 +158,8 @@ class ProvisionScript:
         self.params = json.loads(self.guest.read(params_path))
         del self.guest.files[params_path.lower()]  # the real script deletes it on read
         p = self.params
-        self.guest.write(LOG, b"[2026-11-23T10:00:00] provision start\r\n[2026-11-23T10:00:01] provision done\r\n")
+        self.guest.write(LOG, b"[2026-11-23T10:00:00] provision start\r\n"
+                              b"[2026-11-23T10:00:01] provision done\r\n")
         if self.write_result:
             if self.status == "ok":
                 exes = {"x64": "x64dbg.exe", "x32": "x32dbg.exe"}
@@ -268,7 +270,7 @@ def test_provision_copies_script_and_params_and_returns_summary(rt: FakeRuntime,
     assert ("C:\\mcp",) in [a for a, _ in rt.channel.calls_of("mkdir")]
     assert script.script_bytes == GUEST_SCRIPT.read_bytes()
     assert script.params == {
-        "x64dbg_root": ROOT, "user": "analyst", "password": PASSWORD, "autologon": True, "bind": "0.0.0.0",
+        "x64dbg_root": ROOT, "user": "analyst", "password": PASSWORD, "autologon": True, "bind": ANY_ADDR,
         "ports": {"x64": 9094, "x32": 9095}, "job_root": "C:\\mcp\\jobs", "no_sleep": True,
         "dry_run": False,
     }
@@ -325,7 +327,8 @@ def test_ports_and_job_root_come_from_runtime(vm: TimelineVm, fake_guest: FakeGu
 
 def test_duplicate_arch_ports_are_a_config_error(rt: FakeRuntime, timeline: Timeline) -> None:
     _setup(rt, timeline)
-    rt.backends = {"a": BackendConfig(id="a", arch="x64", port=1), "b": BackendConfig(id="b", arch="x64", port=2)}
+    rt.backends = {"a": BackendConfig(id="a", arch="x64", port=1),
+                   "b": BackendConfig(id="b", arch="x64", port=2)}
     with pytest.raises(ConfigError):
         _provision(rt, Probe(timeline))
     assert rt.channel.calls == []
@@ -367,7 +370,8 @@ def test_password_is_never_logged_returned_or_raised(rt: FakeRuntime, timeline: 
     assert PASSWORD not in caplog.text
 
 
-def test_failed_status_raises_guest_operation_error(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+def test_failed_status_raises_guest_operation_error(rt: FakeRuntime, timeline: Timeline,
+                                                    host_tmp: Path) -> None:
     _setup(rt, timeline, status="failed", error="x64dbg_root not found: C:\\nope")
     with pytest.raises(GuestOperationError) as ei:
         _provision(rt, Probe(timeline), reboot=True, clean_snapshot="NEW_CLEAN")
@@ -383,7 +387,8 @@ def test_failed_status_raises_guest_operation_error(rt: FakeRuntime, timeline: T
     assert list(host_tmp.iterdir()) == []
 
 
-def test_ok_result_with_nonzero_exit_is_a_failure(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+def test_ok_result_with_nonzero_exit_is_a_failure(rt: FakeRuntime, timeline: Timeline,
+                                                  host_tmp: Path) -> None:
     _setup(rt, timeline, status="ok", exit_code=1)
     with pytest.raises(GuestOperationError):
         _provision(rt, Probe(timeline))
@@ -457,7 +462,8 @@ def test_reboot_that_never_goes_down_raises(rt: FakeRuntime, timeline: Timeline,
     assert ei.value.details["phase"] == "down"
 
 
-def test_ready_requires_every_provisioned_backend(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+def test_ready_requires_every_provisioned_backend(rt: FakeRuntime, timeline: Timeline,
+                                                  host_tmp: Path) -> None:
     _setup(rt, timeline)
     with pytest.raises(VmNotReady) as ei:
         _provision(rt, Probe(timeline, dead_ports=(9095,)), reboot=True, wait_ready_s=200)
@@ -495,9 +501,11 @@ def test_existing_snapshot_is_refused_before_any_guest_change(rt: FakeRuntime, t
     assert not [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
 
 
-def test_overwrite_deletes_then_takes_after_ready(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+def test_overwrite_deletes_then_takes_after_ready(rt: FakeRuntime, timeline: Timeline,
+                                                  host_tmp: Path) -> None:
     _setup(rt, timeline)
-    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN", overwrite_snapshot=True)
+    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN",
+                         overwrite_snapshot=True)
     ops = [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
     assert ops == [("delete_snapshot", ("MCP_CLEAN",)), ("take_snapshot", ("MCP_CLEAN",))]
     last_tools = max(i for i, c in enumerate(rt.vm.calls) if c[0] == "tools_state")
@@ -620,7 +628,8 @@ def test_install_kills_debuggers_backs_up_once_and_relaunches(rt: FakeRuntime, t
     assert summary["backends"]["x32"]["status"] == 401
 
 
-def test_second_install_keeps_the_original_backup(rt: FakeRuntime, timeline: Timeline, tmp_path: Path) -> None:
+def test_second_install_keeps_the_original_backup(rt: FakeRuntime, timeline: Timeline,
+                                                  tmp_path: Path) -> None:
     _seed_install(rt.channel)
     GuestPowerShell(rt.channel)
     _install(rt, Probe(timeline), _dist(tmp_path, b"v1"))
@@ -651,7 +660,8 @@ def test_install_replaces_a_stale_new_file(rt: FakeRuntime, timeline: Timeline, 
     assert not rt.channel.file_exists(X64_PLUGIN + ".new")
 
 
-def test_install_reports_versions_only_with_a_token(rt: FakeRuntime, timeline: Timeline, tmp_path: Path) -> None:
+def test_install_reports_versions_only_with_a_token(rt: FakeRuntime, timeline: Timeline,
+                                                    tmp_path: Path) -> None:
     _seed_install(rt.channel)
     GuestPowerShell(rt.channel)
     seen: list = []
@@ -751,8 +761,9 @@ def test_install_gives_up_when_a_debugger_will_not_exit(vm: TimelineVm, fake_clo
 def _entry(root: str, **extra) -> dict:
     arch = {"exe": True, "plugin": {"present": True, "size": 10, "mtime": "2026-11-20T10:00:00Z",
                                     "file_version": None},
-            "config": {"state": "valid", "port": 9094, "bind": "0.0.0.0"}}
-    doc = {"root": root, "x64": arch, "x32": {**arch, "config": {"state": "empty", "port": None, "bind": None}}}
+            "config": {"state": "valid", "port": 9094, "bind": ANY_ADDR}}
+    empty = {"state": "empty", "port": None, "bind": None}
+    doc = {"root": root, "x64": arch, "x32": {**arch, "config": empty}}
     doc.update(extra)
     return doc
 
