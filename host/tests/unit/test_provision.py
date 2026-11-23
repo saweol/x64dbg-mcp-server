@@ -238,7 +238,9 @@ class ProvisionScript:
                             "port": p["ports"][a], "task": f"MCP-{a}dbg", "token_length": 32,
                             "token_generated": False,
                             "plugin": {"present": True, "file_version": None, "size": 123456,
-                                       "mtime": "2026-11-20T10:00:00Z", "sha256": "ab" * 32}}
+                                       "mtime": "2026-11-20T10:00:00Z", "sha256": "ab" * 32},
+                            "settings_ini": f"{p['x64dbg_root']}\\{a}\\{exes[a][:-4]}.ini",
+                            "db_compression": "unchanged" if p.get("dry_run") else "disabled"}
                         for a in self.archs
                     },
                 }
@@ -323,6 +325,49 @@ def test_guest_script_keeps_secret_handling_and_has_new_features() -> None:
 
 def test_runtime_protocol_is_satisfied_by_the_fake(rt: FakeRuntime) -> None:
     assert isinstance(rt, RuntimeLike)
+
+
+# ── database compression off (J-integ) ─────────────────────────────
+def _function_body(text: str, name: str) -> str:
+    start = text.index(f"function {name}(")
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
+def test_guest_script_turns_x64dbg_database_compression_off() -> None:
+    """x64dbg LZ4-compresses databases saved to its default location unless
+    [Engine] DisableDatabaseCompression=1 (x64dbg database.cpp); ida_export_annotations
+    can only read plain JSON. The ini is <exe dir>\\<exe name>.ini (bridgemain.cpp derives it
+    from the module file name): x64dbg.ini for x64dbg.exe, x32dbg.ini for x32dbg.exe."""
+    text = GUEST_SCRIPT.read_text()
+    assert "[System.IO.Path]::ChangeExtension($exe, '.ini')" in text
+    call = "Set-IniValue $ini 'Engine' 'DisableDatabaseCompression' '1'"
+    assert call in text
+    # applied through Invoke-Planned, so a dry run only reports it
+    planned = text.index('Invoke-Planned "set [Engine] DisableDatabaseCompression=1 in $ini"')
+    assert text.index(call) > planned
+    assert "ASSUMPTION" in text[text.index("DisableDatabaseCompression") - 600:planned]
+    assert "settings_ini = $ini" in text and "db_compression =" in text
+
+
+def test_ini_helper_creates_or_updates_and_keeps_other_content() -> None:
+    body = _function_body(GUEST_SCRIPT.read_text(), "Set-IniValue")
+    assert "ReadAllLines" in body and "WriteAllLines" in body  # rewrites the file line by line
+    assert "-ieq $header" in body  # section header compared case-insensitively ([engine] too)
+    assert "-ieq $Key" in body  # existing key replaced in place, case-insensitively
+    assert ".Insert(" in body  # a missing key goes into the existing section
+    assert "$lines.Add($header)" in body  # a missing section is appended
+    assert "0xEF" in body and "UTF8Encoding($bom)" in body  # a UTF-8 BOM is kept as it was
+    assert "return $false" in body  # an ini that already has the value is not rewritten
+
+
+def test_provision_summary_reports_the_settings_ini(rt: FakeRuntime, timeline: Timeline,
+                                                   host_tmp: Path) -> None:
+    _setup(rt, timeline)
+    summary = _provision(rt, Probe(timeline))
+    x64, x32 = summary["backends"]["x64"], summary["backends"]["x32"]
+    assert x64["settings_ini"] == f"{ROOT}\\x64\\x64dbg.ini" and x64["db_compression"] == "disabled"
+    assert x32["settings_ini"] == f"{ROOT}\\x32\\x32dbg.ini" and x32["db_compression"] == "disabled"
 
 
 # ── provision_guest: happy path / params / secrets ─────────────────
