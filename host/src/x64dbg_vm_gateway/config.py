@@ -74,6 +74,9 @@ class ProfileConfig:
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     backends: tuple[BackendConfig, ...] = ()
     relaunch_mode: str = "task"  # "task" (schtasks /run) | "direct" (runProgramInGuest -interactive)
+    # env var holding the guest user name (alternative to guest_user; guest_user wins when both are set).
+    # Appended after the wave-1 fields so positional construction keeps its meaning.
+    guest_user_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,11 @@ class GatewayConfig:
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     config_path: str | None = None
+    # KEY=VALUE file whose values resolve the *_env names (never exported to os.environ).
+    # A relative path is relative to the config file's directory.
+    env_file: str | None = None
+    # host directories samples / uploads may be read from (expanded with ~)
+    upload_roots: tuple[str, ...] = ("~",)
 
     def profile(self, name: str | None = None) -> ProfileConfig:
         key = name or self.default_profile
@@ -159,7 +167,8 @@ _SECRET_KEY_SUGGESTION = {
 _STR, _FLOAT, _INT, _BOOL, _STR_LIST, _STR_MAP = "string", "number", "integer", "boolean", "array", "table"
 
 # File keys per section -> kind. Structural keys (sub-tables) are listed separately.
-_GATEWAY_KEYS = {"jobs_root": _STR, "default_profile": _STR, "max_call_s": _FLOAT}
+_GATEWAY_KEYS = {"jobs_root": _STR, "default_profile": _STR, "max_call_s": _FLOAT, "env_file": _STR,
+                 "upload_roots": _STR_LIST}
 _GATEWAY_STRUCTURAL = frozenset({"profiles", "http", "config_path"})
 _HTTP_KEYS = {"enabled": _BOOL, "bind": _STR, "port": _INT, "tls_cert": _STR, "tls_key": _STR,
               "allow_clients": _STR_LIST, "token_envs": _STR_MAP}
@@ -167,7 +176,7 @@ _PROFILE_KEYS = {
     "mode": _STR, "vmx": _STR, "vmrun": _STR, "vmrun_type": _STR, "clean_snapshot": _STR,
     "protected_snapshots": _STR_LIST, "guest_user": _STR, "guest_password_env": _STR,
     "guest_host": _STR, "job_root_guest": _STR, "require_isolation": _BOOL, "token_source": _STR,
-    "snapshot_prefix": _STR, "relaunch_mode": _STR,
+    "snapshot_prefix": _STR, "relaunch_mode": _STR, "guest_user_env": _STR,
 }
 _PROFILE_STRUCTURAL = frozenset({"name", "retention", "backends"})
 _RETENTION_KEYS = {"max_gateway_snapshots": _INT, "max_age_days": _INT}
@@ -351,6 +360,13 @@ class _Parser:
         values = self.fields(gw, "gateway", _GATEWAY_KEYS)
         if "max_call_s" in values and not (math.isfinite(values["max_call_s"]) and values["max_call_s"] > 0):
             raise self.error("gateway.max_call_s", "must be a finite number greater than 0")
+        for i, root in enumerate(values.get("upload_roots", ())):
+            if not root.strip():
+                raise self.error(f"gateway.upload_roots[{i}]", "must not be empty")
+            if not (root.startswith("~") or Path(root).is_absolute()):
+                # policy.host_path_allowed ignores relative roots (they would depend on the cwd)
+                raise self.error(f"gateway.upload_roots[{i}]",
+                                 "must be an absolute path or start with ~ (home directory)")
 
         http = self.http(self.table(data.get("http", {}), "http"))
 
@@ -417,8 +433,9 @@ class _Parser:
             self.choice(values["relaunch_mode"], RELAUNCH_MODES, f"{prefix}.relaunch_mode")
         if mode == "vmware" and not values.get("vmx"):
             raise self.error(f"{prefix}.vmx", "required when mode = \"vmware\"")
-        if "guest_password_env" in values:
-            self.env_name(values["guest_password_env"], f"{prefix}.guest_password_env")
+        for env_key in ("guest_password_env", "guest_user_env"):
+            if env_key in values:
+                self.env_name(values[env_key], f"{prefix}.{env_key}")
 
         retention = self.retention(self.table(tbl.get("retention", {}), f"{prefix}.retention"),
                                    f"{prefix}.retention")
@@ -442,11 +459,14 @@ class _Parser:
 
         if mode == "vmware" and token_source == "guest-config" and backends:  # noqa: S105 - enum value
             # Reading mcp_config.json out of the guest needs guest credentials.
-            for key in ("guest_user", "guest_password_env"):
-                if key not in values:
-                    raise self.error(f"{prefix}.{key}",
-                                     "required when token_source = \"guest-config\" (the backend token is "
-                                     "read from mcp_config.json inside the guest)")
+            if "guest_user" not in values and "guest_user_env" not in values:
+                raise self.error(f"{prefix}.guest_user",
+                                 "required (or guest_user_env) when token_source = \"guest-config\" (the "
+                                 "backend token is read from mcp_config.json inside the guest)")
+            if "guest_password_env" not in values:
+                raise self.error(f"{prefix}.guest_password_env",
+                                 "required when token_source = \"guest-config\" (the backend token is "
+                                 "read from mcp_config.json inside the guest)")
 
         return ProfileConfig(name=name, **values, retention=retention, backends=tuple(backends))
 
