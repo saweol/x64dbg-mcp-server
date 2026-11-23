@@ -30,9 +30,12 @@ default_profile = "p"
 [profiles.p]
 mode = "vmware"
 vmx = "/vm/x.vmx"
+guest_user = "mcp"
+guest_password_env = "GW_GUEST_PW"
 
 [profiles.p.backends.x64]
 port = 9094
+config = 'C:\\x64\\mcp_config.json'
 """
 
 
@@ -96,6 +99,8 @@ def test_full_example_parses_into_dataclasses():
     remote = cfg.profile("remote-pc")
     assert remote.mode == "endpoint"
     assert remote.vmx is None
+    # no guest to read mcp_config.json from: endpoint profiles take their token from env
+    assert remote.token_source == "env"
     assert remote.backends == (
         BackendConfig(id="x64", arch="x64", url="http://10.0.0.20:9094", token_env="REMOTE_X64DBG_TOKEN"),
     )
@@ -116,7 +121,8 @@ def test_endpoint_only_config_without_gateway_table():
 
 
 def test_explicit_backend_id_overrides_table_key(tmp_path):
-    extra = '\n[profiles.p.backends.second]\nid = "dbg32"\narch = "x32"\nport = 9095\n'
+    extra = ('\n[profiles.p.backends.second]\nid = "dbg32"\narch = "x32"\nport = 9095\n'
+             'config = "C:/x32/mcp_config.json"\n')
     cfg = load_text(tmp_path, BASE + extra)
     assert [b.id for b in cfg.profile().backends] == ["x64", "dbg32"]
     assert cfg.profile().backends[1].arch == "x32"
@@ -346,6 +352,102 @@ def test_misc_value_validation(tmp_path, text, key):
     expect_error(tmp_path, text, key)
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_non_finite_max_call_s_rejected(tmp_path, value):
+    text = BASE.replace('default_profile = "p"', f'default_profile = "p"\nmax_call_s = {value}')
+    expect_error(tmp_path, text, "gateway.max_call_s")
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        (BASE.replace('default_profile = "p"', 'default_profile = "p"\njobs_root = ""'), "gateway.jobs_root"),
+        (BASE.replace('vmx = "/vm/x.vmx"', 'vmx = "  "'), "profiles.p.vmx"),
+        (BASE.replace('vmx = "/vm/x.vmx"', 'vmx = "/vm/x.vmx"\nguest_host = ""'), "profiles.p.guest_host"),
+        (BASE.replace('vmx = "/vm/x.vmx"', 'vmx = "/vm/x.vmx"\nvmrun = ""'), "profiles.p.vmrun"),
+        (BASE.replace('guest_user = "mcp"', 'guest_user = ""'), "profiles.p.guest_user"),
+        (BASE + 'exe = ""\n', "profiles.p.backends.x64.exe"),
+        (BASE + '\n[http]\ntls_cert = ""\ntls_key = ""\n', "http.tls_cert"),
+        (BASE + '\n[http]\nbind = ""\n', "http.bind"),
+    ],
+    ids=["jobs_root", "vmx", "guest_host", "vmrun", "guest_user", "exe", "tls", "bind"],
+)
+def test_empty_strings_rejected(tmp_path, text, key):
+    err = expect_error(tmp_path, text, key)
+    assert "empty" in err.message
+
+
+def test_endpoint_profile_cannot_use_guest_config_tokens(tmp_path):
+    text = ('[profiles.r]\nmode = "endpoint"\ntoken_source = "guest-config"\n'
+            '[profiles.r.backends.x64]\nurl = "http://10.0.0.20:9094"\ntoken_env = "R_TOKEN"\n')
+    err = expect_error(tmp_path, text, "profiles.r.token_source")
+    assert "endpoint" in err.message
+
+
+def test_endpoint_profile_requires_token_env_per_backend(tmp_path):
+    text = '[profiles.r]\nmode = "endpoint"\n[profiles.r.backends.x64]\nurl = "http://10.0.0.20:9094"\n'
+    expect_error(tmp_path, text, "profiles.r.backends.x64.token_env")
+    ok = load_text(tmp_path, text + 'token_env = "R_TOKEN"\n')
+    assert ok.profile().token_source == "env"
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        (BASE.replace('guest_user = "mcp"\n', ""), "profiles.p.guest_user"),
+        (BASE.replace('guest_password_env = "GW_GUEST_PW"\n', ""), "profiles.p.guest_password_env"),
+        (BASE.replace("config = 'C:\\x64\\mcp_config.json'\n", ""), "profiles.p.backends.x64.config"),
+    ],
+    ids=["guest_user", "guest_password_env", "backend-config"],
+)
+def test_guest_config_tokens_need_guest_credentials_and_config_path(tmp_path, text, key):
+    err = expect_error(tmp_path, text, key)
+    assert "guest-config" in err.message
+
+
+def test_guest_config_requirements_skipped_without_backends_or_with_env_tokens(tmp_path):
+    vm_only = '[profiles.p]\nmode = "vmware"\nvmx = "/vm/x.vmx"\n'
+    assert load_text(tmp_path, vm_only).profile().backends == ()
+    env_tokens = (vm_only + 'token_source = "env"\n[profiles.p.backends.x64]\nport = 9094\n'
+                  'token_env = "X64_TOKEN"\n')
+    assert load_text(tmp_path, env_tokens).profile().guest_user is None
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0", "::", "10.0.0.5", "gateway.lan"])  # noqa: S104 - test data
+def test_http_exposed_bind_requires_tokens(tmp_path, bind):
+    text = BASE + f'\n[http]\nenabled = true\nbind = "{bind}"\n'
+    expect_error(tmp_path, text, "http.token_envs")
+    ok = load_text(tmp_path, text + 'token_envs = { admin = "GW_ADMIN" }\n')
+    assert ok.http.bind == bind
+
+
+@pytest.mark.parametrize("bind", ["127.0.0.1", "::1", "localhost", "127.0.0.2"])
+def test_http_loopback_bind_without_tokens_allowed(tmp_path, bind):
+    cfg = load_text(tmp_path, BASE + f'\n[http]\nenabled = true\nbind = "{bind}"\n')
+    assert cfg.http.token_envs == {}
+
+
+def test_http_disabled_exposed_bind_without_tokens_allowed(tmp_path):
+    cfg = load_text(tmp_path, BASE + '\n[http]\nenabled = false\nbind = "0.0.0.0"\n')
+    assert cfg.http.enabled is False
+
+
+def test_unreadable_config_file(tmp_path):
+    d = tmp_path / "config.toml"
+    d.mkdir()  # reading a directory fails with an OSError other than FileNotFoundError
+    with pytest.raises(ConfigError) as ei:
+        load_config(d, environ={})
+    assert "cannot read" in ei.value.message and ei.value.details["path"] == str(d)
+
+
+def test_non_utf8_config_file(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_bytes(b'[gateway]\njobs_root = "\xff\xfe"\n')
+    with pytest.raises(ConfigError) as ei:
+        load_config(p, environ={})
+    assert "UTF-8" in ei.value.message
+
+
 # ── security: inline secrets are refused ───────────────────────────
 SECRET_VALUE = "Sup3r-S3cret-Value!"
 
@@ -385,7 +487,7 @@ def test_env_name_fields_must_look_like_env_var_names(tmp_path, field):
         text = BASE + f'token_env = "{SECRET_VALUE}"\n'
         key = "profiles.p.backends.x64.token_env"
     else:
-        text = BASE.replace('vmx = "/vm/x.vmx"', f'vmx = "/vm/x.vmx"\n{field} = "{SECRET_VALUE}"')
+        text = BASE.replace('guest_password_env = "GW_GUEST_PW"', f'{field} = "{SECRET_VALUE}"')
         key = f"profiles.p.{field}"
     err = expect_error(tmp_path, text, key)
     blob = " ".join([str(err), repr(err), json.dumps(err.to_dict())])

@@ -12,11 +12,18 @@
 Thread-safety: all three classes keep only immutable configuration, so their
 methods may be called from several threads at once. They do not serialise VM
 operations against each other: callers hold ``locks.VmOpLock`` for that.
+
+Known limitation: the vmrun CLI only accepts the guest password on its command
+line (``-gp``), so while a guest command runs the password is visible to other
+local users through ``ps``/``/proc/<pid>/cmdline`` (Task Manager on Windows).
+On shared hosts run the gateway under a dedicated account and mount ``/proc``
+with ``hidepid=2``.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
 import subprocess
@@ -67,25 +74,34 @@ NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Case-insensitive substring rules, first match wins. Derived from real vmrun
 # 1.17.0 output where it could be captured safely (tests/fixtures/vmrun/) and
 # from VIX error wording otherwise; error_messages.json records the provenance.
-_ERROR_RULES: tuple[tuple[type[VmrunError], tuple[str, ...]], ...] = (
-    (ToolsNotRunning, ("tools are not running", "tools is not running", "tools not running",
-                       "tools are not installed", "tools is not installed", "tools not installed")),
-    (GuestAuthFailed, ("invalid user name or password", "user name or password is incorrect",
-                       "unknown user name or bad password", "authentication failure", "authentication failed",
-                       "login failure", "login failed", "logon failure", "cannot authenticate",
-                       "incorrect password", "invalid password", "invalid credentials")),
-    (VmLocked, ("failed to lock", "is locked", "appears to be in use", "already in use",
-                "in use by another", "another operation", "operation is in progress",
-                "operation in progress", "operation is already in progress", "is busy")),
-    (VmNotRunning, ("not powered on", "needs to be powered on", "must be powered on",
-                    "virtual machine is not running", "vm is not running", "is powered off")),
-)
+_TOOLS_NEEDLES = ("tools are not running", "tools is not running", "tools not running",
+                  "tools are not installed", "tools is not installed", "tools not installed")
+_AUTH_NEEDLES = ("invalid user name or password", "user name or password is incorrect",
+                 "unknown user name or bad password", "authentication failure", "authentication failed",
+                 "login failure", "login failed", "logon failure", "cannot authenticate",
+                 "incorrect password", "invalid password", "invalid credentials")
+# Lock/busy wording that can only be about the VM (its .vmx/.lck files or a VIX operation).
+_VM_LOCK_NEEDLES = ("failed to lock", "appears to be in use", "another operation",
+                    "operation is in progress", "operation in progress", "operation is already in progress")
+# Lock wording that can just as well describe a guest file ("The file is locked"): it only
+# means VmLocked for host-side commands, or when vmrun says it could not open the VM.
+_FILE_LOCK_NEEDLES = ("is locked", "already in use", "in use by another", "is busy")
+_NOT_RUNNING_NEEDLES = ("not powered on", "needs to be powered on", "must be powered on",
+                        "virtual machine is not running", "vm is not running", "is powered off")
 _SNAPSHOT_MISSING = ("not found", "does not exist", "doesn't exist", "no such", "cannot find",
                      "could not find", "unable to find")
+# Commands whose failures can be "snapshot not found" (lower-case).
+_SNAPSHOT_COMMANDS = frozenset({"snapshot", "reverttosnapshot", "deletesnapshot", "listsnapshots"})
 # Errors about the VM/vmrun itself: never re-labelled as guest-operation failures.
 _GENERIC = ("cannot open vm", "virtual machine cannot be found", "unrecognized command",
             "should not be powered on", "insufficient permissions in the host")
 _GUEST_COMMAND_RE = re.compile(r"(inguest|guesttohost|hosttoguest)$", re.IGNORECASE)
+# Non-guest commands whose stdout is guest-controlled data (lower-case).
+_GUEST_DATA_COMMANDS = frozenset({"readvariable"})
+# Caller arguments shorter than this are not blanked out before classification: a short
+# word ("on", "not") would cut needles apart far more often than it could steer them.
+_MIN_BLANKED_ARG_LEN = 4
+_BLANK = "\x00"  # never part of a needle, so blanking cannot glue a new needle together
 
 _HINTS: dict[type[VmrunError], tuple[str, str | None]] = {
     VmNotRunning: ("the VM is not powered on; start it first", "session_status"),
@@ -102,21 +118,45 @@ def is_guest_command(command: str) -> bool:
     return bool(_GUEST_COMMAND_RE.search(command))
 
 
-def classify_error(text: str, command: str, *, guest: bool = False,
-                   vmx: str | None = None) -> type[VmrunError]:
-    """Map vmrun error text to the most specific ``VmrunError`` subclass."""
+def returns_guest_data(command: str, *, guest: bool = False) -> bool:
+    """True when the command's stdout can carry guest-controlled text (names, values)."""
+    return guest or is_guest_command(command) or command.lower() in _GUEST_DATA_COMMANDS
+
+
+def _has(text: str, needles: Sequence[str]) -> bool:
+    return any(n in text for n in needles)
+
+
+def classify_error(text: str, command: str, *, guest: bool = False, vmx: str | None = None,
+                   params: Sequence[str] = ()) -> type[VmrunError]:
+    """Map vmrun error text to the most specific ``VmrunError`` subclass.
+
+    The vmx path and the command's own arguments (guest paths, snapshot names...)
+    are blanked out first: vmrun echoes them back and their words must not pick
+    the class. Rules are case-insensitive substrings, most specific first; the
+    snapshot rule only applies to snapshot commands, and for guest commands only
+    VM-level lock wording counts as VmLocked.
+    """
     low = text.lower()
-    if vmx:
-        # The VM path can contain arbitrary words ("not running", "snapshot"...).
-        low = low.replace(vmx.lower(), " ")
-    for cls, needles in _ERROR_RULES:
-        if any(n in low for n in needles):
-            return cls
-    if "snapshot" in low and any(n in low for n in _SNAPSHOT_MISSING):
+    for literal in (vmx, *params):
+        if literal and len(literal) >= _MIN_BLANKED_ARG_LEN:
+            low = low.replace(literal.lower(), _BLANK)
+    guest_op = guest or is_guest_command(command)
+    if _has(low, _TOOLS_NEEDLES):
+        return ToolsNotRunning
+    if _has(low, _AUTH_NEEDLES):
+        return GuestAuthFailed
+    vm_scope = not guest_op or "cannot open vm" in low
+    if _has(low, _VM_LOCK_NEEDLES) or (vm_scope and _has(low, _FILE_LOCK_NEEDLES)):
+        return VmLocked
+    if _has(low, _NOT_RUNNING_NEEDLES):
+        return VmNotRunning
+    if (command.lower() in _SNAPSHOT_COMMANDS and not guest_op and "snapshot" in low
+            and _has(low, _SNAPSHOT_MISSING)):
         return SnapshotNotFound
-    if any(n in low for n in _GENERIC):
+    if _has(low, _GENERIC):
         return VmrunError
-    if guest or is_guest_command(command):
+    if guest_op:
         return GuestOperationError
     return VmrunError
 
@@ -136,12 +176,45 @@ def _truncate(text: str, limit: int = DETAIL_LIMIT_BYTES) -> str:
     return keep + _TRUNCATED
 
 
-def _error_line(*texts: str) -> str | None:
-    for text in texts:
-        for line in text.splitlines():
-            s = line.strip()
-            if s[:6].lower() == "error:":
-                return s[6:].strip()
+def _error_payload(line: str) -> str | None:
+    s = line.strip()
+    return s[6:].strip() if s[:6].lower() == "error:" else None
+
+
+def _last_error_line(text: str) -> str | None:
+    found: str | None = None
+    for line in text.splitlines():
+        payload = _error_payload(line)
+        if payload is not None:
+            found = payload
+    return found
+
+
+def _sole_error_line(text: str) -> str | None:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return _error_payload(lines[0]) if len(lines) == 1 else None
+
+
+def find_error_text(stdout: str, stderr: str, returncode: int | None, *, guest_data: bool) -> str | None:
+    """Return the text after vmrun's ``Error:`` marker, or None.
+
+    Failed call (exit code != 0): the last ``Error:`` line of stdout, else of
+    stderr; vmrun prints its own error last, after any partial output.
+    Exit code 0: only an output that consists of nothing but one ``Error:``
+    line counts, and for commands whose stdout carries guest data only stderr
+    is checked, so a guest file, process or variable named "Error: ..." can
+    neither fail a successful call nor choose an error class.
+    """
+    if returncode != 0:
+        for text in (stdout, stderr):
+            found = _last_error_line(text)
+            if found is not None:
+                return found
+        return None
+    for text in ((stderr,) if guest_data else (stdout, stderr)):
+        found = _sole_error_line(text)
+        if found is not None:
+            return found
     return None
 
 
@@ -196,19 +269,37 @@ class VmrunCli:
 
     # ── public ──────────────────────────────────────────────────────
     def run(self, command: str, *params: str, guest: bool = False,
-            timeout_s: float = DEFAULT_TIMEOUT_S, vmx: bool = True) -> VmrunResult:
+            timeout_s: float | None = DEFAULT_TIMEOUT_S, vmx: bool = True) -> VmrunResult:
+        """Run one vmrun command (see ``contracts.VmrunRunner``).
+
+        ``timeout_s=None`` means DEFAULT_TIMEOUT_S; a budget that is already used
+        up (<= 0 or NaN) raises VmrunTimeout without starting vmrun.
+
+        Besides the VmrunError family, two precondition failures are raised before
+        vmrun starts: GuestAuthFailed when ``guest=True`` but no credentials are
+        configured, and ConfigError when ``vmx=True`` but the runner has no vmx
+        (a wiring error, not a vmrun failure).
+        """
+        started = self._clock.monotonic()
+        if vmx and not self._vmx:
+            raise ConfigError(f"vmrun {command} needs a vmx path but this profile has none",
+                              stage="vmrun", details={"command": command})
+        argv = self._argv(command, params, guest=guest, vmx=vmx)
         if guest and self._creds is None:
             raise GuestAuthFailed(
                 f"vmrun {command} needs guest credentials but none are configured",
                 stage="vmrun",
                 hint="set profiles.<name>.guest_user and guest_password_env (and export that variable)",
-                details={"command": command},
+                details=self._details(argv, None, "", "", command, started),
             )
-        if vmx and not self._vmx:
-            raise ConfigError(f"vmrun {command} needs a vmx path but this profile has none")
-        argv = self._argv(command, params, guest=guest, vmx=vmx)
-        timeout = float(timeout_s) if timeout_s and timeout_s > 0 else DEFAULT_TIMEOUT_S
-        started = self._clock.monotonic()
+        timeout = DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        if math.isnan(timeout) or timeout <= 0:
+            raise VmrunTimeout(
+                f"vmrun {command} was not started: no time left in the caller's budget",
+                stage="vmrun",
+                hint="the operation's overall deadline has passed; retry with a fresh budget",
+                details={**self._details(argv, None, "", "", command, started), "timeout_s": timeout_s},
+            )
 
         with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
             spawn_error: str | None = None
@@ -246,9 +337,10 @@ class VmrunCli:
                 details={**self._details(argv, returncode, stdout, stderr, command, started),
                          "timeout_s": timeout},
             )
-        error_text = _error_line(stdout, stderr)
+        error_text = find_error_text(stdout, stderr, returncode,
+                                     guest_data=returns_guest_data(command, guest=guest))
         if returncode != 0 or error_text is not None:
-            raise self._error(command, argv, returncode, stdout, stderr, error_text, guest, started)
+            raise self._error(command, params, argv, returncode, stdout, stderr, error_text, guest, started)
         return VmrunResult(int(returncode or 0), stdout, stderr)
 
     # ── internals ───────────────────────────────────────────────────
@@ -304,8 +396,8 @@ class VmrunCli:
             "elapsed_s": round(max(0.0, self._clock.monotonic() - started), 3),
         }
 
-    def _error(self, command: str, argv: Sequence[str], returncode: int | None, stdout: str, stderr: str,
-               error_text: str | None, guest: bool, started: float) -> VmrunError:
+    def _error(self, command: str, params: Sequence[str], argv: Sequence[str], returncode: int | None,
+               stdout: str, stderr: str, error_text: str | None, guest: bool, started: float) -> VmrunError:
         if error_text is not None:
             text = self._scrub(error_text)
             message = f"vmrun {command} failed: {text}"
@@ -313,7 +405,7 @@ class VmrunCli:
             text = self._scrub(f"{stdout}\n{stderr}")
             last = self._scrub(_last_line(stderr, stdout))
             message = f"vmrun {command} failed with exit code {returncode}" + (f": {last}" if last else "")
-        cls = classify_error(text, command, guest=guest, vmx=self._vmx)
+        cls = classify_error(text, command, guest=guest, vmx=self._vmx, params=[str(p) for p in params])
         hint, next_tool = _HINTS.get(cls, (None, None))
         return cls(_truncate(message), stage="vmrun", hint=hint, next_tool=next_tool,
                    details=self._details(argv, returncode, stdout, stderr, command, started))
@@ -324,6 +416,8 @@ _VMX_LINE = re.compile(r"^([A-Za-z0-9_.:\-]+)\s*=\s*(.*?)\s*$")
 _SNAPSHOT_HEADER = re.compile(r"^Total snapshots:\s*\d+\s*$", re.IGNORECASE)
 _RUNNING_HEADER = re.compile(r"^Total running VMs:\s*\d+\s*$", re.IGNORECASE)
 _SHARED_FOLDER_RE = re.compile(r"^sharedfolder(\d+)\.present$")
+# VMware names a VM's suspend file "<vmx stem>.vmss" or "<vmx stem>-<hex>.vmss".
+_OWN_VMSS_SUFFIX = r"(?:-[0-9a-f]+)?\.vmss"
 _ETHERNET_RE = re.compile(r"^ethernet(\d+)\.present$")
 
 
@@ -374,6 +468,15 @@ def _falsy(value: str | None) -> bool:
     return value is not None and value.strip().lower() in ("false", "no", "0")
 
 
+def _on_unless_false(value: str | None) -> bool:
+    """Fail-closed vmx boolean for the isolation gate: only a recognised false is off.
+
+    A missing key or an unrecognised spelling ("T", "on"...) counts as on, so a
+    value this parser does not understand can only make the VM look less isolated.
+    """
+    return not _falsy(value)
+
+
 def _first_line(text: str) -> str:
     for line in text.splitlines():
         if line.strip():
@@ -418,6 +521,7 @@ class VmrunProvider:
     ) -> None:
         self.runner = runner
         self.vmx = vmx
+        # Part of the specified constructor (plan 5.2); the provider itself does not read it.
         self.clock: Clock = clock or SystemClock()
         self._vmx_reader = vmx_reader or _read_text
         self._timeouts = {**self.DEFAULT_TIMEOUTS, **(timeouts or {})}
@@ -442,11 +546,10 @@ class VmrunProvider:
 
     def _suspended_on_disk(self) -> bool:
         vmx = Path(self.vmx)
-        stem = vmx.stem.lower()
+        own_vmss = re.compile(re.escape(vmx.stem.lower()) + _OWN_VMSS_SUFFIX)
         try:
             for entry in vmx.parent.iterdir():
-                name = entry.name.lower()
-                if name.endswith(".vmss") and name.startswith(stem):
+                if own_vmss.fullmatch(entry.name.lower()):
                     return True
         except OSError:
             pass
@@ -467,11 +570,12 @@ class VmrunProvider:
             res = self._run("checkToolsState")
         except VmNotRunning:
             return ToolsState.UNKNOWN
-        value = _first_line(res.stdout).lower().replace("_", " ")
+        # letters only: "not installed", "notInstalled", "not_installed" are one state
+        value = re.sub(r"[^a-z]", "", _first_line(res.stdout).lower())
         return {
             "running": ToolsState.RUNNING,
             "installed": ToolsState.INSTALLED,
-            "not installed": ToolsState.NOT_INSTALLED,
+            "notinstalled": ToolsState.NOT_INSTALLED,
         }.get(value, ToolsState.UNKNOWN)
 
     def guest_ip(self, *, wait: bool = False, timeout_s: float = 60.0) -> str | None:
@@ -530,17 +634,19 @@ class VmrunProvider:
         keys = self._vmx_keys()
         hgfs_disabled = _truthy(keys.get("isolation.tools.hgfs.disable"))
 
+        # Fail closed: only a recognised false turns a share or NIC off, and only a
+        # recognised true turns HGFS off (see _on_unless_false).
         enabled = writable = False
         for n in _indexes(keys, _SHARED_FOLDER_RE):
-            present = _truthy(keys.get(f"sharedfolder{n}.present"))
-            if present and _truthy(keys.get(f"sharedfolder{n}.enabled")):
+            present = _on_unless_false(keys.get(f"sharedfolder{n}.present"))
+            if present and _on_unless_false(keys.get(f"sharedfolder{n}.enabled")):
                 enabled = True
-                writable = writable or _truthy(keys.get(f"sharedfolder{n}.writeaccess"))
+                writable = writable or _on_unless_false(keys.get(f"sharedfolder{n}.writeaccess"))
         shared_enabled = enabled and not hgfs_disabled
 
         networks: list[str] = []
         for n in _indexes(keys, _ETHERNET_RE):
-            if not _truthy(keys.get(f"ethernet{n}.present")):
+            if not _on_unless_false(keys.get(f"ethernet{n}.present")):
                 continue
             if _falsy(keys.get(f"ethernet{n}.startconnected")):
                 networks.append("disconnected")

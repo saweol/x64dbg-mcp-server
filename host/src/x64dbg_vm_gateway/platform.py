@@ -97,7 +97,9 @@ def find_vmrun(
         return candidate if exists(candidate) else None
 
     def try_which(name: str) -> str | None:
-        search = environ.get("PATH")
+        # Always pass an explicit search path: with path=None shutil.which would read
+        # os.environ, bypassing an injected env. No PATH means the OS default path.
+        search = environ.get("PATH", os.defpath)
         tried.append(f"PATH ({name})")
         found = which(name, path=search)
         return found if found and exists(found) else None

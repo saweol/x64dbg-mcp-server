@@ -180,13 +180,14 @@ def test_write_timeout_cleans_up_and_unblocks_queued_readers():
     assert acquired.wait(WAIT)
 
     outcome: list[BaseException] = []
-    # The preempt hook runs in the writer's thread before it blocks: holding it until the
-    # second reader is provably queued makes the ordering deterministic.
+    # The writer waits for its preempt hooks (bounded by its own timeout) before it blocks:
+    # holding the hook until the second reader is provably queued makes the ordering
+    # deterministic, and the writer's timeout must outlast that handshake.
     lock.add_preempt_hook(lambda: until(lambda: lock._waiting_readers == 1))
 
     def writer() -> None:
         try:
-            with lock.write(0.05):
+            with lock.write(0.3):
                 pass
         except LockTimeout as e:
             outcome.append(e)
@@ -368,9 +369,89 @@ def test_reentrant_write_and_read_inside_write():
     with lock.write(1.0):
         with lock.write(1.0):
             with lock.read(1.0):
-                assert lock.state()["writer"] is True
+                # a read nested in the caller's own write lock is not a separate reader
+                assert lock.state() == {"readers": 0, "writer": True, "waiting_writers": 0}
         assert lock.state()["writer"] is True
     assert lock.state() == {"readers": 0, "writer": False, "waiting_writers": 0}
+
+
+def test_read_nested_in_write_does_not_trigger_preempt_hooks():
+    # e.g. a revert holding the write lock runs its post-revert health check under a nested
+    # read: a second VM op queueing up must not cancel that check through the hooks.
+    lock = VmOpLock()
+    calls: list[dict] = []
+    lock.add_preempt_hook(lambda: calls.append(lock.state()))
+    in_read, release = threading.Event(), threading.Event()
+
+    def first_writer() -> None:
+        with lock.write(WAIT):
+            with lock.read(WAIT):
+                in_read.set()
+                release.wait(WAIT)
+
+    w1 = Worker(first_writer)
+    w1.start()
+    assert in_read.wait(WAIT)
+    w2 = Worker(lambda: _write_once(lock))
+    w2.start()
+    until(lambda: lock.state()["waiting_writers"] == 1)
+    assert lock.state() == {"readers": 0, "writer": True, "waiting_writers": 1}
+    release.set()
+    w1.finish()
+    w2.finish()
+    assert calls == []
+    assert lock.state() == {"readers": 0, "writer": False, "waiting_writers": 0}
+
+
+def test_write_downgrades_to_read_when_released_first():
+    lock = VmOpLock()
+    write_cm, read_cm = lock.write(1.0), lock.read(1.0)
+    write_cm.__enter__()
+    read_cm.__enter__()
+    write_cm.__exit__(None, None, None)  # still holding the nested read
+    assert lock.state() == {"readers": 1, "writer": False, "waiting_writers": 0}
+    got = threading.Event()
+
+    def other_reader() -> None:
+        with lock.read(WAIT):
+            got.set()
+
+    r = Worker(other_reader)
+    r.start()
+    assert got.wait(WAIT)  # shared with other readers now
+    r.finish()
+    with pytest.raises(RuntimeError):  # and, like any read hold, cannot be upgraded
+        with lock.write(0.05):
+            pass
+    read_cm.__exit__(None, None, None)
+    assert lock.state() == {"readers": 0, "writer": False, "waiting_writers": 0}
+
+
+def test_slow_preempt_hook_does_not_stretch_the_write_timeout():
+    lock = VmOpLock()
+    acquired, release = threading.Event(), threading.Event()
+    hook_release, hook_started = threading.Event(), threading.Event()
+
+    def stuck_hook() -> None:  # e.g. a cancel_all() that hangs
+        hook_started.set()
+        hook_release.wait(WAIT)
+
+    lock.add_preempt_hook(stuck_hook)
+    r = hold_read(lock, acquired, release)
+    assert acquired.wait(WAIT)
+    started = time.monotonic()
+    try:
+        with pytest.raises(LockTimeout):
+            with lock.write(0.1):
+                pass
+        elapsed = time.monotonic() - started
+        assert hook_started.is_set()
+        assert elapsed < 1.0, elapsed  # bounded by the 0.1s timeout, not by the stuck hook
+        assert lock.state() == {"readers": 1, "writer": False, "waiting_writers": 0}
+    finally:
+        hook_release.set()
+        release.set()
+    r.finish()
 
 
 def test_read_to_write_upgrade_is_refused():

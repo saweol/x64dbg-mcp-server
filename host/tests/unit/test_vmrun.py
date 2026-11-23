@@ -1,8 +1,9 @@
 """Tests for vmrun.VmrunCli, vmrun.VmrunProvider and vmrun.NullProvider (plan 5.2, 5.7).
 
 Real vmrun output captured on the dev host lives in tests/fixtures/vmrun/ (see
-captures.json for provenance); error texts that could not be captured safely are
-marked 'vix-unverified' in error_messages.json.
+captures.json for provenance; snapshot names there are sanitized, structure kept);
+error texts that could not be captured safely are marked 'vix-unverified' in
+error_messages.json.
 """
 
 from __future__ import annotations
@@ -44,7 +45,6 @@ from x64dbg_vm_gateway.vmrun import NullProvider, VmrunCli, VmrunProvider
 
 FIX = Path(__file__).resolve().parent.parent / "fixtures" / "vmrun"
 RAW = FIX / "raw"
-REAL_VMX = "/vms/analysis_vm/analysis_vm.vmx"
 PASSWORD = "Pa55-w0rd!unique"
 NOISE_OUT = (
     "[AppLoader] Use shipped Linux kernel AIO access library.\n"
@@ -65,6 +65,8 @@ class Script:
     stderr: bytes = b""
     rc: int = 0
     hang: bool = False  # wait() times out until kill()
+    unkillable: bool = False  # wait() keeps timing out even after kill()
+    interrupt: bool = False  # the first wait() raises KeyboardInterrupt
 
 
 class FakeProc:
@@ -83,7 +85,9 @@ class FakeProc:
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_timeouts.append(timeout)
-        if self.script.hang and not self.killed:
+        if self.script.interrupt and len(self.wait_timeouts) == 1:
+            raise KeyboardInterrupt
+        if (self.script.hang and not self.killed) or self.script.unkillable:
             raise subprocess.TimeoutExpired(self.argv, timeout)
         self.returncode = -9 if self.killed else self.script.rc
         return self.returncode
@@ -229,7 +233,7 @@ def test_noise_lines_filtered_from_real_capture():
     assert res.stderr == ""
     assert res.stdout.splitlines()[0] == "Total snapshots: 33"
     assert "AppLoader" not in res.stdout and "libaio" not in res.stdout
-    assert res.stdout.splitlines()[1:3] == ["vbsedit_install", "\tbefore_analysis"]
+    assert res.stdout.splitlines()[1:3] == ["snap01", "\tsnap02"]
 
 
 def test_noise_on_both_streams_is_removed():
@@ -286,6 +290,135 @@ def test_error_line_with_zero_exit_code_is_still_an_error():
     p = FakePopen(Script(b"Error: Failed to lock the file\n", rc=0))
     with pytest.raises(VmLocked):
         make_cli(p).run("snapshot", "s1")
+
+
+def test_error_like_line_in_successful_guest_listing_is_data():
+    # a guest file named "Error: report.txt" is data, not a vmrun failure (exit code 0)
+    out = b"Directory list: 2\nError: report.txt\nnotes.txt\n"
+    res = make_cli(FakePopen(Script(out, rc=0)), creds=CREDS).run("listDirectoryInGuest", "C:\\x", guest=True)
+    assert res.stdout.splitlines()[1] == "Error: report.txt"
+
+
+def test_guest_variable_value_that_looks_like_an_error_is_data():
+    # readVariable prints the (guest-controlled) value as the only line of stdout
+    res = make_cli(FakePopen(Script(b"Error: The file is locked\n", rc=0))).run(
+        "readVariable", "guestVar", "status")
+    assert res.stdout == "Error: The file is locked"
+
+
+def test_error_like_snapshot_name_does_not_break_list_snapshots(tmp_path):
+    out = b"Total snapshots: 2\nbase\n\tError: weird\n"
+    vmx = tmp_path / "x.vmx"
+    vmx.write_text("")
+    cli = VmrunCli("/usr/bin/vmrun", str(vmx), "ws", None, system="Linux",
+                   popen=FakePopen(Script(out, rc=0)), clock=FakeClock())
+    prov = VmrunProvider(cli, str(vmx), clock=FakeClock())
+    assert prov.list_snapshots() == [Snapshot("base", 0, None), Snapshot("Error: weird", 1, "base")]
+
+
+def test_error_line_on_stderr_still_counts_for_guest_commands_with_zero_exit():
+    p = FakePopen(Script(b"", b"Error: Guest login failure\n", rc=0))
+    with pytest.raises(GuestAuthFailed):
+        make_cli(p, creds=CREDS).run("runProgramInGuest", "C:\\a.exe", guest=True)
+
+
+def test_failed_call_uses_the_last_error_line_not_earlier_guest_output():
+    # vmrun prints its own error last; an earlier guest-controlled line must not steer the class
+    out = b"Error: fake.txt is locked\nError: The virtual machine is not powered on\n"
+    with pytest.raises(VmNotRunning) as ei:
+        make_cli(FakePopen(Script(out, rc=255)), creds=CREDS).run("listDirectoryInGuest", "C:\\x",
+                                                                  guest=True)
+    assert "not powered on" in ei.value.message
+
+
+@pytest.mark.parametrize(
+    ("text", "command", "guest", "expected"),
+    [
+        # guest paths that contain "snapshot" are not snapshot errors
+        ("File not found: C:\\snapshot\\a", "fileExistsInGuest", True, GuestOperationError),
+        ("A file was not found: C:\\snapshot\\a", "copyFileFromGuestToHost", True, GuestOperationError),
+        # the snapshot rule only applies to snapshot commands
+        ("Snapshot not found: gw-1", "start", False, VmrunError),
+        ("Snapshot not found: gw-1", "revertToSnapshot", False, SnapshotNotFound),
+        # guest-file lock wording is a guest failure, not a retryable VM lock
+        ("The guest file is locked", "deleteFileInGuest", True, GuestOperationError),
+        ("The file is in use by another process", "deleteFileInGuest", True, GuestOperationError),
+        # VM-level lock wording still maps to VmLocked for guest commands
+        ("Another operation is already in progress", "runProgramInGuest", True, VmLocked),
+        ("Cannot open VM: /vm/x.vmx, The file is locked", "listProcessesInGuest", True, VmLocked),
+        ("The file is locked", "revertToSnapshot", False, VmLocked),
+    ],
+)
+def test_classification_is_scoped_to_the_command(text, command, guest, expected):
+    from x64dbg_vm_gateway.vmrun import classify_error
+
+    assert classify_error(text, command, guest=guest, vmx="/vm/x.vmx") is expected
+
+
+def test_words_inside_command_arguments_do_not_steer_classification():
+    # a guest path echoed back by vmrun is caller data: its words must not pick the class
+    path = "C:\\Tools are not running\\is locked\\snapshot not found.txt"
+    text = f"Error: A file was not found: {path}\n".encode()
+    with pytest.raises(VmrunError) as ei:
+        make_cli(FakePopen(Script(text, rc=255)), creds=CREDS).run(
+            "copyFileFromGuestToHost", path, "/tmp/out.txt", guest=True)
+    assert type(ei.value) is GuestOperationError
+    assert path in ei.value.message  # the message still shows the full text
+    # control: the same wording outside an argument is still recognised
+    with pytest.raises(ToolsNotRunning):
+        make_cli(FakePopen(Script(b"Error: VMware Tools are not running in the guest\n", rc=255)),
+                 creds=CREDS).run("copyFileFromGuestToHost", "C:\\a.txt", "/tmp/out.txt", guest=True)
+
+
+@pytest.mark.parametrize("timeout_s", [0, -5, 0.0, float("nan")])
+def test_exhausted_timeout_budget_fails_fast_without_spawning(timeout_s):
+    p = FakePopen()
+    with pytest.raises(VmrunTimeout) as ei:
+        make_cli(p).run("getGuestIPAddress", "-wait", timeout_s=timeout_s)
+    assert p.procs == []
+    assert ei.value.details["returncode"] is None
+
+
+def test_guest_ip_with_no_time_left_returns_none_without_spawning(tmp_path):
+    vmx = tmp_path / "x.vmx"
+    vmx.write_text("")
+    p = FakePopen(Script(b"192.168.56.10\n"))
+    cli = VmrunCli("/usr/bin/vmrun", str(vmx), "ws", None, system="Linux", popen=p, clock=FakeClock())
+    assert VmrunProvider(cli, str(vmx)).guest_ip(wait=True, timeout_s=0) is None
+    assert p.procs == []
+
+
+def test_runner_without_vmx_refuses_vmx_commands_before_spawning():
+    p = FakePopen()
+    with pytest.raises(ConfigError):
+        make_cli(p, vmx=None).run("checkToolsState")
+    assert p.procs == []
+    make_cli(p, vmx=None).run("list", vmx=False)  # control: vmx-less commands still run
+    assert len(p.procs) == 1
+
+
+def test_missing_credentials_error_has_standard_details_shape():
+    with pytest.raises(GuestAuthFailed) as ei:
+        make_cli(FakePopen(), creds=None).run("listProcessesInGuest", guest=True)
+    d = ei.value.details
+    assert d["argv"] == ["/usr/bin/vmrun", "-T", "ws", "listProcessesInGuest", "/vm/x.vmx"]
+    assert d["returncode"] is None and d["stdout"] == "" and d["stderr"] == ""
+
+
+def test_interrupt_while_waiting_kills_the_process():
+    p = FakePopen(Script(interrupt=True))
+    with pytest.raises(KeyboardInterrupt):
+        make_cli(p).run("start", "nogui")
+    assert p.last.killed
+
+
+def test_timeout_when_the_killed_process_cannot_be_reaped():
+    p = FakePopen(Script(b"partial\n", unkillable=True))
+    with pytest.raises(VmrunTimeout) as ei:
+        make_cli(p).run("stop", "hard", timeout_s=0.5)
+    assert p.last.killed
+    assert ei.value.details["returncode"] is None
+    assert len(p.last.wait_timeouts) == 2 and p.last.wait_timeouts[1] is not None
 
 
 def test_nonzero_exit_without_error_text():
@@ -408,6 +541,22 @@ def test_power_state_suspended_by_vmss_next_to_vmx(tmp_path):
     assert prov.power_state() is PowerState.SUSPENDED
 
 
+def test_power_state_suspended_by_hex_suffixed_vmss(tmp_path):
+    prov, r, vmx = provider(tmp_path)
+    (vmx.parent / "x-1a2b3c4d.vmss").write_bytes(b"")
+    r.queue("list", "Total running VMs: 0")
+    assert prov.power_state() is PowerState.SUSPENDED
+
+
+@pytest.mark.parametrize("sibling", ["xylophone-1a2b.vmss", "x2.vmss", "xy.vmss", "x-snapshot1.vmss",
+                                     "x.vmss.bak"])
+def test_power_state_ignores_vmss_of_sibling_vms(tmp_path, sibling):
+    prov, r, vmx = provider(tmp_path)
+    (vmx.parent / sibling).write_bytes(b"")
+    r.queue("list", "Total running VMs: 0")
+    assert prov.power_state() is PowerState.OFF
+
+
 def test_power_state_suspended_by_checkpoint_vmstate(tmp_path):
     prov, r, vmx = provider(tmp_path, vmx_text='checkpoint.vmState.readOnly = "FALSE"\n'
                                                 'checkpoint.vmState = "x-1a2b.vmss"\n')
@@ -439,7 +588,9 @@ def test_power_state_propagates_vmrun_errors(tmp_path):
     ("out", "state"),
     [("running", ToolsState.RUNNING), ("installed", ToolsState.INSTALLED),
      ("not installed", ToolsState.NOT_INSTALLED), ("unknown", ToolsState.UNKNOWN),
-     ("", ToolsState.UNKNOWN), ("Running\n", ToolsState.RUNNING)],
+     ("", ToolsState.UNKNOWN), ("Running\n", ToolsState.RUNNING),
+     ("notInstalled", ToolsState.NOT_INSTALLED), ("not_installed", ToolsState.NOT_INSTALLED),
+     ("NotInstalled\n", ToolsState.NOT_INSTALLED), ("not-installed", ToolsState.NOT_INSTALLED)],
 )
 def test_tools_state_mapping(tmp_path, out, state):
     prov, r, _ = provider(tmp_path)
@@ -508,12 +659,13 @@ def test_list_snapshots_parses_real_show_tree(tmp_path):
     assert r.calls[-1]["params"] == ("showTree",)
     assert len(snaps) == 33
     by_name = {s.name: s for s in snaps}
-    assert snaps[0] == Snapshot("vbsedit_install", 0, None)
-    assert snaps[1] == Snapshot("before_analysis", 1, "vbsedit_install")
-    assert by_name["agent_omega"] == Snapshot("agent_omega", 9, "agent_base")
-    assert by_name["MCP_BASE"] == Snapshot("MCP_BASE", 12, "themida_base")
-    assert by_name["remote_base"] == Snapshot("remote_base", 11, "4g_analysis_base_20260205_1")
-    assert by_name["argonwiper_base"] == Snapshot("argonwiper_base", 8, "4G_Analaysis_base")
+    assert snaps[0] == Snapshot("snap01", 0, None)
+    assert snaps[1] == Snapshot("snap02", 1, "snap01")
+    # a shallower sibling after a deeper subtree attaches to the right ancestor
+    assert by_name["snap12"] == Snapshot("snap12", 9, "snap09")
+    assert by_name["MCP_BASE"] == Snapshot("MCP_BASE", 12, "snap20")
+    assert by_name["remote_base"] == Snapshot("remote_base", 11, "snap19")
+    assert by_name["snap28"] == Snapshot("snap28", 8, "snap08")
     # every parent is an earlier snapshot exactly one level up
     seen: dict[str, Snapshot] = {}
     for s in snaps:
@@ -646,6 +798,39 @@ def test_isolation_unknown_connection_type_kept_and_not_isolated(tmp_path):
     assert rep.isolated is False
 
 
+@pytest.mark.parametrize("spelling", ["T", "Y", "on", "enabled", "?"])
+def test_isolation_unrecognised_nic_boolean_fails_closed(tmp_path, spelling):
+    text = f'ethernet0.present = "{spelling}"\nethernet0.connectionType = "bridged"\n'
+    prov, _, _ = provider(tmp_path, vmx_text=text)
+    rep = prov.isolation_report()
+    assert rep.network_types == ("bridged",)
+    assert rep.isolated is False
+
+
+@pytest.mark.parametrize("spelling", ["T", "on", "?"])
+def test_isolation_unrecognised_share_booleans_fail_closed(tmp_path, spelling):
+    text = (f'sharedFolder0.present = "{spelling}"\nsharedFolder0.enabled = "{spelling}"\n'
+            f'sharedFolder0.writeAccess = "{spelling}"\n')
+    prov, _, _ = provider(tmp_path, vmx_text=text)
+    rep = prov.isolation_report()
+    assert rep.shared_folders_enabled is True and rep.shared_folders_writable is True
+    assert rep.isolated is False
+
+
+def test_isolation_share_without_enabled_or_write_keys_fails_closed(tmp_path):
+    prov, _, _ = provider(tmp_path, vmx_text='sharedFolder0.present = "TRUE"\n')
+    rep = prov.isolation_report()
+    assert rep.shared_folders_enabled is True and rep.shared_folders_writable is True
+
+
+@pytest.mark.parametrize("false", ["FALSE", "false", "no", "0"])
+def test_isolation_recognised_false_values_still_disable(tmp_path, false):
+    text = (f'ethernet0.present = "{false}"\nethernet0.connectionType = "bridged"\n'
+            f'sharedFolder0.present = "TRUE"\nsharedFolder0.enabled = "{false}"\n')
+    prov, _, _ = provider(tmp_path, vmx_text=text)
+    assert prov.isolation_report() == IsolationReport(False, False, ())
+
+
 def test_isolation_uses_injected_reader(tmp_path):
     seen = []
 
@@ -698,7 +883,10 @@ def test_null_provider_control_methods_raise(call):
 def test_real_vmrun_read_only_roundtrip():
     from x64dbg_vm_gateway.platform import find_vmrun
 
-    vmx = os.environ.get("X64DBG_GW_TEST_VMX", REAL_VMX)
+    # Point this at a hard clone of the analysis VM (never the production VM itself).
+    vmx = os.environ.get("X64DBG_GW_TEST_VMX")
+    if not vmx:
+        pytest.skip("set X64DBG_GW_TEST_VMX to the .vmx of a test clone to run this")
     if not os.path.exists(vmx):
         pytest.skip(f"vmx not present: {vmx}")
     path = find_vmrun()

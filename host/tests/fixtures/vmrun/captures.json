@@ -1,5 +1,5 @@
 {
-  "_about": "Real vmrun output captured on the development host (Linux, vmrun 1.17.0 build-24583834, 2026-11-23). Only read-only commands were run against the real VM; every other command targeted the non-existent path /nonexistent/x.vmx. raw/<name>.stdout and raw/<name>.stderr hold the bytes exactly as printed. The guest password used for the listProcessesInGuest capture was a throw-away value and is masked here.",
+  "_about": "Real vmrun output captured on the development host (Linux, vmrun 1.17.0 build-24583834, 2026-11-23). Only read-only commands were run against the real VM; every other command targeted the non-existent path /nonexistent/x.vmx. raw/<name>.stdout and raw/<name>.stderr hold the bytes exactly as printed, except that in listSnapshots_*.stdout every snapshot name other than the two already published in docs/VM_ORCHESTRATION_PLAN.md (MCP_BASE, remote_base) was replaced by snapNN (NN = its line number in the tree); header, count, TAB depth, order and line endings are unchanged. The guest password used for the listProcessesInGuest capture was a throw-away value and is masked here.",
   "vmrun_version": "1.17.0 build-24583834",
   "host_system": "Linux",
   "captures": {

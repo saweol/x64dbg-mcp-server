@@ -148,6 +148,48 @@ def test_macos_not_found():
     assert MAC_DEFAULT in ei.value.details["tried"]
 
 
+def test_injected_env_without_path_does_not_read_the_process_path(monkeypatch):
+    # the injected env is authoritative: no PATH there means the OS default search path,
+    # never os.environ["PATH"] of the test process
+    monkeypatch.setenv("PATH", "/should/not/be/used")
+    seen = {}
+
+    def which(name, path=None):
+        seen["path"] = path
+        return None
+
+    plat.find_vmrun(system="Linux", env={}, which=which, exists=exists_in("/usr/bin/vmrun"))
+    assert seen["path"] == os.defpath
+
+
+@pytest.mark.parametrize("var", ["ProgramFiles(x86)", "ProgramFiles"])
+def test_windows_program_files_env_candidates(var):
+    expected = "D:\\PF\\VMware\\VMware Workstation\\vmrun.exe"
+    got = plat.find_vmrun(system="Windows", env={var: "D:\\PF"}, which=no_which,
+                          registry_reader=lambda k, v: None, exists=exists_in(expected, WIN_DEFAULT))
+    assert got == expected
+
+
+def test_windows_path_fallback_after_fixed_locations():
+    seen = {}
+
+    def which(name, path=None):
+        seen["args"] = (name, path)
+        return "E:\\bin\\vmrun.exe"
+
+    got = plat.find_vmrun(system="Windows", env={"PATH": "E:\\bin"}, which=which,
+                          registry_reader=lambda k, v: None, exists=exists_in("E:\\bin\\vmrun.exe"))
+    assert got == "E:\\bin\\vmrun.exe"
+    assert seen["args"] == ("vmrun.exe", "E:\\bin")
+
+
+def test_macos_path_fallback_after_bundle():
+    got = plat.find_vmrun(system="Darwin", env={"PATH": "/opt/bin"},
+                          which=lambda name, path=None: "/opt/bin/vmrun",
+                          exists=exists_in("/opt/bin/vmrun"))
+    assert got == "/opt/bin/vmrun"
+
+
 # ── vmrun_type ──────────────────────────────────────────────────────
 @pytest.mark.parametrize(
     ("configured", "system", "expected"),

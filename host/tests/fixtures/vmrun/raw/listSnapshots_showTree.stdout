@@ -1,34 +1,34 @@
 Total snapshots: 33
-vbsedit_install
-	before_analysis
-		RDP_BASE
-			RDP_Analysis_BASE
-				disable_av_base
-					turnoff_av_and_pluginSet
-						old_agent_base
-							4G_Analaysis_base
-								agent_base
-									260120_AV_Base
-										260204_av_base
-									agent_omega
-										suspend_test
-										agent_alpha
-											agent_beta
-								4g_analysis_base_20260128
-									75ba_base
-									4g_analysis_base_20260205_2
-										4g_analysis_base_20260205_1
-											themida_base
-												memory
-													vmprotect_unpack
+snap01
+	snap02
+		snap03
+			snap04
+				snap05
+					snap06
+						snap07
+							snap08
+								snap09
+									snap10
+										snap11
+									snap12
+										snap13
+										snap14
+											snap15
+								snap16
+									snap17
+									snap18
+										snap19
+											snap20
+												snap21
+													snap22
 												MCP_BASE
 											remote_base
-												shellcode
-													bp_dreamhack
-														first_decode_data
-								argonwiper_base
-									argon_base
-										argon_base2
-											argon_base_3
-												after_enc
-												before_argon_base_4
+												snap25
+													snap26
+														snap27
+								snap28
+									snap29
+										snap30
+											snap31
+												snap32
+												snap33

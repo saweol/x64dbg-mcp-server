@@ -6,14 +6,25 @@
 - read lock: backend tool calls and guest file operations
 
 When a writer starts waiting while readers are active, the registered preempt
-hooks run once (in the writer's thread, outside the internal mutex) so readers
-can abort in-flight work, e.g. ``BackendClient.cancel_all()`` which turns the
-pending calls into ``CANCELLED_BY_VM_OP``.
+hooks run once (outside the internal mutex) so readers can abort in-flight work,
+e.g. ``BackendClient.cancel_all()`` which turns the pending calls into
+``CANCELLED_BY_VM_OP``. The hooks run on a helper thread and the writer waits
+for them at most until its own deadline, so a slow or hung hook cannot stretch
+``write(timeout_s)``. Hooks should only signal cancellation and return promptly:
+one that outlives the writer's timeout keeps running in the background and may
+then cancel calls that started after the writer gave up.
+
+Ordering: writers are preferred over readers (a waiting writer blocks new
+readers), but writers are not queued FIFO among themselves; any waiting writer
+may be the next to acquire.
 
 Thread-safety: every public method is thread-safe. Locks are reentrant per
-thread (a read inside a read, a read or write inside a write). Upgrading a held
-read lock to a write lock is refused with RuntimeError because two upgrading
-readers would deadlock each other.
+thread (a read inside a read, a read or write inside a write). A read taken
+inside the caller's own write lock is not a separate reader: it does not show
+in ``state()["readers"]`` and does not trigger preempt hooks. If the write lock
+is released while such reads are still held, the lock is downgraded to a read
+hold. Upgrading a held read lock to a write lock is refused with RuntimeError
+because two upgrading readers would deadlock each other.
 """
 
 from __future__ import annotations
@@ -40,6 +51,7 @@ class VmOpLock:
         self._readers: dict[int, int] = {}  # thread id -> nested read holds
         self._writer: int | None = None  # thread id holding the write lock
         self._writer_depth = 0
+        self._writer_reads = 0  # read holds the writer thread took inside its write lock
         self._waiting_writers = 0
         self._waiting_readers = 0  # diagnostics/tests only; not part of state()
         self._hooks: list[PreemptHook] = []
@@ -109,10 +121,14 @@ class VmOpLock:
         me = threading.get_ident()
         deadline = self._deadline(timeout_s)
         with self._cond:
-            if self._writer == me or me in self._readers:
-                # Reentrant: never queue behind a waiting writer while we already
-                # hold the lock, or the writer and this thread deadlock.
-                self._readers[me] = self._readers.get(me, 0) + 1
+            # Reentrant: never queue behind a waiting writer while we already hold
+            # the lock, or the writer and this thread deadlock.
+            if self._writer == me:
+                # Nested in our own write lock: not a separate reader (see module doc).
+                self._writer_reads += 1
+                return
+            if me in self._readers:
+                self._readers[me] += 1
                 return
             self._waiting_readers += 1
             try:
@@ -128,6 +144,9 @@ class VmOpLock:
     def _release_read(self) -> None:
         me = threading.get_ident()
         with self._cond:
+            if self._writer == me and self._writer_reads > 0:
+                self._writer_reads -= 1
+                return
             count = self._readers.get(me, 0)
             if count <= 0:
                 raise RuntimeError("release of a VmOpLock read lock that is not held")
@@ -153,8 +172,9 @@ class VmOpLock:
             self._waiting_writers += 1
             hooks = list(self._hooks) if self._readers else []
         try:
-            # Outside the mutex: hooks may call back into this lock or block briefly.
-            self._run_hooks(hooks)
+            # Outside the mutex: hooks may call back into this lock.
+            if hooks:
+                self._run_hooks_until(hooks, deadline)
             with self._cond:
                 while self._writer is not None or self._readers:
                     remaining = self._remaining(deadline)
@@ -177,7 +197,21 @@ class VmOpLock:
             self._writer_depth -= 1
             if self._writer_depth == 0:
                 self._writer = None
+                if self._writer_reads:
+                    # Downgrade: reads taken inside the write lock outlive it.
+                    self._readers[me] = self._writer_reads
+                    self._writer_reads = 0
                 self._cond.notify_all()
+
+    def _run_hooks_until(self, hooks: list[PreemptHook], deadline: float | None) -> None:
+        """Run ``hooks`` on a helper thread; wait for them no longer than ``deadline``."""
+        worker = threading.Thread(target=self._run_hooks, args=(hooks,), name="VmOpLock-preempt",
+                                  daemon=True)
+        worker.start()
+        remaining = self._remaining(deadline)
+        worker.join(None if remaining is None else max(0.0, remaining))
+        if worker.is_alive():
+            log.warning("VmOpLock preempt hooks are still running at the writer's deadline")
 
     @staticmethod
     def _run_hooks(hooks: list[PreemptHook]) -> None:

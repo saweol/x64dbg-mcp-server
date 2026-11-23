@@ -21,6 +21,7 @@ environment; the resulting dataclasses are immutable.
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import posixpath
 import re
@@ -98,8 +99,6 @@ class GatewayConfig:
     config_path: str | None = None
 
     def profile(self, name: str | None = None) -> ProfileConfig:
-        from .errors import ConfigError
-
         key = name or self.default_profile
         if key is None:
             if len(self.profiles) == 1:
@@ -117,8 +116,6 @@ class GatewayConfig:
 
 def resolve_secret(env_name: str | None, environ: dict[str, str] | None = None) -> Secret | None:
     """Return the secret stored in environment variable ``env_name`` (or None)."""
-    import os
-
     if not env_name:
         return None
     env = os.environ if environ is None else environ
@@ -313,6 +310,11 @@ class _Parser:
             want = "an array of strings" if kind == _STR_LIST else (
                 "a table of strings" if kind == _STR_MAP else f"a {kind}")
             raise self.error(key, f"expected {want}, got {_type_name(value)}")
+        if kind == _STR and not value.strip():
+            # No string setting has a meaningful empty value: an empty path, host or
+            # name only fails later and further from its cause. (An empty
+            # snapshot_prefix would even make every snapshot look gateway-owned.)
+            raise self.error(key, "must not be empty")
         if kind == _FLOAT:
             return float(value)
         if kind == _STR_LIST:
@@ -347,8 +349,8 @@ class _Parser:
         gw = self.table(data.get("gateway", {}), "gateway")
         self.check_keys(gw, "gateway", set(_GATEWAY_KEYS))
         values = self.fields(gw, "gateway", _GATEWAY_KEYS)
-        if "max_call_s" in values and values["max_call_s"] <= 0:
-            raise self.error("gateway.max_call_s", "must be greater than 0")
+        if "max_call_s" in values and not (math.isfinite(values["max_call_s"]) and values["max_call_s"] > 0):
+            raise self.error("gateway.max_call_s", "must be a finite number greater than 0")
 
         http = self.http(self.table(data.get("http", {}), "http"))
 
@@ -382,6 +384,14 @@ class _Parser:
         if has_cert != has_key:
             missing = "http.tls_key" if has_cert else "http.tls_cert"
             raise self.error(missing, "tls_cert and tls_key must be set together")
+        bind = values.get("bind", HttpServerConfig.bind)
+        if values.get("enabled") and not values.get("token_envs") and not _is_loopback_host(bind):
+            raise self.error(
+                "http.token_envs",
+                "required when http.enabled = true and http.bind is not a loopback address "
+                "(other machines could otherwise call the gateway without authentication)",
+                hint="set http.token_envs.<read|analyze|admin> to environment variable NAMES",
+            )
         return HttpServerConfig(**values)
 
     def profile(self, name: str, tbl: Mapping[str, Any]) -> ProfileConfig:
@@ -396,15 +406,19 @@ class _Parser:
             self.choice(values["vmrun_type"], VMRUN_TYPES, f"{prefix}.vmrun_type")
         token_source = self.choice(values.get("token_source", "guest-config"), TOKEN_SOURCES,
                                    f"{prefix}.token_source")
+        if mode == "endpoint":
+            if values.get("token_source") == "guest-config":  # noqa: S105 - enum value, not a secret
+                raise self.error(f"{prefix}.token_source",
+                                 "guest-config is not available in endpoint mode (there is no guest to "
+                                 "read mcp_config.json from); use \"env\" with token_env on each backend")
+            # Endpoint profiles can only take their token from the environment.
+            token_source = values["token_source"] = "env"  # noqa: S105 - enum value, not a secret
         if "relaunch_mode" in values:
             self.choice(values["relaunch_mode"], RELAUNCH_MODES, f"{prefix}.relaunch_mode")
         if mode == "vmware" and not values.get("vmx"):
             raise self.error(f"{prefix}.vmx", "required when mode = \"vmware\"")
         if "guest_password_env" in values:
             self.env_name(values["guest_password_env"], f"{prefix}.guest_password_env")
-        if "snapshot_prefix" in values and not values["snapshot_prefix"].strip():
-            # An empty prefix would make every snapshot look gateway-owned to the delete policy.
-            raise self.error(f"{prefix}.snapshot_prefix", "must not be empty")
 
         retention = self.retention(self.table(tbl.get("retention", {}), f"{prefix}.retention"),
                                    f"{prefix}.retention")
@@ -418,8 +432,21 @@ class _Parser:
                 raise self.error(f"{dotted}.id", "duplicate backend id")
             seen.add(b.id)
             if token_source == "env" and not b.token_env:  # noqa: S105 - enum value, not a secret
-                raise self.error(f"{dotted}.token_env", "required when token_source = \"env\"")
+                why = "in endpoint mode" if mode == "endpoint" else "when token_source = \"env\""
+                raise self.error(f"{dotted}.token_env", f"required {why}")
+            if token_source == "guest-config" and not b.config:  # noqa: S105 - enum value, not a secret
+                raise self.error(f"{dotted}.config",
+                                 "required when token_source = \"guest-config\" (guest path of the "
+                                 "backend's mcp_config.json)")
             backends.append(b)
+
+        if mode == "vmware" and token_source == "guest-config" and backends:  # noqa: S105 - enum value
+            # Reading mcp_config.json out of the guest needs guest credentials.
+            for key in ("guest_user", "guest_password_env"):
+                if key not in values:
+                    raise self.error(f"{prefix}.{key}",
+                                     "required when token_source = \"guest-config\" (the backend token is "
+                                     "read from mcp_config.json inside the guest)")
 
         return ProfileConfig(name=name, **values, retention=retention, backends=tuple(backends))
 
@@ -457,6 +484,16 @@ class _Parser:
         if "port" not in values and "url" not in values:
             raise self.error(dotted, "a backend needs a port (vmware mode) or a url")
         return BackendConfig(id=bid, arch=arch, **values)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for "localhost" and loopback IP literals; any other name counts as exposed."""
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_http_url(url: str) -> bool:
