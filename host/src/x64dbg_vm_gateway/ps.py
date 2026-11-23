@@ -27,7 +27,15 @@ Wrapper semantics (Windows PowerShell 5.1):
   script with exit code 1. Wrap calls that may fail harmlessly in the script's
   own ``try``/``catch``;
 - output lines are flushed as they are produced (``AutoFlush``), so output
-  written before an ``exit`` or a crash is still captured.
+  written before an ``exit`` or a crash is still captured;
+- its first line is a comment carrying the call's unique tag, so the process
+  can be told apart from other PowerShell instances by its command line.
+
+Timeouts: when ``run_program`` times out, vmrun gives up but the guest process
+keeps running (and keeps its output file open). The helper then kills the
+``powershell.exe`` whose command line carries this call's tag (best effort)
+before deleting its temp files; a temp file that still cannot be deleted is
+logged as a warning with its path.
 
 These semantics follow PowerShell's documented behaviour and have NOT been run
 on a real PowerShell: the unit tests emulate the guest and only check what is
@@ -50,12 +58,12 @@ import logging
 import re
 import secrets
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 from .contracts import GuestChannel
-from .errors import GatewayError, PathNotAllowed, TransferError
+from .errors import GatewayError, PathNotAllowed, TransferError, VmrunTimeout
 from .guest import GUEST_ENV_ERRORS, POWERSHELL_EXE, validate_guest_path
 
 __all__ = [
@@ -85,7 +93,10 @@ DEFAULT_TIMEOUT_S = 300.0
 
 # Every character PowerShell treats as a single quote inside a '...' literal.
 _SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
-_PARAM_NAME_RE = re.compile(r"-[A-Za-z_][A-Za-z0-9_]*:?")
+_PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# What PowerShell would read as a parameter name if it appeared unquoted.
+_PARAM_LIKE_RE = re.compile(r"-[A-Za-z_][A-Za-z0-9_]*:?")
+_POWERSHELL_IMAGE = "powershell.exe"
 _TRUNCATED = "\n[output truncated]"
 
 
@@ -123,9 +134,32 @@ def ps_quote(value: str) -> str:
     return "'" + "".join(ch + ch if ch in _SINGLE_QUOTES else ch for ch in value) + "'"
 
 
-def _ps_arg(arg: str) -> str:
-    """A ``-Name`` token stays a parameter name; anything else becomes a literal."""
-    return arg if _PARAM_NAME_RE.fullmatch(arg) else ps_quote(arg)
+def _ps_invocation_args(args: Sequence[str], params: Mapping[str, str | int | bool] | None) -> list[str]:
+    """PowerShell tokens for ``params`` (named) followed by ``args`` (positional).
+
+    Every value becomes a quoted literal, so no value can turn into a parameter
+    name. ``True`` passes a switch, ``False`` passes ``-Name:$false``.
+    """
+    tokens: list[str] = []
+    for name, value in (params or {}).items():
+        if not isinstance(name, str) or not _PARAM_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid PowerShell parameter name: {name!r} (give it without the dash)")
+        if isinstance(value, bool):
+            tokens.append(f"-{name}" if value else f"-{name}:$false")
+        elif isinstance(value, str | int):
+            tokens += [f"-{name}", ps_quote(str(value))]
+        else:
+            raise TypeError(f"value of parameter {name!r} must be str, int or bool")
+    for arg in args:
+        if not isinstance(arg, str):
+            raise TypeError("script arguments must be str")
+        if _PARAM_LIKE_RE.fullmatch(arg):
+            # A -File style "-Name" token: refuse it instead of guessing whether it is a
+            # parameter name or a value that happens to start with a dash.
+            raise ValueError(f"positional argument {arg!r} looks like a parameter name; "
+                             "pass named parameters through params={...}")
+        tokens.append(ps_quote(arg))
+    return tokens
 
 
 # ── wrapper ─────────────────────────────────────────────────────────
@@ -143,13 +177,20 @@ function __McpLine($o) {
 }"""
 
 
-def build_wrapper(script: str, *, out_path: str | None, tmp_dir: str) -> str:
+def _tag_line(tag: str) -> str:
+    return f"# mcp-ps {tag}\n"
+
+
+def build_wrapper(script: str, *, out_path: str | None, tmp_dir: str, tag: str | None = None) -> str:
     """Wrap ``script`` so its streams land in ``out_path`` (UTF-8) and its exit code is defined.
 
     With ``out_path=None`` all output is discarded. ``script`` is inserted
     verbatim on its own lines, so here-strings keep their column-0 terminators.
+    ``tag`` (hex) becomes a leading comment that identifies this call's process.
     """
-    head = "$ProgressPreference = 'SilentlyContinue'\n$__mcpRc = 0\n"
+    if tag is not None and not re.fullmatch(r"[0-9a-f]{1,32}", tag):
+        raise ValueError("tag must be 1-32 lower-case hex digits")
+    head = (_tag_line(tag) if tag else "") + "$ProgressPreference = 'SilentlyContinue'\n$__mcpRc = 0\n"
     body = f"\n& {{\n{script}\n}} *>&1"
     if out_path is None:
         return (f"{head}try {{{body} | Out-Null\n}} catch {{\n    $__mcpRc = 1\n}}\nexit $__mcpRc\n")
@@ -194,11 +235,52 @@ def _check_script(script: object) -> str:
 
 
 def _delete_quiet(channel: GuestChannel, guest_path: str) -> None:
-    """Best-effort removal of a guest temp file; never masks the caller's outcome."""
+    """Best-effort removal of a guest temp file; never masks the caller's outcome.
+
+    A file that is still there afterwards (locked by a process that outlived a
+    timeout, Tools gone, ...) is logged as a warning with its path; a file that
+    never existed is not.
+    """
     try:
         channel.delete_file(guest_path)
+        return
     except GatewayError as exc:
-        log.debug("could not delete guest temp file %s (%s)", guest_path, exc.code)
+        code = exc.code
+    try:
+        leaked = channel.file_exists(guest_path)
+    except GatewayError:
+        leaked = True  # cannot tell: report it rather than hide a leak
+    if leaked:
+        log.warning("guest temp file %s could not be deleted (%s); remove it by hand", guest_path, code)
+    else:
+        log.debug("guest temp file %s was not there to delete (%s)", guest_path, code)
+
+
+def _kill_tagged(channel: GuestChannel, marker: str) -> None:
+    """Best effort: kill guest ``powershell.exe`` processes whose command line contains ``marker``."""
+    try:
+        procs = channel.list_processes()
+    except GatewayError as exc:
+        log.warning("could not list guest processes to stop a timed-out PowerShell (%s)", exc.code)
+        return
+    for p in procs:
+        if p.image_name != _POWERSHELL_IMAGE or marker not in p.cmd:
+            continue
+        try:
+            channel.kill_process(p.pid)
+            log.warning("killed timed-out guest PowerShell (pid %d)", p.pid)
+        except GatewayError as exc:
+            log.warning("could not kill timed-out guest PowerShell pid %d (%s)", p.pid, exc.code)
+
+
+def _encoded_marker(encoded: str, tag: str) -> str:
+    """The prefix of ``encoded`` fixed by the wrapper's tag line alone (whole base64 groups)."""
+    nbytes = len(_tag_line(tag).encode("utf-16-le"))
+    return encoded[: (nbytes // 3) * 4]
+
+
+def _normalise(text: str) -> str:
+    return text.lstrip("\ufeff").replace("\r\n", "\n")
 
 
 def _decode_output(data: bytes) -> str:
@@ -214,7 +296,27 @@ def _decode_output(data: bytes) -> str:
                 text = data.decode("cp949")  # Korean guests: OEM/ANSI code page 949
             except UnicodeDecodeError:
                 text = data.decode("utf-8", errors="replace")
-    return text.lstrip("\ufeff").replace("\r\n", "\n")
+    return _normalise(text)
+
+
+def _decode_head(data: bytes) -> str:
+    """Decode the first bytes of a longer file without splitting the last character.
+
+    A cut inside a multi-byte character would make strict UTF-8 decoding fail
+    and send the whole text to the cp949 fallback, garbling it. So: UTF-8 with
+    up to 3 trailing bytes dropped, then cp949 with up to 1 dropped.
+    """
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return _decode_output(data[: len(data) - len(data) % 2])
+    if data.startswith(codecs.BOM_UTF8):
+        data = data[len(codecs.BOM_UTF8):]
+    for encoding, max_cut in (("utf-8", 3), ("cp949", 1)):
+        for cut in range(max_cut + 1):
+            try:
+                return _normalise(data[: len(data) - cut].decode(encoding))
+            except UnicodeDecodeError:
+                continue
+    return _normalise(data.decode("utf-8", errors="replace"))
 
 
 def fetch_guest_text(channel: GuestChannel, guest_path: str, *,
@@ -248,7 +350,7 @@ def fetch_guest_text(channel: GuestChannel, guest_path: str, *,
                 return _decode_output(data[cut + 1:] if cut >= 0 else data)
             data = f.read(max_bytes + 1)
     if len(data) > max_bytes:
-        return _decode_output(data[:max_bytes]) + _TRUNCATED
+        return _decode_head(data[:max_bytes]) + _TRUNCATED
     return _decode_output(data)
 
 
@@ -294,26 +396,32 @@ def run_powershell(
 
     Raises the channel's errors for guest-environment failures (Tools down,
     timeout, credentials) and PathNotAllowed for an unusable ``guest_tmp_dir``
-    (it must be a valid absolute guest path without whitespace).
+    (it must be a valid absolute guest path without whitespace). On a timeout
+    the guest PowerShell of this call is killed (best effort) before the
+    VmrunTimeout propagates.
     """
     _check_script(script)
     tmp_dir = _check_tmp_dir(guest_tmp_dir)
     token = secrets.token_hex(8)
     out_path = _gjoin(tmp_dir, f"ps-{token}.out") if capture else None
-    wrapper = build_wrapper(script, out_path=out_path, tmp_dir=tmp_dir)
+    wrapper = build_wrapper(script, out_path=out_path, tmp_dir=tmp_dir, tag=token)
     encoded = encode_command(wrapper)
     guest_ps1: str | None = None
     try:
         if len(encoded) <= max_encoded_chars:
             args = [*PS_BASE_ARGS, "-EncodedCommand", encoded]
-            mode = "encoded"
+            mode, marker = "encoded", _encoded_marker(encoded, token)
         else:
             guest_ps1 = _gjoin(tmp_dir, f"ps-{token}.ps1")
             channel.mkdir(tmp_dir)
             _copy_text(channel, wrapper, guest_ps1)
             args = [*PS_BASE_ARGS, "-File", guest_ps1]
-            mode = "file"
-        rc = channel.run_program(POWERSHELL_EXE, args, wait=True, timeout_s=timeout_s)
+            mode, marker = "file", guest_ps1
+        try:
+            rc = channel.run_program(POWERSHELL_EXE, args, wait=True, timeout_s=timeout_s)
+        except VmrunTimeout:
+            _kill_tagged(channel, marker)
+            raise
         exit_code = -1 if rc is None else int(rc)
         log.debug("powershell (%s, %d encoded chars) exited with %d", mode, len(encoded), exit_code)
         output = ""
@@ -331,6 +439,7 @@ def run_powershell_file(
     local_ps1: Path | str,
     args: Sequence[str] = (),
     *,
+    params: Mapping[str, str | int | bool] | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     guest_tmp_dir: str = DEFAULT_GUEST_TMP_DIR,
     capture: bool = True,
@@ -338,23 +447,27 @@ def run_powershell_file(
 ) -> PsResult:
     """Copy a host ``.ps1`` (which may declare ``param()``) to the guest and run it as a file.
 
-    The script is invoked as ``& '<guest copy>' <args>`` from a small wrapper sent
-    with ``-EncodedCommand``: arguments become PowerShell literals instead of
-    command-line text, so no vmrun quoting can break them. An argument that looks
-    like ``-Name`` (or ``-Name:``) is passed as a parameter name, everything else
-    as a single-quoted string. The exit code is the script's ``exit N`` (as with
-    ``powershell -File``), 1 for an escaped terminating error, otherwise the last
-    ``$LASTEXITCODE`` it left behind (0 when it ran no failing native command).
-    The guest copy is deleted afterwards.
+    The script is invoked as ``& '<guest copy>' <params> <args>`` from a small
+    wrapper sent with ``-EncodedCommand`` (deliberately not ``powershell -File``,
+    whose arguments would be command-line text that vmrun's quoting can break):
+    every value becomes a single-quoted PowerShell literal.
+
+    ``params`` maps parameter names (without the dash) to values: a str/int
+    gives ``-Name 'value'`` (a value starting with ``-`` stays a value), True a
+    switch ``-Name``, False ``-Name:$false``. ``args`` are positional values; one
+    that looks like a parameter name (``-Name``) is refused with ValueError
+    rather than guessed, so pass named parameters through ``params``.
+
+    The exit code is the script's ``exit N`` (as with ``powershell -File``), 1
+    for an escaped terminating error, otherwise the last ``$LASTEXITCODE`` it
+    left behind (0 when it ran no failing native command). The guest copy is
+    deleted afterwards.
     """
     src = Path(local_ps1)
     if not src.is_file():
         raise TransferError("PowerShell script not found on the host", stage="powershell",
                             details={"host_path": str(src)})
-    argv = list(args)
-    if not all(isinstance(a, str) for a in argv):
-        raise TypeError("script arguments must be str")
-    quoted = [_ps_arg(a) for a in argv]  # validates every argument before touching the guest
+    quoted = _ps_invocation_args(list(args), params)  # validated before touching the guest
     tmp_dir = _check_tmp_dir(guest_tmp_dir)
     guest_ps1 = _gjoin(tmp_dir, f"psf-{secrets.token_hex(8)}.ps1")
     channel.mkdir(tmp_dir)

@@ -19,7 +19,13 @@ from pathlib import Path
 import pytest
 
 from tests.fakes.fake_guest import FakeGuest
-from x64dbg_vm_gateway.errors import PathNotAllowed, ToolsNotRunning, TransferError
+from x64dbg_vm_gateway.errors import (
+    GuestOperationError,
+    PathNotAllowed,
+    ToolsNotRunning,
+    TransferError,
+    VmrunTimeout,
+)
 from x64dbg_vm_gateway.ps import (
     DEFAULT_GUEST_TMP_DIR,
     MAX_ENCODED_CHARS,
@@ -28,6 +34,7 @@ from x64dbg_vm_gateway.ps import (
     build_wrapper,
     decode_command,
     encode_command,
+    fetch_guest_text,
     ps_quote,
     run_powershell,
     run_powershell_file,
@@ -196,6 +203,99 @@ def test_run_powershell_output_is_bounded(fake_guest: FakeGuest, host_tmp: Path)
     assert len(res.output) < 1100
 
 
+def test_truncation_never_splits_a_utf8_character(fake_guest: FakeGuest, host_tmp: Path) -> None:
+    # 1000 is not a multiple of 3: a plain cut ends inside a character, strict UTF-8
+    # decoding fails and the cp949 fallback would garble the whole text.
+    GuestPowerShell(fake_guest, lambda body: (0, "한" * 2000))
+    res = run_powershell(fake_guest, "x", max_output_bytes=1000)
+    head, marker, _ = res.output.partition("\n[output truncated]")
+    assert marker
+    assert head == "한" * 333
+
+
+@pytest.mark.parametrize("limit", [1000, 1002])  # both cut inside a 2-byte character
+def test_truncation_never_splits_a_cp949_character(fake_guest: FakeGuest, host_tmp: Path, limit: int) -> None:
+    text = "파일이 없습니다.\r\n" * 200  # 18 bytes per line in cp949
+    GuestPowerShell(fake_guest, lambda body: (0, text.encode("cp949")))
+    res = run_powershell(fake_guest, "x", max_output_bytes=limit)
+    head, marker, _ = res.output.partition("\n[output truncated]")
+    assert marker
+    assert "�" not in head
+    assert text.replace("\r\n", "\n").startswith(head)
+    assert len(head.replace("\n", "\r\n").encode("cp949")) == limit - 1
+
+
+def test_fetch_guest_text_tail_starts_at_a_line_boundary(fake_guest: FakeGuest, host_tmp: Path) -> None:
+    lines = [f"line {i:04d} 한글" for i in range(500)]
+    fake_guest.write("C:\\mcp\\big.log", "\r\n".join(lines).encode("utf-8"))
+    text = fetch_guest_text(fake_guest, "C:\\mcp\\big.log", max_bytes=200, tail=True)
+    assert text is not None
+    got = text.split("\n")
+    assert got[-1] == lines[-1]
+    assert all(line in lines for line in got)  # no partial first line
+    assert list(host_tmp.iterdir()) == []
+
+
+def test_fetch_guest_text_decodes_utf16_with_bom(fake_guest: FakeGuest, host_tmp: Path) -> None:
+    fake_guest.write("C:\\mcp\\u16.txt", codecs.BOM_UTF16_LE + "한글\r\nzwei".encode("utf-16-le"))
+    assert fetch_guest_text(fake_guest, "C:\\mcp\\u16.txt") == "한글\nzwei"
+    assert fetch_guest_text(fake_guest, "C:\\mcp\\missing.txt") is None
+
+
+# ── timeouts / leaked temp files ───────────────────────────────────
+def _timing_out_powershell(guest: FakeGuest) -> list[int]:
+    """powershell.exe that keeps running (and keeps its output file) when vmrun times out."""
+    pids: list[int] = []
+
+    def run(exe: str, args: tuple, **kw):
+        assert exe == POWERSHELL_EXE
+        pids.append(guest.add_process(" ".join([exe, *args])).pid)
+        wrapper = decode_command(args[5]) if args[4] == "-EncodedCommand" else \
+            guest.read(args[5])[len(codecs.BOM_UTF8):].decode("utf-8")
+        out = _OUT_RE.search(wrapper)
+        if out:
+            guest.write(out.group(1), b"partial")
+        raise VmrunTimeout("vmrun runProgramInGuest timed out")
+
+    guest.add_process("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile other")
+    guest.on_run_program = run
+    return pids
+
+
+@pytest.mark.parametrize("max_encoded_chars", [MAX_ENCODED_CHARS, 10])
+def test_timeout_kills_this_calls_powershell_and_cleans_up(fake_guest: FakeGuest, host_tmp: Path,
+                                                         max_encoded_chars: int) -> None:
+    pids = _timing_out_powershell(fake_guest)
+    with pytest.raises(VmrunTimeout):
+        run_powershell(fake_guest, "Start-Sleep 999", timeout_s=5, max_encoded_chars=max_encoded_chars)
+    killed = [a[0] for a, _ in fake_guest.calls_of("kill_process")]
+    assert killed == pids  # only the process started by this call
+    assert [p.cmd for p in fake_guest.processes] == [
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile other"]
+    assert not any(k.endswith((".out", ".ps1")) for k in fake_guest.files)
+    assert list(host_tmp.iterdir()) == []
+
+
+def test_undeletable_temp_file_is_reported_as_a_warning(fake_guest: FakeGuest, host_tmp: Path,
+                                                        caplog: pytest.LogCaptureFixture) -> None:
+    emu = GuestPowerShell(fake_guest, lambda body: (0, "x"))
+    fake_guest.fail_next("delete_file", GuestOperationError("The file is in use"))
+    caplog.set_level(logging.DEBUG)
+    run_powershell(fake_guest, "Get-Date")
+    out = emu.runs[0]["out"]
+    assert fake_guest.file_exists(out)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(out in r.getMessage() for r in warnings)
+
+
+def test_missing_temp_file_is_not_a_warning(fake_guest: FakeGuest, host_tmp: Path,
+                                            caplog: pytest.LogCaptureFixture) -> None:
+    GuestPowerShell(fake_guest, lambda body: (1, None))  # the output file was never created
+    caplog.set_level(logging.DEBUG)
+    run_powershell(fake_guest, "x")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 # ── run_powershell: -File fallback ─────────────────────────────────
 def test_long_script_is_copied_and_run_with_file(fake_guest: FakeGuest, host_tmp: Path) -> None:
     script = "Write-Output 'line'  # 한글\n" * 400
@@ -279,13 +379,35 @@ def test_run_powershell_file_invokes_the_copied_script_with_literal_args(fake_gu
         return 4, "ran"
 
     GuestPowerShell(fake_guest, handler)
-    res = run_powershell_file(fake_guest, local, ["-ParamsFile", "C:\\x y\\p.json", "it's", "-Switch"])
+    res = run_powershell_file(fake_guest, local, ["C:\\pos 1", "it's", "-1"],
+                              params={"ParamsFile": "C:\\x y\\p.json", "Switch": True, "Quiet": False,
+                                      "User": "-DryRun"})
     assert res == PsResult(4, "ran")
     assert seen["content"] == local.read_bytes()  # ASCII: copied byte-for-byte
-    assert seen["args"] == " -ParamsFile 'C:\\x y\\p.json' 'it''s' -Switch"
+    # Named parameters come only from ``params``; every value, including one that looks
+    # like a parameter name, is a quoted literal.
+    assert seen["args"] == (" -ParamsFile 'C:\\x y\\p.json' -Switch -Quiet:$false -User '-DryRun'"
+                            " 'C:\\pos 1' 'it''s' '-1'")
     assert seen["path"].lower().startswith("c:\\mcp\\tmp\\")
     assert not fake_guest.file_exists(seen["path"])
     assert list(host_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(("args", "params", "exc"), [
+    (["-DryRun"], None, ValueError),  # looks like a parameter name: must go through params
+    (["-ParamsFile:"], None, ValueError),
+    ([], {"bad name": "x"}, ValueError),
+    ([], {"-Dash": "x"}, ValueError),
+    ([], {"Obj": object()}, TypeError),
+    ([], {"Nul": "a\x00b"}, ValueError),
+])
+def test_run_powershell_file_rejects_ambiguous_arguments(fake_guest: FakeGuest, tmp_path: Path,
+                                                         args, params, exc) -> None:
+    local = tmp_path / "ok.ps1"
+    local.write_text("exit 0\n")
+    with pytest.raises(exc):
+        run_powershell_file(fake_guest, local, args, params=params)
+    assert fake_guest.calls == []
 
 
 def test_run_powershell_file_propagates_the_script_exit_code_via_lastexitcode(fake_guest: FakeGuest,
@@ -315,6 +437,22 @@ def test_run_powershell_file_adds_bom_to_non_ascii_utf8(fake_guest: FakeGuest, h
     run_powershell_file(fake_guest, local)
     assert seen["content"] == codecs.BOM_UTF8 + local.read_bytes()
     assert list(host_tmp.iterdir()) == []
+
+
+def test_run_powershell_file_leaves_legacy_code_page_scripts_alone(fake_guest: FakeGuest, host_tmp: Path,
+                                                                    tmp_path: Path) -> None:
+    local = tmp_path / "cp949.ps1"
+    local.write_bytes("Write-Output '파일'\r\n".encode("cp949"))  # not valid UTF-8
+    seen: dict = {}
+
+    def handler(body: str):
+        path = re.search(r"^& '([^']+)'", body, re.MULTILINE).group(1)
+        seen["content"] = fake_guest.read(path)
+        return 0, ""
+
+    GuestPowerShell(fake_guest, handler)
+    run_powershell_file(fake_guest, local)
+    assert seen["content"] == local.read_bytes()
 
 
 def test_run_powershell_file_requires_a_local_file(fake_guest: FakeGuest, tmp_path: Path) -> None:

@@ -14,7 +14,9 @@ import logging
 import math
 import os
 import re
+import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from tests.fakes.fake_guest import FakeGuest
+from tests.fakes.fake_plugin_server import FakePluginServer
 from tests.fakes.fake_vm import FakeClock, FakeVm
 from tests.unit.test_ps import GuestPowerShell
 from x64dbg_vm_gateway.config import BackendConfig, ProfileConfig
@@ -38,18 +41,24 @@ from x64dbg_vm_gateway.errors import (
     VmrunTimeout,
 )
 from x64dbg_vm_gateway.provision import (
+    _DISCOVER_SCRIPT,
     RuntimeLike,
+    default_http_probe,
+    default_info_probe,
+    default_local_ip_for,
     discover_x64dbg,
     install_plugin,
     packaged_provision_script,
     provision_guest,
 )
+from x64dbg_vm_gateway.ps import build_wrapper
 
 REPO = Path(__file__).resolve().parents[3]
 GUEST_SCRIPT = REPO / "guest" / "provision.ps1"
 ROOT = "C:\\Users\\analyst\\Desktop\\x64dbg\\release"
 PASSWORD = "pw-SECRET-4711"
 IP = "192.168.56.10"
+HOST_IP = "192.168.56.1"  # host-only adapter of the host, as seen from the guest
 RESULT = "C:\\mcp\\provision.result.json"
 LOG = "C:\\mcp\\provision.log"
 SHUTDOWN = "C:\\Windows\\System32\\shutdown.exe"
@@ -89,28 +98,82 @@ class Timeline:
 
 
 class TimelineVm(FakeVm):
-    def __init__(self, timeline: Timeline) -> None:
+    """Tools stop while the timeline says the guest is down.
+
+    ``tools_errors`` / ``tools_unknown`` / ``missing_ip``: the first N queries fail
+    with a vmrun timeout / report an unknown Tools state / return no IP, as a
+    loaded host or vmrun hiccup does. ``tools_follow=False`` keeps Tools RUNNING
+    through a reboot, so only the dark ports show it.
+    """
+
+    def __init__(self, timeline: Timeline, *, tools_errors: int = 0, tools_unknown: int = 0,
+                 missing_ip: int = 0, tools_follow: bool = True) -> None:
         super().__init__()
         self.timeline = timeline
         self.ip = IP
+        self.tools_errors = tools_errors
+        self.tools_unknown = tools_unknown
+        self.missing_ip = missing_ip
+        self.tools_follow = tools_follow
 
     def tools_state(self) -> ToolsState:
         self._rec("tools_state")
-        return ToolsState.INSTALLED if self.timeline.down() else ToolsState.RUNNING
+        if self.tools_errors > 0:
+            self.tools_errors -= 1
+            raise VmrunTimeout("vmrun checkToolsState timed out")
+        if self.tools_unknown > 0:
+            self.tools_unknown -= 1
+            return ToolsState.UNKNOWN
+        if self.tools_follow and self.timeline.down():
+            return ToolsState.INSTALLED
+        return ToolsState.RUNNING
+
+    def guest_ip(self, *, wait: bool = False, timeout_s: float = 60.0) -> str | None:
+        if self.missing_ip > 0:
+            self._rec("guest_ip", wait)
+            self.missing_ip -= 1
+            return None
+        return super().guest_ip(wait=wait, timeout_s=timeout_s)
 
 
 class Probe:
-    def __init__(self, timeline: Timeline, *, status: int = 401, dead_ports: tuple[int, ...] = ()) -> None:
+    """``GET /`` of the plugin ports: dark while the guest is down.
+
+    ``up_at`` maps a port to the clock time it starts answering; ``dark_calls``
+    makes the first N probes fail (a transient network hiccup). Every answer is
+    recorded with its time in ``answers``.
+    """
+
+    def __init__(self, timeline: Timeline, *, status: int = 401, dead_ports: tuple[int, ...] = (),
+                 dark_calls: int = 0) -> None:
         self.timeline = timeline
         self.status = status
         self.dead_ports = set(dead_ports)
+        self.up_at: dict[int, float] = {}
+        self.dark_calls = dark_calls
         self.calls: list[tuple[str, int, float]] = []
+        self.answers: list[tuple[float, int, int | None]] = []
+
+    def _status(self, port: int) -> int | None:
+        if self.dark_calls > 0:
+            self.dark_calls -= 1
+            return None
+        if port in self.dead_ports or self.timeline.down():
+            return None
+        if self.timeline.clock.t < self.up_at.get(port, -INF):
+            return None
+        return self.status
 
     def __call__(self, ip: str, port: int, timeout: float) -> int | None:
         self.calls.append((ip, port, timeout))
-        if port in self.dead_ports or self.timeline.down():
-            return None
-        return self.status
+        status = self._status(port)
+        self.answers.append((self.timeline.clock.t, port, status))
+        return status
+
+    def max_rejections_per_minute(self, port: int) -> int:
+        """Most 401 answers ``port`` gave within any 60 s (the plugin locks out at 5)."""
+        times = [t for t, p, s in self.answers if p == port and s == 401]
+        return max((sum(1 for u in times if t <= u < t + 60) for t in times), default=0)
 
 
 @dataclass
@@ -136,7 +199,7 @@ class ProvisionScript:
 
     def __init__(self, guest: FakeGuest, *, status: str = "ok", exit_code: int | None = None,
                  error: str = "", archs: tuple[str, ...] = ("x64", "x32"), write_result: bool = True,
-                 output: str = "") -> None:
+                 output: str = "", log_lines: tuple[str, ...] = ()) -> None:
         self.guest = guest
         self.status = status
         self.exit_code = exit_code if exit_code is not None else (0 if status == "ok" else 1)
@@ -144,6 +207,7 @@ class ProvisionScript:
         self.archs = archs
         self.write_result = write_result
         self.output = output
+        self.log_lines = log_lines
         self.params: dict | None = None
         self.script_bytes: bytes | None = None
         self.runs = 0
@@ -158,8 +222,9 @@ class ProvisionScript:
         self.params = json.loads(self.guest.read(params_path))
         del self.guest.files[params_path.lower()]  # the real script deletes it on read
         p = self.params
-        self.guest.write(LOG, b"[2026-11-23T10:00:00] provision start\r\n"
-                              b"[2026-11-23T10:00:01] provision done\r\n")
+        extra = "".join(f"[2026-11-23T10:00:00] {line}\r\n" for line in self.log_lines).encode()
+        self.guest.write(LOG, b"[2026-11-23T10:00:00] provision start\r\n" + extra
+                              + b"[2026-11-23T10:00:01] provision done\r\n")
         if self.write_result:
             if self.status == "ok":
                 exes = {"x64": "x64dbg.exe", "x32": "x32dbg.exe"}
@@ -224,7 +289,7 @@ def _setup(rt: FakeRuntime, timeline: Timeline, *, reboot_s: float = 60.0, stale
 
 def _provision(rt: FakeRuntime, probe: Probe, **kw):
     args = {"x64dbg_root": ROOT, "user": "analyst", "password": Secret(PASSWORD), "reboot": False,
-            "http_probe": probe}
+            "http_probe": probe, "local_ip_for": lambda ip: HOST_IP}
     args.update(kw)
     return provision_guest(rt, **args)
 
@@ -272,7 +337,7 @@ def test_provision_copies_script_and_params_and_returns_summary(rt: FakeRuntime,
     assert script.params == {
         "x64dbg_root": ROOT, "user": "analyst", "password": PASSWORD, "autologon": True, "bind": ANY_ADDR,
         "ports": {"x64": 9094, "x32": 9095}, "job_root": "C:\\mcp\\jobs", "no_sleep": True,
-        "dry_run": False,
+        "dry_run": False, "allowed_clients": [HOST_IP],
     }
     params_copies = [a for a, _ in rt.channel.calls_of("copy_to_guest") if str(a[1]).endswith(".json")]
     assert len(params_copies) == 1
@@ -342,12 +407,23 @@ def test_autologon_requires_password_before_touching_the_guest(rt: FakeRuntime, 
 
 
 @pytest.mark.parametrize("kw", [{"x64dbg_root": "relative\\x64dbg"}, {"bind": "not-an-ip"},
+                                {"bind": "::"}, {"bind": "::1"},
                                 {"user": ""}, {"user": 'a"b'}, {"job_root": "\\\\srv\\jobs"},
                                 {"wait_ready_s": 0}])
 def test_invalid_arguments_are_rejected_up_front(rt: FakeRuntime, timeline: Timeline, kw: dict) -> None:
     _setup(rt, timeline)
     with pytest.raises((ConfigError, PathNotAllowed, ValueError)):
         _provision(rt, Probe(timeline), **kw)
+    assert rt.channel.calls == []
+
+
+@pytest.mark.parametrize("bind", ["::", "::1", "fe80::1"])
+def test_ipv6_bind_is_a_config_error(rt: FakeRuntime, timeline: Timeline, bind: str) -> None:
+    # The plugin binds IPv4 only and refuses to start otherwise.
+    _setup(rt, timeline)
+    with pytest.raises(ConfigError) as ei:
+        _provision(rt, Probe(timeline), bind=bind, allowed_clients=[HOST_IP])
+    assert "IPv4" in ei.value.message
     assert rt.channel.calls == []
 
 
@@ -457,9 +533,13 @@ def test_reboot_timeout_raises_vm_not_ready(rt: FakeRuntime, timeline: Timeline,
 def test_reboot_that_never_goes_down_raises(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
     script = ProvisionScript(rt.channel)
     GuestPowerShell(rt.channel, script)  # shutdown.exe does nothing
+    probe = Probe(timeline)
     with pytest.raises(VmNotReady) as ei:
-        _provision(rt, Probe(timeline), reboot=True, wait_ready_s=60)
+        _provision(rt, probe, reboot=True, wait_ready_s=60)
     assert ei.value.details["phase"] == "down"
+    # The old instances were asked only a few times: five 401s within 60 s lock the host out.
+    assert probe.max_rejections_per_minute(9094) == 3
+    assert probe.max_rejections_per_minute(9095) == 3
 
 
 def test_ready_requires_every_provisioned_backend(rt: FakeRuntime, timeline: Timeline,
@@ -492,26 +572,292 @@ def test_probe_status_other_than_200_or_401_is_not_ready(rt: FakeRuntime, timeli
         _provision(rt, Probe(timeline, status=500), reboot=True, wait_ready_s=100)
 
 
+@pytest.mark.parametrize("flaky", [{"tools_errors": 1}, {"tools_unknown": 1}, {"missing_ip": 1},
+                                   {"tools_errors": 3, "missing_ip": 2}])
+def test_unobservable_guest_is_not_taken_for_the_reboot(fake_guest: FakeGuest, fake_clock: FakeClock,
+                                                        timeline: Timeline, host_tmp: Path,
+                                                        flaky: dict) -> None:
+    # A vmrun hiccup right after shutdown.exe was started says nothing about the reboot:
+    # the old debuggers still answer, and a snapshot taken now would precede the reboot.
+    vm = TimelineVm(timeline, **flaky)
+    rt = FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(), clock=fake_clock)
+    _setup(rt, timeline, stale_s=10, reboot_s=30)
+    t0 = fake_clock.t
+    # An explicit allowlist: no guest_ip() query before the reboot uses up the hiccups.
+    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN_V2",
+                         allowed_clients=[HOST_IP])
+    window_end = timeline.windows[0][1]
+    assert summary["ready_s"] >= 40
+    take = [i for i, c in enumerate(vm.calls) if c[0] == "take_snapshot"]
+    assert take and fake_clock.t >= window_end
+    assert summary["snapshot"] == {"name": "MCP_CLEAN_V2", "replaced": False}
+    assert fake_clock.t - t0 < 40 + 2 * 5 + 1
+
+
+def test_one_dark_probe_round_is_not_a_reboot(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+    _setup(rt, timeline, stale_s=10, reboot_s=30)
+    summary = _provision(rt, Probe(timeline, dark_calls=2), reboot=True)  # both ports, first poll
+    assert summary["ready_s"] >= 40
+
+
+def test_reboot_seen_only_through_dark_ports(fake_guest: FakeGuest, fake_clock: FakeClock,
+                                             timeline: Timeline, host_tmp: Path) -> None:
+    vm = TimelineVm(timeline, tools_follow=False)  # Tools never report the reboot
+    rt = FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(), clock=fake_clock)
+    _setup(rt, timeline, stale_s=2, reboot_s=60)
+    summary = _provision(rt, Probe(timeline), reboot=True)
+    assert summary["rebooted"] is True and summary["ready_s"] >= 60
+
+
+def test_answered_ports_are_not_probed_again(rt: FakeRuntime, timeline: Timeline, fake_clock: FakeClock,
+                                             host_tmp: Path) -> None:
+    # Every unauthenticated GET / is a failed login for the v1.10 plugin; five within
+    # 60 s lock the host out (HTTP 429). x64 is up long before x32 here.
+    _setup(rt, timeline, reboot_s=30)
+    probe = Probe(timeline)
+    probe.up_at[9095] = fake_clock.t + 150
+    summary = _provision(rt, probe, reboot=True)
+    assert summary["readiness"] == {"x64": 401, "x32": 401}
+    assert summary["ready_s"] >= 150
+    assert probe.max_rejections_per_minute(9094) <= 2
+    assert probe.max_rejections_per_minute(9095) <= 2
+
+
+def test_install_wait_does_not_trip_the_auth_lockout(rt: FakeRuntime, timeline: Timeline,
+                                                     fake_clock: FakeClock, tmp_path: Path) -> None:
+    _seed_install(rt.channel)
+    GuestPowerShell(rt.channel)
+    probe = Probe(timeline)
+    probe.up_at[9095] = fake_clock.t + 60
+    summary = _install(rt, probe, _dist(tmp_path))
+    assert summary["backends"]["x32"]["status"] == 401
+    assert probe.max_rejections_per_minute(9094) == 1
+
+
+def test_locked_out_port_counts_as_up_and_is_reported(rt: FakeRuntime, timeline: Timeline, host_tmp: Path,
+                                                      caplog: pytest.LogCaptureFixture) -> None:
+    _setup(rt, timeline)
+    summary = _provision(rt, Probe(timeline, status=429), reboot=True)
+    assert summary["readiness"] == {"x64": 429, "x32": 429}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("429" in m for m in warnings)
+
+
+def test_ip_change_after_reboot_reprobes(fake_guest: FakeGuest, fake_clock: FakeClock, timeline: Timeline,
+                                         host_tmp: Path) -> None:
+    vm = TimelineVm(timeline)
+    rt = FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(), clock=fake_clock)
+    _setup(rt, timeline, reboot_s=30)
+    probe = Probe(timeline)
+    probe.up_at[9095] = fake_clock.t + 100
+    real_ip = vm.guest_ip
+
+    def ip_after_reboot(*, wait: bool = False, timeout_s: float = 60.0) -> str | None:
+        ip = real_ip(wait=wait, timeout_s=timeout_s)
+        renewed = bool(timeline.windows) and fake_clock.t > timeline.windows[0][1] + 20
+        return "192.168.56.20" if ip and renewed else ip
+
+    vm.guest_ip = ip_after_reboot  # type: ignore[method-assign]
+    _provision(rt, probe, reboot=True)
+    late = {(ip, port) for ip, port, _ in probe.calls}
+    assert ("192.168.56.20", 9094) in late and ("192.168.56.20", 9095) in late
+
+
+# ── plugin allowlist (v1.10 refuses a non-loopback bind without it) ─
+def test_non_loopback_bind_allows_the_hosts_address_by_default(rt: FakeRuntime, timeline: Timeline,
+                                                               host_tmp: Path) -> None:
+    script, _ = _setup(rt, timeline)
+    asked: list[str] = []
+    summary = _provision(rt, Probe(timeline), local_ip_for=lambda ip: asked.append(ip) or HOST_IP)
+    assert asked == [IP]
+    assert script.params["allowed_clients"] == [HOST_IP]
+    assert summary["allowed_clients"] == [HOST_IP]
+
+
+def test_explicit_allowed_clients_are_normalised(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+    script, _ = _setup(rt, timeline)
+
+    def never(ip: str) -> str:
+        raise AssertionError("must not be derived when given")
+
+    _provision(rt, Probe(timeline), allowed_clients=[" 192.168.56.7/24", "10.0.0.5", "10.0.0.5"],
+               local_ip_for=never)
+    assert script.params["allowed_clients"] == ["192.168.56.0/24", "10.0.0.5"]
+
+
+@pytest.mark.parametrize("bad", [[], ["not-an-ip"], ["::1"], ["10.0.0.0/33"], "10.0.0.1",
+                                 [f"10.0.{i // 250}.{i % 250}" for i in range(65)], [None]])
+def test_bad_allowed_clients_are_rejected_before_touching_the_guest(rt: FakeRuntime, timeline: Timeline,
+                                                                    bad) -> None:
+    _setup(rt, timeline)
+    with pytest.raises(ConfigError):
+        _provision(rt, Probe(timeline), allowed_clients=bad)
+    assert rt.channel.calls == []
+
+
+def test_non_loopback_bind_without_a_host_address_is_refused(rt: FakeRuntime, timeline: Timeline) -> None:
+    _setup(rt, timeline)
+    with pytest.raises(ConfigError) as ei:
+        _provision(rt, Probe(timeline), local_ip_for=lambda ip: None)
+    assert "allowed_clients" in (ei.value.hint or "")
+    assert rt.channel.calls == []
+
+
+def test_loopback_bind_needs_no_allowlist(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+    script, _ = _setup(rt, timeline)
+
+    def never(ip: str) -> str:
+        raise AssertionError("loopback needs no allowlist")
+
+    summary = _provision(rt, Probe(timeline), bind="127.0.0.1", local_ip_for=never)
+    assert script.params["allowed_clients"] == []
+    assert summary["allowed_clients"] == []
+
+
+def test_guest_script_merges_the_plugin_config_and_allows_external_clients() -> None:
+    text = GUEST_SCRIPT.read_text()
+    assert "allowed_clients" in text
+    assert "AllowExternal" in text and "AllowedClients" in text
+    assert "NoteProperty" in text  # keys of an existing config the script does not manage are kept
+    # The four keys every plugin version reads come first (v1.3 reads only 512 bytes).
+    order = [text.index(k) for k in ("IpAddress = $bind", "Port = $port", "AutoStart = $true",
+                                     "AuthToken = $token")]
+    assert order == sorted(order)
+
+
+# ── default probes (real I/O, loopback only) ───────────────────────
+def test_default_probes_against_a_plugin_server() -> None:
+    token = "T" * 32
+    srv = FakePluginServer(token=token, version="1.10").start()
+    try:
+        assert default_http_probe("127.0.0.1", srv.port, 3.0) == 401
+        info = default_info_probe("127.0.0.1", srv.port, 3.0, Secret(token))
+        assert info is not None and info["version"] == "1.10"
+        assert default_info_probe("127.0.0.1", srv.port, 3.0, Secret("wrong")) is None
+        assert [r.authorization for r in srv.requests if r.authorized] == [f"Bearer {token}"]
+        srv.set_raw_response("GET", 200, b"not json")
+        assert default_info_probe("127.0.0.1", srv.port, 3.0, Secret(token)) is None
+        srv.set_raw_response("GET", 200, b"[1, 2]")
+        assert default_info_probe("127.0.0.1", srv.port, 3.0, Secret(token)) is None
+        srv.set_raw_response("GET", 200, b'{"version": "' + b"x" * (70 * 1024) + b'"}')
+        assert default_info_probe("127.0.0.1", srv.port, 3.0, Secret(token)) is None  # over 64 KiB
+    finally:
+        srv.stop()
+    assert default_http_probe("127.0.0.1", srv.port, 1.0) is None  # refused
+
+
+def test_default_local_ip_for_loopback() -> None:
+    assert default_local_ip_for("127.0.0.1") == "127.0.0.1"
+    assert default_local_ip_for("not-an-ip") is None
+
+
+# ── guest-side PowerShell parses (only where PowerShell 7 is installed) ─
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) is not installed")
+def test_guest_powershell_parses(tmp_path: Path) -> None:
+    # A syntax check only, with the PowerShell 7 parser (a superset of 5.1's syntax);
+    # behaviour on Windows PowerShell 5.1 still needs the spike VM (tests/vm).
+    scripts = {
+        "provision.ps1": GUEST_SCRIPT.read_text(),
+        "discover.ps1": _DISCOVER_SCRIPT.replace("__MAX_DEPTH__", "4").replace("__EXTRA_ROOTS__", "'D:\\x'"),
+        "wrapper.ps1": build_wrapper("Get-Date\nexit 3", out_path="C:\\mcp\\tmp\\ps-1.out",
+                                     tmp_dir="C:\\mcp\\tmp", tag="0123456789abcdef"),
+        "quiet.ps1": build_wrapper("Get-Date", out_path=None, tmp_dir="C:\\mcp\\tmp"),
+    }
+    paths = []
+    for name, text in scripts.items():
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        paths.append(str(p))
+    checker = tmp_path / "check.ps1"
+    checker.write_text(
+        "$failed = 0\n"
+        "foreach ($path in $args) {\n"
+        "    $tokens = $null; $errors = $null\n"
+        "    [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)"
+        " | Out-Null\n"
+        "    foreach ($e in $errors) {\n"
+        "        Write-Output ('{0}:{1}: {2}' -f $path, $e.Extent.StartLineNumber, $e.Message)\n"
+        "        $failed = 1\n"
+        "    }\n"
+        "}\n"
+        "exit $failed\n", encoding="utf-8")
+    res = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(checker), *paths],
+                         capture_output=True, text=True, timeout=50, check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 # ── clean snapshot ──────────────────────────────────────────────────
 def test_existing_snapshot_is_refused_before_any_guest_change(rt: FakeRuntime, timeline: Timeline) -> None:
     _setup(rt, timeline)
-    with pytest.raises(StateViolation):
+    with pytest.raises(StateViolation) as ei:
         _provision(rt, Probe(timeline), clean_snapshot="MCP_CLEAN")
+    assert "overwrite_snapshot" not in (ei.value.hint or "")  # it is protected: overwrite would not help
     assert rt.channel.calls == []
     assert not [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
 
 
 def test_overwrite_deletes_then_takes_after_ready(rt: FakeRuntime, timeline: Timeline,
                                                   host_tmp: Path) -> None:
+    rt.vm.snapshots.append(Snapshot("MCP_CLEAN_TRY"))
     _setup(rt, timeline)
-    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN",
+    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN_TRY",
                          overwrite_snapshot=True)
     ops = [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
-    assert ops == [("delete_snapshot", ("MCP_CLEAN",)), ("take_snapshot", ("MCP_CLEAN",))]
+    assert ops == [("delete_snapshot", ("MCP_CLEAN_TRY",)), ("take_snapshot", ("MCP_CLEAN_TRY",))]
     last_tools = max(i for i, c in enumerate(rt.vm.calls) if c[0] == "tools_state")
     first_snap = min(i for i, c in enumerate(rt.vm.calls) if c[0] == "delete_snapshot")
     assert last_tools < first_snap
-    assert summary["snapshot"] == {"name": "MCP_CLEAN", "replaced": True}
+    assert summary["snapshot"] == {"name": "MCP_CLEAN_TRY", "replaced": True}
+
+
+@pytest.mark.parametrize("protected", [("MCP_CLEAN", "MCP_BASE"), ()])
+@pytest.mark.parametrize("name", ["MCP_CLEAN", "mcp_clean"])
+def test_overwrite_never_deletes_the_profiles_clean_snapshot(vm: TimelineVm, fake_guest: FakeGuest,
+                                                             fake_clock: FakeClock, timeline: Timeline,
+                                                             protected: tuple, name: str) -> None:
+    # Plan 5.7: protected snapshots are never deleted, and the profile's clean snapshot
+    # is always protected (as in policy.check_snapshot_delete).
+    rt = FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(protected_snapshots=protected),
+                     clock=fake_clock)
+    _setup(rt, timeline)
+    with pytest.raises(ProtectedSnapshotError) as ei:
+        _provision(rt, Probe(timeline), reboot=True, clean_snapshot=name, overwrite_snapshot=True)
+    assert "clean_snapshot" in (ei.value.hint or "")
+    assert rt.channel.calls == []
+    assert not [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
+
+
+def test_failed_take_after_delete_says_the_old_snapshot_is_gone(rt: FakeRuntime, timeline: Timeline,
+                                                               host_tmp: Path,
+                                                               caplog: pytest.LogCaptureFixture) -> None:
+    rt.vm.snapshots.append(Snapshot("MCP_CLEAN_TRY"))
+    _setup(rt, timeline)
+
+    def failing_take(name: str) -> None:
+        rt.vm.calls.append(("take_snapshot", (name,)))
+        raise VmrunTimeout("vmrun snapshot timed out")
+
+    rt.vm.take_snapshot = failing_take  # type: ignore[method-assign]
+    with pytest.raises(VmrunTimeout) as ei:
+        _provision(rt, Probe(timeline), clean_snapshot="MCP_CLEAN_TRY", overwrite_snapshot=True)
+    d = ei.value.details
+    assert d["snapshot"] == "MCP_CLEAN_TRY"
+    assert d["step"] == "take_snapshot"
+    assert d["old_snapshot_deleted"] is True
+    assert "MCP_CLEAN_TRY" in (ei.value.hint or "")
+    assert "MCP_CLEAN_TRY" not in [s.name for s in rt.vm.snapshots]
+    assert any(r.levelno >= logging.ERROR and "MCP_CLEAN_TRY" in r.getMessage() for r in caplog.records)
+
+
+def test_failed_take_of_a_new_snapshot_reports_the_step(rt: FakeRuntime, timeline: Timeline,
+                                                       host_tmp: Path) -> None:
+    _setup(rt, timeline)
+    rt.vm.take_snapshot = lambda name: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        VmrunTimeout("vmrun snapshot timed out"))
+    with pytest.raises(VmrunTimeout) as ei:
+        _provision(rt, Probe(timeline), clean_snapshot="MCP_CLEAN_V2")
+    assert ei.value.details["step"] == "take_snapshot"
+    assert ei.value.details["old_snapshot_deleted"] is False
 
 
 def test_absent_snapshot_is_taken(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
@@ -540,10 +886,10 @@ def test_overwrite_never_touches_other_protected_snapshots(rt: FakeRuntime, time
 
 
 def test_ambiguous_snapshot_name_is_refused(rt: FakeRuntime, timeline: Timeline) -> None:
-    rt.vm.snapshots.append(Snapshot("MCP_CLEAN"))
+    rt.vm.snapshots += [Snapshot("MCP_TRY"), Snapshot("mcp_try")]
     _setup(rt, timeline)
     with pytest.raises(StateViolation):
-        _provision(rt, Probe(timeline), clean_snapshot="MCP_CLEAN", overwrite_snapshot=True)
+        _provision(rt, Probe(timeline), clean_snapshot="MCP_TRY", overwrite_snapshot=True)
     assert rt.channel.calls == []
 
 
@@ -560,6 +906,30 @@ def test_dry_run_reports_plan_without_reboot_or_snapshot(rt: FakeRuntime, timeli
     assert summary["rebooted"] is False and summary["snapshot"] is None
     assert not any(a[0] == SHUTDOWN for a, _ in rt.channel.calls_of("run_program"))
     assert not [c for c in rt.vm.calls if c[0] in ("take_snapshot", "delete_snapshot")]
+
+
+def test_dry_run_never_sends_the_password(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+    script, _ = _setup(rt, timeline)
+    _provision(rt, Probe(timeline), dry_run=True)
+    assert script.params["autologon"] is True and script.params["dry_run"] is True
+    assert "password" not in script.params
+    # ... and the guest script does not insist on one when it only plans.
+    text = GUEST_SCRIPT.read_text()
+    check = next(line for line in text.splitlines() if "autologon requested but no password" in line)
+    assert "-not $dry" in check
+
+
+def test_scrubbing_only_touches_guest_text(rt: FakeRuntime, timeline: Timeline, host_tmp: Path) -> None:
+    # A password equal to the account name (common on analysis VMs) must not mangle
+    # host-supplied paths, while guest-written text is still scrubbed.
+    _setup(rt, timeline, log_lines=("auto-logon configured for analyst",))
+    summary = provision_guest(rt, x64dbg_root=ROOT, user="analyst", password=Secret("analyst"), reboot=False,
+                              http_probe=Probe(timeline), local_ip_for=lambda ip: HOST_IP)
+    assert summary["x64dbg_root"] == ROOT
+    assert summary["user"] == "analyst"
+    assert summary["backends"]["x64"]["exe"] == f"{ROOT}\\x64\\x64dbg.exe"
+    assert summary["backends"]["x64"]["config"] == f"{ROOT}\\x64\\mcp_config.json"
+    assert any(line.endswith("auto-logon configured for ***") for line in summary["log_tail"])
 
 
 # ── install_plugin ──────────────────────────────────────────────────
@@ -744,6 +1114,95 @@ def test_install_waits_for_killed_debuggers_to_exit(vm: TimelineVm, fake_clock: 
     _install(rt, Probe(timeline), _dist(tmp_path))
     assert len(guest.calls_of("list_processes")) >= 4
     assert guest.read(X64_PLUGIN) == b"new64"
+
+
+class SwapFailGuest(FakeGuest):
+    """Renaming ``<plugin>.new`` into place fails ``swap_failures`` times (AV lock)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.swap_failures = 0
+
+    def rename(self, src: str, dst: str) -> None:
+        if src.lower().endswith(".new") and self.swap_failures > 0:
+            self.swap_failures -= 1
+            self._record("rename", src, dst)
+            raise GuestOperationError("Error: Access is denied")
+        super().rename(src, dst)
+
+
+@pytest.fixture
+def swap_rt(vm: TimelineVm, fake_clock: FakeClock) -> FakeRuntime:
+    return FakeRuntime(vm=vm, channel=SwapFailGuest(), profile=_profile(), clock=fake_clock)
+
+
+def test_failed_swap_with_an_existing_backup_restores_the_previous_plugin(swap_rt: FakeRuntime,
+                                                                          timeline: Timeline,
+                                                                          tmp_path: Path) -> None:
+    guest = swap_rt.channel
+    _seed_install(guest)
+    GuestPowerShell(guest)
+    _install(swap_rt, Probe(timeline), _dist(tmp_path, b"v1"))  # creates the .bak backups
+    guest.swap_failures = 1
+    with pytest.raises(GuestOperationError) as ei:
+        _install(swap_rt, Probe(timeline), _dist(tmp_path, b"v2"))
+    assert guest.read(X64_PLUGIN) == b"v164"  # the previous build is back in place
+    assert guest.read(X64_PLUGIN + ".bak") == b"old64"
+    assert not guest.file_exists(X64_PLUGIN + ".old")
+    d = ei.value.details
+    assert d["failed_arch"] == "x64" and d["target"] == X64_PLUGIN and d["restored"] is True
+    assert d["installed"] == {}
+
+
+def test_failed_swap_without_a_backup_restores_the_original(swap_rt: FakeRuntime, timeline: Timeline,
+                                                            tmp_path: Path) -> None:
+    guest = swap_rt.channel
+    _seed_install(guest)
+    GuestPowerShell(guest)
+    guest.swap_failures = 1
+    with pytest.raises(GuestOperationError) as ei:
+        _install(swap_rt, Probe(timeline), _dist(tmp_path))
+    assert guest.read(X64_PLUGIN) == b"old64"
+    assert not guest.file_exists(X64_PLUGIN + ".bak")
+    assert ei.value.details["restored"] is True
+
+
+def test_upload_failure_reports_progress_and_relaunches_the_old_plugin(rt: FakeRuntime, timeline: Timeline,
+                                                                       tmp_path: Path) -> None:
+    _seed_install(rt.channel)
+    GuestPowerShell(rt.channel)
+    rt.channel.fail_next("copy_to_guest", GuestOperationError("Error: disk full"))
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    d = ei.value.details
+    assert d["failed_arch"] == "x64" and d["installed"] == {}
+    assert len(d["killed"]) == 2
+    assert d["relaunched"] == ["MCP-x64dbg", "MCP-x32dbg"]
+    assert rt.channel.read(X64_PLUGIN) == b"old64" and rt.channel.read(X32_PLUGIN) == b"old32"
+    runs = [a for a, _ in rt.channel.calls_of("run_program") if a[0] == SCHTASKS]
+    assert runs == [(SCHTASKS, ("/run", "/tn", "MCP-x64dbg")), (SCHTASKS, ("/run", "/tn", "MCP-x32dbg"))]
+
+
+def test_failure_on_the_second_arch_reports_the_first(rt: FakeRuntime, timeline: Timeline,
+                                                      tmp_path: Path) -> None:
+    _seed_install(rt.channel)
+    GuestPowerShell(rt.channel)
+    orig = rt.channel.copy_to_guest
+
+    def copy(host_path: Path, guest_path: str) -> None:
+        if guest_path.endswith(".dp32.new"):
+            raise GuestOperationError("Error: disk full")
+        orig(host_path, guest_path)
+
+    rt.channel.copy_to_guest = copy  # type: ignore[method-assign]
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path), relaunch=False)
+    d = ei.value.details
+    assert d["failed_arch"] == "x32"
+    assert d["installed"]["x64"]["guest_path"] == X64_PLUGIN
+    assert d["relaunched"] == []
+    assert rt.channel.read(X64_PLUGIN) == b"new64" and rt.channel.read(X32_PLUGIN) == b"old32"
+    assert not [a for a, _ in rt.channel.calls_of("run_program") if a[0] == SCHTASKS]
 
 
 def test_install_gives_up_when_a_debugger_will_not_exit(vm: TimelineVm, fake_clock: FakeClock,

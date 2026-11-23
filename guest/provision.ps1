@@ -11,9 +11,13 @@
   JSON keys:
     x64dbg_root   e.g. "C:\\Users\\analyst\\Desktop\\x64dbg\\release" (contains x64\ and x32\)
     user          interactive account that runs the debuggers (e.g. "analyst")
-    password      optional; required only when autologon = true
+    password      optional; required only when autologon = true (and not dry_run:
+                  the host does not send it for a dry run)
     autologon     bool, configure Winlogon auto-logon for `user`
     bind          plugin bind address written to mcp_config.json (e.g. "0.0.0.0")
+    allowed_clients  optional list of IPv4 addresses / CIDR ranges; when non-empty the
+                  config also gets AllowExternal = true and AllowedClients, which plugin
+                  v1.10+ requires for a non-loopback bind (older plugins ignore both)
     ports         { "x64": 9094, "x32": 9095 }
     job_root      e.g. "C:\\mcp\\jobs"; created and made writable (Modify) for `user`
     tokens        optional { "x64": "...", "x32": "..." }; existing valid tokens are kept,
@@ -22,6 +26,10 @@
     dry_run       bool, only report the planned actions (log + result "actions");
                   nothing is changed except that the params file is still deleted
                   and the log/result files are written. Same as the -DryRun switch.
+
+  mcp_config.json is merged: IpAddress, Port, AutoStart, AuthToken (and
+  AllowExternal / AllowedClients when allowed_clients is given) are written
+  first, every other key of an existing valid config is kept as it was.
 
   Results:
     C:\mcp\provision.log            progress log (no secrets), including the plugin
@@ -76,6 +84,24 @@ function Read-ExistingToken([string]$ConfigPath) {
     return $null
 }
 
+function Read-ConfigObject([string]$ConfigPath) {
+    # The top-level keys of an existing plugin config as an ordered dictionary, or an
+    # empty one when the file is missing, zero-filled, corrupt or not a JSON object.
+    $out = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $out }
+    try {
+        $raw = [System.IO.File]::ReadAllText($ConfigPath)
+        if ($raw.Trim([char]0).Trim().Length -eq 0) { return $out }
+        $obj = $raw | ConvertFrom-Json
+        if ($null -ne $obj) {
+            foreach ($prop in @($obj.PSObject.Properties)) {
+                if ($prop.MemberType -eq 'NoteProperty') { $out[$prop.Name] = $prop.Value }
+            }
+        }
+    } catch { }
+    return $out
+}
+
 function Get-PluginInfo([string]$Path) {
     # Identifies the deployed plugin build: the file version when the DLL carries
     # one, otherwise size + mtime + SHA-256 tell builds apart. Read-only.
@@ -119,9 +145,10 @@ try {
     $user = [string]$p.user
     if (-not $root -or -not (Test-Path -LiteralPath $root)) { throw "x64dbg_root not found: $root" }
     if (-not $user) { throw 'user is required' }
-    if ($p.autologon -and -not $p.password) { throw 'autologon requested but no password supplied' }
+    if ($p.autologon -and -not $p.password -and -not $dry) { throw 'autologon requested but no password supplied' }
     $bind = if ($p.bind) { [string]$p.bind } else { '127.0.0.1' }
     $jobRoot = if ($p.job_root) { [string]$p.job_root } else { 'C:\mcp\jobs' }
+    $allowedClients = [string[]]@($p.allowed_clients | Where-Object { $_ } | ForEach-Object { [string]$_ })
 
     $result = [ordered]@{
         x64dbg_root = $root; user = $user; bind = $bind; job_root = $jobRoot; dry_run = $dry
@@ -180,9 +207,23 @@ try {
         }
         $tokenLength = if ($token) { $token.Length } else { 32 }
 
+        # The keys every plugin version reads come first (v1.3 reads only 512 bytes).
         $cfg = [ordered]@{ IpAddress = $bind; Port = $port; AutoStart = $true; AuthToken = $token }
-        Invoke-Planned "write $cfgPath (bind=$bind port=$port token=$tokenSource)" {
-            Write-Utf8NoBom $cfgPath ($cfg | ConvertTo-Json -Compress)
+        $allowText = 'unchanged'
+        if ($allowedClients.Count -gt 0) {
+            $cfg.AllowExternal = $true
+            $cfg.AllowedClients = $allowedClients
+            $allowText = $allowedClients -join ','
+        }
+        # Keep every other key of an existing config (operator settings such as MaxClients).
+        $existing = Read-ConfigObject $cfgPath
+        $kept = New-Object System.Collections.Generic.List[string]
+        foreach ($k in @($existing.Keys)) {
+            if (-not $cfg.Contains($k)) { $cfg[$k] = $existing[$k]; $kept.Add([string]$k) }
+        }
+        $keptText = if ($kept.Count -gt 0) { $kept -join ',' } else { 'none' }
+        Invoke-Planned "write $cfgPath (bind=$bind port=$port token=$tokenSource allowed_clients=$allowText kept_keys=$keptText)" {
+            Write-Utf8NoBom $cfgPath ($cfg | ConvertTo-Json -Compress -Depth 10)
         }
 
         Invoke-Planned "register scheduled task $($a.task) -> $exe (user $user, Interactive, Highest, AtLogOn)" {

@@ -20,11 +20,31 @@ auto-logon, so debuggers are (re)started through the scheduled tasks; after a
 reboot both plugins answered within 44 s; ``GET /`` without a token answers 401
 on plugins up to v1.10, which already proves the HTTP server is up.
 
+Plugin v1.10 (this repo) counts every unauthenticated request from a non-loopback
+address as a failed login and answers 429 for ``AuthLockoutSeconds`` (default
+300 s) after five within 60 s. Readiness waits therefore stop probing a port once
+it has answered, and treat 429 as "server up". v1.10 also refuses to bind a
+non-loopback address unless ``mcp_config.json`` has ``AllowExternal: true`` and a
+non-empty ``AllowedClients``; provisioning writes both (``allowed_clients``,
+by default the host's own address on the guest's network).
+
+Snapshots: protected snapshots and the profile's clean snapshot are never
+deleted (plan 5.7), not even with ``overwrite_snapshot``; provision into a new
+name instead and point the profile at it.
+
 Secrets: the guest password travels only in a params file (0600 on the host,
 deleted in ``finally``; the guest script deletes its copy on read and the host
-removes it if the script never ran). It is never logged, and every text that
-comes back from the guest is scrubbed of it before it reaches a summary or an
-exception. Bearer tokens are only handed to the injectable ``info_probe``.
+removes it if the script never ran), and not at all for ``dry_run``. It is never
+logged, and every free text that comes back from the guest (log, error, output,
+planned actions) is scrubbed of it before it reaches a summary or an exception;
+host-supplied values (root, user, ...) are returned as given. Bearer tokens are
+only handed to the injectable ``info_probe``.
+
+Verification status: the guest-side PowerShell (provision.ps1 beyond the
+version verified in Phase 0, the discovery script and the ps.py wrappers) is
+covered only by unit tests that emulate the guest, plus a syntax check that runs
+where ``pwsh`` is installed. It has not been run on Windows PowerShell 5.1:
+exercise it on the spike VM (tests/vm) before relying on it.
 
 These functions do not take the VM-operation lock or pause the supervisor; the
 caller (CLI / app) must do that around them.
@@ -44,6 +64,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -82,9 +103,11 @@ __all__ = [
     "ArchSpec",
     "HttpProbe",
     "InfoProbe",
+    "LocalIpFor",
     "RuntimeLike",
     "default_http_probe",
     "default_info_probe",
+    "default_local_ip_for",
     "discover_x64dbg",
     "install_plugin",
     "packaged_provision_script",
@@ -98,8 +121,13 @@ RESULT_PATH = "C:\\mcp\\provision.result.json"
 LOG_PATH = "C:\\mcp\\provision.log"
 SHUTDOWN_EXE = "C:\\Windows\\System32\\shutdown.exe"
 REBOOT_ARGS: tuple[str, ...] = ("/r", "/t", "2", "/f")
-#: ``GET /`` answers that prove the plugin's HTTP server is up (401: no token sent).
-READY_STATUSES = frozenset({200, 401})
+#: HTTP status of a plugin that has locked this host out after failed logins (v1.10+).
+LOCKED_OUT_STATUS = 429
+#: ``GET /`` answers that prove the plugin's HTTP server is up (401: no token sent;
+#: 429: locked out, which only a running server can answer).
+READY_STATUSES = frozenset({200, 401, LOCKED_OUT_STATUS})
+#: Plugin limit on ``AllowedClients`` entries (netpolicy.MAX_ALLOWED_CLIENTS).
+MAX_ALLOWED_CLIENTS = 64
 
 
 @dataclass(frozen=True)
@@ -120,6 +148,8 @@ HttpProbe = Callable[[str, int, float], "int | None"]
 #: ``info_probe(ip, port, timeout_s, token) -> GET / JSON object or None`` (never raises).
 InfoProbe = Callable[[str, int, float, Secret], "dict[str, Any] | None"]
 TokenFor = Callable[[str], "Secret | str | None"]
+#: ``local_ip_for(guest_ip) -> host address the guest sees this host connect from``.
+LocalIpFor = Callable[[str], "str | None"]
 
 _PROBE_BODY_LIMIT = 64 * 1024
 _RESULT_LIMIT = 256 * 1024
@@ -130,6 +160,11 @@ _CONFIG_STATES = frozenset({"valid", "missing", "empty", "corrupt", "bad_token"}
 _USER_FORBIDDEN = frozenset('"/[]:;|=,+*?<>')
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MARKER = "MCPJSON:"
+#: Ports dark this many polls in a row (Tools still running) count as the reboot.
+_DARK_ROUNDS = 2
+#: While waiting for the reboot, a port is probed until it has answered this often
+#: (each unauthenticated answer is a failed login for the plugin; 5 lock the host out).
+_DOWN_PHASE_ANSWERS = 3
 
 
 @runtime_checkable
@@ -187,6 +222,29 @@ def default_info_probe(ip: str, port: int, timeout: float, token: Secret) -> dic
     return doc if isinstance(doc, dict) else None
 
 
+def default_local_ip_for(remote_ip: str) -> str | None:
+    """IPv4 address of the host interface that routes to ``remote_ip``, or None.
+
+    A UDP ``connect`` only selects the route; no packet is sent.
+    """
+    try:
+        target = str(ipaddress.IPv4Address(remote_ip))
+    except ValueError:
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2.0)
+            s.connect((target, 9))  # discard port; nothing is sent
+            addr = s.getsockname()[0]
+    except OSError:
+        return None
+    try:
+        ip = ipaddress.IPv4Address(addr)
+    except ValueError:
+        return None
+    return None if ip.is_unspecified else str(ip)
+
+
 def _safe_probe(probe: HttpProbe, ip: str, port: int, timeout: float) -> int | None:
     try:
         status = probe(ip, port, timeout)
@@ -236,11 +294,63 @@ def _check_user(user: object) -> str:
 
 
 def _check_bind(bind: object) -> str:
+    # The plugin only binds IPv4 ("IpAddress must be a valid IPv4 address").
     try:
-        return str(ipaddress.ip_address(str(bind).strip()))
+        return str(ipaddress.IPv4Address(str(bind).strip()))
     except ValueError:
-        raise ConfigError("bind must be an IP address (e.g. 0.0.0.0 or the host-only adapter IP)",
+        raise ConfigError("bind must be an IPv4 address (e.g. 0.0.0.0 or the guest's host-only IP)",
                           stage="provision", details={"bind": _clip(repr(bind), 80)}) from None
+
+
+def _check_allowed_clients(value: object) -> list[str]:
+    """Normalised IPv4 addresses / CIDR ranges (duplicates dropped, order kept)."""
+    if isinstance(value, str | bytes) or not isinstance(value, Iterable):
+        raise ConfigError("allowed_clients must be a list of IPv4 addresses or CIDR ranges",
+                          stage="provision", details={"allowed_clients": _clip(repr(value), 80)})
+    out: list[str] = []
+    for item in value:
+        try:
+            if not isinstance(item, str):
+                raise ValueError(item)
+            text = item.strip()
+            entry = (str(ipaddress.IPv4Network(text, strict=False)) if "/" in text
+                     else str(ipaddress.IPv4Address(text)))
+        except ValueError:
+            raise ConfigError("allowed_clients entries must be IPv4 addresses or CIDR ranges",
+                              stage="provision", details={"entry": _clip(repr(item), 80)}) from None
+        if entry not in out:
+            out.append(entry)
+    if len(out) > MAX_ALLOWED_CLIENTS:
+        raise ConfigError(f"allowed_clients has more than {MAX_ALLOWED_CLIENTS} entries (plugin limit)",
+                          stage="provision", details={"count": len(out)})
+    return out
+
+
+def _resolve_allowed_clients(runtime: RuntimeLike, bind_ip: str, allowed_clients: object,
+                             local_ip_for: LocalIpFor) -> list[str]:
+    """``AllowedClients`` for the plugin configs ([] for a loopback bind without a list)."""
+    loopback = ipaddress.IPv4Address(bind_ip).is_loopback
+    if allowed_clients is not None:
+        allowed = _check_allowed_clients(allowed_clients)
+    elif loopback:
+        return []
+    else:
+        guest = runtime.guest_ip()
+        host: str | None = None
+        if guest:
+            try:
+                host = local_ip_for(guest)
+            except (OSError, ValueError):
+                host = None
+        allowed = _check_allowed_clients([host]) if host else []
+    if not allowed and not loopback:
+        raise ConfigError(
+            f"bind {bind_ip} is not loopback, and the plugin (v1.10+) then refuses to start "
+            "without a non-empty AllowedClients list", stage="provision",
+            details={"bind": bind_ip},
+            hint="pass allowed_clients=[<this host's IP on the guest network>] (or a CIDR range), "
+                 "or bind=127.0.0.1")
+    return allowed
 
 
 def _ports_by_arch(backends: Mapping[str, BackendConfig]) -> dict[str, int]:
@@ -258,7 +368,11 @@ def _ports_by_arch(backends: Mapping[str, BackendConfig]) -> dict[str, int]:
 
 
 def _scrub(value: Any, hidden: Sequence[str]) -> Any:
-    """Replace every secret value inside strings (recursively) with ``***``."""
+    """Replace every secret value inside strings (recursively) with ``***``.
+
+    Only for free text written by the guest: a short password can be a substring of
+    ordinary values (e.g. equal to the account name), which must not be mangled.
+    """
     if isinstance(value, str):
         for s in hidden:
             if s:
@@ -308,9 +422,13 @@ def _clean_plugin(value: Any) -> dict[str, Any]:
 # ── readiness polling ───────────────────────────────────────────────
 @dataclass
 class _Observation:
-    tools_running: bool
+    tools: ToolsState | None  # None: the query itself failed (nothing was observed)
     ip: str | None
     statuses: dict[str, int | None] = field(default_factory=dict)
+
+    @property
+    def tools_running(self) -> bool:
+        return self.tools == ToolsState.RUNNING
 
     @property
     def ready(self) -> bool:
@@ -318,31 +436,69 @@ class _Observation:
                                                             for s in self.statuses.values())
 
     @property
-    def down(self) -> bool:
-        # "No backend answers" rather than "some backend is missing": one port that was
-        # already dead before the reboot must not be mistaken for the reboot itself.
-        # Without any port to probe only Tools / the guest IP can show the reboot.
-        if not self.tools_running or not self.ip:
-            return True
-        return bool(self.statuses) and not any(s in READY_STATUSES for s in self.statuses.values())
+    def tools_down(self) -> bool:
+        """VMware answered that Tools are not running: the guest OS is not up."""
+        return self.tools in (ToolsState.INSTALLED, ToolsState.NOT_INSTALLED)
+
+    @property
+    def ports_dark(self) -> bool:
+        """Tools running and the IP known, yet no backend answers.
+
+        "No backend answers" rather than "some backend is missing": one port that was
+        already dead before the reboot must not be mistaken for the reboot itself.
+        A failed Tools query, UNKNOWN or a missing IP is neither down nor dark.
+        """
+        return (self.tools_running and bool(self.ip) and bool(self.statuses)
+                and not any(s in READY_STATUSES for s in self.statuses.values()))
 
     @property
     def pending(self) -> list[str]:
         return sorted(bid for bid, s in self.statuses.items() if s not in READY_STATUSES)
 
     def details(self) -> dict[str, Any]:
-        return {"tools_running": self.tools_running, "ip": self.ip, "readiness": dict(self.statuses),
-                "pending": self.pending}
+        return {"tools_state": self.tools.value if self.tools is not None else None,
+                "tools_running": self.tools_running, "ip": self.ip,
+                "readiness": dict(self.statuses), "pending": self.pending}
 
 
-def _observe(runtime: RuntimeLike, targets: Mapping[str, int], probe: HttpProbe,
-             probe_timeout_s: float) -> _Observation:
+class _PortProber:
+    """Probes backend ports with ``GET /``, at most ``answers`` times per port that answers.
+
+    Once a port has answered (200/401/429) that often for the current guest IP, its
+    last answer is reused instead of probing again: plugins from v1.10 count every
+    unauthenticated request as a failed login and lock this host out after five
+    within 60 s. A new guest IP (new boot / lease) starts the count afresh.
+    """
+
+    def __init__(self, probe: HttpProbe, timeout_s: float, *, answers: int) -> None:
+        self._probe = probe
+        self._timeout_s = timeout_s
+        self._answers = answers
+        self._ip: str | None = None
+        self._seen: dict[str, tuple[int, int]] = {}  # backend id -> (answers so far, last status)
+
+    def __call__(self, ip: str, bid: str, port: int) -> int | None:
+        if ip != self._ip:
+            self._ip, self._seen = ip, {}
+        count, last = self._seen.get(bid, (0, 0))
+        if count >= self._answers:
+            return last
+        status = _safe_probe(self._probe, ip, port, self._timeout_s)
+        if status in READY_STATUSES:
+            self._seen[bid] = (count + 1, status)
+        return status
+
+
+def _observe(runtime: RuntimeLike, targets: Mapping[str, int],
+             probe_port: Callable[[str, str, int], int | None]) -> _Observation:
+    tools: ToolsState | None
     try:
-        tools_running = runtime.vm.tools_state() == ToolsState.RUNNING
-    except GatewayError:
-        tools_running = False
+        tools = runtime.vm.tools_state()
+    except GatewayError as exc:
+        log.debug("Tools state query failed (%s); nothing observed this round", exc.code)
+        tools = None
     ip: str | None = None
-    if tools_running:
+    if tools == ToolsState.RUNNING:
         try:
             ip = runtime.guest_ip()
         except GatewayError:
@@ -350,8 +506,8 @@ def _observe(runtime: RuntimeLike, targets: Mapping[str, int], probe: HttpProbe,
     statuses: dict[str, int | None] = dict.fromkeys(targets)
     if ip:
         for bid, port in targets.items():
-            statuses[bid] = _safe_probe(probe, ip, port, probe_timeout_s)
-    return _Observation(tools_running, ip, statuses)
+            statuses[bid] = probe_port(ip, bid, port)
+    return _Observation(tools, ip, statuses)
 
 
 def _poll_until(clock: Clock, deadline: float, poll_s: float, check: Callable[[], bool]) -> bool:
@@ -371,14 +527,21 @@ def _wait_up(runtime: RuntimeLike, targets: Mapping[str, int], *, deadline: floa
              probe: HttpProbe, probe_timeout_s: float, stage: str, timeout_s: float,
              extra: Mapping[str, Any] | None = None) -> _Observation:
     last: list[_Observation] = []
+    prober = _PortProber(probe, probe_timeout_s, answers=1)
 
     def ready() -> bool:
-        last[:] = [_observe(runtime, targets, probe, probe_timeout_s)]
+        last[:] = [_observe(runtime, targets, prober)]
         return last[0].ready
 
     if _poll_until(runtime.clock, deadline, poll_s, ready):
-        return last[0]
-    obs = last[0] if last else _Observation(False, None, dict.fromkeys(targets))
+        obs = last[0]
+        locked = sorted(bid for bid, s in obs.statuses.items() if s == LOCKED_OUT_STATUS)
+        if locked:
+            log.warning("backend(s) %s answered HTTP 429: the plugin has locked this host out after "
+                        "failed logins, and refuses the gateway's requests until the lockout ends "
+                        "(AuthLockoutSeconds, default 300 s)", ", ".join(locked))
+        return obs
+    obs = last[0] if last else _Observation(None, None, dict.fromkeys(targets))
     raise VmNotReady(
         f"guest backends not ready within {timeout_s:g}s (waiting for: "
         f"{', '.join(obs.pending) or 'VMware Tools / guest IP'})",
@@ -391,12 +554,28 @@ def _wait_up(runtime: RuntimeLike, targets: Mapping[str, int], *, deadline: floa
 
 def _wait_reboot(runtime: RuntimeLike, targets: Mapping[str, int], *, wait_ready_s: float, poll_s: float,
                  probe: HttpProbe, probe_timeout_s: float) -> tuple[float, _Observation]:
-    """Wait until the guest is seen going down, then until every target answers."""
+    """Wait until the guest is seen going down, then until every target answers.
+
+    Down means VMware reporting Tools as not running, or every port dark for
+    ``_DARK_ROUNDS`` polls in a row while Tools still run. A failed or UNKNOWN
+    Tools query and a missing guest IP are no evidence either way: polling goes
+    on, so the still-running old debuggers can never pass for the rebooted ones.
+    """
     clock = runtime.clock
     start = clock.monotonic()
     deadline = start + wait_ready_s
-    if not _poll_until(clock, deadline, poll_s,
-                       lambda: _observe(runtime, targets, probe, probe_timeout_s).down):
+    prober = _PortProber(probe, probe_timeout_s, answers=_DOWN_PHASE_ANSWERS)
+    dark_rounds = 0
+
+    def went_down() -> bool:
+        nonlocal dark_rounds
+        obs = _observe(runtime, targets, prober)
+        if obs.tools_down:
+            return True
+        dark_rounds = dark_rounds + 1 if obs.ports_dark else 0
+        return dark_rounds >= _DARK_ROUNDS
+
+    if not _poll_until(clock, deadline, poll_s, went_down):
         raise VmNotReady(
             f"the guest did not go down within {wait_ready_s:g}s after the reboot was requested",
             stage="reboot", details={"phase": "down", "timeout_s": wait_ready_s},
@@ -419,6 +598,15 @@ class _SnapshotPlan:
         return {"name": self.name, "exists": self.exists, "action": self.action}
 
 
+def _protected_snapshots(profile: ProfileConfig) -> set[str]:
+    """Case-folded names never deleted: ``protected_snapshots`` plus the clean snapshot
+    (the same set policy.check_snapshot_delete protects)."""
+    names = {p.casefold() for p in profile.protected_snapshots if isinstance(p, str)}
+    if profile.clean_snapshot:
+        names.add(profile.clean_snapshot.casefold())
+    return names
+
+
 def _plan_snapshot(runtime: RuntimeLike, name: str, overwrite: bool) -> _SnapshotPlan:
     if not isinstance(name, str) or not name.strip():
         raise ConfigError("clean_snapshot must be a non-empty snapshot name", stage="snapshot")
@@ -427,16 +615,21 @@ def _plan_snapshot(runtime: RuntimeLike, name: str, overwrite: bool) -> _Snapsho
     exists = bool(same)
     if not exists:
         return _SnapshotPlan(name, False, "take")
+    protected = folded in _protected_snapshots(runtime.profile)
     if not overwrite:
         return _SnapshotPlan(name, True, "refuse", StateViolation(
             f"snapshot {name!r} already exists", stage="snapshot", details={"snapshot": name},
-            hint="pass overwrite_snapshot=True to replace it, or choose another name"))
-    clean = runtime.profile.clean_snapshot
-    protected = {p.casefold() for p in runtime.profile.protected_snapshots}
-    if folded in protected and (clean is None or folded != clean.casefold()):
+            hint="choose another name (protected snapshots and the profile's clean snapshot are "
+                 "never replaced)" if protected
+            else "pass overwrite_snapshot=True to replace it, or choose another name"))
+    if protected:
+        # Plan 5.7: the protected list (and the profile's clean snapshot) is never deleted.
+        # Replacing means delete-then-take, and a failed take would leave no clean snapshot.
         return _SnapshotPlan(name, True, "refuse", ProtectedSnapshotError(
-            f"snapshot {name!r} is protected and is not this profile's clean snapshot",
-            stage="snapshot", details={"snapshot": name}))
+            f"snapshot {name!r} is protected (or is the profile's clean snapshot) and is never deleted",
+            stage="snapshot", details={"snapshot": name},
+            hint="provision into a new snapshot name and point the profile's clean_snapshot at it; "
+                 "delete the old snapshot in VMware yourself once the new one works"))
     if len(same) > 1 or same[0] != name:
         return _SnapshotPlan(name, True, "refuse", StateViolation(
             f"snapshot name {name!r} does not identify exactly one snapshot", stage="snapshot",
@@ -445,13 +638,34 @@ def _plan_snapshot(runtime: RuntimeLike, name: str, overwrite: bool) -> _Snapsho
 
 
 def _take_snapshot(runtime: RuntimeLike, name: str, overwrite: bool) -> dict[str, Any]:
+    """Take ``name``; with a "replace" plan the old one is deleted first.
+
+    The VM provider cannot rename snapshots, so a replacement cannot be taken
+    first under another name. When the take fails after the delete, the error
+    says so (``details['old_snapshot_deleted']``) and the failure is logged.
+    """
     plan = _plan_snapshot(runtime, name, overwrite)  # re-check: the VM may have changed meanwhile
     if plan.error is not None:
         raise plan.error
-    if plan.action == "replace":
-        log.warning("replacing snapshot %r", name)
-        runtime.vm.delete_snapshot(name)
-    runtime.vm.take_snapshot(name)
+    step, deleted = "delete_snapshot", False
+    try:
+        if plan.action == "replace":
+            log.warning("deleting snapshot %r to replace it", name)
+            runtime.vm.delete_snapshot(name)
+            deleted = True
+        step = "take_snapshot"
+        runtime.vm.take_snapshot(name)
+    except GatewayError as exc:
+        exc.details.update({"snapshot": name, "step": step, "old_snapshot_deleted": deleted})
+        if deleted:
+            log.error("snapshot %r was deleted, but taking its replacement failed (%s): "
+                      "the VM has no snapshot of that name now", name, exc.code)
+            exc.hint = (f"the old snapshot {name!r} is already deleted; the guest is provisioned, so "
+                        f"take {name!r} again once the cause is fixed"
+                        + (f" ({exc.hint})" if exc.hint else ""))
+        else:
+            log.error("snapshot %r: %s failed (%s)", name, step, exc.code)
+        raise
     log.info("snapshot %r taken", name)
     return {"name": name, "replaced": plan.action == "replace"}
 
@@ -525,6 +739,8 @@ def provision_guest(
     clean_snapshot: str | None = None,
     overwrite_snapshot: bool = False,
     http_probe: HttpProbe = default_http_probe,
+    allowed_clients: Sequence[str] | None = None,
+    local_ip_for: LocalIpFor = default_local_ip_for,
     no_sleep: bool = True,
     dry_run: bool = False,
     poll_s: float = 5.0,
@@ -539,21 +755,34 @@ def provision_guest(
     and run the packaged provision.ps1 as a file; read
     ``provision.result.json`` / ``provision.log``. Then, unless ``dry_run``:
     reboot (``shutdown.exe /r /t 2 /f``, not awaited) and wait for the guest to
-    go down and for VMware Tools plus every provisioned backend port (HTTP 200
-    or 401) within ``wait_ready_s``; finally take ``clean_snapshot`` (an
-    existing one is refused unless ``overwrite_snapshot``, which deletes it
-    first; protected snapshots other than the profile's clean snapshot are
-    never replaced). Without a reboot the readiness wait still runs before a
-    snapshot, because the snapshot must capture running debuggers.
+    go down and for VMware Tools plus every provisioned backend port (HTTP 200,
+    401 or 429) within ``wait_ready_s``; finally take ``clean_snapshot``. An
+    existing snapshot of that name is refused unless ``overwrite_snapshot``,
+    which deletes it first; protected snapshots and the profile's clean
+    snapshot are never deleted, even then. Without a reboot the readiness wait
+    still runs before a snapshot, because the snapshot must capture running
+    debuggers.
+
+    The plugin configs are merged (keys the script does not manage are kept).
+    With a non-empty ``allowed_clients`` (IPv4 addresses / CIDR ranges) they
+    also get ``AllowExternal: true`` and ``AllowedClients``. A non-loopback
+    ``bind`` requires them (plugin v1.10+ refuses to start otherwise): when
+    ``allowed_clients`` is None they default to the host's own address towards
+    the guest IP (``local_ip_for``), and without one the call is refused up
+    front. A loopback bind without ``allowed_clients`` leaves both keys as
+    they are.
 
     ``dry_run`` asks the script for its planned actions only (``actions`` and
-    ``plan`` in the summary) and performs no reboot and no snapshot change.
+    ``plan`` in the summary), does not send the password, and performs no
+    reboot and no snapshot change.
 
     Raises ConfigError / PathNotAllowed / ValueError for bad arguments,
     StateViolation / ProtectedSnapshotError for the snapshot slot,
     GuestOperationError when the script reports failure, VmNotReady when the
-    guest does not come back in time, and the channel's errors otherwise.
-    The summary never contains the password.
+    guest does not come back in time, and the channel's / VM provider's errors
+    otherwise (a failed snapshot step adds ``step`` and
+    ``old_snapshot_deleted`` to the error's details). The summary never
+    contains the password.
     """
     root = validate_guest_path(x64dbg_root)
     jr = validate_guest_path(job_root if job_root is not None else runtime.profile.job_root_guest)
@@ -569,6 +798,7 @@ def provision_guest(
                           hint="set the guest password environment variable of the profile, "
                                "or pass autologon=False")
     ports = _ports_by_arch(runtime.backends)
+    allowed = _resolve_allowed_clients(runtime, bind_ip, allowed_clients, local_ip_for)
     snap_plan = _plan_snapshot(runtime, clean_snapshot, overwrite_snapshot) if clean_snapshot else None
     if snap_plan is not None and snap_plan.error is not None and not dry_run:
         raise snap_plan.error
@@ -577,9 +807,10 @@ def provision_guest(
     params: dict[str, Any] = {
         "x64dbg_root": root, "user": account, "autologon": bool(autologon), "bind": bind_ip,
         "ports": ports, "job_root": jr, "no_sleep": bool(no_sleep), "dry_run": bool(dry_run),
+        "allowed_clients": allowed,
     }
-    if autologon and secret is not None:
-        params["password"] = secret.reveal()
+    if autologon and secret is not None and not dry_run:
+        params["password"] = secret.reveal()  # a dry run only plans: the guest never needs it
 
     channel = runtime.channel
     log.info("provisioning guest: root=%s user=%s autologon=%s dry_run=%s", root, account, autologon, dry_run)
@@ -589,7 +820,7 @@ def provision_guest(
     try:
         _copy_params(channel, params, guest_params)
         with resources.as_file(packaged_provision_script()) as script_path:
-            res = run_powershell_file(channel, script_path, ["-ParamsFile", guest_params],
+            res = run_powershell_file(channel, script_path, params={"ParamsFile": guest_params},
                                       timeout_s=script_timeout_s)
     finally:
         params.pop("password", None)
@@ -615,12 +846,14 @@ def provision_guest(
 
     backends = _clean_backends(result.get("backends"))
     skipped = result.get("skipped") if isinstance(result.get("skipped"), list) else []
+    # Host-supplied values are returned as given; only guest free text is scrubbed.
     summary: dict[str, Any] = {
         "status": "ok",
         "dry_run": bool(dry_run),
         "x64dbg_root": root,
         "user": account,
         "bind": bind_ip,
+        "allowed_clients": list(allowed),
         "job_root": jr,
         "autologon": result.get("autologon") is True,
         "backends": backends,
@@ -633,11 +866,11 @@ def provision_guest(
     }
     if dry_run:
         actions = result.get("actions")
-        summary["actions"] = [_clip(a) for a in actions if isinstance(a, str)][:200] \
-            if isinstance(actions, list) else []
+        summary["actions"] = _scrub([_clip(a) for a in actions if isinstance(a, str)][:200]
+                                    if isinstance(actions, list) else [], hidden)
         summary["plan"] = {"reboot": bool(reboot),
                            "snapshot": snap_plan.public() if snap_plan is not None else None}
-        return _scrub(summary, hidden)
+        return summary
 
     if not backends:
         raise GuestOperationError(
@@ -660,7 +893,7 @@ def provision_guest(
 
     if snap_plan is not None:
         summary["snapshot"] = _take_snapshot(runtime, snap_plan.name, overwrite_snapshot)
-    return _scrub(summary, hidden)
+    return summary
 
 
 # ── plugin deployment ───────────────────────────────────────────────
@@ -698,24 +931,68 @@ def _kill_debuggers(runtime: RuntimeLike, images: Iterable[str], *, kill_wait_s:
 def _replace_plugin(channel: GuestChannel, local: Path, target: str) -> str:
     """Swap in ``local`` as ``target`` via ``target.new``; back the original up to ``.bak`` once.
 
+    The current plugin is moved aside (to ``.bak`` when there is no backup yet,
+    otherwise to ``.old``, deleted afterwards) before ``.new`` is renamed into
+    place; if that rename fails it is moved back, so a failure never leaves the
+    debugger without a plugin unless the move back fails too (the error's
+    details then name ``previous_plugin``).
+
     Returns "created" (this call made the backup), "kept" (an earlier backup was
     left untouched) or "none" (there was nothing to back up).
     """
-    new, bak = target + ".new", target + ".bak"
+    new, bak, old = target + ".new", target + ".bak", target + ".old"
     _delete_if_exists(channel, new)
     channel.copy_to_guest(local, new)  # upload first: the old plugin stays until the copy worked
     has_backup = channel.file_exists(bak)
-    if channel.file_exists(target):
-        if has_backup:
-            channel.delete_file(target)
-            backup = "kept"
+    if not channel.file_exists(target):
+        channel.rename(new, target)
+        return "kept" if has_backup else "none"
+    aside = old if has_backup else bak
+    if has_backup:
+        _delete_if_exists(channel, old)  # left over from an interrupted install
+    channel.rename(target, aside)
+    try:
+        channel.rename(new, target)
+    except GatewayError as exc:
+        try:
+            channel.rename(aside, target)
+            restored = True
+        except GatewayError as undo:
+            restored = False
+            log.error("plugin swap failed and %s could not be moved back to %s (%s)",
+                      aside, target, undo.code)
+        exc.details.update({"target": target, "uploaded": new, "restored": restored})
+        if not restored:
+            exc.details["previous_plugin"] = aside
+        raise
+    if has_backup:
+        try:
+            channel.delete_file(old)
+        except GatewayError as exc:
+            log.warning("could not delete %s (%s); the next install removes it", old, exc.code)
+        return "kept"
+    return "created"
+
+
+def _task_for(arch: str, by_arch: Mapping[str, BackendConfig]) -> str:
+    cfg = by_arch.get(arch)
+    return cfg.launch_task if cfg is not None and cfg.launch_task else ARCH_SPECS[arch].task
+
+
+def _relaunch_quietly(channel: GuestChannel, tasks: Sequence[str]) -> list[str]:
+    """Best effort after a failed install: start ``tasks``; returns the ones that started."""
+    started: list[str] = []
+    for task in tasks:
+        try:
+            rc = channel.run_program(SCHTASKS_EXE, ["/run", "/tn", task], wait=True, timeout_s=60.0)
+        except GatewayError as exc:
+            log.warning("could not relaunch %s after the failed install (%s)", task, exc.code)
+            continue
+        if rc in (0, None):
+            started.append(task)
         else:
-            channel.rename(target, bak)
-            backup = "created"
-    else:
-        backup = "kept" if has_backup else "none"
-    channel.rename(new, target)
-    return backup
+            log.warning("schtasks /run /tn %s exited with %s after the failed install", task, rc)
+    return started
 
 
 def install_plugin(
@@ -744,14 +1021,20 @@ def install_plugin(
 
     With ``relaunch`` the logon tasks (``launch_task`` of the backend, default
     MCP-x64dbg / MCP-x32dbg) are started with ``schtasks /run`` and every
-    backend port must answer ``GET /`` (200/401) within ``wait_ready_s``. The
+    backend port must answer ``GET /`` (200/401/429) within ``wait_ready_s``
+    (each port is asked until it answers once, to stay clear of the plugin's
+    auth lockout). The
     plugin version is read from ``GET /`` only when ``token_for(backend_id)``
     returns a token (unauthenticated ``GET /`` answers 401 up to v1.10).
 
     Raises TransferError (missing build output), GuestOperationError (no x64dbg
     under the root, schtasks failure), BackendUnavailable (a debugger did not
     exit) and VmNotReady (ports not answering; ``details['installed']`` then
-    says what was replaced).
+    says what was replaced). When uploading or swapping a plugin fails after
+    the debuggers were killed, the channel's error is raised with
+    ``details`` ``failed_arch``, ``installed`` (what was already replaced),
+    ``killed`` and ``relaunched`` (the logon tasks started again, with
+    ``relaunch``, so the debuggers come back with the plugin they had).
     """
     dist = Path(dist_dir)
     local = {arch: dist / arch / "plugins" / spec.plugin for arch, spec in ARCH_SPECS.items()}
@@ -760,6 +1043,9 @@ def install_plugin(
         raise TransferError("plugin build output not found", stage="install_plugin",
                             details={"dist_dir": str(dist), "missing": missing},
                             hint="build the plugin and pass the folder holding x64\\plugins and x32\\plugins")
+    # Read the local builds before anything in the guest changes.
+    builds = {arch: {"sha256": sha256_file(path), "size": path.stat().st_size}
+              for arch, path in local.items()}
     root = validate_guest_path(x64dbg_root)
     wait_ready_s = _positive("wait_ready_s", wait_ready_s)
     poll_s = _positive("poll_s", poll_s)
@@ -771,19 +1057,40 @@ def install_plugin(
     if not present:
         raise GuestOperationError(f"no x64dbg.exe / x32dbg.exe under {root}", stage="install_plugin",
                                   details={"x64dbg_root": root}, hint="see discover_x64dbg")
+    by_arch: dict[str, BackendConfig] = {}
+    for b in runtime.backends.values():
+        by_arch.setdefault(b.arch, b)
     killed = _kill_debuggers(runtime, [ARCH_SPECS[a].exe for a in present], kill_wait_s=kill_wait_s)
 
     installed: dict[str, dict[str, Any]] = {}
-    for arch in present:
-        spec = ARCH_SPECS[arch]
-        plugin_dir = _gjoin(root, arch, "plugins")
-        target = _gjoin(plugin_dir, spec.plugin)
-        channel.mkdir(plugin_dir)
-        backup = _replace_plugin(channel, local[arch], target)
-        installed[arch] = {"guest_path": target, "backup": backup,
-                           "backup_path": target + ".bak" if backup != "none" else None,
-                           "sha256": sha256_file(local[arch]), "size": local[arch].stat().st_size}
-        log.info("plugin %s installed at %s (backup: %s)", arch, target, backup)
+    arch = present[0]
+    try:
+        for arch in present:
+            spec = ARCH_SPECS[arch]
+            plugin_dir = _gjoin(root, arch, "plugins")
+            target = _gjoin(plugin_dir, spec.plugin)
+            try:
+                channel.mkdir(plugin_dir)
+                backup = _replace_plugin(channel, local[arch], target)
+            except GatewayError as exc:
+                exc.details.setdefault("target", target)
+                raise
+            installed[arch] = {"guest_path": target, "backup": backup,
+                               "backup_path": target + ".bak" if backup != "none" else None, **builds[arch]}
+            log.info("plugin %s installed at %s (backup: %s)", arch, target, backup)
+    except GatewayError as exc:
+        # The debuggers are dead and an upload/swap failed: say what was done, and bring the
+        # debuggers back (each plugin file is either the new build or the one it replaced).
+        relaunched = _relaunch_quietly(channel, [_task_for(a, by_arch) for a in present]) if relaunch else []
+        log.error("plugin install failed for %s (%s); installed: %s; relaunched: %s",
+                  arch, exc.code, ", ".join(installed) or "none", ", ".join(relaunched) or "none")
+        exc.details.update({"failed_arch": arch, "installed": installed, "killed": killed,
+                            "relaunched": relaunched})
+        if exc.hint is None:
+            exc.hint = ("architectures missing from details['installed'] keep their previous plugin "
+                        "(if details['restored'] is false it is at details['previous_plugin'] and must "
+                        "be renamed back by hand); fix the cause and run install_plugin again")
+        raise
 
     summary: dict[str, Any] = {"x64dbg_root": root, "installed": installed,
                                "skipped": [a for a in ARCH_SPECS if a not in present],
@@ -791,13 +1098,9 @@ def install_plugin(
     if not relaunch:
         return summary
 
-    by_arch: dict[str, BackendConfig] = {}
-    for b in runtime.backends.values():
-        by_arch.setdefault(b.arch, b)
     failures: dict[str, int] = {}
     for arch in present:
-        cfg = by_arch.get(arch)
-        task = cfg.launch_task if cfg is not None and cfg.launch_task else ARCH_SPECS[arch].task
+        task = _task_for(arch, by_arch)
         rc = channel.run_program(SCHTASKS_EXE, ["/run", "/tn", task], wait=True, timeout_s=60.0)
         if rc not in (0, None):
             failures[task] = rc
