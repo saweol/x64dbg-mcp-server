@@ -39,10 +39,12 @@ from tests.unit.test_provision import (
     TimelineVm,
     _dist,
     _install,
+    _plugins_leftovers,
     _profile,
     _seed_install,
 )
 from tests.unit.test_ps import GuestPowerShell
+from x64dbg_vm_gateway import provision
 from x64dbg_vm_gateway.contracts import Secret
 from x64dbg_vm_gateway.errors import GuestOperationError, ToolsNotRunning, VmNotReady, VmrunTimeout
 from x64dbg_vm_gateway.provision import guest_boot_time, provision_guest
@@ -58,11 +60,15 @@ def _iso(dt: datetime) -> str:
 
 # ── guest emulation ─────────────────────────────────────────────────
 class GuestBoot:
-    """``LastBootUpTime`` of the emulated guest: a new boot at the end of every reboot window.
+    """``LastBootUpTime`` and uptime of the emulated guest: a new boot at the end of every
+    reboot window.
 
-    ``fail_at``: exceptions raised by given reads (1 = first); ``shift_s``: offsets added to
-    the reported value (jitter or a clock step without a reboot); ``output``:
-    replaces the whole output (malformed answers). Reads are logged in ``reads``.
+    ``fail_at``: exceptions raised by given reads (1 = first); ``shift_s``: offsets added
+    to the reported boot time only (jitter, or a wall-clock step in the expected Windows
+    behaviour: the boot time moves with the clock, so ``now - boot`` stays the uptime);
+    ``uptime_shift_s``: offsets added to the reported uptime only (a clock step if the
+    boot time does NOT move with the clock); ``uptime=False`` leaves the uptime line out;
+    ``output``: replaces the whole output (malformed answers). Reads are logged in ``reads``.
     """
 
     def __init__(self, timeline: Timeline) -> None:
@@ -70,14 +76,18 @@ class GuestBoot:
         self.base_t = timeline.clock.t - 3600.0  # the guest has been up for an hour
         self.fail_at: dict[int, Exception] = {}  # read number (1 = first) -> exception
         self.shift_s: list[float] = []
+        self.uptime_shift_s: list[float] = []
+        self.uptime = True
         self.output: str | None = None
         self.reads: list[tuple[float, str | None]] = []
 
-    def boot_dt(self) -> datetime:
+    def boot_t(self) -> float:
         t = self.timeline.clock.t
         ends = [e for s, e in self.timeline.windows if e <= t]
-        boot_t = max(ends) if ends else self.base_t
-        return BOOT0 + timedelta(seconds=boot_t - self.base_t)
+        return max(ends) if ends else self.base_t
+
+    def boot_dt(self) -> datetime:
+        return BOOT0 + timedelta(seconds=self.boot_t() - self.base_t)
 
     def __call__(self, body: str) -> tuple[int, str]:
         t = self.timeline.clock.t
@@ -90,9 +100,13 @@ class GuestBoot:
         if self.output is not None:
             return 0, self.output
         shift = self.shift_s.pop(0) if self.shift_s else 0.0
+        ushift = self.uptime_shift_s.pop(0) if self.uptime_shift_s else 0.0
         value = _iso(self.boot_dt() + timedelta(seconds=shift))
         self.reads[-1] = (t, value)
-        return 0, f"MCPBOOT:{value}\r\n"
+        out = f"MCPBOOT:{value}\r\n"
+        if self.uptime:
+            out += f"MCPUPTIME:{t - self.boot_t() + ushift:.3f}\r\n"
+        return 0, out
 
 
 class RebootProbe(Probe):
@@ -177,6 +191,34 @@ def test_guest_boot_time_reads_last_boot_up_time_through_powershell(fake_guest, 
     assert "ToUniversalTime()" in run["body"]
 
 
+def test_boot_query_also_reports_the_uptime(fake_guest, host_tmp) -> None:
+    # The uptime (now - LastBootUpTime, both UTC) does not move when the guest clock is
+    # stepped; the reboot detection needs it besides the boot time (review of E2).
+    answer = "MCPBOOT:2026-11-23T13:16:44.5000000Z\r\nMCPUPTIME:3600.250\r\n"
+    emu = GuestPowerShell(fake_guest, lambda body: (0, answer))
+    reading = provision._read_boot(fake_guest)
+    assert reading is not None
+    assert reading.iso == "2026-11-23T13:16:44.5000000Z" and reading.uptime_s == 3600.25
+    body = emu.runs[0]["body"]
+    assert "MCPUPTIME:" in body and "(Get-Date).ToUniversalTime()" in body
+    assert "InvariantCulture" in body  # no locale decimal comma (Korean guest, any other)
+
+
+@pytest.mark.parametrize("answer", ["MCPBOOT:2026-11-23T13:16:44Z\r\n",
+                                    "MCPBOOT:2026-11-23T13:16:44Z\r\nMCPUPTIME:\r\n",
+                                    "MCPBOOT:2026-11-23T13:16:44Z\r\nMCPUPTIME:-3.5\r\n",
+                                    "MCPBOOT:2026-11-23T13:16:44Z\r\nMCPUPTIME:1,5\r\n",
+                                    "MCPUPTIME:12.0\r\n"])
+def test_boot_reading_needs_both_values(fake_guest, host_tmp, answer) -> None:
+    GuestPowerShell(fake_guest, lambda body: (0, answer))
+    assert provision._read_boot(fake_guest) is None
+
+
+def test_guest_boot_time_does_not_need_the_uptime(fake_guest, host_tmp) -> None:
+    GuestPowerShell(fake_guest, lambda body: (0, "MCPBOOT:2026-11-23T13:16:44Z\r\n"))
+    assert guest_boot_time(fake_guest) == "2026-11-23T13:16:44Z"
+
+
 @pytest.mark.parametrize("answer", [(0, ""), (0, "MCPBOOT:yesterday"), (1, "MCPBOOT:2026-11-23T13:16:44Z"),
                                     (0, "MCPBOOT:2026-13-45T99:00:00Z")])
 def test_guest_boot_time_none_for_unusable_answers(fake_guest, host_tmp, answer) -> None:
@@ -259,14 +301,62 @@ def test_reboot_that_never_happens_reports_the_unchanged_boot_time(rt, timeline,
     assert len([r for r in gboot.reads if r[1] is not None]) >= 3  # it kept polling
 
 
-@pytest.mark.parametrize("shift", [0.4, -0.4, 1.0, -30.0, -3600.0])
-def test_jitter_or_a_backward_clock_step_is_not_a_reboot(rt, timeline, host_tmp, shift) -> None:
+@pytest.mark.parametrize("shift", [0.4, -0.4, 1.0, -30.0, -3600.0, 5.0, 3600.0, 3 * 86400.0])
+def test_jitter_or_a_clock_step_is_not_a_reboot(rt, timeline, host_tmp, shift) -> None:
+    # A forward step (VMware Tools time sync after a revert, w32time) moves LastBootUpTime
+    # forward with the clock; without a reboot the uptime does not drop (review of E2).
     probe = RebootProbe(timeline)
     _, gboot, _ = _setup(rt, timeline, reboot_s=0, reboots=False)
     gboot.shift_s = [0.0] + [shift] * 50  # first read (before) exact, later ones shifted
     with pytest.raises(VmNotReady) as ei:
         _provision(rt, probe, wait_ready_s=30)
     assert ei.value.details["phase"] == "down"
+
+
+@pytest.mark.parametrize("step", [-5.0, -3600.0, 5.0, 3600.0])
+def test_clock_step_that_leaves_the_boot_time_alone_is_not_a_reboot(rt, timeline, host_tmp, step) -> None:
+    # The other model of a clock step: the boot time stays, so now - boot (the uptime as
+    # computed in the guest) jumps. The boot time not moving forward rules the reboot out.
+    probe = RebootProbe(timeline)
+    _, gboot, _ = _setup(rt, timeline, reboot_s=0, reboots=False)
+    gboot.uptime_shift_s = [0.0] + [step] * 50
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=30)
+    assert ei.value.details["phase"] == "down"
+
+
+def test_reboot_is_recognised_by_the_uptime_drop_with_a_clock_step(rt, timeline, fake_clock,
+                                                                   host_tmp) -> None:
+    # Control for the uptime rule: a real (fast) reboot plus a forward clock step after it
+    # is still recognised (boot time later, uptime far below the hour before).
+    probe = RebootProbe(timeline, delay_s=20)
+    _, gboot, _ = _setup(rt, timeline, stale_s=E2_STALE_S, reboot_s=E2_DOWN_S)
+    gboot.shift_s = [0.0] + [7200.0] * 50
+    summary = _provision(rt, probe, wait_ready_s=300)
+    assert summary["reboot_signal"] == "boot_time"
+    assert fake_clock.t >= timeline.windows[0][1] + 20
+
+
+def test_boot_time_without_uptime_is_not_used(rt, timeline, host_tmp,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    # A guest that reports no uptime: the boot time alone cannot tell a reboot from a
+    # clock step, so only the secondary (down) signal is used, and the E2 fast reboot is
+    # missed again (same timeline as the E2 regression test).
+    probe = RebootProbe(timeline, delay_s=20)
+    _, gboot, _ = _setup(rt, timeline, stale_s=E2_STALE_S, reboot_s=E2_DOWN_S)
+    gboot.uptime = False
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=120)
+    assert ei.value.details["phase"] == "down"
+    assert any("uptime" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+def test_boot_time_without_uptime_still_sees_a_long_reboot(rt, timeline, host_tmp) -> None:
+    probe = RebootProbe(timeline)
+    _, gboot, _ = _setup(rt, timeline, stale_s=2, reboot_s=60)
+    gboot.uptime = False
+    summary = _provision(rt, probe)
+    assert summary["rebooted"] is True and summary["reboot_signal"] == "down"
 
 
 def test_failed_boot_time_reads_during_the_reboot_are_tolerated(fake_guest, fake_clock, timeline,
@@ -516,9 +606,135 @@ def test_failed_backup_leaves_the_plugin_untouched(rt, timeline, tmp_path) -> No
     assert rt.channel.read(X64_PLUGIN) == b"old64" and rt.channel.read(X32_PLUGIN) == b"old32"
     assert ei.value.details["failed_arch"] == "x64"
     assert ei.value.details["relaunched"] == ["MCP-x64dbg", "MCP-x32dbg"]
-    assert not any(k.endswith((".old", ".bak")) and "\\plugins\\" in k for k in rt.channel.files)
+    # nothing but the plugins stays in plugins\, not even the uploaded .new (review of E7)
+    assert _plugins_leftovers(rt.channel) == []
     runs = [a for a, _ in rt.channel.calls_of("run_program") if a[0] == SCHTASKS]
     assert len(runs) == 2
+
+
+def test_failed_upload_leaves_no_partial_new_file(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    orig = rt.channel.copy_to_guest
+
+    def copy(host_path: Path, guest_path: str) -> None:
+        if guest_path.lower().endswith(".dp64.new"):
+            rt.channel.write(guest_path, b"partial")  # vmrun died half way through the copy
+            raise GuestOperationError("Error: disk full")
+        orig(host_path, guest_path)
+
+    rt.channel.copy_to_guest = copy  # type: ignore[method-assign]
+    with pytest.raises(GuestOperationError):
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    assert rt.channel.read(X64_PLUGIN) == b"old64"
+    assert _plugins_leftovers(rt.channel) == []
+
+
+def _interrupted_swap(guest: FakeGuest) -> None:
+    """What a run that died between rename(plugin, .old) and rename(.new, plugin) leaves."""
+    guest.write(X64_PLUGIN + ".old", guest.read(X64_PLUGIN))
+    guest.delete_file(X64_PLUGIN)
+    guest.write(X64_PLUGIN + ".new", b"half-installed")
+    guest.calls.clear()
+
+
+def test_interrupted_swap_puts_the_previous_plugin_back_and_backs_it_up(rt, timeline, tmp_path) -> None:
+    # The .old is then the only copy of the previous build: it becomes the plugin again
+    # and goes through the normal backup, before the new build replaces it.
+    _seed_install(rt.channel)
+    _interrupted_swap(rt.channel)
+    _emu(rt.channel)
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    x64 = summary["installed"]["x64"]
+    assert x64["backup"] == "created"
+    assert rt.channel.read(x64["backup_path"]) == b"old64"
+    assert rt.channel.read(X64_PLUGIN) == b"new64"
+    assert _plugins_leftovers(rt.channel) == []
+
+
+def test_interrupted_swap_with_a_failing_backup_keeps_the_previous_plugin(rt, timeline, tmp_path) -> None:
+    # Review of E7: the stale .old was deleted when moving it to plugins_backup failed,
+    # although no plugin file existed, i.e. it was the only copy of the previous build.
+    _seed_install(rt.channel)
+    _interrupted_swap(rt.channel)
+    _emu(rt.channel)
+    orig = rt.channel.copy_to_guest
+
+    def copy(host_path: Path, guest_path: str) -> None:
+        if "plugins_backup" in guest_path:
+            raise GuestOperationError("Error: disk full")
+        orig(host_path, guest_path)
+
+    rt.channel.copy_to_guest = copy  # type: ignore[method-assign]
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    assert rt.channel.read(X64_PLUGIN) == b"old64"  # back in place, not lost
+    assert _plugins_leftovers(rt.channel) == []
+    assert ei.value.details["failed_arch"] == "x64"
+
+
+def test_interrupted_swap_whose_old_cannot_be_put_back_is_kept(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _interrupted_swap(rt.channel)
+    _emu(rt.channel)
+    orig = rt.channel.rename
+
+    def rename(src: str, dst: str) -> None:
+        if src.lower().endswith(".old"):
+            raise GuestOperationError("Error: Access is denied")
+        orig(src, dst)
+
+    rt.channel.rename = rename  # type: ignore[method-assign]
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    assert rt.channel.read(X64_PLUGIN + ".old") == b"old64"
+    assert not rt.channel.file_exists(X64_PLUGIN)
+    assert not rt.channel.file_exists(X64_PLUGIN + ".new")
+    assert ei.value.details["previous_plugin"].lower() == (X64_PLUGIN + ".old").lower()
+
+
+def test_backup_name_exhaustion_is_an_error_before_the_swap(rt, timeline, fake_clock, tmp_path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(provision, "_BACKUP_NAME_TRIES", 2)
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    rt.channel.mkdir(X64_BACKUPS)
+    for i in range(2):
+        rt.channel.write(f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.{_stamp(fake_clock, i)}.bak", b"other%d" % i)
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    assert "no free backup name" in ei.value.message
+    assert ei.value.details["backup_dir"] == X64_BACKUPS
+    assert rt.channel.read(X64_PLUGIN) == b"old64"
+    assert _plugins_leftovers(rt.channel) == []
+
+
+def test_utc_now_converts_the_clock_to_whole_utc_seconds() -> None:
+    class Clock:
+        def now_iso(self) -> str:
+            return "2026-11-23T09:00:05.750000+09:00"
+
+    assert provision._utc_now(Clock()) == datetime(2026, 11, 23, 0, 0, 5, tzinfo=UTC)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["not a time", None, ""])
+def test_utc_now_falls_back_to_the_host_clock(value) -> None:
+    class Clock:
+        def now_iso(self):
+            return value
+
+    before = datetime.now(UTC).replace(microsecond=0)
+    got = provision._utc_now(Clock())  # type: ignore[arg-type]
+    assert before <= got <= datetime.now(UTC)
+    assert got.tzinfo is not None and got.utcoffset() == timedelta(0) and got.microsecond == 0
+
+
+def test_utc_now_reads_a_naive_clock_as_utc() -> None:
+    class Clock:
+        def now_iso(self) -> str:
+            return "2026-11-23T01:02:03"
+
+    assert provision._utc_now(Clock()) == datetime(2026, 11, 23, 1, 2, 3, tzinfo=UTC)  # type: ignore[arg-type]
 
 
 def test_backup_happens_before_the_swap(rt, timeline, tmp_path) -> None:

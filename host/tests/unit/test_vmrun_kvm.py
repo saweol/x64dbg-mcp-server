@@ -113,3 +113,15 @@ def test_null_provider_reports_no_instance() -> None:
     n = NullProvider()
     assert n.vm_process_ids() == []
     assert n.instance_report() == {"listed": False, "pids": [], "orphans": []}
+
+
+def test_instance_report_is_a_typed_dict() -> None:
+    # The report stays a plain dict for callers that use .get() (the app's start guard),
+    # with its keys typed for static checking (review: was dict[str, Any]).
+    from typing import get_type_hints
+
+    from x64dbg_vm_gateway.vmrun import InstanceReport
+
+    assert get_type_hints(InstanceReport) == {"listed": bool, "pids": list[int], "orphans": list[int]}
+    assert get_type_hints(VmrunProvider.instance_report)["return"] is InstanceReport
+    assert get_type_hints(NullProvider.instance_report)["return"] is InstanceReport

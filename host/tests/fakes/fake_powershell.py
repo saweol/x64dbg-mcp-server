@@ -1,6 +1,6 @@
 """Emulates the PowerShell one-liners the gateway runs in the guest, on top of FakeGuest.
 
-Supported (exactly the commands transfer.py builds):
+Supported (exactly the commands transfer.py builds, decoded from ``-EncodedCommand``):
 
 - ``(Get-FileHash -Algorithm SHA256 -LiteralPath '<src>').Hash | Out-File -Encoding ascii -FilePath '<dst>'``
 - ``Compress-Archive -Path '<dir>\\*' -DestinationPath '<zip>' -Force``
@@ -23,8 +23,10 @@ import zipfile
 from pathlib import PureWindowsPath
 
 from tests.fakes.fake_guest import FakeGuest
+from x64dbg_vm_gateway.ps import decode_command
 
-PS_PREFIX = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+#: transfer.py sends its one-liners as -EncodedCommand (E3: nothing depends on command-line quoting).
+PS_PREFIX = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]
 _HASH_RE = re.compile(r"-LiteralPath '([^']+)'\)\.Hash \| Out-File -Encoding ascii -FilePath '([^']+)'$")
 _ZIP_RE = re.compile(r"^Compress-Archive -Path '([^']+)\\\*' -DestinationPath '([^']+)' -Force$")
 _SIZE_RE = re.compile(
@@ -54,7 +56,7 @@ class GuestPowerShell:
     def __call__(self, exe: str, args: tuple, **_kw) -> int:
         assert is_powershell(exe), exe
         assert list(args[:5]) == PS_PREFIX and len(args) == 6, args
-        cmd = args[5]
+        cmd = decode_command(args[5])
         self.commands.append(cmd)
         if m := _SIZE_RE.match(cmd):
             src, dst = m.groups()

@@ -1,7 +1,7 @@
 """Run PowerShell in the guest through any ``contracts.GuestChannel``.
 
-Findings (spike VM, vmrun 1.17.0; Phase 0 and E3 in docs/PHASE0_RESULTS.md) this
-module is built around:
+Findings (spike VM, vmrun 1.17.0; docs/PHASE0_RESULTS.md row V4, as corrected by
+the 2026-11-23 E2E run, where it is called E3) this module is built around:
 
 - vmrun builds the ``runProgramInGuest`` command line by wrapping every argument
   in double quotes without escaping anything (E3). ``guest.VixChannel`` escapes

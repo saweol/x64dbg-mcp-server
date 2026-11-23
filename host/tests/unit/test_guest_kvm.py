@@ -127,6 +127,47 @@ CASES = [
 ]
 
 
+# Microsoft's documented examples ("Parsing C command-line arguments", Microsoft C/C++
+# docs): raw command-line text -> argv[1:]. Hand-written, so they anchor both the
+# reference parser above and platform.split_windows_command_line, which share an algorithm.
+MS_DOC_EXAMPLES = [
+    ('"a b c" d e', ["a b c", "d", "e"]),
+    ('"ab\\"c" "\\\\" d', ['ab"c', "\\", "d"]),
+    ('a\\\\\\b d"e f"g h', ["a\\\\\\b", "de fg", "h"]),
+    ('a\\\\\\"b c d', ['a\\"b', "c", "d"]),
+    ('a\\\\\\\\"b c" d e', ["a\\\\b c", "d", "e"]),
+    ('a"b"" c d', ['ab" c d']),
+]
+
+
+def _splitters():
+    from x64dbg_vm_gateway.platform import split_windows_command_line
+
+    return [command_line_to_argv, split_windows_command_line]
+
+
+@pytest.mark.parametrize(("cmdline", "expected"), MS_DOC_EXAMPLES)
+@pytest.mark.parametrize("split", _splitters(), ids=["reference", "platform"])
+def test_parsers_agree_with_microsofts_documented_examples(split, cmdline, expected):
+    assert split("prog.exe " + cmdline)[1:] == expected
+    assert split('"C:\\Program Files\\p.exe" ' + cmdline)[1:] == expected
+
+
+@pytest.mark.parametrize("split", _splitters(), ids=["reference", "platform"])
+def test_both_parsers_round_trip_every_case(split):
+    cmdline = vmrun_command_line(PROGRAM, [escape_for_vmrun(a) for a in CASES])
+    argv = split(cmdline)
+    assert argv[0] == PROGRAM and argv[1:] == CASES
+
+
+def test_argv0_takes_no_escapes():
+    from x64dbg_vm_gateway.platform import split_windows_command_line
+
+    for split in (command_line_to_argv, split_windows_command_line):
+        assert split('"C:\\a\\" b') == ["C:\\a\\", "b"]  # a backslash before argv[0]'s quote is literal
+        assert split("C:\\x.exe\t\"q r\"") == ["C:\\x.exe", "q r"]
+
+
 # ── the reference model reproduces the E3 measurement ──────────────
 def test_reference_parser_reproduces_the_e3_measurement():
     # vmrun's raw wrapping of unescaped arguments, as measured in the guest.
@@ -310,8 +351,9 @@ def test_schtasks_and_shutdown_argv_round_trip(wired, fake_guest):
 
 
 def test_transfer_powershell_commands_round_trip(wired, fake_guest, tmp_path, fake_clock):
-    # transfer.py passes -Command <one argument>; under E3 that argument must reach
-    # powershell.exe unchanged (no inner double quotes, no trailing backslash).
+    # transfer.py sends its PowerShell one-liners as -EncodedCommand (spec item 3: prefer
+    # -EncodedCommand for scripts): base64 needs no quoting under any rule, and PowerShell
+    # does not re-parse the text as it does a -Command argument.
     chan, emu, _ = wired
     tps = TransferPowerShell(fake_guest)
     fake_guest.on_run_program = tps
@@ -323,8 +365,10 @@ def test_transfer_powershell_commands_round_trip(wired, fake_guest, tmp_path, fa
     sha = hashlib.sha256(data).hexdigest()
     final = transfer.upload_sample(chan, src, in_dir, sha256=sha, kind="exe", clock=fake_clock)
     assert fake_guest.read(final) == data
-    assert emu.received == [(*ps.PS_BASE_ARGS, "-Command", tps.commands[0])]
+    assert emu.received == [(*ps.PS_BASE_ARGS, "-EncodedCommand", ps.encode_command(tps.commands[0]))]
     assert "'" in tps.commands[0] and " " in tps.commands[0]
+    (call,) = [c for c in emu.command_lines if "powershell.exe" in c]
+    assert "Get-FileHash" not in call  # the script text is not on the command line
 
 
 def test_tar_arguments_with_a_drive_root_round_trip(wired, fake_guest):

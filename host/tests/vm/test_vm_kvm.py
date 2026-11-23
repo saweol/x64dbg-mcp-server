@@ -9,8 +9,12 @@ VM's power state or snapshots:
   exactly (it writes ``[Environment]::GetCommandLineArgs()``, ``$args`` and the raw
   command line as JSON to a guest file that is copied back). Guest side effects:
   the script and its output file under ``C:\\mcp\\tmp`` (both deleted).
+- E3: transfer.py's PowerShell one-liners (now ``-EncodedCommand``) run and
+  write what they should (a guest file under ``C:\\mcp\\tmp`` with a blank in
+  its name, deleted afterwards).
 - E1: ``instance_report()`` (``vmrun list`` + host process scan, read-only).
-- E2: ``guest_boot_time()`` returns an ISO-8601 UTC time (one PowerShell run).
+- E2: ``guest_boot_time()`` returns an ISO-8601 UTC time, and the boot query's
+  uptime grows while the boot time stays (two PowerShell runs each).
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from x64dbg_vm_gateway.guest import POWERSHELL_EXE
+from x64dbg_vm_gateway.ps import ps_quote
 
 pytestmark = pytest.mark.vm
 
@@ -107,6 +112,31 @@ def test_e3_program_arguments_round_trip_through_vmrun(runtime, tmp_path: Path) 
     assert [a for a in doc["args"] if a] == [a for a in ARG_CASES if a], doc["command_line"]
 
 
+def test_e3_transfer_powershell_one_liner_runs_through_vmrun(runtime, tmp_path: Path) -> None:
+    # transfer._ps: the exact path upload hashing / fetch size probes / Compress-Archive use.
+    from x64dbg_vm_gateway import transfer
+
+    channel = runtime.channel  # type: ignore[attr-defined]
+    token = secrets.token_hex(6)
+    out_guest = f"{TMP_DIR}\\kvm ps {token}.txt"
+    text = 'it\'s "quoted" & spaced \\ ; $notavar'
+    command = (f"{ps_quote(text)} | Out-File -Encoding ascii -FilePath {ps_quote(out_guest)}")
+    channel.mkdir(TMP_DIR)
+    try:
+        assert transfer._ps(channel, POWERSHELL_EXE, command, 120.0) == 0
+        back = tmp_path / "ps.txt"
+        channel.copy_from_guest(out_guest, back)
+    finally:
+        with contextlib.suppress(Exception):  # best-effort cleanup in a VM test
+            channel.delete_file(out_guest)
+    assert back.read_bytes().decode("ascii").rstrip("\r\n") == text
+    # Control: a failing one-liner gives a non-zero exit code (VixChannel returns it), so the
+    # 0 above is the command's own success, not a run that never parsed the script.
+    rc = transfer._ps(channel, POWERSHELL_EXE, "Get-Item -LiteralPath 'C:\\no\\such\\file' -ErrorAction Stop",
+                      120.0)
+    assert rc not in (0, None)
+
+
 def test_e1_instance_report_is_consistent(runtime) -> None:
     vm = runtime.vm  # type: ignore[attr-defined]
     if not hasattr(vm, "instance_report"):
@@ -132,3 +162,17 @@ def test_e2_guest_boot_time_is_an_iso_utc_time(runtime) -> None:
     # detection allows (provision._BOOT_TIME_TOLERANCE_S); exact equality is expected.
     first, second = (datetime.fromisoformat(v.replace("Z", "+00:00")) for v in (value, again))
     assert abs((second - first).total_seconds()) <= 1.0, (value, again)
+
+
+def test_e2_uptime_grows_while_the_boot_time_stays(runtime) -> None:
+    # The reboot detection needs both values of one query (provision._is_new_boot).
+    from x64dbg_vm_gateway import provision
+
+    first = provision._read_boot(runtime.channel)  # type: ignore[attr-defined]
+    second = provision._read_boot(runtime.channel)  # type: ignore[attr-defined]
+    assert first is not None and second is not None
+    assert first.uptime_s is not None and second.uptime_s is not None
+    assert first.uptime_s > 60  # a running guest
+    assert second.uptime_s >= first.uptime_s - provision._BOOT_TIME_TOLERANCE_S, (first, second)
+    assert abs((second.at - first.at).total_seconds()) <= provision._BOOT_TIME_TOLERANCE_S, (first, second)
+    assert not provision._is_new_boot(first, second)

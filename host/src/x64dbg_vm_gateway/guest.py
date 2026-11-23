@@ -320,8 +320,9 @@ def escape_for_vmrun(arg: str) -> str:
 class VixChannel:
     """``contracts.GuestChannel`` implemented with vmrun guest operations (VIX).
 
-    Program arguments (E3, measured on the spike VM with vmrun 1.17.0 and a
-    PowerShell ``-File`` script logging ``[Environment]::CommandLine``): vmrun
+    Program arguments (E3: the E2E run's correction of docs/PHASE0_RESULTS.md
+    row V4, measured on the spike VM with vmrun 1.17.0 and a PowerShell
+    ``-File`` script logging ``[Environment]::CommandLine``): vmrun
     builds the guest command line itself and wraps every program argument in
     double quotes without escaping anything. ``a b``, ``c"d``, ``plain``,
     ``e\\f`` arrived as ``"a b" "c"d" "plain" "e\\f"`` and the program received

@@ -16,14 +16,19 @@ plus the VM provider, so it is unit-testable with FakeGuest / FakeVm.
   ``plugins\\``), relaunches the debuggers through the logon tasks and reports
   what answers.
 - :func:`guest_boot_time` reads the guest's ``LastBootUpTime``; the reboot wait
-  compares it with the value read before the reboot (E2).
+  compares it, together with the guest's uptime, with the values read before the
+  reboot (E2).
 
-Facts behind the design (Phase 0 and the E2E run, docs/PHASE0_RESULTS.md): vmrun
-wraps every program argument in double quotes without escaping (E3, handled by
+E1-E7 name the defects found by the real-VM end-to-end run of 2026-11-23
+(docs/PHASE0_RESULTS.md: row V4 and the section "E2E 중 추가로 확인한 사실"; E7 is
+the ``<plugin>.bak`` that install_plugin left in ``plugins\\``).
+
+Facts behind the design (Phase 0 and that run): vmrun wraps every program
+argument in double quotes without escaping (E3, row V4; handled by
 ``guest.escape_for_vmrun``; scripts go through ``ps.run_powershell*``); there is
 no interactive session before auto-logon, so debuggers are (re)started through
 the scheduled tasks; after a reboot both plugins answered within 44 s; a reboot
-can be over between two 5 s polls (E2), hence the boot-time comparison;
+can be over between two 5 s polls (E2, "재부팅 감지"), hence the boot-time comparison;
 ``GET /`` without a token answers 401 on plugins up to v1.10, which already
 proves the HTTP server is up.
 
@@ -174,17 +179,23 @@ _DARK_ROUNDS = 2
 #: While waiting for the reboot, a port is probed until it has answered this often
 #: (each unauthenticated answer is a failed login for the plugin; 5 lock the host out).
 _DOWN_PHASE_ANSWERS = 3
-#: ``Win32_OperatingSystem.LastBootUpTime`` as ISO-8601 UTC (.NET round-trip format "o").
+#: ``Win32_OperatingSystem.LastBootUpTime`` as ISO-8601 UTC (.NET round-trip format "o"),
+#: and the uptime ``now - LastBootUpTime`` in seconds (both UTC, invariant culture).
 _BOOT_MARKER = "MCPBOOT:"
+_UPTIME_MARKER = "MCPUPTIME:"
 _BOOT_SCRIPT = (
     "$os = Get-CimInstance -ClassName Win32_OperatingSystem -Property LastBootUpTime\n"
-    f"'{_BOOT_MARKER}' + $os.LastBootUpTime.ToUniversalTime().ToString('o')"
+    "$boot = $os.LastBootUpTime.ToUniversalTime()\n"
+    "$up = ((Get-Date).ToUniversalTime() - $boot).TotalSeconds\n"
+    f"'{_BOOT_MARKER}' + $boot.ToString('o')\n"
+    f"'{_UPTIME_MARKER}' + $up.ToString('F3', [System.Globalization.CultureInfo]::InvariantCulture)"
 )
 _BOOT_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,7}))?Z")
+_UPTIME_RE = re.compile(r"\d{1,12}(?:\.\d{1,9})?")
 #: Upper bound for one boot-time read (PowerShell start-up in a loaded guest can be slow).
 _BOOT_READ_TIMEOUT_S = 60.0
-#: A reboot moves the boot time forward by at least the guest's uptime; a smaller move
-#: (rounding of the computed value) or a move backwards (clock set back) is no reboot.
+#: Jitter allowed in both values (the boot time is computed by Windows on every query).
+#: A reboot moves the boot time forward AND makes the uptime drop; see _is_new_boot.
 _BOOT_TIME_TOLERANCE_S = 1.0
 #: Plugin backups live in ``<root>\<arch>\plugins_backup`` (E7: never in plugins\, which
 #: x64dbg scans for plugins), named ``<plugin>.<UTC yyyymmddTHHMMSSZ>.bak``.
@@ -609,6 +620,34 @@ def _boot_datetime(value: str | None) -> datetime | None:
     return dt + timedelta(microseconds=int(((m.group(2) or "") + "000000")[:6]))
 
 
+@dataclass(frozen=True)
+class _BootReading:
+    """One answer of the boot query: ``LastBootUpTime`` and, when reported, the uptime."""
+
+    iso: str  # as reported, e.g. 2026-11-23T13:16:44.5000000Z
+    at: datetime
+    uptime_s: float | None
+
+
+def _marked(output: str, marker: str) -> str | None:
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip().startswith(marker)]
+    return lines[-1][len(marker):].strip() if lines else None
+
+
+def _query_boot(channel: GuestChannel, timeout_s: float, guest_tmp_dir: str) -> _BootReading | None:
+    res = run_powershell(channel, _BOOT_SCRIPT, timeout_s=_positive("timeout_s", timeout_s),
+                         guest_tmp_dir=guest_tmp_dir)
+    if not res.ok:
+        return None
+    iso = _marked(res.output, _BOOT_MARKER)
+    at = _boot_datetime(iso)
+    if iso is None or at is None:
+        return None
+    up = _marked(res.output, _UPTIME_MARKER)
+    uptime = float(up) if up is not None and _UPTIME_RE.fullmatch(up) else None
+    return _BootReading(iso, at, uptime)
+
+
 def guest_boot_time(channel: GuestChannel, *, timeout_s: float = _BOOT_READ_TIMEOUT_S,
                     guest_tmp_dir: str = DEFAULT_GUEST_TMP_DIR) -> str | None:
     """The guest's last boot time as an ISO-8601 UTC string (e.g. ``2026-11-23T13:16:44.5000000Z``).
@@ -619,76 +658,106 @@ def guest_boot_time(channel: GuestChannel, *, timeout_s: float = _BOOT_READ_TIME
     channel's errors (Tools not running, vmrun timeout, ...), so "the guest did
     not answer" stays distinguishable from "it answered nothing usable".
     """
-    res = run_powershell(channel, _BOOT_SCRIPT, timeout_s=_positive("timeout_s", timeout_s),
-                         guest_tmp_dir=guest_tmp_dir)
-    if not res.ok:
-        return None
-    lines = [ln.strip() for ln in res.output.splitlines() if ln.strip().startswith(_BOOT_MARKER)]
-    if not lines:
-        return None
-    value = lines[-1][len(_BOOT_MARKER):].strip()
-    return value if _boot_datetime(value) is not None else None
+    reading = _query_boot(channel, timeout_s, guest_tmp_dir)
+    return reading.iso if reading is not None else None
 
 
-def _boot_time_before_reboot(channel: GuestChannel) -> str | None:
-    """Boot time read before the reboot request; None (logged) when it cannot be read."""
+def _read_boot(channel: GuestChannel, *, timeout_s: float = _BOOT_READ_TIMEOUT_S,
+               guest_tmp_dir: str = DEFAULT_GUEST_TMP_DIR) -> _BootReading | None:
+    """Boot time plus uptime (same query as :func:`guest_boot_time`); None unless both are usable.
+
+    The reboot detection needs both (see :func:`_is_new_boot`). Raises the channel's errors.
+    """
+    reading = _query_boot(channel, timeout_s, guest_tmp_dir)
+    return reading if reading is not None and reading.uptime_s is not None else None
+
+
+def _is_new_boot(before: _BootReading, now: _BootReading) -> bool:
+    """True when ``now`` was read after a boot later than the one ``before`` was read in.
+
+    Both conditions must hold (each beyond ``_BOOT_TIME_TOLERANCE_S``):
+
+    - the boot time moved forward. A reboot moves it by at least the old uptime.
+    - the uptime dropped below the uptime read before. Without a reboot the
+      uptime only grows. This check is what a guest clock step cannot fake:
+      Windows is expected to move ``LastBootUpTime`` with the clock (the kernel
+      adjusts its recorded boot time when the system time is set; not yet
+      measured on the spike VM), so a step forward (VMware Tools time sync
+      after a revert, w32time) would move the boot time forward without a
+      reboot, while ``now - LastBootUpTime`` stays the uptime.
+
+    Should the boot time instead stay put across a clock step, the first
+    condition rules the step out. Either way a step alone is never a reboot.
+    The price: a reboot read only once the new uptime has passed the old one is
+    not recognised here; the secondary "down" signal of :func:`_wait_reboot`
+    covers such slow reboots.
+    """
+    if before.uptime_s is None or now.uptime_s is None:
+        return False
+    moved = (now.at - before.at).total_seconds() > _BOOT_TIME_TOLERANCE_S
+    dropped = now.uptime_s + _BOOT_TIME_TOLERANCE_S < before.uptime_s
+    return moved and dropped
+
+
+def _boot_time_before_reboot(channel: GuestChannel) -> _BootReading | None:
+    """Boot time and uptime read before the reboot request; None (logged) when unusable."""
     try:
-        value = guest_boot_time(channel)
+        value = _read_boot(channel)
     except GatewayError as exc:
-        log.warning("could not read the guest boot time before the reboot (%s); only the guest going "
-                    "down can show the reboot, and a fast reboot may be missed", exc.code)
+        log.warning("could not read the guest boot time and uptime before the reboot (%s); only the "
+                    "guest going down can show the reboot, and a fast reboot may be missed", exc.code)
         return None
     if value is None:
-        log.warning("the guest reported no usable boot time; only the guest going down can show the "
-                    "reboot, and a fast reboot may be missed")
+        log.warning("the guest reported no usable boot time and uptime; only the guest going down can "
+                    "show the reboot, and a fast reboot may be missed")
     return value
 
 
 @dataclass
 class _RebootWatch:
-    before: str | None  # boot time read before the reboot was requested
+    before: _BootReading | None  # read before the reboot was requested
     signal: str | None = None  # "boot_time" | "down": what showed the reboot
     after: str | None = None  # the new boot time, when that showed the reboot
     last: str | None = None  # last boot time read while waiting
-    before_dt: datetime | None = field(init=False, default=None)
 
-    def __post_init__(self) -> None:
-        self.before_dt = _boot_datetime(self.before)
+    @property
+    def before_iso(self) -> str | None:
+        return self.before.iso if self.before is not None else None
 
     def read(self, channel: GuestChannel, remaining_s: float) -> bool:
-        """Read the boot time once; True when it moved forward past the tolerance.
+        """Read boot time and uptime once; True when they show a new boot (:func:`_is_new_boot`).
 
-        A failed read (guest going down, Tools starting, vmrun timeout) is no
-        evidence either way and returns False.
+        A failed or unusable read (guest going down, Tools starting, vmrun
+        timeout) is no evidence either way and returns False.
         """
-        if self.before_dt is None or remaining_s <= 0:
+        if self.before is None or remaining_s <= 0:
             return False
         try:
-            value = guest_boot_time(channel, timeout_s=min(_BOOT_READ_TIMEOUT_S, remaining_s))
+            now = _read_boot(channel, timeout_s=min(_BOOT_READ_TIMEOUT_S, remaining_s))
         except GatewayError as exc:
             log.debug("guest boot time not readable while waiting for the reboot (%s)", exc.code)
             return False
-        now = _boot_datetime(value)
         if now is None:
             return False
-        self.last = value
-        if (now - self.before_dt).total_seconds() > _BOOT_TIME_TOLERANCE_S:
-            self.after = value
+        self.last = now.iso
+        if _is_new_boot(self.before, now):
+            self.after = now.iso
             return True
         return False
 
 
 def _wait_reboot(runtime: RuntimeLike, targets: Mapping[str, int], *, wait_ready_s: float, poll_s: float,
                  probe: HttpProbe, probe_timeout_s: float,
-                 boot_before: str | None) -> tuple[float, _Observation, _RebootWatch]:
+                 boot_before: _BootReading | None) -> tuple[float, _Observation, _RebootWatch]:
     """Wait until the guest has rebooted, then until every target answers.
 
-    Primary signal (E2): the guest's boot time (:func:`guest_boot_time`) moved
-    forward by more than ``_BOOT_TIME_TOLERANCE_S`` from ``boot_before``, which
-    was read before the reboot was requested. It is read once per poll while
-    VMware reports Tools running; failed reads are skipped. A guest that is down
-    for less than one poll interval is still seen this way (the E2 failure:
-    LastBootUpTime moved 22:16:44 -> 22:22:29, yet no poll saw the guest down).
+    Primary signal (E2): compared with ``boot_before`` (read before the reboot
+    was requested), the guest's boot time moved forward and its uptime dropped
+    (:func:`_is_new_boot`; the uptime keeps a guest clock step from passing for
+    a reboot). Both are read once per poll while VMware reports Tools running;
+    failed reads are skipped. A guest that is down for less than one poll
+    interval is still seen this way (the E2 failure: LastBootUpTime moved
+    22:16:44 -> 22:22:29, yet no poll saw the guest down).
 
     Secondary signal (the only one when ``boot_before`` is None): the guest seen
     going down: VMware reporting Tools as not running, or every port dark for
@@ -721,17 +790,18 @@ def _wait_reboot(runtime: RuntimeLike, targets: Mapping[str, int], *, wait_ready
         if watch.before is None:
             raise VmNotReady(
                 f"the guest did not go down within {wait_ready_s:g}s after the reboot was requested "
-                "(its boot time could not be read, so only going down could show the reboot)",
+                "(its boot time and uptime could not be read, so only going down could show the reboot)",
                 stage="reboot", details={"phase": "down", "timeout_s": wait_ready_s, "boot_time": None},
                 hint="the old debugger instances are still answering; check that shutdown.exe can run",
             )
-        last = f" (last read: {watch.last})" if watch.last and watch.last != watch.before else ""
+        before = watch.before_iso
+        last = f" (last read: {watch.last})" if watch.last and watch.last != before else ""
         unread = "" if watch.last else "; it could not be read again since"
         raise VmNotReady(
             f"the guest did not reboot within {wait_ready_s:g}s after the reboot was requested: "
-            f"its boot time is still {watch.before}{last}{unread}",
+            f"its boot time is still {before}{last}{unread}",
             stage="reboot",
-            details={"phase": "down", "timeout_s": wait_ready_s, "boot_time": watch.before,
+            details={"phase": "down", "timeout_s": wait_ready_s, "boot_time": before,
                      "last_boot_time": watch.last},
             hint="shutdown.exe /r may have been refused or the guest hangs while shutting down; "
                  "take a screenshot (vm_screenshot)",
@@ -912,9 +982,10 @@ def provision_guest(
     from ``runtime.backends``, job root defaulting to ``profile.job_root_guest``)
     and run the packaged provision.ps1 as a file; read
     ``provision.result.json`` / ``provision.log``. Then, unless ``dry_run``:
-    read the guest's boot time, reboot (``shutdown.exe /r /t 2 /f``, not
-    awaited) and wait until the boot time has changed (or, as a secondary
-    signal, the guest was seen going down) and VMware Tools plus every
+    read the guest's boot time and uptime, reboot (``shutdown.exe /r /t 2 /f``,
+    not awaited) and wait until the boot time has moved forward with the uptime
+    dropping (or, as a secondary signal, the guest was seen going down) and
+    VMware Tools plus every
     provisioned backend port answer (HTTP 200, 401 or 429), all within
     ``wait_ready_s``; finally take ``clean_snapshot``. The summary's
     ``reboot_signal`` ("boot_time" / "down") and ``boot_time`` (``before`` /
@@ -1047,13 +1118,14 @@ def provision_guest(
         boot_before = _boot_time_before_reboot(channel)
         channel.run_program(SHUTDOWN_EXE, list(REBOOT_ARGS), wait=False)
         log.info("guest reboot requested (boot time %s); waiting up to %gs for %s",
-                 boot_before or "unknown", wait_ready_s, ", ".join(targets))
+                 boot_before.iso if boot_before is not None else "unknown", wait_ready_s,
+                 ", ".join(targets))
         ready_s, obs, watch = _wait_reboot(runtime, targets, wait_ready_s=wait_ready_s, poll_s=poll_s,
                                            probe=http_probe, probe_timeout_s=probe_timeout_s,
                                            boot_before=boot_before)
         summary.update(rebooted=True, ready_s=round(ready_s, 1), readiness=dict(obs.statuses),
                        reboot_signal=watch.signal,
-                       boot_time={"before": watch.before, "after": watch.after})
+                       boot_time={"before": watch.before_iso, "after": watch.after})
     elif snap_plan is not None:
         start = runtime.clock.monotonic()
         obs = _wait_up(runtime, targets, deadline=start + wait_ready_s, poll_s=poll_s, probe=http_probe,
@@ -1221,18 +1293,52 @@ def _adopt_legacy_backup(channel: GuestChannel, legacy: str, backups: _Backups, 
     return path
 
 
+def _discard_upload(channel: GuestChannel, new: str) -> None:
+    """Best effort after a failure before the swap: remove the uploaded ``.new`` (E7)."""
+    try:
+        _delete_if_exists(channel, new)
+    except GatewayError as exc:
+        log.warning("could not remove %s (%s); the next install removes it", new, exc.code)
+
+
+def _settle_stale_old(channel: GuestChannel, old: str, target: str, backups: _Backups, tmp: Path) -> None:
+    """Deal with a ``<plugin>.old`` left by an interrupted install, before the swap.
+
+    Without ``target`` the earlier run died between its two renames: ``.old`` is
+    the previous plugin and the only copy of it, so it is renamed back to
+    ``target`` (and then backed up like any current plugin); if that rename
+    fails, the error names it in ``previous_plugin``. Next to an existing
+    ``target`` it is a stale extra copy: moved into ``plugins_backup``, or
+    deleted when that fails (as before).
+    """
+    if not channel.file_exists(target):
+        try:
+            channel.rename(old, target)
+        except GatewayError as exc:
+            exc.details.update({"target": target, "restored": False, "previous_plugin": old})
+            raise
+        log.warning("found %s but no %s (an interrupted install); moved it back before installing",
+                    old, target)
+        return
+    if _adopt_legacy_backup(channel, old, backups, tmp) is None:
+        _delete_if_exists(channel, old)
+
+
 def _replace_plugin(channel: GuestChannel, local: Path, target: str, backups: _Backups) -> dict[str, Any]:
     """Swap in ``local`` as ``target``; back the replaced build up in ``plugins_backup`` first.
 
     Steps: upload ``target.new``; move a ``target.bak`` left by earlier versions
-    and a stale ``target.old`` into the backup folder (a ``.old`` that cannot be
-    moved is deleted, as before); copy the current plugin to the host, hash it and copy
-    it to ``<backup dir>\\<plugin>.<UTC stamp>.bak`` unless a backup with the same
+    into the backup folder; settle a stale ``target.old`` (:func:`_settle_stale_old`:
+    put back as ``target`` when ``target`` is missing, else moved to the backup
+    folder); copy the current plugin to the host, hash it and copy it to
+    ``<backup dir>\\<plugin>.<UTC stamp>.bak`` unless a backup with the same
     SHA-256 exists; only then rename ``target`` to ``target.old`` and ``.new``
-    into place, and delete ``.old``. When the second rename fails, ``.old`` is
-    moved back, so a failure never leaves the debugger without a plugin unless
-    the move back fails too (the error's details then name ``previous_plugin``).
-    Nothing but the plugin itself stays in plugins\\ (E7).
+    into place, and delete ``.old``. A failure before the swap removes ``.new``
+    again (best effort), so nothing but the plugin itself stays in plugins\\
+    (E7). When the second rename fails, ``.old`` is moved back, so a failure
+    never leaves the debugger without a plugin unless the move back fails too
+    (the error's details then name ``previous_plugin``); ``.new`` is then kept
+    and named in ``details['uploaded']``.
 
     Returns ``backup`` ("created": this call stored it; "kept": an identical
     backup existed; "none": there was no plugin to back up), ``backup_path`` and
@@ -1240,20 +1346,22 @@ def _replace_plugin(channel: GuestChannel, local: Path, target: str, backups: _B
     """
     new, old, legacy = target + ".new", target + ".old", target + ".bak"
     result: dict[str, Any] = {"backup": "none", "backup_path": None, "legacy_backup": None}
-    _delete_if_exists(channel, new)
-    channel.copy_to_guest(local, new)  # upload first: the old plugin stays until the copy worked
-    with tempfile.TemporaryDirectory(prefix="x64dbg-gw-plugin-") as tmp:
-        if channel.file_exists(legacy):
-            result["legacy_backup"] = _adopt_legacy_backup(channel, legacy, backups, Path(tmp))
-        # A .old left by an interrupted install: this version backs its build up before
-        # the swap, earlier versions did not always; keep it unless that fails.
-        if channel.file_exists(old) and _adopt_legacy_backup(channel, old, backups, Path(tmp)) is None:
-            _delete_if_exists(channel, old)
-        if not channel.file_exists(target):
-            channel.rename(new, target)
-            return result
-        current = Path(tmp) / "current.bin"
-        path, created = backups.store(channel, current, _fetch_and_hash(channel, target, current))
+    try:
+        _delete_if_exists(channel, new)
+        channel.copy_to_guest(local, new)  # upload first: the old plugin stays until the copy worked
+        with tempfile.TemporaryDirectory(prefix="x64dbg-gw-plugin-") as tmp:
+            if channel.file_exists(legacy):
+                result["legacy_backup"] = _adopt_legacy_backup(channel, legacy, backups, Path(tmp))
+            if channel.file_exists(old):
+                _settle_stale_old(channel, old, target, backups, Path(tmp))
+            if not channel.file_exists(target):
+                channel.rename(new, target)
+                return result
+            current = Path(tmp) / "current.bin"
+            path, created = backups.store(channel, current, _fetch_and_hash(channel, target, current))
+    except GatewayError:
+        _discard_upload(channel, new)
+        raise
     result.update(backup="created" if created else "kept", backup_path=path)
     channel.rename(target, old)
     try:

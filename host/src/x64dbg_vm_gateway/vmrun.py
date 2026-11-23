@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, TypedDict
 
 from .contracts import (
     Clock,
@@ -493,13 +493,22 @@ def _check_snapshot_name(name: str) -> None:
         )
 
 
+class InstanceReport(TypedDict):
+    """What :meth:`VmrunProvider.instance_report` returns (a plain dict at run time)."""
+
+    listed: bool  # `vmrun list` names the .vmx
+    pids: list[int]  # every host hypervisor process running the .vmx, sorted
+    orphans: list[int]  # the ones VMware does not account for (see instance_report)
+
+
 class VmrunProvider:
     """``contracts.VmProvider`` backed by a ``VmrunRunner`` (normally ``VmrunCli``).
 
     Besides the protocol it offers :meth:`vm_process_ids` / :meth:`instance_report`,
     which look at the host's process table for hypervisor processes of this .vmx
     (``process_finder``, default :func:`platform.find_vmx_processes`), because
-    ``vmrun list`` alone missed a surviving instance (E1).
+    ``vmrun list`` alone missed a surviving instance (E1: the duplicate-instance
+    incident in docs/PHASE0_RESULTS.md, section "E2E 중 추가로 확인한 사실").
     """
 
     DEFAULT_TIMEOUTS: Mapping[str, float] = {
@@ -572,7 +581,7 @@ class VmrunProvider:
         pids = finder(self.vmx) if finder is not None else find_vmx_processes(self.vmx)
         return sorted({int(p) for p in pids})
 
-    def instance_report(self) -> dict[str, Any]:
+    def instance_report(self) -> InstanceReport:
         """``{'listed': bool, 'pids': [...], 'orphans': [...]}`` for this .vmx.
 
         ``listed``: ``vmrun list`` names the VM. ``pids``: every hypervisor
@@ -589,7 +598,7 @@ class VmrunProvider:
         pids = self.vm_process_ids()
         listed = self._listed()
         orphans = list(pids) if pids and (not listed or len(pids) > 1) else []
-        return {"listed": listed, "pids": pids, "orphans": orphans}
+        return InstanceReport(listed=listed, pids=pids, orphans=orphans)
 
     def _suspended_on_disk(self) -> bool:
         vmx = Path(self.vmx)
@@ -759,9 +768,9 @@ class NullProvider:
     def vm_process_ids(self) -> list[int]:
         return []
 
-    def instance_report(self) -> dict[str, Any]:
+    def instance_report(self) -> InstanceReport:
         """No VM in endpoint mode: nothing listed, no process."""
-        return {"listed": False, "pids": [], "orphans": []}
+        return InstanceReport(listed=False, pids=[], orphans=[])
 
     def list_snapshots(self) -> list[Snapshot]:
         raise self._unavailable()

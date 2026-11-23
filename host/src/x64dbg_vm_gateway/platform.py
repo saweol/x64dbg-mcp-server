@@ -447,8 +447,9 @@ def find_vmx_processes(
     """PIDs of the hypervisor processes (``vmware-vmx``) that run exactly ``vmx_path``.
 
     ``vmrun list`` only shows the VMs VMware knows about. After a revert an older
-    ``vmware-vmx`` of the same .vmx can survive unlisted (E1, docs/PHASE0_RESULTS.md),
-    and ``vmrun start`` then runs a second instance with the same MAC and IP. This
+    ``vmware-vmx`` of the same .vmx can survive unlisted (E1: the duplicate-instance
+    incident in docs/PHASE0_RESULTS.md, section "E2E 중 추가로 확인한 사실"), and
+    ``vmrun start`` then runs a second instance with the same MAC and IP. This
     scan asks the host's process table instead:
 
     - Linux (and any host that is neither Windows nor macOS):
@@ -462,8 +463,11 @@ def find_vmx_processes(
       the command (ps does not quote, so argv cannot be split exactly).
     - Windows: Windows PowerShell + CIM ``Win32_Process`` for the ``vmware-vmx``
       images, ``CommandLine`` split with the MSVCRT rules and the .vmx argument
-      compared case-insensitively. Processes whose command line this user may
-      not read are skipped.
+      compared case-insensitively after ``os.path.realpath`` on both sides
+      (on a Windows host that is ``GetFinalPathNameByHandleW``, which also maps
+      8.3 short names, ``subst`` and mapped drives to one form; a path that
+      cannot be opened is resolved only as far as it can be). Processes whose
+      command line this user may not read are skipped.
 
     Subprocesses run with a timeout (:data:`PROCESS_SCAN_TIMEOUT_S`). Returns the
     PIDs sorted. Raises GatewayError (stage ``platform``) when the process table
