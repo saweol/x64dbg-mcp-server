@@ -11,9 +11,9 @@ import time
 from collections.abc import Callable
 
 import pytest
-from x64dbg_vm_gateway.locks import VmOpLock
 
 from x64dbg_vm_gateway.errors import LockTimeout
+from x64dbg_vm_gateway.locks import VmOpLock
 
 WAIT = 5.0  # generous upper bound for cross-thread handshakes; normally instant
 

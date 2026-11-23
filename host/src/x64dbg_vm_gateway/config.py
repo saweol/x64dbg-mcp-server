@@ -32,6 +32,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .contracts import Secret
+from .errors import ConfigError
+from .platform import host_system
 
 
 @dataclass(frozen=True)
@@ -196,12 +198,6 @@ def _looks_like_inline_secret(key: str) -> bool:
     return k in _SECRET_KEYS or k.endswith(_SECRET_SUFFIXES)
 
 
-def _host_system(system: str | None) -> str:
-    from .platform import host_system
-
-    return host_system(system)
-
-
 def default_config_path(*, system: str | None = None, environ: Mapping[str, str] | None = None) -> Path:
     """Per-OS default config location.
 
@@ -210,7 +206,7 @@ def default_config_path(*, system: str | None = None, environ: Mapping[str, str]
     Windows: ``%APPDATA%\\x64dbg-vm-gateway\\config.toml``.
     """
     env = os.environ if environ is None else environ
-    if _host_system(system) == "Windows":
+    if host_system(system) == "Windows":
         appdata = env.get("APPDATA")
         if not appdata:
             profile = env.get("USERPROFILE") or str(Path.home())
@@ -235,8 +231,6 @@ def load_config(
     Path resolution: explicit ``path`` > env ``X64DBG_VM_GATEWAY_CONFIG`` >
     ``default_config_path()``. Raises ConfigError on any problem.
     """
-    from .errors import ConfigError
-
     env = os.environ if environ is None else environ
     if path is not None:
         source = Path(path).expanduser()
@@ -281,9 +275,7 @@ class _Parser:
         self.source = source
 
     # ── error helpers ───────────────────────────────────────────────
-    def error(self, key: str, problem: str, hint: str | None = None) -> Exception:
-        from .errors import ConfigError
-
+    def error(self, key: str, problem: str, hint: str | None = None) -> ConfigError:
         where = f" (in {self.source})" if self.source else ""
         return ConfigError(f"config key {key}: {problem}{where}", stage="config", hint=hint,
                            details={"key": key, "path": self.source})
