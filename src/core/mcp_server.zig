@@ -409,12 +409,13 @@ fn serverLoop() void {
     var last_retry_log: u64 = 0;
     while (ws2.bind(sock, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) != 0) {
         const err = ws2.WSAGetLastError();
+        // stop() may have closed the socket under us: exit quietly.
+        if (!running.load(.acquire)) return;
         if (err != .WSAEADDRINUSE) {
             running.store(false, .release);
             logMsg("bind() failed (WSA error {d}).", .{@intFromEnum(err)});
             return;
         }
-        if (!running.load(.acquire)) return;
         const now = GetTickCount64();
         if (last_retry_log == 0 or now -| last_retry_log >= BIND_RETRY_LOG_MS) {
             logMsg("Port {d} is in use (another process, or connections of the previous server instance are still open); retrying every {d} s until it is free.", .{ port, BIND_RETRY_INTERVAL_MS / 1000 });
