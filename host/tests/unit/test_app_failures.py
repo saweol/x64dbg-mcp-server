@@ -30,7 +30,7 @@ def lab(tmp_path):
 
 def jobs(lab):
     """Jobs as the (latest) gateway sees them; a second JobStore could not open the locked root."""
-    return lab.gateways[-1].list_jobs()
+    return lab.gateways[-1].list_jobs()["jobs"]
 
 
 def wait_until(pred, timeout_s: float = 10.0) -> None:

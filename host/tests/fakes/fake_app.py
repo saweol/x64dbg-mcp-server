@@ -9,15 +9,20 @@ it ran on in ``threads``) and then, in this order:
 3. returns ``results[method]`` (called with the kwargs if it is callable, deep
    copied otherwise) or a default JSON-serialisable answer.
 
-``runtime(profile)`` is not part of the Protocol; it mirrors ``app.Gateway.runtime``
-which the CLI hands to the provisioning module.
+``runtime(profile)`` and ``open()`` are not part of the Protocol; they mirror
+``app.Gateway.runtime`` (which the CLI hands to the provisioning module) and
+``app.Gateway.open`` (which claims the jobs root). A ``FakeRuntime`` records, in
+``log``, what the CLI does to it around provisioning: ``supervisor.pause`` /
+``supervisor.resume``, ``lock.write`` / ``lock.release``, ``bump:<backend>`` and
+``invalidate_clients``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 from x64dbg_vm_gateway.contracts import ToolInfo
@@ -49,9 +54,50 @@ def _texts_result(tool: str) -> JSON:
             "is_error": False}
 
 
+class _FakeVmOpLock:
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+        self.write_timeouts: list[float | None] = []
+
+    @contextlib.contextmanager
+    def write(self, timeout_s: float | None = None) -> Iterator[None]:
+        self.write_timeouts.append(timeout_s)
+        self._log.append("lock.write")
+        try:
+            yield
+        finally:
+            self._log.append("lock.release")
+
+
+class _FakeSupervisor:
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+        self.epochs: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def paused(self) -> Iterator[None]:
+        self._log.append("supervisor.pause")
+        try:
+            yield
+        finally:
+            self._log.append("supervisor.resume")
+
+    def bump_epoch(self, backend_id: str, reason: str) -> int:
+        self._log.append(f"bump:{backend_id}")
+        self.epochs[backend_id] = self.epochs.get(backend_id, 0) + 1
+        return self.epochs[backend_id]
+
+
 class FakeRuntime:
-    def __init__(self, profile: str | None) -> None:
+    def __init__(self, profile: str | None, backends: Sequence[str] = ("x64", "x32")) -> None:
         self.profile = profile
+        self.log: list[str] = []
+        self.backends = {b: None for b in backends}
+        self.lock = _FakeVmOpLock(self.log)
+        self.supervisor = _FakeSupervisor(self.log)
+
+    def invalidate_clients(self, *, drop_tokens: bool = False, reason: str = "") -> None:
+        self.log.append("invalidate_clients")
 
 
 class FakeApp:
@@ -193,6 +239,14 @@ class FakeApp:
         return self._record("ida_import_annotations", {"applied": len(items)}, items=items, module=module,
                             ida_imagebase=ida_imagebase, job_id=job_id)
 
+    # ── jobs (read-only) ────────────────────────────────────────────
+    def list_jobs(self, profile: str | None = None) -> JSON:
+        return self._record("list_jobs", {"profile": profile, "jobs": [], "corrupt": []}, profile=profile)
+
+    def get_job(self, job_id: str) -> JSON:
+        return self._record("get_job", {"job_id": job_id, "state": "ANALYZING", "history": []},
+                            job_id=job_id)
+
     # ── human-only ──────────────────────────────────────────────────
     def discard_job(self, job_id: str, actor: str) -> JSON:
         return self._record("discard_job", {"job_id": job_id, "state": "DISCARDED"}, job_id=job_id,
@@ -204,6 +258,9 @@ class FakeApp:
         self.closed = True
 
     # ── orchestrator extras (not in the Protocol) ───────────────────
+    def open(self) -> None:
+        self._record("open", None)
+
     def runtime(self, profile: str | None = None) -> FakeRuntime:
         rt = FakeRuntime(profile)
         with self._lock:
