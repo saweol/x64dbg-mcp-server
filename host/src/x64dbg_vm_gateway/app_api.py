@@ -107,6 +107,19 @@ class GatewayApp(Protocol):
                                ida_imagebase: str | int | None = None,
                                job_id: str | None = None) -> JSON: ...
 
+    # ── jobs (read-only views of the serving gateway's job store) ───
+    def list_jobs(self, profile: str | None = None) -> JSON:
+        """{"profile": str | None, "jobs": [job view, oldest first], "corrupt": [...]}.
+
+        Every job the store knows (terminal ones included), optionally of one profile;
+        ``corrupt`` lists job directories without a usable state. Changes nothing."""
+        ...
+
+    def get_job(self, job_id: str) -> JSON:
+        """One job view plus ``history``, ``needs_recovery``, ``recovery_hint`` and
+        ``next_tool``. Raises InvalidJobId / JobNotFound. Changes nothing."""
+        ...
+
     # ── human-only (CLI) operations — never exposed as MCP tools ────
     def discard_job(self, job_id: str, actor: str) -> JSON: ...
     def close(self) -> None: ...

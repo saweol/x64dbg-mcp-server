@@ -2260,14 +2260,35 @@ class Gateway(GatewayApp):
         assert view is not None
         return view
 
-    def list_jobs(self, profile: str | None = None) -> list[dict[str, Any]]:
-        """Every known job (oldest first), optionally of one profile (CLI / diagnostics).
+    # ── jobs (read-only) ────────────────────────────────────────────
+    def list_jobs(self, profile: str | None = None) -> dict[str, Any]:
+        """Every known job (oldest first), optionally of one profile, plus unreadable job dirs.
 
-        Not part of ``GatewayApp``: the job store is locked by this process, so a
-        second process cannot open it to list jobs while the gateway runs.
+        The job store is locked by the serving process, so a second process cannot
+        open it while a gateway runs: clients ask the gateway (this method).
         """
         name = self._profile_name(profile) if profile else None
-        return [v for j in self._jobs().list(name) if (v := self._job_view(j)) is not None]
+        store = self._jobs()
+        corrupt = [c for c in store.corrupt_jobs() if name is None or c.profile in (None, name)]
+        return {
+            "profile": name,
+            "jobs": [v for j in store.list(name) if (v := self._job_view(j)) is not None],
+            "corrupt": [c.to_json() for c in corrupt],
+        }
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        job = self._jobs().get(job_id)
+        view = self._job_view(job)
+        assert view is not None
+        state = JobState(job.state)
+        recovering = bool(job.flags.get("needs_recovery")) and not job.terminal
+        return {
+            **view,
+            "history": [dict(h) for h in job.history],
+            "needs_recovery": recovering,
+            "recovery_hint": RECOVERY_HINTS.get(state) if recovering else None,
+            "next_tool": RECOVERY_NEXT_TOOL.get(state) if recovering else None,
+        }
 
     def close(self) -> None:
         with self._lock:
