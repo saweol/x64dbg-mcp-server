@@ -28,7 +28,9 @@ are capped and every string is cleaned of control/bidi characters.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import unicodedata
 from collections.abc import Iterable
 from typing import Any
@@ -46,6 +48,7 @@ IDA_COMMENT_MAX = 1024
 _MAX_HEX_CHARS = 64
 _MAX_MODULE_KEY_CHARS = 255
 _MAX_CONDITION_CHARS = 256
+CANCEL_CHECK_EVERY = 256  # items between ida_kernwin.user_cancelled() polls (module global for tests)
 
 ACTION_IMPORT = "x64dbg_sync:import"
 ACTION_EXPORT = "x64dbg_sync:export"
@@ -57,10 +60,12 @@ MENU_EXPORT = "File/Produce file/"
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _PATH_SEP_RE = re.compile(r"[\\/]")
 _IDA_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$?@")
-# IDA refuses user names that look like its own dummy names ("sub_401000").
+# IDA refuses user names that look like its own dummy names ("sub_401000"). The prefixes are
+# the ones listed in IDA's "Names representation" help; SN_NODUMMY (passed when available)
+# makes IDA itself prefix anything else it considers dummy-like.
 _DUMMY_NAME_RE = re.compile(
-    r"(?:sub|loc|locret|off|seg|asc|byte|word|dword|qword|oword|tbyte|xmmword|ymmword|zmmword|flt|dbl"
-    r"|packreal|unk|stru|algn|nullsub|j|def|jpt|funcs|lpstr|str|custdata|dummy)_[0-9A-Fa-f]+",
+    r"(?:sub|locret|loc|off|seg|asc|byte|word|dword|qword|byte3|xmmword|ymmword|zmmword|packreal"
+    r"|flt|dbl|tbyte|stru|custdata|algn|unk)_[0-9A-Fa-f]+",
     re.IGNORECASE,
 )
 _DROP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
@@ -140,16 +145,30 @@ def sanitize_ida_comment(text: str) -> str:
     return _clean_text(text, IDA_COMMENT_MAX)
 
 
+class Cancelled(Exception):
+    """The user pressed Cancel in IDA's wait box."""
+
+
 def _normalize_item(raw: Any) -> dict[str, Any] | None:
-    """Validated import item, or None when it is unusable."""
+    """Validated import item, or None when it is unusable.
+
+    A name without any IDA-safe character (e.g. all Korean, or ``"::"``) is not
+    turned into a placeholder, which would overwrite the IDB's own name: it is
+    kept as ``label_text`` and ends up in the comment tag instead.
+    """
     if not isinstance(raw, dict):
         return None
     try:
         rva = parse_hex(raw.get("rva"), "rva")
     except ValueError:
         return None
-    name = raw.get("name")
-    name = sanitize_ida_name(name) if isinstance(name, str) and name.strip() else None
+    raw_name = raw.get("name")
+    name = None
+    label_text = None
+    if isinstance(raw_name, str) and raw_name.strip():
+        name = _name_core(raw_name) or None
+        if name is None:
+            label_text = _clean_text(raw_name, IDA_NAME_MAX) or None
     comment = raw.get("comment")
     comment = (sanitize_ida_comment(comment) or None) if isinstance(comment, str) else None
     bookmark = raw.get("bookmark") is True
@@ -163,20 +182,28 @@ def _normalize_item(raw: Any) -> dict[str, Any] | None:
             "condition": (_clean_text(condition, _MAX_CONDITION_CHARS) or None)
             if isinstance(condition, str) else None,
         }
-    if name is None and comment is None and not bookmark and breakpoint_info is None:
+    if name is None and label_text is None and comment is None and not bookmark and breakpoint_info is None:
         return None
-    return {"rva": rva, "name": name, "comment": comment, "bookmark": bookmark, "breakpoint": breakpoint_info}
+    return {
+        "rva": rva,
+        "name": name,
+        "label_text": label_text,
+        "comment": comment,
+        "bookmark": bookmark,
+        "breakpoint": breakpoint_info,
+    }
 
 
 def load_sync_document(data: Any) -> dict[str, Any]:
     """Parse and validate an ``x64dbg-ida-sync/1`` document (bytes or str).
 
     Returns ``{"schema", "modules": {lower-cased name: {"base_runtime":
-    int|None, "items": [{"rva", "name", "comment", "bookmark",
+    int|None, "items": [{"rva", "name", "label_text", "comment", "bookmark",
     "breakpoint"}]}}, "skipped": int, "warnings": [str]}`` with names and
     comments already sanitised for IDA. Invalid items and module entries are
-    skipped (counted / warned); a wrong schema, non-JSON content or an
-    oversized document raises ValueError.
+    skipped (counted / warned); module keys that differ only in case are
+    merged (warned). A wrong schema, non-JSON content or an oversized document
+    raises ValueError.
     """
     if isinstance(data, (bytes, bytearray)):
         if len(data) > MAX_DOC_BYTES:
@@ -241,7 +268,14 @@ def load_sync_document(data: Any) -> dict[str, Any]:
                 continue
             items.append(item)
             total += 1
-        out[label.lower()] = {"base_runtime": base, "items": items}
+        key = label.lower()
+        if key in out:
+            warnings.append(f"module {label!r} merged with an earlier key: module names differ only in case")
+            out[key]["items"].extend(items)
+            if out[key]["base_runtime"] is None:
+                out[key]["base_runtime"] = base
+        else:
+            out[key] = {"base_runtime": base, "items": items}
     if truncated:
         warnings.append(f"document truncated to {MAX_ITEMS} items")
     return {"schema": schema, "modules": out, "skipped": skipped, "warnings": warnings}
@@ -270,8 +304,12 @@ def match_module(module_names: Iterable[str], input_file_name: str) -> str | Non
 
 
 def describe_tags(item: dict[str, Any]) -> str | None:
-    """``[x64dbg: bookmark; hardware bp, disabled, condition rcx==1]`` or None."""
+    """``[x64dbg: label <text>; bookmark; hardware bp, disabled, condition rcx==1]`` or None.
+
+    ``label <text>`` carries an x64dbg label that has no IDA-safe characters."""
     tags = []
+    if item.get("label_text"):
+        tags.append("label {}".format(item["label_text"]))
     if item.get("bookmark"):
         tags.append("bookmark")
     bp = item.get("breakpoint")
@@ -307,12 +345,14 @@ def build_import_plan(doc: dict[str, Any], module_key: str, imagebase: int) -> l
 
 
 def merge_comment(existing: str | None, new: str | None) -> str | None:
-    """Comment to store, or None when nothing changes (empty or already present)."""
+    """Comment to store, or None when nothing changes (empty, or already present as a
+    whole line, which keeps re-imports idempotent since merged comments are joined
+    with newlines). A substring of a longer line is not a duplicate."""
     if not new:
         return None
     if not existing:
         return new
-    if new in existing:
+    if new in existing.splitlines():
         return None
     return existing + "\n" + new
 
@@ -372,12 +412,47 @@ def build_export_document(
 
 
 def format_import_report(counts: dict[str, Any]) -> str:
-    return (
+    values = {"name_unusable": 0, "cancelled": False, "processed": counts.get("items", 0)}
+    values.update(counts)
+    text = (
         "x64dbg sync: imported module {module} at image base {imagebase}\n"
         "items {items}: renamed {renamed} (failed {rename_failed}), commented {commented} "
         "(unchanged {comment_unchanged}, failed {comment_failed}), unmapped {unmapped}, "
-        "invalid items skipped {skipped_invalid}"
-    ).format(**counts)
+        "names kept as comments {name_unusable}, invalid items skipped {skipped_invalid}"
+    ).format(**values)
+    if values["cancelled"]:
+        text += "\ncancelled by the user after {processed} of {items} items".format(**values)
+    return text
+
+
+def _cancel_poller(ida_kernwin: Any) -> Any:
+    """Callable that raises :class:`Cancelled` once the user pressed Cancel; it
+    polls ``user_cancelled()`` on the first call and every ``CANCEL_CHECK_EVERY``."""
+    calls = [0]
+
+    def poll() -> None:
+        if calls[0] % max(1, CANCEL_CHECK_EVERY) == 0 and ida_kernwin.user_cancelled():
+            raise Cancelled()
+        calls[0] += 1
+
+    return poll
+
+
+def _write_json_atomic(path: str, doc: Any) -> None:
+    """Write to a temporary file next to ``path`` and rename it over ``path``, so a
+    failed write (disk full, ...) never leaves a truncated file behind."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".x64dbg-sync-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _read_capped(path: str) -> bytes:
@@ -419,38 +494,52 @@ def import_from_file(path: str, module: str | None = None, interactive: bool = T
         "module": key, "imagebase": f"0x{imagebase:X}", "items": len(plan),
         "renamed": 0, "rename_failed": 0, "commented": 0, "comment_unchanged": 0, "comment_failed": 0,
         "unmapped": 0, "skipped_invalid": doc["skipped"],
+        "name_unusable": sum(1 for item in doc["modules"][key]["items"] if item.get("label_text")),
+        "cancelled": False, "processed": 0,
     }
-    for entry in plan:
-        ea = entry["ea"]
-        if not ida_bytes.is_mapped(ea):
-            counts["unmapped"] += 1
-            continue
-        if entry["name"]:
-            if ida_name.set_name(ea, entry["name"], flags):
-                counts["renamed"] += 1
-            else:
-                counts["rename_failed"] += 1
-        if entry["comment"]:
-            merged = merge_comment(ida_bytes.get_cmt(ea, False), entry["comment"])
-            if merged is None:
-                counts["comment_unchanged"] += 1
-            elif ida_bytes.set_cmt(ea, merged, False):
-                counts["commented"] += 1
-            else:
-                counts["comment_failed"] += 1
+    poll = _cancel_poller(ida_kernwin)
+    ida_kernwin.show_wait_box(f"x64dbg sync: importing {len(plan)} items of {key}")
+    try:
+        for entry in plan:
+            poll()
+            counts["processed"] += 1
+            ea = entry["ea"]
+            if not ida_bytes.is_mapped(ea):
+                counts["unmapped"] += 1
+                continue
+            if entry["name"]:
+                if ida_name.set_name(ea, entry["name"], flags):
+                    counts["renamed"] += 1
+                else:
+                    counts["rename_failed"] += 1
+            if entry["comment"]:
+                merged = merge_comment(ida_bytes.get_cmt(ea, False), entry["comment"])
+                if merged is None:
+                    counts["comment_unchanged"] += 1
+                elif ida_bytes.set_cmt(ea, merged, False):
+                    counts["commented"] += 1
+                else:
+                    counts["comment_failed"] += 1
+    except Cancelled:
+        counts["cancelled"] = True  # changes made so far stay (IDA's undo can revert them)
+    finally:
+        ida_kernwin.hide_wait_box()
     return counts
 
 
 def collect_ida_annotations() -> list[tuple[int, str | None, str | None]]:
     """``(ea, name, comment)`` for non-dummy names and comments outside extern
     segments, sorted by address. Comments: regular + repeatable instruction
-    comments and, at function starts, the function comments."""
+    comments and, at function starts, the function comments. Raises
+    :class:`Cancelled` when the user cancels the wait box shown by the caller."""
     import ida_bytes
     import ida_funcs
+    import ida_kernwin
     import ida_segment
     import idautils
 
     xtrn = getattr(ida_segment, "SEG_XTRN", 1)
+    poll = _cancel_poller(ida_kernwin)
 
     def in_image(ea: int) -> bool:
         seg = ida_segment.getseg(ea)
@@ -459,9 +548,11 @@ def collect_ida_annotations() -> list[tuple[int, str | None, str | None]]:
     names: dict[int, str] = {}
     comments: dict[int, list[str]] = {}
     for ea, name in idautils.Names():
+        poll()
         if in_image(ea):
             names[ea] = name
     for fea in idautils.Functions():
+        poll()
         func = ida_funcs.get_func(fea)
         if func is None or not in_image(fea):
             continue
@@ -474,6 +565,7 @@ def collect_ida_annotations() -> list[tuple[int, str | None, str | None]]:
         if seg is None or seg.type == xtrn:
             continue
         for ea in idautils.Heads(seg.start_ea, seg.end_ea):
+            poll()
             for rpt in (False, True):
                 text = ida_bytes.get_cmt(ea, rpt)
                 if text:
@@ -485,13 +577,19 @@ def collect_ida_annotations() -> list[tuple[int, str | None, str | None]]:
 
 
 def export_to_file(path: str) -> dict[str, Any]:
+    """Write the export document to ``path`` atomically (the previous file survives
+    a failed or cancelled export). Raises OSError/ValueError or :class:`Cancelled`."""
+    import ida_kernwin
     import ida_nalt
     import idaapi
 
     root = ida_nalt.get_root_filename() or "unknown"
-    doc = build_export_document(root, int(idaapi.get_imagebase()), collect_ida_annotations())
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=1, ensure_ascii=False)
+    ida_kernwin.show_wait_box(f"x64dbg sync: collecting names and comments of {root}")
+    try:
+        doc = build_export_document(root, int(idaapi.get_imagebase()), collect_ida_annotations())
+        _write_json_atomic(path, doc)
+    finally:
+        ida_kernwin.hide_wait_box()
     (module,) = doc["modules"]
     return {"module": module, "items": len(doc["modules"][module]["items"]), "path": path}
 
@@ -521,6 +619,9 @@ def run_export_action() -> dict[str, Any] | None:
         return None
     try:
         result = export_to_file(path)
+    except Cancelled:
+        ida_kernwin.warning("x64dbg sync: export cancelled; nothing was written")
+        return None
     except (OSError, ValueError) as exc:
         ida_kernwin.warning(f"x64dbg sync: export failed: {exc}")
         return None
@@ -591,7 +692,9 @@ def PLUGIN_ENTRY() -> Any:  # noqa: N802 - name required by IDA
     import idaapi
 
     class X64dbgSyncPlugin(idaapi.plugin_t):
-        flags = idaapi.PLUGIN_KEEP
+        # plugin_t.flags takes PLUGIN_* flag bits; PLUGIN_KEEP is only an init() return
+        # code (its value 2 would mean PLUGIN_DRAW here). 0: loaded per database.
+        flags = 0
         comment = "Exchange names/comments with x64dbg (x64dbg-ida-sync JSON)"
         help = "File > Load file / Produce file > x64dbg-ida-sync JSON; see ida/README.md"
         wanted_name = "x64dbg sync"

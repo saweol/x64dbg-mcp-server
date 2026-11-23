@@ -51,6 +51,7 @@ class FakeIdaState:
     heads: list[int] = field(default_factory=list)
     funcs: list[FakeFunc] = field(default_factory=list)
     fail_set_name: set[int] = field(default_factory=set)
+    fail_set_cmt: set[int] = field(default_factory=set)
     set_name_calls: list[tuple[int, str, int]] = field(default_factory=list)
     ask_file_result: str | None = None
     ask_str_result: str | None = None
@@ -60,6 +61,10 @@ class FakeIdaState:
     registered: dict[str, Any] = field(default_factory=dict)
     unregistered: list[str] = field(default_factory=list)
     attached: list[tuple[str, str, int]] = field(default_factory=list)
+    wait_boxes_shown: int = 0
+    wait_boxes_hidden: int = 0
+    cancel_after: int | None = None  # user_cancelled() turns True on this call number (1-based)
+    cancel_checks: int = 0
 
     def seg_at(self, ea: int) -> FakeSegment | None:
         for s in self.segments:
@@ -70,8 +75,14 @@ class FakeIdaState:
 
 def _build_modules(st: FakeIdaState) -> dict[str, types.ModuleType]:
     idaapi = types.ModuleType("idaapi")
-    idaapi.PLUGIN_KEEP = 2
+    # init() return codes
     idaapi.PLUGIN_SKIP = 0
+    idaapi.PLUGIN_OK = 1
+    idaapi.PLUGIN_KEEP = 2
+    # plugin_t.flags bits (a different namespace: 2 is PLUGIN_DRAW, not PLUGIN_KEEP)
+    idaapi.PLUGIN_MOD = 0x1
+    idaapi.PLUGIN_DRAW = 0x2
+    idaapi.PLUGIN_FIX = 0x80
 
     class plugin_t:  # noqa: N801 - mirrors the IDA class name
         pass
@@ -98,6 +109,8 @@ def _build_modules(st: FakeIdaState) -> dict[str, types.ModuleType]:
     ida_bytes = types.ModuleType("ida_bytes")
 
     def set_cmt(ea: int, cmt: str, rpt: bool) -> bool:
+        if ea in st.fail_set_cmt:
+            return False
         st.comments[(ea, bool(rpt))] = cmt
         return True
 
@@ -178,6 +191,21 @@ def _build_modules(st: FakeIdaState) -> dict[str, types.ModuleType]:
     ida_kernwin.info = st.infos.append
     ida_kernwin.warning = st.warnings.append
     ida_kernwin.msg = lambda text: None
+
+    def show_wait_box(text: str) -> None:
+        st.wait_boxes_shown += 1
+
+    def hide_wait_box() -> None:
+        st.wait_boxes_hidden += 1
+
+    def user_cancelled() -> bool:
+        st.cancel_checks += 1
+        return st.cancel_after is not None and st.cancel_checks >= st.cancel_after
+
+    ida_kernwin.show_wait_box = show_wait_box
+    ida_kernwin.hide_wait_box = hide_wait_box
+    ida_kernwin.replace_wait_box = lambda text: None
+    ida_kernwin.user_cancelled = user_cancelled
 
     return {
         "idaapi": idaapi,

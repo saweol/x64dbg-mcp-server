@@ -101,6 +101,7 @@ class TestLoadDocument:
         assert a == {
             "rva": 0x1000,
             "name": "decrypt_config",
+            "label_text": None,
             "comment": None,
             "bookmark": False,
             "breakpoint": {"type": "normal", "enabled": True, "condition": None},
@@ -118,6 +119,21 @@ class TestLoadDocument:
     def test_module_keys_are_lowercased(self) -> None:
         doc = xs.load_sync_document(dumps(make_doc([{"rva": "0x1", "name": "a"}], module="Sample.EXE")))
         assert list(doc["modules"]) == ["sample.exe"]
+
+    def test_module_keys_differing_only_in_case_are_merged(self) -> None:
+        raw = {
+            "schema": "x64dbg-ida-sync/1",
+            "modules": {
+                "A.dll": {"base_runtime": None, "items": [{"rva": "0x10", "name": "first"}]},
+                "a.dll": {"base_runtime": "0x10000000", "items": [{"rva": "0x20", "name": "second"}]},
+            },
+        }
+        doc = xs.load_sync_document(dumps(raw))
+        assert list(doc["modules"]) == ["a.dll"]
+        mod = doc["modules"]["a.dll"]
+        assert [i["name"] for i in mod["items"]] == ["first", "second"]
+        assert mod["base_runtime"] == 0x10000000
+        assert any("differ only in case" in w for w in doc["warnings"])
 
     def test_invalid_items_are_skipped(self) -> None:
         doc = xs.load_sync_document(
@@ -213,6 +229,13 @@ def test_match_module(names: list[str], root: str, expected: str | None) -> None
         ("sub_401000", "_sub_401000"),  # dummy-looking names are refused by IDA
         ("loc_140001000", "_loc_140001000"),
         ("sub_main", "sub_main"),  # not followed by hex -> not a dummy name
+        ("byte3_10", "_byte3_10"),
+        ("unk_1000", "_unk_1000"),
+        ("str_1", "str_1"),  # not an IDA dummy prefix
+        ("funcs_1", "funcs_1"),
+        ("def_1A", "def_1A"),
+        ("dummy_1", "dummy_1"),
+        ("j_1", "j_1"),
         ("ｍａｌｗａｒｅ", "malware"),
         ("evil‮gnp", "evil_gnp"),
     ],
@@ -259,6 +282,33 @@ def test_sanitize_ida_comment_property() -> None:
         out = xs.sanitize_ida_comment(s)
         assert len(out) <= xs.IDA_COMMENT_MAX
         assert all(unicodedata.category(ch) not in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in out)
+
+
+@pytest.mark.parametrize("raw", ["복호화_루틴", "日本語", "::", "~", "<>"])
+def test_unusable_names_become_a_label_tag(raw: str) -> None:
+    doc = xs.load_sync_document(dumps(make_doc([{"rva": "0x10", "name": raw}])))
+    (item,) = doc["modules"]["sample.exe"]["items"]
+    assert item["name"] is None
+    assert item["label_text"] == raw
+    (entry,) = xs.build_import_plan(doc, "sample.exe", 0x140000000)
+    assert entry["name"] is None
+    assert entry["comment"] == f"[x64dbg: label {raw}]"
+
+
+def test_unusable_name_tag_combines_with_other_tags() -> None:
+    doc = xs.load_sync_document(
+        dumps(make_doc([{"rva": "0x10", "name": "복호화", "comment": "note", "bookmark": True}]))
+    )
+    (entry,) = xs.build_import_plan(doc, "sample.exe", 0x140000000)
+    assert entry["comment"] == "note [x64dbg: label 복호화; bookmark]"
+
+
+def test_name_of_only_control_characters_is_dropped() -> None:
+    doc = xs.load_sync_document(
+        dumps(make_doc([{"rva": "0x10", "name": "\u202e\x00"}, {"rva": "0x20", "name": "ok"}]))
+    )
+    assert [i["rva"] for i in doc["modules"]["sample.exe"]["items"]] == [0x20]
+    assert doc["skipped"] == 1
 
 
 # ── import planning ─────────────────────────────────────────────────
@@ -315,7 +365,10 @@ def test_build_import_plan_skips_overflow() -> None:
         (None, "x", "x"),
         ("", "x", "x"),
         ("x", "x", None),
-        ("old note x", "x", None),
+        ("old\nx", "x", None),  # already present as a whole line (earlier import)
+        ("old\r\nx", "x", None),
+        ("old note x", "x", "old note x\nx"),  # a substring of another line is not a duplicate
+        ("decrypt_config_v2 note", "decrypt_config", "decrypt_config_v2 note\ndecrypt_config"),
         ("old", "new", "old\nnew"),
         ("old", "", None),
     ],
@@ -381,6 +434,28 @@ def test_format_import_report() -> None:
         }
     )
     assert "sample.exe" in text and "renamed 2" in text and "unmapped 1" in text
+    assert "cancelled" not in text
+
+
+def test_format_import_report_mentions_unusable_names_and_cancel() -> None:
+    counts = {
+        "module": "sample.exe",
+        "imagebase": "0x140000000",
+        "items": 3,
+        "renamed": 0,
+        "rename_failed": 0,
+        "commented": 1,
+        "comment_unchanged": 0,
+        "comment_failed": 0,
+        "unmapped": 0,
+        "skipped_invalid": 0,
+        "name_unusable": 2,
+        "cancelled": True,
+        "processed": 1,
+    }
+    text = xs.format_import_report(counts)
+    assert "names kept as comments 2" in text
+    assert "cancelled" in text and "1 of 3" in text
 
 
 # ── IDA-facing code against stub modules ────────────────────────────
@@ -418,6 +493,53 @@ class TestWithFakeIda:
         counts2 = xs.import_from_file(path)
         assert counts2["comment_unchanged"] == 1
         assert fake_ida.comments[(0x140001010, False)].count("decrypts config") == 1
+
+    def test_unusable_name_keeps_the_existing_ida_name(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        fake_ida.names[0x140001000] = "my_analysis_name"
+        path = self.write_doc(tmp_path, make_doc([{"rva": "0x1000", "name": "복호화_루틴"}]))
+        counts = xs.import_from_file(path)
+        assert fake_ida.set_name_calls == []
+        assert fake_ida.names[0x140001000] == "my_analysis_name"
+        assert fake_ida.comments[(0x140001000, False)] == "[x64dbg: label 복호화_루틴]"
+        assert counts["name_unusable"] == 1
+        assert counts["renamed"] == 0 and counts["commented"] == 1
+
+    def test_import_counts_failed_comments(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        fake_ida.fail_set_cmt.add(0x140001010)
+        path = self.write_doc(
+            tmp_path,
+            make_doc([{"rva": "0x1010", "comment": "will fail"}, {"rva": "0x1020", "comment": "fine"}]),
+        )
+        counts = xs.import_from_file(path)
+        assert counts["comment_failed"] == 1
+        assert counts["commented"] == 1
+        assert (0x140001010, False) not in fake_ida.comments
+
+    def test_import_shows_and_hides_a_wait_box(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        path = self.write_doc(tmp_path, make_doc([{"rva": "0x1000", "name": "x"}]))
+        xs.import_from_file(path)
+        assert fake_ida.wait_boxes_shown == 1
+        assert fake_ida.wait_boxes_hidden == 1
+        assert fake_ida.cancel_checks >= 1
+
+    def test_import_can_be_cancelled(
+        self, fake_ida: FakeIdaState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(xs, "CANCEL_CHECK_EVERY", 1)
+        fake_ida.cancel_after = 3  # the third check (before the third item) cancels
+        path = self.write_doc(
+            tmp_path, make_doc([{"rva": hex(0x1000 + i * 0x10), "name": f"n{i}"} for i in range(5)])
+        )
+        counts = xs.import_from_file(path)
+        assert counts["cancelled"] is True
+        assert counts["processed"] == 2
+        assert counts["renamed"] == 2
+        assert sorted(fake_ida.names) == [0x140001000, 0x140001010]
+        assert fake_ida.wait_boxes_hidden == fake_ida.wait_boxes_shown == 1
+        fake_ida.ask_file_result = path
+        fake_ida.cancel_checks = 0
+        assert xs.run_import_action() is not None
+        assert "cancelled" in fake_ida.infos[-1]
 
     def test_import_matches_module_by_root_filename(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
         raw = make_doc([{"rva": "0x1000", "name": "in_sample"}])
@@ -480,6 +602,75 @@ class TestWithFakeIda:
         }
         assert fake_ida.infos
 
+    def test_failed_export_keeps_the_previous_file(
+        self, fake_ida: FakeIdaState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_ida.names[0x140001000] = "decrypt_config"
+        out = tmp_path / "export.json"
+        out.write_text("previous export", encoding="utf-8")
+
+        def failing_dump(obj: object, fh: object, **kwargs: object) -> None:
+            fh.write('{"schema": "x64dbg-ida-sync/1", "mod')  # type: ignore[attr-defined]
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(xs.json, "dump", failing_dump)
+        fake_ida.ask_file_result = str(out)
+        assert xs.run_export_action() is None
+        assert "export failed" in fake_ida.warnings[-1]
+        assert out.read_text(encoding="utf-8") == "previous export"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["export.json"]  # no temp file left
+        assert fake_ida.wait_boxes_hidden == fake_ida.wait_boxes_shown
+
+    def test_export_replaces_the_previous_file(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        fake_ida.names[0x140001000] = "decrypt_config"
+        out = tmp_path / "export.json"
+        out.write_text("previous export", encoding="utf-8")
+        result = xs.export_to_file(str(out))
+        assert result["items"] == 1
+        assert json.loads(out.read_text(encoding="utf-8"))["schema"] == xs.SCHEMA
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["export.json"]
+        assert fake_ida.wait_boxes_shown == fake_ida.wait_boxes_hidden == 1
+
+    def test_export_to_an_unwritable_path_warns(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        fake_ida.names[0x140001000] = "decrypt_config"
+        fake_ida.ask_file_result = str(tmp_path / "missing_dir" / "export.json")
+        assert xs.run_export_action() is None
+        assert fake_ida.warnings and "export failed" in fake_ida.warnings[-1]
+        assert not (tmp_path / "missing_dir").exists()
+
+    def test_export_can_be_cancelled(
+        self, fake_ida: FakeIdaState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(xs, "CANCEL_CHECK_EVERY", 1)
+        fake_ida.names.update({0x140001000: "a", 0x140001010: "b"})
+        fake_ida.heads = [0x140001000, 0x140001010]
+        fake_ida.cancel_after = 1
+        out = tmp_path / "export.json"
+        fake_ida.ask_file_result = str(out)
+        assert xs.run_export_action() is None
+        assert not out.exists()
+        assert any("cancelled" in m for m in fake_ida.warnings + fake_ida.infos)
+        assert fake_ida.wait_boxes_hidden == fake_ida.wait_boxes_shown == 1
+
+    def test_choose_and_run_dispatches(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
+        fake_ida.ask_buttons_result = 1  # "Import"
+        fake_ida.ask_file_result = self.write_doc(tmp_path, make_doc([{"rva": "0x1000", "name": "imported"}]))
+        xs.choose_and_run()
+        assert fake_ida.names[0x140001000] == "imported"
+        assert "renamed 1" in fake_ida.infos[-1]
+
+        fake_ida.ask_buttons_result = 0  # "Export"
+        out = tmp_path / "export.json"
+        fake_ida.ask_file_result = str(out)
+        xs.choose_and_run()
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        assert doc["modules"]["sample.exe"]["items"] == [{"rva": "0x1000", "name": "imported"}]
+
+        fake_ida.ask_buttons_result = -1  # "Cancel": nothing happens
+        infos = len(fake_ida.infos)
+        xs.choose_and_run()
+        assert len(fake_ida.infos) == infos
+
     def test_run_import_action(self, fake_ida: FakeIdaState, tmp_path: Path) -> None:
         assert xs.run_import_action() is None  # dialog cancelled
         fake_ida.ask_file_result = self.write_doc(tmp_path, make_doc([{"rva": "0x1000", "name": "x"}]))
@@ -508,6 +699,8 @@ class TestWithFakeIda:
     def test_plugin_entry(self, fake_ida: FakeIdaState) -> None:
         plugin = xs.PLUGIN_ENTRY()
         assert plugin.wanted_name == "x64dbg sync"
+        # flags are plugin_t bits; PLUGIN_KEEP (2) is an init() return code and would mean PLUGIN_DRAW
+        assert plugin.flags == 0
         assert plugin.init() == 2  # PLUGIN_KEEP
         assert xs.ACTION_EXPORT in fake_ida.registered
         fake_ida.ask_buttons_result = -1
@@ -516,34 +709,6 @@ class TestWithFakeIda:
         assert fake_ida.registered == {}
 
 
-# ── cross-check with the gateway library ────────────────────────────
-def test_gateway_export_is_accepted_by_the_script() -> None:
-    ida_sync = pytest.importorskip("x64dbg_vm_gateway.ida_sync")
-    db = {
-        "labels": [{"module": "sample.exe", "address": "0x1000", "manual": True, "text": "decrypt config"}],
-        "comments": [{"module": "sample.exe", "address": "0x1010", "manual": True, "text": "xor loop"}],
-        "bookmarks": [{"module": "sample.exe", "address": "0x1010", "manual": True}],
-        "breakpoints": [{"module": "sample.exe", "address": "0x1000", "enabled": True, "type": 0}],
-    }
-    exported = ida_sync.export_for_ida(ida_sync.parse_x64dbg_db(dumps(db)))
-    doc = xs.load_sync_document(json.dumps(exported))
-    plan = xs.build_import_plan(doc, "sample.exe", 0x140000000)
-    assert [(p["ea"], p["name"]) for p in plan] == [(0x140001000, "decrypt_config"), (0x140001010, None)]
-
-
-def test_script_export_is_accepted_by_the_gateway() -> None:
-    ida_sync = pytest.importorskip("x64dbg_vm_gateway.ida_sync")
-    exported = xs.build_export_document(
-        "sample.exe", 0x140000000, [(0x140001000, "decrypt_config", "from IDA")]
-    )
-    items = exported["modules"]["sample.exe"]["items"]
-    mm = {"sample.exe": ida_sync.ModuleInfo("sample.exe", 0x7FF6A1230000, 0x2A000)}
-    plan = ida_sync.plan_import(items, module="sample.exe", module_map=mm)
-    assert plan == [
-        {
-            "runtime_address": "0x7FF6A1231000",
-            "rva": "0x1000",
-            "label": "decrypt_config",
-            "comment": "from IDA",
-        }
-    ]
+# The cross-checks with the gateway library (gateway export -> script import and script
+# export -> gateway plan_import) live in host/tests/unit/test_ida_sync.py, which the default
+# `uv run pytest` collects; that file also runs this suite in a subprocess.

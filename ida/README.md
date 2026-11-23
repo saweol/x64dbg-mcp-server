@@ -39,7 +39,11 @@ ida-multi-mcp edits the IDB.
    output or from the *Export* action below (its `items` can be passed as-is).
 2. Gateway: `ida_import_annotations(items, module="sample.exe", ida_imagebase="0x140000000")`.
    It returns `[{runtime_address, rva, label, comment}]`, with labels and comments already
-   made x64dbg-safe.
+   made x64dbg-safe. Items that carry only `bookmark` / `breakpoint` data produce no entry.
+   By default one invalid item rejects the whole batch (`items[3]: …`). For a best-effort
+   import, the library's `plan_import_report(..., on_error="skip")` plans the valid items
+   and lists the others under `skipped` with the reason. This is useful for IDA exports
+   that contain items past the end of the runtime module.
 3. Gateway (mirrored tool): `CommentOrLabelAtAddress(address=runtime_address, value=label, mode="Label")`,
    and the same call with `mode="Comment"`.
 
@@ -85,17 +89,28 @@ Import details:
   `sample.exe`. If nothing matches, IDA asks for the module name.
 * Names are set with `ida_name.set_name(ea, name, SN_NOWARN | SN_FORCE | SN_NOCHECK | SN_NODUMMY)`
   (each flag only if the IDA version has it). Before that they are limited to
-  `[A-Za-z0-9_$?@]`, and names that look like IDA dummy names (`sub_401000`) or start
-  with a digit get a `_` prefix.
+  `[A-Za-z0-9_$?@]`. Names that start with a digit, or that look like IDA dummy names
+  (`sub_401000`, `byte_…`, `unk_…`, and the other prefixes in IDA's *Names
+  representation* help), get a `_` prefix. `SN_NODUMMY` covers any other dummy-like
+  name.
+* A name with no IDA-safe character at all (for example all Korean, or `::`) does **not**
+  rename the address, so the IDB's own name is kept. It goes into the comment tag as
+  `[x64dbg: label 복호화_루틴]` and is counted as *names kept as comments*.
 * Comments are appended to the existing regular comment, never overwriting it. Importing
-  the same file twice does not duplicate them. Bookmarks and breakpoints become a tag such
-  as `[x64dbg: bookmark; hardware bp, disabled, condition rcx==1]`.
-* Addresses that are not mapped in the IDB are counted as `unmapped` and skipped. A report
-  with all the counters is shown at the end.
+  the same file twice does not duplicate them: a comment counts as already present only
+  when it matches a whole line of the existing comment. Bookmarks and breakpoints become a
+  tag such as `[x64dbg: bookmark; hardware bp, disabled, condition rcx==1]`.
+* Module keys that differ only in case (`A.dll` and `a.dll`) are merged, with a warning.
+* Addresses that are not mapped in the IDB are counted as `unmapped` and skipped. A wait
+  box with a *Cancel* button is shown while the items are applied. Cancelling stops the
+  import; the changes made so far stay and can be reverted with IDA's undo. A report with
+  all the counters is shown at the end.
 
 The export writes every non-dummy name (`idautils.Names()`) and every regular or
 repeatable comment, plus function comments, outside extern (`SEG_XTRN`) segments. RVAs
-are relative to the current image base.
+are relative to the current image base. It runs under a cancellable wait box. The file
+is written to a temporary file next to the target and then renamed over it, so a failed
+or cancelled export leaves the previous file untouched.
 
 ## Schema `x64dbg-ida-sync/1`
 
@@ -129,7 +144,7 @@ are relative to the current image base.
 | `modules.*.ida_imagebase` | hex string | Only in IDA exports: the image base the RVAs were computed from. |
 | `modules.*.items[]` | array | Sorted by RVA, one entry per address. |
 | `items[].rva` | hex string | Offset from the module base. Always present. |
-| `items[].name` | string | A label or name. The gateway export already makes it x64dbg-safe. |
+| `items[].name` | string | A label or name. The gateway export already makes it x64dbg-safe. A label with no safe character is exported as a comment starting with `x64dbg label: …` instead. |
 | `items[].comment` | string | A one-line comment. |
 | `items[].bookmark` | `true` | An x64dbg bookmark. |
 | `items[].breakpoint` | object | `{type: normal\|hardware\|memory, enabled: bool, condition?: string}` |
@@ -150,10 +165,16 @@ untrusted:
   characters, and line breaks.
 * **x64dbg length limits.** x64dbg labels are capped at 254 bytes and comments at 510
   UTF-8 bytes, which is what `LabelSet` / `CommentSet` accept.
-* **x64dbg label charset.** x64dbg labels are limited to `[A-Za-z0-9_@?$.:<>~]`. They are
-  never empty, and a label that starts with a digit gets a `_` prefix.
+* **x64dbg label charset.** x64dbg labels are limited to `[A-Za-z0-9_@?$.:<>~]` and are
+  never empty. A `_` prefix is added to labels that x64dbg's expression evaluator would
+  resolve before labels. These are numbers (a leading digit, hex digits only such as
+  `deadbeef`, `x`-prefixed hex, `.`-prefixed decimals), register names (`rax`, `cip`,
+  `xmm0`, …) and flags (`_zf`). This order is assumed from x64dbg's `valfromstring` as
+  recalled; it was not re-checked against an x64dbg build. A name with no safe character
+  becomes `IDA name: …` at the front of the comment, never a placeholder label.
 * **Rejected batches.** `ida_import_annotations` rejects the whole batch at the first
-  invalid item and names it (`items[3]: …`).
+  invalid item and names it (`items[3]: …`). `plan_import_report(..., on_error="skip")`
+  skips and lists invalid items instead.
 
 Not handled:
 
@@ -166,9 +187,13 @@ Not handled:
 
 ```sh
 cd host
-uv run pytest tests/unit/test_ida_sync.py -q   # gateway library
-uv run pytest ../ida/tests -q                  # IDA script against stub ida_* modules
+uv run pytest tests/unit/test_ida_sync.py -q   # gateway library, cross-checks with the script,
+                                               # and the ida/tests suite in a subprocess
+uv run pytest ../ida/tests -q                  # IDA script against stub ida_* modules only
 ```
+
+`ida/tests` sits outside the host project's `testpaths`, so `test_ida_sync.py` runs it in a
+subprocess. That way the default `uv run pytest` covers the script too.
 
 The fixtures (`host/tests/fixtures/ida/`) are synthetic. They follow the plugin's
 `ListModules` formatter and x64dbg's database writer. No real sample or database is

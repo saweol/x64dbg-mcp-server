@@ -12,9 +12,12 @@ that pair:
   ``x64dbg-ida-sync/1`` JSON document consumed by ``ida/x64dbg_sync.py``.
 - :func:`plan_import` turns IDA-side items (RVA or IDA address + name/comment)
   into runtime addresses with x64dbg-safe labels/comments, ready for the
-  ``CommentOrLabelAtAddress`` tool.
+  ``CommentOrLabelAtAddress`` tool; :func:`plan_import_report` is the same with
+  a per-item skip mode and the list of skipped items.
 
-Everything is pure: no I/O, no global mutable state. Every malformed input
+Everything is pure: no I/O, no global mutable state, and no gateway imports
+beyond the package version (the proxy's wrapper tags are mirrored below and a
+test keeps them equal). Every malformed input
 raises ``ValueError`` with a message meant for the AI client; wrong argument
 types raise ``ValueError`` too, so callers need a single ``except``. Sizes are
 never trusted: text, item counts and string lengths are capped (the caps are
@@ -44,7 +47,10 @@ x64dbg database assumptions (checked against x64dbg ``development`` sources:
    The compressed layout lives in a prebuilt library and is NOT parsed here:
    anything that does not start with ``{`` is rejected as
    ``unsupported database format``. The plugin tool ``SaveDatabase`` with a
-   ``filePath`` therefore produces a parseable file.
+   ``filePath`` therefore produces a parseable file. The error message only
+   guesses the kind of binary data: an LZ4 frame magic (``04 22 4D 18``) is
+   recognised, and a plausible little-endian 4-byte size prefix is reported as
+   "looks compressed"; x64dbg's exact compressed layout is NOT verified here.
 2. Addresses are written by ``json_hex`` as ``"0x%llX"`` strings. Labels,
    comments and bookmarks (``AddrInfoSerializer``) use ``module`` (file name
    with extension, ``""`` for addresses outside any module) and ``address``
@@ -60,7 +66,8 @@ x64dbg database assumptions (checked against x64dbg ``development`` sources:
    databases used ``address`` instead of ``start``; it is accepted as fallback.
 4. Breakpoints (``BpCacheSave``): ``address`` (RVA), ``enabled``, ``type``
    (0 normal, 1 hardware, 2 memory, 3 DLL, 4 exception), ``titantype``,
-   ``name``, ``module`` (absent for exception breakpoints), ``breakCondition``,
+   ``name``, ``module`` (empty or possibly absent for exception breakpoints;
+   both are accepted and mean "no module"), ``breakCondition``,
    ``logText``, ``logCondition``, ``commandText``, ``commandCondition``,
    ``logFile``, ``fastResume``, ``silent``, ``oldbytes`` (normal),
    ``memsize`` (memory). Single-shot breakpoints are never saved. For DLL
@@ -73,6 +80,15 @@ x64dbg database assumptions (checked against x64dbg ``development`` sources:
 x64dbg limits used by the sanitisers: ``LabelSet``/``CommentSet`` reject
 ``strlen(text) >= MAX_LABEL_SIZE - 1`` / ``MAX_COMMENT_SIZE - 1`` (256/512),
 i.e. at most 254/510 UTF-8 bytes.
+
+Label names that x64dbg's expression evaluator would resolve before labels
+get a ``_`` prefix (see :func:`_is_reserved_label`): numbers (hex digits with
+an optional ``x`` prefix, ``.``-prefixed decimals, anything starting with a
+digit), register names and ``_<flag>``. The evaluation order (registers,
+flags and numbers before labels) and the ``_cf``-style flag syntax are taken
+from x64dbg's ``valfromstring`` and expression documentation as recalled;
+they were not re-checked against an x64dbg build here, and the prefix is
+harmless if x64dbg is more lenient.
 
 Thread-safety: all functions are pure; dataclasses are immutable except
 :class:`Annotations`, which is a plain result container.
@@ -89,7 +105,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import __version__
-from .proxy import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 
 __all__ = [
     "COMMENT_MAX_BYTES",
@@ -111,6 +126,7 @@ __all__ = [
     "parse_module_list",
     "parse_x64dbg_db",
     "plan_import",
+    "plan_import_report",
     "rebase",
     "sanitize_comment",
     "sanitize_label",
@@ -118,7 +134,13 @@ __all__ = [
 
 SCHEMA = "x64dbg-ida-sync/1"
 DIRECTIONS = ("runtime_to_rva", "rva_to_runtime", "runtime_to_ida", "ida_to_runtime")
+ON_ERROR_MODES = ("raise", "skip")
 MAX_ADDRESS = 2**64 - 1
+
+# Mirrors proxy.UNTRUSTED_OPEN / UNTRUSTED_CLOSE (kept equal by a unit test) so this
+# pure library does not import the proxy/supervisor stack.
+UNTRUSTED_OPEN = "<untrusted_guest_output>"
+UNTRUSTED_CLOSE = "</untrusted_guest_output>"
 
 # Input caps (module globals so tests can lower them; read at call time).
 MAX_ITEMS = 50_000  # entries per database category, items per export/import
@@ -135,6 +157,7 @@ _MAX_MODULE_NAME_CHARS = 255  # MAX_MODULE_SIZE (256) including the NUL
 _MAX_ADDRESS_CHARS = 64
 _MAX_QUERY_CHARS = 1024
 _MAX_LISTED_NAMES = 20
+_MAX_REPORT_WARNINGS = 100
 
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _MODULE_LINE_RE = re.compile(r"0x([0-9A-Fa-f]{1,16})\s*\|\s*0x([0-9A-Fa-f]{1,16})\s*\|\s*(.*\S)")
@@ -143,6 +166,17 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 _INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
 _LABEL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@?$.:<>~")
 _DROP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+# Tokens x64dbg resolves before labels in expressions (see the module docstring).
+_X64DBG_NUMBER_RE = re.compile(r"x?[0-9a-f]+|\.[0-9]+", re.IGNORECASE)
+_X64DBG_REGISTER_RE = re.compile(
+    r"[re]?(?:ax|bx|cx|dx|si|di|bp|sp|ip)|[abcd][hl]|(?:si|di|bp|sp)l|r(?:[89]|1[0-5])[dwb]?"
+    r"|c(?:ax|bx|cx|dx|si|di|bp|sp|ip)|[c-gs]s|dr[0-7]|[cer]?flags|st[0-7]|x87r[0-7]|mm[0-7]"
+    r"|[xyz]mm(?:[0-9]|[12][0-9]|3[01])|lasterror|laststatus",
+    re.IGNORECASE,
+)
+_X64DBG_FLAGS = frozenset(
+    {"cf", "pf", "af", "zf", "sf", "tf", "if", "df", "of", "rf", "vm", "ac", "vif", "vip", "id"}
+)
 
 _BP_TYPES = {0: "normal", 1: "hardware", 2: "memory", 3: "dll", 4: "exception"}
 _ADDRESS_BOUND_BP_TYPES = frozenset({"normal", "hardware", "memory"})
@@ -237,7 +271,19 @@ def sanitize_comment(text: str) -> str:
     return _truncate_utf8(_clean_text(text, COMMENT_MAX_BYTES), COMMENT_MAX_BYTES)
 
 
+def _is_reserved_label(label: str) -> bool:
+    """True when x64dbg would read ``label`` as a number, register or flag in an
+    expression instead of looking the label up."""
+    return (
+        label[:1].isdigit()
+        or _X64DBG_NUMBER_RE.fullmatch(label) is not None
+        or _X64DBG_REGISTER_RE.fullmatch(label) is not None
+        or (label[:1] == "_" and label[1:].lower() in _X64DBG_FLAGS)
+    )
+
+
 def _label_core(text: str) -> str:
+    """x64dbg-safe label, or ``""`` when ``text`` has no usable character."""
     normalized = unicodedata.normalize("NFKC", text[: LABEL_MAX_BYTES * 4]).strip()
     out: list[str] = []
     replaced = False
@@ -251,9 +297,10 @@ def _label_core(text: str) -> str:
     label = "".join(out)
     if not label.strip("_"):
         return ""
-    if label[0].isdigit():  # would be read as a number in x64dbg expressions
-        label = "_" + label
-    return label[:LABEL_MAX_BYTES]
+    label = label[:LABEL_MAX_BYTES]
+    while _is_reserved_label(label):  # at most twice: "cf" -> "_cf" (a flag) -> "__cf"
+        label = ("_" + label)[:LABEL_MAX_BYTES]
+    return label
 
 
 def sanitize_label(text: str, *, fallback: str = "lbl") -> str:
@@ -261,9 +308,11 @@ def sanitize_label(text: str, *, fallback: str = "lbl") -> str:
 
     NFKC-normalised (full-width letters become ASCII), restricted to
     ``[A-Za-z0-9_@?$.:<>~]`` (each run of other characters becomes one ``_``),
-    prefixed with ``_`` when it starts with a digit, at most
-    :data:`LABEL_MAX_BYTES` characters. When nothing but underscores remains,
-    the (sanitised) ``fallback`` is returned, or ``"lbl"``.
+    at most :data:`LABEL_MAX_BYTES` characters, and prefixed with ``_`` while
+    x64dbg would read it as a number, register or flag (``1stage``,
+    ``deadbeef``, ``rax``, ``_zf``; see :func:`_is_reserved_label`). When
+    nothing but underscores remains, the (sanitised) ``fallback`` is returned,
+    or ``"lbl"``.
     """
     if not isinstance(text, str):
         raise ValueError(f"label must be a string, got {type(text).__name__}")
@@ -793,13 +842,14 @@ def _describe_binary(raw: bytes) -> str:
         if raw.startswith(magic):
             return f"{kind}-compressed data, not JSON; {_SAVE_HINT}"
     if len(raw) >= 8:
-        # Heuristic only: a plausible uncompressed size (not smaller than the
+        # Heuristic only (the exact x64dbg layout is not verified here): a
+        # plausible little-endian uncompressed-size prefix (not smaller than the
         # payload, within LZ4's ~255:1 maximum ratio and below 256 MiB).
         (declared,) = struct.unpack_from("<I", raw)
         if len(raw) - 4 <= declared <= min(_LZ4_MAX_DECLARED, 255 * len(raw)):
             return (
-                "binary data that looks LZ4-compressed (x64dbg's default database compression: a 4-byte "
-                f"size followed by an LZ4 block); {_SAVE_HINT}"
+                "binary data that looks compressed (x64dbg LZ4-compresses databases saved without an "
+                f"explicit path); {_SAVE_HINT}"
             )
     return f"expected a JSON object, data starts with {raw[:16].hex()}"
 
@@ -1003,7 +1053,11 @@ def export_for_ida(
     warnings}``; each item is ``{rva, name?, comment?, bookmark?: true,
     breakpoint?: {type, enabled, condition?}}``, sorted by RVA and merged per
     address. Names go through :func:`sanitize_label`, comments and conditions
-    through :func:`sanitize_comment`. ``base_runtime`` comes from
+    through :func:`sanitize_comment`. A label without any x64dbg-safe
+    character (e.g. all Korean) is not replaced by a placeholder name, which
+    would overwrite the IDA name on import: it is kept at the front of the
+    comment as ``x64dbg label: <text>`` (counted in ``warnings``).
+    ``base_runtime`` comes from
     ``module_map`` (exact name match) or is None. ``modules`` filters by name
     or stem (case-insensitive). Entries without a module and DLL/exception
     breakpoints are counted in ``skipped``; the item total is capped at
@@ -1034,10 +1088,20 @@ def export_for_ida(
             return None
         return per_module.setdefault(key, {}).setdefault(rva, {"rva": format_address(rva)})
 
+    label_notes: list[tuple[dict[str, Any], str]] = []
     for lb in annotations.labels:
         item = slot(lb.module, lb.rva, lb.manual)
-        if item is not None:
-            item["name"] = sanitize_label(lb.text, fallback=f"lbl_{lb.rva:X}")
+        if item is None:
+            continue
+        name = _label_core(lb.text)
+        if name:
+            item["name"] = name
+            continue
+        note = sanitize_comment(lb.text)
+        if note:
+            label_notes.append((item, f"x64dbg label: {note}"))
+        else:
+            skipped["empty"] += 1
     for cm in annotations.comments:
         text = sanitize_comment(cm.text)
         if not text:
@@ -1046,6 +1110,13 @@ def export_for_ida(
         item = slot(cm.module, cm.rva, cm.manual)
         if item is not None:
             item["comment"] = text
+    for item, note in label_notes:  # in front, so the comment byte cap cannot cut it off
+        existing = item.get("comment")
+        item["comment"] = sanitize_comment(f"{note} | {existing}" if existing else note)
+    if label_notes:
+        warnings.append(
+            f"{len(label_notes)} labels have no x64dbg/IDA-safe characters; kept as 'x64dbg label:' comments"
+        )
     for bm in annotations.bookmarks:
         item = slot(bm.module, bm.rva, bm.manual)
         if item is not None:
@@ -1066,7 +1137,9 @@ def export_for_ida(
     total = 0
     truncated = False
     for key in sorted(per_module):
-        items = [per_module[key][rva] for rva in sorted(per_module[key])]
+        items = [it for _, it in sorted(per_module[key].items()) if len(it) > 1]  # drop empty slots
+        if not items:
+            continue
         room = MAX_ITEMS - total
         if len(items) > room:
             items = items[:room]
@@ -1091,24 +1164,111 @@ def export_for_ida(
     }
 
 
-def plan_import(
+class _NothingToImport(Exception):
+    """An item that is valid but carries nothing a label/comment can hold."""
+
+
+def _plan_item(
+    item: object, where: str, mod: ModuleInfo, base_ida: int | None
+) -> tuple[dict[str, Any], str | None]:
+    """One plan entry (plus an optional warning). Raises ValueError for an
+    invalid item and :class:`_NothingToImport` for a bookmark/breakpoint-only one."""
+    if not isinstance(item, Mapping):
+        raise ValueError(f"{where}: must be a mapping (JSON object), got {type(item).__name__}")
+    has_rva = item.get("rva") is not None
+    has_ida = item.get("ida_address") is not None
+    if has_rva and has_ida:
+        raise ValueError(f"{where}: give either 'rva' or 'ida_address', not both")
+    if not (has_rva or has_ida):
+        raise ValueError(f"{where}: needs either 'rva' or 'ida_address'")
+    name = item.get("name")
+    comment = item.get("comment")
+    if name is not None and not isinstance(name, str):
+        raise ValueError(f"{where}: 'name' must be a string")
+    if comment is not None and not isinstance(comment, str):
+        raise ValueError(f"{where}: 'comment' must be a string")
+    if name is None and comment is None:
+        if item.get("bookmark") is not None or item.get("breakpoint") is not None:
+            raise _NothingToImport(
+                f"{where}: bookmark/breakpoint data only (no 'name' or 'comment' to import)"
+            )
+        raise ValueError(f"{where}: needs a 'name' and/or a 'comment'")
+    try:
+        if has_rva:
+            rva = parse_address(item["rva"], what="rva")
+        else:
+            if base_ida is None:
+                raise ValueError("ida_imagebase is required for items with 'ida_address'")
+            ida = parse_address(item["ida_address"], what="ida_address")
+            if ida < base_ida:
+                raise ValueError(
+                    f"ida_address {format_address(ida)} is below ida_imagebase {format_address(base_ida)}"
+                )
+            rva = ida - base_ida
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+    if mod.size is not None and rva >= mod.size:
+        raise ValueError(
+            f"{where}: rva {format_address(rva)} is outside module {mod.name} "
+            f"(size {format_address(mod.size)})"
+        )
+    runtime = mod.base + rva
+    if runtime > MAX_ADDRESS:
+        raise ValueError(f"{where}: runtime address exceeds the 64-bit address space")
+    label: str | None = None
+    note = ""
+    warning = None
+    if name and name.strip():
+        label = _label_core(name) or None
+        if label is None:  # no x64dbg-safe character: keep the name as text, never a placeholder
+            note = sanitize_comment(name)
+            if note:
+                warning = f"{where}: name has no x64dbg-safe characters; kept in the comment"
+    text = sanitize_comment(comment) if comment else ""
+    if note:
+        text = sanitize_comment(f"IDA name: {note} | {text}" if text else f"IDA name: {note}")
+    if label is None and not text:
+        raise ValueError(f"{where}: nothing to import after sanitising 'name'/'comment'")
+    entry = {
+        "runtime_address": format_address(runtime),
+        "rva": format_address(rva),
+        "label": label,
+        "comment": text or None,
+    }
+    return entry, warning
+
+
+def plan_import_report(
     items: Sequence[Mapping[str, Any]],
     *,
     module: str,
     module_map: object,
     ida_imagebase: int | str | None = None,
-) -> list[dict[str, Any]]:
-    """Turn IDA-side annotations into x64dbg operations.
+    on_error: str = "raise",
+) -> dict[str, Any]:
+    """Turn IDA-side annotations into x64dbg operations, with a report.
 
     Each item has either ``rva`` or ``ida_address`` (the latter needs
     ``ida_imagebase``) plus ``name`` and/or ``comment``; other keys are
-    ignored, so items of an ``x64dbg-ida-sync/1`` document are accepted as-is.
-    Returns ``[{runtime_address, rva, label, comment}]`` in input order with
-    :func:`sanitize_label` / :func:`sanitize_comment` applied (``label`` /
-    ``comment`` None when absent). The whole batch is rejected with a
-    ValueError naming the offending ``items[i]`` on the first invalid item,
-    and when it holds more than ``MAX_ITEMS`` items.
+    ignored. Items that carry only ``bookmark``/``breakpoint`` data (as in an
+    ``x64dbg-ida-sync/1`` document) produce no operation and are listed in
+    ``skipped``. A name without any x64dbg-safe character is not turned into a
+    placeholder label: it goes to the front of the comment as ``IDA name:
+    <text>`` (listed in ``warnings``).
+
+    ``on_error``: ``"raise"`` (default) rejects the whole batch with a
+    ValueError naming the first invalid ``items[i]``; ``"skip"`` lists invalid
+    items in ``skipped`` with the reason and plans the rest. Batch-level
+    problems (not a list, more than ``MAX_ITEMS`` items, unknown module, bad
+    ``ida_imagebase``) always raise.
+
+    Returns ``{module, plan: [{runtime_address, rva, label, comment}],
+    skipped: [{index, reason}], warnings: [str]}``; ``plan`` keeps input order
+    with :func:`sanitize_label` / :func:`sanitize_comment` applied (``label`` /
+    ``comment`` None when absent).
     """
+    if on_error not in ON_ERROR_MODES:
+        raise ValueError(f"on_error must be one of {', '.join(ON_ERROR_MODES)}; got {on_error!r}")
     if isinstance(items, (str, bytes, bytearray, Mapping)) or not isinstance(items, Sequence):
         raise ValueError("items must be a list of objects")
     if len(items) > MAX_ITEMS:
@@ -1120,56 +1280,46 @@ def plan_import(
     base_ida = None if ida_imagebase is None else parse_address(ida_imagebase, what="ida_imagebase")
 
     plan: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    warnings: list[str] = []
     for i, item in enumerate(items):
-        where = f"items[{i}]"
-        if not isinstance(item, Mapping):
-            raise ValueError(f"{where}: must be a mapping (JSON object), got {type(item).__name__}")
-        has_rva = item.get("rva") is not None
-        has_ida = item.get("ida_address") is not None
-        if has_rva and has_ida:
-            raise ValueError(f"{where}: give either 'rva' or 'ida_address', not both")
-        if not (has_rva or has_ida):
-            raise ValueError(f"{where}: needs either 'rva' or 'ida_address'")
-        name = item.get("name")
-        comment = item.get("comment")
-        if name is not None and not isinstance(name, str):
-            raise ValueError(f"{where}: 'name' must be a string")
-        if comment is not None and not isinstance(comment, str):
-            raise ValueError(f"{where}: 'comment' must be a string")
-        if name is None and comment is None:
-            raise ValueError(f"{where}: needs a 'name' and/or a 'comment'")
         try:
-            if has_rva:
-                rva = parse_address(item["rva"], what="rva")
-            else:
-                if base_ida is None:
-                    raise ValueError("ida_imagebase is required for items with 'ida_address'")
-                ida = parse_address(item["ida_address"], what="ida_address")
-                if ida < base_ida:
-                    raise ValueError(
-                        f"ida_address {format_address(ida)} is below ida_imagebase {format_address(base_ida)}"
-                    )
-                rva = ida - base_ida
+            entry, warning = _plan_item(item, f"items[{i}]", mod, base_ida)
+        except _NothingToImport as exc:
+            skipped.append({"index": i, "reason": str(exc)})
+            continue
         except ValueError as exc:
-            raise ValueError(f"{where}: {exc}") from None
-        if mod.size is not None and rva >= mod.size:
-            raise ValueError(
-                f"{where}: rva {format_address(rva)} is outside module {mod.name} "
-                f"(size {format_address(mod.size)})"
-            )
-        runtime = mod.base + rva
-        if runtime > MAX_ADDRESS:
-            raise ValueError(f"{where}: runtime address exceeds the 64-bit address space")
-        label = sanitize_label(name, fallback=f"lbl_{rva:X}") if name and name.strip() else None
-        text = sanitize_comment(comment) if comment else ""
-        if label is None and not text:
-            raise ValueError(f"{where}: nothing to import after sanitising 'name'/'comment'")
-        plan.append(
-            {
-                "runtime_address": format_address(runtime),
-                "rva": format_address(rva),
-                "label": label,
-                "comment": text or None,
-            }
-        )
-    return plan
+            if on_error == "raise":
+                raise
+            skipped.append({"index": i, "reason": str(exc)})
+            continue
+        plan.append(entry)
+        if warning is not None:
+            warnings.append(warning)
+    if len(warnings) > _MAX_REPORT_WARNINGS:
+        warnings = warnings[:_MAX_REPORT_WARNINGS] + [
+            f"... {len(warnings) - _MAX_REPORT_WARNINGS} more warnings omitted"
+        ]
+    return {"module": mod.name, "plan": plan, "skipped": skipped, "warnings": warnings}
+
+
+def plan_import(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    module: str,
+    module_map: object,
+    ida_imagebase: int | str | None = None,
+) -> list[dict[str, Any]]:
+    """Turn IDA-side annotations into x64dbg operations (all or nothing).
+
+    Same rules as :func:`plan_import_report` with ``on_error="raise"``: returns
+    only the ``plan`` list ``[{runtime_address, rva, label, comment}]``. Items
+    of an ``x64dbg-ida-sync/1`` document are accepted as-is; bookmark- or
+    breakpoint-only items produce no entry (use :func:`plan_import_report` to
+    see them). The whole batch is rejected with a ValueError naming the
+    offending ``items[i]`` on the first invalid item, and when it holds more
+    than ``MAX_ITEMS`` items.
+    """
+    return plan_import_report(
+        items, module=module, module_map=module_map, ida_imagebase=ida_imagebase, on_error="raise"
+    )["plan"]

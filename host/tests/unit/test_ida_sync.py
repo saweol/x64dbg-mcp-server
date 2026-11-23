@@ -13,13 +13,21 @@ Fixtures under tests/fixtures/ida/ are synthetic:
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import random
+import re
 import struct
+import subprocess
+import sys
 import unicodedata
 from pathlib import Path
+from types import ModuleType
 
 import pytest
+
+from x64dbg_vm_gateway import ida_sync
 from x64dbg_vm_gateway.ida_sync import (
     COMMENT_MAX_BYTES,
     LABEL_MAX_BYTES,
@@ -32,15 +40,19 @@ from x64dbg_vm_gateway.ida_sync import (
     parse_module_list,
     parse_x64dbg_db,
     plan_import,
+    plan_import_report,
     rebase,
     sanitize_comment,
     sanitize_label,
 )
 
-from x64dbg_vm_gateway import ida_sync
-
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "ida"
+HOST_DIR = Path(__file__).resolve().parents[2]
+IDA_DIR = HOST_DIR.parent / "ida"
+IDA_SCRIPT = IDA_DIR / "x64dbg_sync.py"
 LABEL_CHARSET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@?$.:<>~")
+# Tokens x64dbg's expression evaluator resolves before labels (see ida_sync._is_reserved_label).
+X64DBG_NUMBER_RE = re.compile(r"x?[0-9a-f]+|\.[0-9]+", re.IGNORECASE)
 
 SAMPLE_BASE = 0x7FF6A1230000
 SAMPLE_SIZE = 0x2A000
@@ -63,6 +75,107 @@ def fixture_bytes(name: str) -> bytes:
 @pytest.fixture
 def modmap() -> dict[str, ModuleInfo]:
     return parse_module_list(fixture_text("list_modules.txt"))
+
+
+@pytest.fixture(scope="module")
+def ida_script() -> ModuleType:
+    """ida/x64dbg_sync.py loaded by path (it imports no ida_* module at import time)."""
+    assert IDA_SCRIPT.is_file(), f"{IDA_SCRIPT} is missing"
+    spec = importlib.util.spec_from_file_location("x64dbg_sync_under_test", IDA_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ── import hygiene ──────────────────────────────────────────────────
+def test_library_does_not_import_the_proxy_stack() -> None:
+    code = (
+        "import sys, x64dbg_vm_gateway.ida_sync; "
+        "print(sorted(m for m in sys.modules if m.startswith('x64dbg_vm_gateway')))"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env, check=True
+    )
+    assert out.stdout.strip() == "['x64dbg_vm_gateway', 'x64dbg_vm_gateway.ida_sync']"
+
+
+def test_wrapper_tags_match_the_proxy() -> None:
+    from x64dbg_vm_gateway import proxy
+
+    assert ida_sync.UNTRUSTED_OPEN == proxy.UNTRUSTED_OPEN
+    assert ida_sync.UNTRUSTED_CLOSE == proxy.UNTRUSTED_CLOSE
+
+
+# ── cross-check with ida/x64dbg_sync.py (schema drift guard) ────────
+def test_gateway_export_is_accepted_by_the_script(ida_script: ModuleType) -> None:
+    db = {
+        "labels": [
+            {"module": "sample.exe", "address": "0x1000", "manual": True, "text": "decrypt config"},
+            {"module": "sample.exe", "address": "0x1020", "manual": True, "text": "복호화_루틴"},
+        ],
+        "comments": [{"module": "sample.exe", "address": "0x1010", "manual": True, "text": "xor loop"}],
+        "bookmarks": [{"module": "sample.exe", "address": "0x1010", "manual": True}],
+        "breakpoints": [{"module": "sample.exe", "address": "0x1000", "enabled": True, "type": 0}],
+    }
+    exported = export_for_ida(parse_x64dbg_db(json.dumps(db).encode()))
+    doc = ida_script.load_sync_document(json.dumps(exported))
+    assert doc["skipped"] == 0
+    plan = ida_script.build_import_plan(doc, "sample.exe", 0x140000000)
+    assert [(p["ea"], p["name"], p["comment"]) for p in plan] == [
+        (0x140001000, "decrypt_config", "[x64dbg: normal bp, enabled]"),
+        (0x140001010, None, "xor loop [x64dbg: bookmark]"),
+        (0x140001020, None, "x64dbg label: 복호화_루틴"),
+    ]
+
+
+def test_script_export_is_accepted_by_the_gateway(ida_script: ModuleType) -> None:
+    exported = ida_script.build_export_document(
+        "sample.exe", 0x140000000, [(0x140001000, "decrypt_config", "from IDA")]
+    )
+    items = exported["modules"]["sample.exe"]["items"]
+    mm = {"sample.exe": ModuleInfo("sample.exe", SAMPLE_BASE, SAMPLE_SIZE)}
+    assert plan_import(items, module="sample.exe", module_map=mm) == [
+        {
+            "runtime_address": "0x7FF6A1231000",
+            "rva": "0x1000",
+            "label": "decrypt_config",
+            "comment": "from IDA",
+        }
+    ]
+
+
+def test_script_export_with_an_item_past_the_image_end(ida_script: ModuleType) -> None:
+    exported = ida_script.build_export_document(
+        "sample.exe",
+        0x140000000,
+        [(0x140001000, "init", None), (0x140000000 + SAMPLE_SIZE + 0x1000, "extern_thing", None)],
+    )
+    items = exported["modules"]["sample.exe"]["items"]
+    mm = {"sample.exe": ModuleInfo("sample.exe", SAMPLE_BASE, SAMPLE_SIZE)}
+    with pytest.raises(ValueError, match=r"items\[1\].*outside"):
+        plan_import(items, module="sample.exe", module_map=mm)
+    report = plan_import_report(items, module="sample.exe", module_map=mm, on_error="skip")
+    assert [p["label"] for p in report["plan"]] == ["init"]
+    (skip,) = report["skipped"]
+    assert skip["index"] == 1 and "outside" in skip["reason"]
+
+
+def test_ida_script_suite_passes() -> None:
+    """ida/tests sits outside this project's testpaths; run it here so the default run covers it."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", str(IDA_DIR / "tests"), "-q", "-p", "no:cacheprovider"],
+        cwd=HOST_DIR,
+        capture_output=True,
+        text=True,
+        timeout=50,
+        env=env,
+        check=False,
+    )
+    assert out.returncode == 0, out.stdout[-4000:] + out.stderr[-2000:]
+    assert " passed" in out.stdout and "failed" not in out.stdout
 
 
 # ── parse_module_list ───────────────────────────────────────────────
@@ -671,6 +784,26 @@ class TestExport:
         with pytest.raises(ValueError):
             export_for_ida({"labels": []})  # type: ignore[arg-type]
 
+    def test_label_without_safe_characters_is_kept_as_comment(self) -> None:
+        doc = {
+            "labels": [
+                {"module": "a.exe", "address": "0x10", "text": "복호화_루틴"},
+                {"module": "a.exe", "address": "0x20", "text": "설정"},
+            ],
+            "comments": [{"module": "a.exe", "address": "0x20", "text": "existing note"}],
+        }
+        out = export_for_ida(parse_x64dbg_db(json.dumps(doc).encode()))
+        first, second = out["modules"]["a.exe"]["items"]
+        assert first == {"rva": "0x10", "comment": "x64dbg label: 복호화_루틴"}
+        assert second == {"rva": "0x20", "comment": "x64dbg label: 설정 | existing note"}
+        assert any("2 labels" in w for w in out["warnings"])
+
+    def test_label_that_cleans_to_nothing_leaves_no_empty_item(self) -> None:
+        ann = Annotations(labels=[ida_sync.Label("a.exe", 0x10, "\u202e")])
+        out = export_for_ida(ann)
+        assert out["modules"] == {}
+        assert out["skipped"]["empty"] == 1
+
 
 # ── plan_import ─────────────────────────────────────────────────────
 class TestPlanImport:
@@ -749,6 +882,69 @@ class TestPlanImport:
         assert len(plan) == len(named)
         assert plan[0]["runtime_address"] == "0x7FF6A1231000"
 
+    def test_accepts_unfiltered_export_items(self) -> None:
+        db = {
+            "labels": [{"module": "sample.exe", "address": "0x1000", "text": "decrypt_config"}],
+            "bookmarks": [{"module": "sample.exe", "address": "0x1100"}],
+            "breakpoints": [{"module": "sample.exe", "address": "0x1200", "type": 0, "enabled": True}],
+        }
+        items = export_for_ida(parse_x64dbg_db(json.dumps(db).encode()))["modules"]["sample.exe"]["items"]
+        assert len(items) == 3
+        mm = {"sample.exe": ModuleInfo("sample.exe", SAMPLE_BASE, SAMPLE_SIZE)}
+        plan = plan_import(items, module="sample.exe", module_map=mm)
+        assert [(p["rva"], p["label"]) for p in plan] == [("0x1000", "decrypt_config")]
+        report = plan_import_report(items, module="sample.exe", module_map=mm)
+        assert [s["index"] for s in report["skipped"]] == [1, 2]
+        assert all("bookmark/breakpoint" in s["reason"] for s in report["skipped"])
+
+    def test_report_skip_mode_collects_invalid_items(self, modmap: dict[str, ModuleInfo]) -> None:
+        items = [
+            {"rva": "0x10", "name": "ok"},
+            {"rva": "zz", "name": "bad rva"},
+            "not a mapping",
+            {"rva": hex(SAMPLE_SIZE), "name": "past the end"},
+            {"rva": "0x10"},
+            {"rva": "0x20", "comment": "also ok"},
+        ]
+        report = plan_import_report(items, module="sample.exe", module_map=modmap, on_error="skip")
+        assert [p["rva"] for p in report["plan"]] == ["0x10", "0x20"]
+        assert [s["index"] for s in report["skipped"]] == [1, 2, 3, 4]
+        assert report["module"] == "sample.exe"
+        json.dumps(report)
+        # the default mode keeps the all-or-nothing contract
+        with pytest.raises(ValueError, match=r"items\[1\]"):
+            plan_import_report(items, module="sample.exe", module_map=modmap)
+
+    def test_report_rejects_unknown_mode_and_batch_errors(self, modmap: dict[str, ModuleInfo]) -> None:
+        with pytest.raises(ValueError, match="on_error"):
+            plan_import_report([], module="sample.exe", module_map=modmap, on_error="ignore")
+        with pytest.raises(ValueError, match="not found"):
+            plan_import_report(
+                [{"rva": "0x1", "name": "x"}], module="x.dll", module_map=modmap, on_error="skip"
+            )
+
+    def test_name_without_safe_characters_goes_to_the_comment(self, modmap: dict[str, ModuleInfo]) -> None:
+        report = plan_import_report(
+            [
+                {"rva": "0x10", "name": "복호화_루틴"},
+                {"rva": "0x20", "name": "설정", "comment": "from IDA"},
+            ],
+            module="sample.exe",
+            module_map=modmap,
+        )
+        first, second = report["plan"]
+        assert first == {
+            "runtime_address": "0x7FF6A1230010",
+            "rva": "0x10",
+            "label": None,
+            "comment": "IDA name: 복호화_루틴",
+        }
+        assert (second["label"], second["comment"]) == (None, "IDA name: 설정 | from IDA")
+        assert len(report["warnings"]) == 2 and "items[0]" in report["warnings"][0]
+        assert plan_import(
+            [{"rva": "0x10", "name": "복호화_루틴"}], module="sample.exe", module_map=modmap
+        ) == [first]
+
     def test_overlong_strings_are_capped(self, modmap: dict[str, ModuleInfo]) -> None:
         (p,) = plan_import(
             [{"rva": "0x1", "name": "n" * 100_000, "comment": "가" * 100_000}],
@@ -773,7 +969,23 @@ class TestSanitizeLabel:
             ("__imp_CreateFileW", "__imp_CreateFileW"),  # existing underscores are kept
             ("ｍａｌｗａｒｅ", "malware"),  # NFKC folds full-width letters
             ("1stage", "_1stage"),  # would be read as a number in x64dbg expressions
-            ("deadbeef", "deadbeef"),  # hex-letter words stay (only a leading digit is prefixed)
+            ("deadbeef", "_deadbeef"),  # x64dbg reads hex digits as a number before labels
+            ("abc", "_abc"),
+            ("CAFE", "_CAFE"),
+            ("xdeadbeef", "_xdeadbeef"),  # 'x' hex prefix
+            (".10", "_.10"),  # '.' decimal prefix
+            ("rax", "_rax"),  # registers are resolved before labels
+            ("RIP", "_RIP"),
+            ("r15d", "_r15d"),
+            ("cip", "_cip"),
+            ("xmm7", "_xmm7"),
+            ("dr7", "_dr7"),
+            ("eflags", "_eflags"),
+            ("_zf", "__zf"),  # x64dbg flag syntax
+            ("cf", "__cf"),  # hex, and '_cf' would be a flag
+            ("cafe_babe", "cafe_babe"),  # not a number
+            ("raxx", "raxx"),
+            ("x", "x"),
             ("0x401000", "_0x401000"),
             ("evil\u202egnp", "evil_gnp"),
             ("tab\there", "tab_here"),
@@ -819,6 +1031,12 @@ class TestSanitizeLabel:
             assert set(out) <= LABEL_CHARSET
             assert len(out) <= LABEL_MAX_BYTES
             assert not out[0].isdigit()
+            assert not X64DBG_NUMBER_RE.fullmatch(out)
+
+    def test_overlong_hex_stays_reserved_safe(self) -> None:
+        out = sanitize_label("a" * 300 + "_tail")
+        assert len(out) == LABEL_MAX_BYTES
+        assert not X64DBG_NUMBER_RE.fullmatch(out)
 
 
 class TestSanitizeComment:
