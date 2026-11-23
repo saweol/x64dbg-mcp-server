@@ -772,6 +772,20 @@ def test_recover_scan_flags_nonterminal_jobs_without_changing_state(root):
     s3.close()
 
 
+def test_recover_scan_removes_leftover_temp_state_files(store):
+    live = store.create("p1", GUEST_ROOT)
+    done = drive(store, store.create("p2", GUEST_ROOT).id, S.DONE)
+    leftovers = [Path(live.host_root) / ".state.json.0123456789ab.tmp",
+                 Path(done.host_root) / ".state.json.ba9876543210.tmp"]
+    for p in leftovers:
+        p.write_text("{half")
+    keep = Path(live.host_root) / ".notes.tmp"
+    keep.write_text("not ours")
+    store.recover_scan()
+    assert not any(p.exists() for p in leftovers)
+    assert keep.exists()
+
+
 def test_recover_scan_on_empty_root(store):
     assert store.recover_scan() == []
 
@@ -995,6 +1009,31 @@ def test_unreadable_lock_is_treated_as_stale(root, content):
     s = make_store(root).open()
     assert json.loads((root / ".lock").read_text())["pid"] == OWN_PID
     s.close()
+
+
+@pytest.mark.skipif(not POSIX, reason="O_NOFOLLOW symlink semantics")
+def test_symlinked_lock_is_treated_as_held_not_stale(root, tmp_path):
+    root.mkdir(parents=True)
+    target = tmp_path / "elsewhere.lock"
+    target.write_text(json.dumps({"pid": 999999, "nonce": "x"}))  # dead pid
+    (root / ".lock").symlink_to(target)
+    with pytest.raises(LockTimeout):
+        make_store(root, alive=lambda p: False).open()
+    assert (root / ".lock").is_symlink() and target.exists()  # nothing deleted
+
+
+@pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="needs a non-root POSIX user")
+def test_unreadable_lock_is_treated_as_held_not_stale(root):
+    root.mkdir(parents=True)
+    lock = root / ".lock"
+    lock.write_text(json.dumps({"pid": 999999, "nonce": "x"}))
+    lock.chmod(0o000)
+    try:
+        with pytest.raises(LockTimeout):
+            make_store(root, alive=lambda p: False).open()
+        assert lock.exists()
+    finally:
+        lock.chmod(0o600)
 
 
 def test_lock_from_other_host_is_never_reclaimed(root):

@@ -125,6 +125,7 @@ _UPDATABLE_FIELDS = frozenset(
     {"sample", "backend_id", "epoch", "restarts", "manifest_path", "flags", "error"}
 )
 _CORRUPT_RE = re.compile(r"state\.json\.corrupt-([0-9]+)")
+_TEMP_RE = re.compile(r"\.state\.json\.[0-9a-f]{12}\.tmp")  # see _atomic_write
 _MAX_ID_ATTEMPTS = 8
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _INTENT_TAIL_BYTES = 64 * 1024
@@ -809,6 +810,7 @@ class JobStore:
             out: list[Job | CorruptJob] = []
             fresh: dict[str, Job] = {}
             for job_dir in self._iter_job_dirs():
+                self._remove_stale_temp_files(job_dir)
                 try:
                     job = self._read_job(job_dir)
                 except FileNotFoundError:
@@ -909,6 +911,15 @@ class JobStore:
         return jobs
 
     @staticmethod
+    def _remove_stale_temp_files(job_dir: Path) -> None:
+        # Left by a crash inside _atomic_write. Safe to delete: we hold the root's
+        # process lock, so no other writer can own them.
+        for p in job_dir.iterdir():
+            if _TEMP_RE.fullmatch(p.name):
+                with contextlib.suppress(OSError):
+                    p.unlink()
+
+    @staticmethod
     def _corrupt_files(job_dir: Path) -> tuple[str, ...]:
         found: list[tuple[int, str]] = []
         for p in job_dir.iterdir():
@@ -1005,7 +1016,14 @@ class JobStore:
                     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
                                  | _O_CLOEXEC, 0o600)
                 except FileExistsError:
-                    record = self._read_lock(path)
+                    try:
+                        record = self._read_lock(path)
+                    except FileNotFoundError:
+                        continue  # released meanwhile; retry the create
+                    except OSError as e:
+                        # Unreadable (permissions, symlink, ...): we cannot prove it is
+                        # stale, so treat it as held. Only garbled content counts as stale.
+                        return {"pid": None, "host": None, "error": type(e).__name__}
                     if record is not None and self._owner_alive(record):
                         return record
                     owner = record or {}
@@ -1031,9 +1049,10 @@ class JobStore:
 
     @staticmethod
     def _read_lock(path: Path) -> dict[str, Any] | None:
+        """Parsed lock record, or None if its content is garbled. I/O errors propagate."""
         try:
             data = json.loads(_read_capped(path, 4096))
-        except (OSError, ValueError, RecursionError):
+        except (ValueError, RecursionError):
             return None
         if not isinstance(data, dict):
             return None
@@ -1062,7 +1081,10 @@ class JobStore:
         path = self.root / _LOCK_FILE
         try:
             with _GuardLock(self.root / _GUARD_FILE, self._clock, self._guard_timeout_s):
-                record = self._read_lock(path)
+                try:
+                    record = self._read_lock(path)
+                except OSError:
+                    record = None  # gone or unreadable: not provably ours, leave it alone
                 if record is not None and record.get("nonce") == self._nonce:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(path)

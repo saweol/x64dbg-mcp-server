@@ -288,7 +288,7 @@ def isolation_gate(report: IsolationReport, require: bool) -> list[str]:
     if report.shared_folders_writable and enabled is not False:
         violations.append("shared folders are writable from the guest")
     for net in report.network_types:
-        if net.strip().lower() not in _ISOLATED_NETWORKS:
+        if not isinstance(net, str) or net.strip().lower() not in _ISOLATED_NETWORKS:
             violations.append(f"network adapter type {net!r} is not host-only")
     if violations and require:
         raise IsolationRequired(

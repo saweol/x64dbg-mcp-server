@@ -357,6 +357,12 @@ def test_writable_flag_on_disabled_shared_folders_is_not_a_violation():
     assert isolation_gate(IsolationReport(False, True, ("hostonly",)), require=True) == []
 
 
+def test_non_string_network_type_is_a_violation_not_a_crash():
+    rep = IsolationReport(False, False, (None,))  # type: ignore[arg-type]
+    with pytest.raises(IsolationRequired):
+        isolation_gate(rep, require=True)
+
+
 @pytest.mark.parametrize("net", ["custom", "vmnet8", "", "HostOnly"])
 def test_unknown_network_types_are_violations_case_insensitively(net):
     rep = IsolationReport(False, False, (net,))
