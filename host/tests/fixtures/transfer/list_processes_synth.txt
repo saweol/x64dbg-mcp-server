@@ -1,0 +1,7 @@
+Process list: 6
+pid=0, owner=, cmd=[System Process]
+pid=4, owner=NT AUTHORITY\SYSTEM, cmd=
+pid=612, owner=NT AUTHORITY\SYSTEM, cmd=C:\Windows\System32\smss.exe
+pid=1234, owner=DESKTOP-ABC\mcp, cmd="C:\tools\x64dbg\release\x64\x64dbg.exe" a b
+pid=2048, owner=DESKTOP-ABC\mcp, cmd="C:\mcp\jobs\j1\in\0123456789ab.exe" --opt=a,b,c "x, y"
+pid=4096, owner=DESKTOP-ABC\mcp, cmd=C:\Windows\System32\notepad.exe C:\a, b.txt
