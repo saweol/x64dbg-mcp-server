@@ -12,6 +12,7 @@ const pathutil = @import("../core/pathutil.zig");
 const launch = @import("../core/launch.zig");
 const cmdline = @import("cmdline.zig");
 const serverinfo = @import("serverinfo.zig");
+const debugstate = @import("debugstate.zig");
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -1058,14 +1059,14 @@ fn clearEventLog(_: ?std.json.Value, out: []u8) ToolResult {
 fn getDebugState(_: ?std.json.Value, out: []u8) ToolResult {
     const debugging = bridge.isDebugging();
     const running = bridge.isRunning();
-    const locked = bridge.isRunLocked();
 
     if (!debugging) {
         return fmtResult(out, "isDebugging: false\nstatus: NO_TARGET\nhint: Use LoadBinary to open an executable first.", .{});
     }
 
     const pid = bridge.valFromString("$pid");
-    const status: []const u8 = if (running) "RUNNING" else if (locked) "LOCKED" else "PAUSED";
+    // Not "LOCKED": x64dbg holds its run lock whenever the target is stopped (debugstate.zig).
+    const status = debugstate.statusWord(debugging, running);
 
     if (running) {
         return fmtResult(out, "isDebugging: true\nisRunning: true\npid: {d}\nstatus: {s}", .{ pid, status });

@@ -219,7 +219,7 @@ foreach ($d in $dirs) {
         $rows.Add([pscustomobject]@{ dir = $d; name = $f.Name; sha256 = $h })
     }
 }
-'MCPJSON:' + (ConvertTo-Json -InputObject @($rows) -Depth 3 -Compress)
+'MCPJSON:' + (ConvertTo-Json -InputObject ($rows.ToArray()) -Depth 3 -Compress)
 """
 
 
@@ -1648,7 +1648,7 @@ foreach ($root in $roots.Values) {
     }
     $out.Add([pscustomobject]$entry)
 }
-'MCPJSON:' + (ConvertTo-Json -InputObject @($out) -Depth 6 -Compress)
+'MCPJSON:' + (ConvertTo-Json -InputObject ($out.ToArray()) -Depth 6 -Compress)
 """
 
 

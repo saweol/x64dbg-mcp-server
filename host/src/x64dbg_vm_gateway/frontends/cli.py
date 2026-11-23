@@ -54,6 +54,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, TextIO
 
 from .. import config as gw_config
+from .. import envfile
 from .. import platform as gw_platform
 from ..errors import ConfigError, GatewayError, JobNotFound, LockTimeout, StateViolation, VmrunNotFound
 from ..jobs import DISCARD_ACTOR, JOB_ID_RE, Job, validate_job_id
@@ -432,16 +433,21 @@ def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
         raise UsageError("--wait-ready must be greater than 0")
     config = _load_config(args)
     prof = config.profile(args.profile)
-    user = args.user or prof.guest_user
+    # the same resolution as the serving gateway: the real environment over gateway.env_file
+    environ = envfile.resolve_environ(config, os.environ)
+    user = args.user or prof.guest_user or (environ.get(prof.guest_user_env) if prof.guest_user_env else None)
     if not user:
-        raise UsageError("--user is required because the profile has no guest_user")
-    password = gw_config.resolve_secret(prof.guest_password_env, os.environ)
+        raise UsageError(
+            "--user is required because the profile has no guest_user"
+            + (f" and {prof.guest_user_env} is not set" if prof.guest_user_env else "")
+        )
+    password = gw_config.resolve_secret(prof.guest_password_env, environ)
     autologon = not args.no_autologon
     if autologon and password is None:
         env_name = prof.guest_password_env
         raise ConfigError(
             "auto-logon needs the guest password, but "
-            + (f"environment variable {env_name} is not set" if env_name
+            + (f"environment variable {env_name} is not set (environment or gateway.env_file)" if env_name
                else f"profile {prof.name!r} has no guest_password_env"),
             stage="provision",
             hint="export the guest password in that variable, or pass --no-autologon",

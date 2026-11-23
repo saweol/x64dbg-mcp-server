@@ -776,3 +776,56 @@ def test_lone_surrogates_do_not_break_json_output(cfg_path, wiring, fake, monkey
     monkeypatch.setattr(sys, "stdout", out)
     assert run(["--config", str(cfg_path), "--json", "status"]) == 0
     assert json.loads(_text_of(out)) == {"warning": "bad \ud800 text"}
+
+
+# ── provision with the QUICKSTART config shape (real-VM finding) ───
+def _env_file_config(tmp_path: Path) -> Path:
+    """guest_user_env + guest_password_env resolved from gateway.env_file (docs/QUICKSTART_KO.md)."""
+    env = tmp_path / "lab.env"
+    env.write_text("GW_QS_USER=labuser\nGW_QS_PW=from-env-file\n", encoding="utf-8")
+    env.chmod(0o600)
+    text = f"""
+[gateway]
+jobs_root = "{(tmp_path / 'jobs').as_posix()}"
+default_profile = "lab"
+env_file = "{env.as_posix()}"
+
+[profiles.lab]
+mode = "vmware"
+vmx = "/vms/lab/lab.vmx"
+clean_snapshot = "MCP_CLEAN"
+guest_user_env = "GW_QS_USER"
+guest_password_env = "GW_QS_PW"
+
+[profiles.lab.backends.x64]
+port = 9094
+config = 'C:\\x64dbg\\release\\x64\\mcp_config.json'
+"""
+    path = tmp_path / "qs.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_provision_takes_user_and_password_from_the_env_file(
+    tmp_path, wiring, provision, monkeypatch, capsys
+):
+    monkeypatch.delenv("GW_QS_USER", raising=False)
+    monkeypatch.delenv("GW_QS_PW", raising=False)
+    cfg = _env_file_config(tmp_path)
+    rc = run(["--config", str(cfg), "provision", "--x64dbg-root", "C:\\x64dbg\\release", "--no-reboot"])
+    out = capsys.readouterr()
+    assert rc == 0, out
+    _, _, kw = provision.calls[0]
+    assert kw["user"] == "labuser"
+    assert isinstance(kw["password"], Secret) and kw["password"].reveal() == "from-env-file"
+    assert "from-env-file" not in out.out + out.err
+
+
+def test_provision_real_environment_wins_over_the_env_file(tmp_path, wiring, provision, monkeypatch):
+    monkeypatch.setenv("GW_QS_USER", "shelluser")
+    monkeypatch.setenv("GW_QS_PW", "from-shell")
+    cfg = _env_file_config(tmp_path)
+    rc = run(["--config", str(cfg), "provision", "--x64dbg-root", "C:\\x", "--no-reboot"])
+    assert rc == 0
+    _, _, kw = provision.calls[0]
+    assert kw["user"] == "shelluser" and kw["password"].reveal() == "from-shell"
