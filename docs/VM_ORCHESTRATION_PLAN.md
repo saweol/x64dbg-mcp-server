@@ -693,3 +693,24 @@ docs/VM_ORCHESTRATION_PLAN.md
 - 플러그인 코드 중 정독하지 않은 부분: 80개 핸들러 중 LoadBinary·RestartDebug·StopDebug·Dump*·SaveDatabase·WaitFor*·ExecuteDebuggerCommand를 제외한 본문, `notifyEvent`의 SSE 전송부, `bridge.cmdExec`를 비UI 스레드에서 부를 때의 내부 동기화, `JsonWriter`가 DEL·C1·방향 제어문자를 처리하는지
 - MCP Python SDK low-level API의 동적 툴 목록과 progress 지원 세부, Claude Code의 툴 timeout 값
 - zig 빌드와 테스트는 실행하지 않았다(host에 zig 미설치).
+
+---
+
+## 13. Wave 3 통합(J-integ) 결정 기록
+
+Wave 1·2 모듈을 묶으면서 내린 결정이다. 근거와 검증 방법을 함께 적는다. 실 VM에서 확인하지 않은 항목은 "가정"으로 표시한다.
+
+| 항목 | 결정 | 근거·검증 |
+|---|---|---|
+| 의존성 | `mcp>=2.3,<3`에 더해 패키지가 직접 import하는 `anyio`, `jsonschema`, `starlette`, `uvicorn`을 선언한다. `uv.lock`은 재생성했고 해석된 버전은 바뀌지 않았다. | `test_packaging.py`가 src의 import와 선언을 대조한다. |
+| CI | host 잡을 ubuntu/windows/macos × Python 3.12로 추가한다(`uv sync --locked`, `uv run pytest -q`, `uv run ruff check src tests`). Zig 잡은 그대로 둔다. `ida/tests`는 testpaths에 넣지 않고 기존 subprocess 테스트로 돌린다(중복 실행을 피하고 단순하다). | Windows·macOS 러너는 이 세션에서 돌려 보지 않았다. |
+| HTTP 429 | v1.10 플러그인의 인증 실패 잠금(429 + `Retry-After`)은 `BACKEND_THROTTLED`(retryable, `details.retry_after_s`)로 올린다. supervisor는 `THROTTLED` 상태로 분류하고 절대 kill·재기동하지 않는다. proxy는 재시도하지 않고 그대로 전달한다. 프로비저닝의 준비 확인은 429를 계속 "응답함"으로 본다. | 살아 있는 플러그인을 재기동하면 토큰 문제만 가려진다. |
+| 오류 코드 | `INVALID_ARGUMENT`(app.py에서 errors.py로 이동), `BACKEND_THROTTLED`, `DATABASE_FORMAT`을 추가했다. 기존 코드는 바꾸지 않았다. | `test_errors.py`가 코드 중복을 막는다. |
+| 상태기계 | `COLLECTED→DONE`, `DISCARDED→DONE`(revert 없는 finish), `REVERTING→REVERTING`(재시도)을 추가했다. 재시작 뒤 REVERTING에 남은 job은 `analysis_finish`가 revert를 다시 하고, 그동안은 `needs_recovery`를 지워 "중단됨"으로 보고하지 않는다. `session_status`의 복구 항목에 `next_tool`을 넣었다. | 불변식 "DONE은 수집·폐기·revert 뒤에만"은 유지된다(`test_jobs.py`). |
+| 전원 정책 | `power`를 `power_start`(start·resume: UPLOADING/COLLECTING/REVERTING 중에만 거부, ANALYZING 중 허용)와 `power_stop`(stop·suspend·reset: revert와 같은 규칙)으로 나눴다. | host 절전으로 suspend된 VM을 분석 중에 재개할 수 있어야 한다. resume은 상태를 잃지 않는다. |
+| job 조회 | `GatewayApp.list_jobs`/`get_job`(읽기 전용)을 추가했다. CLI `jobs list/show`는 state.json을 그대로 읽는다. gateway가 jobs root 잠금을 쥐고 있으면 `discard` 등은 pid와 해야 할 일(gateway 중지 또는 MCP 툴 사용)을 알려 준다. | MCP 툴로는 노출하지 않았다(툴 이름 규칙 D7, 범위). |
+| 내장 툴 목록 | v1.9·v1.10 목록을 모두 싣고, 백엔드마다 플러그인 버전(GET /, initialize, 캐시된 목록의 버전 순)으로 고른다. 버전 이하에서 가장 새 목록, 없으면 가장 오래된 목록이다. 새 클라이언트를 만들면 GET /를 한 번 보내 첫 호출 전에 버전을 안다. | v1.10의 GetServerInfo(read-only)가 첫 접촉부터 올바르게 분류된다. |
+| reload_on_restart | 재기동을 알게 된 호출에서 BACKEND_RESTARTED를 돌려주기 전에 샘플을 다시 올린다(SetArtifactDir → LoadBinary → WaitForPause, epoch당 한 번). `details.reloaded`는 지금 디버거에 샘플이 올라가 있는지를 말한다. | §4.2 |
+| IDA(해석 D) | 모듈 맵은 샘플이 올라가 있으면 직접 호출한 ListModules(읽기 전용, 죽은 디버거를 재기동하지 않음), 아니면 manifest의 `module_map.raw`다. 샘플 모듈에는 PE ImageBase를 preferred base로 넣는다. export는 SaveDatabase → host 복사(`artifacts/ida_sync.dd64`) → `artifacts/ida_sync.json`(0600)이고, 세션이 없으면 수집된 DB를 쓴다. import는 live 맵이 있어야 하고 `CommentOrLabelAtAddress`(Label/Comment)를 proxy로 호출한다. | `test_app_ida.py`(fake lab). 실제 x64dbg DB 형식은 `ida_sync` 문서의 가정을 따른다. |
+| DB 압축 | `guest/provision.ps1`이 디버거 exe 옆의 ini(`x64dbg.ini`, `x32dbg.ini`)의 `[Engine]`에 `DisableDatabaseCompression=1`을 쓴다. 파일·섹션·키가 없으면 만들고 다른 줄은 보존한다. LZ4 DB는 `DATABASE_FORMAT`으로 거부하고 hint가 이 설정을 가리킨다. | **가정**: ini 파일 이름(exe 이름 기준)과 키 이름. 실 VM에서 확인해야 한다. 실행 중인 x64dbg가 종료할 때 설정을 덮어쓸 수 있다(재부팅으로 반영되는지 확인 필요). |
+| CLI 프로비저닝 | `provision`/`install-plugin`은 jobs root 잠금을 먼저 잡고(실행 중인 gateway 검출), supervisor를 멈추고 VmOpLock 쓰기 락을 쥔 채 실행한다. 플러그인 설치(또는 프로비저닝 재부팅) 뒤에는 모든 백엔드 epoch를 올리고 캐시된 클라이언트·토큰을 버린다. | 같은 프로세스 안의 VM 작업과만 직렬화된다. 다른 프로세스의 gateway는 jobs root 잠금으로 막는다. |

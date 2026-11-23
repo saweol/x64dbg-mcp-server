@@ -27,20 +27,34 @@ Hard rules enforced here (not delegated to the MCP client):
 Recovery after a gateway restart (``recover_scan`` flags live jobs with
 ``needs_recovery``; nothing is resumed automatically): a job left COLLECTING is
 collected again by ``analysis_collect``, a job left REVERTING is finished by
-``analysis_finish`` (the revert is redone), ANALYZING / COLLECTED(_PARTIAL) /
-DISCARDED jobs continue normally, and jobs interrupted while starting
-(CREATED..LOADING) need a human discard. ``session_status`` lists each with a
-``recovery_hint``.
+``analysis_finish`` (the revert is redone: REVERTING -> REVERTING), ANALYZING /
+COLLECTED(_PARTIAL) / DISCARDED jobs continue normally, and jobs interrupted
+while starting (CREATED..LOADING) need a human discard. ``session_status`` lists
+each with a ``recovery_hint`` and ``next_tool``. ``analysis_finish(revert=False)``
+goes from COLLECTED / DISCARDED straight to DONE.
+
+reload_on_restart: when a mirrored call learns that the job's debugger was
+relaunched (BACKEND_RESTARTED), the sample is loaded again (SetArtifactDir when
+supported, LoadBinary, WaitForPause) before the error is returned, once per
+epoch; ``details.reloaded`` says whether the sample is loaded now.
+
+IDA (plan 6.4, interpretation D): ``ida_rebase`` / ``ida_export_annotations`` /
+``ida_import_annotations`` use ``ida_sync`` with the job's module map (a live
+ListModules while the sample is loaded, else the collected one); the export
+writes ``artifacts/ida_sync.json``, the import sets labels and comments through
+the mirrored ``CommentOrLabelAtAddress``.
 
 Long operations (analysis_start/collect/finish, snapshot and power tools,
-file_download) run on the profile's ``ops.OperationRunner`` and answer
-``{"state": "in_progress"}`` when they outlast ``wait_s``. The runner serialises
-them, so a download can never race with a collection that clears ``raw/extra``.
+file_download, the IDA export/import) run on the profile's
+``ops.OperationRunner`` and answer ``{"state": "in_progress"}`` when they outlast
+``wait_s``. The runner serialises them, so a download can never race with a
+collection that clears ``raw/extra``.
 
 Host layout of a job (``<jobs_root>/<job_id>/``): ``input/sample.bin`` (the
 sample copy that is uploaded), ``screens/`` (screenshots), ``artifacts/``
-(``transfer.collect_artifacts`` output) and ``artifacts/raw/extra/NNNN_<name>``
-for ``file_download``. Because a collection starts by deleting ``raw/extra``,
+(``transfer.collect_artifacts`` output), ``artifacts/raw/extra/NNNN_<name>``
+for ``file_download`` and ``artifacts/ida_sync.json`` / ``ida_sync.dd64|dd32``
+for the IDA export. Because a collection starts by deleting ``raw/extra``,
 earlier downloads are moved to ``artifacts/downloads/`` first.
 
 Thread-safety: every public method may be called from several threads. The

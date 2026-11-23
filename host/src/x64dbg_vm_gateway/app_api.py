@@ -99,13 +99,28 @@ class GatewayApp(Protocol):
     # ── IDA integration (interpretation D) ──────────────────────────
     def ida_rebase(self, address: str | int, *, direction: str, module: str | None = None,
                    ida_imagebase: str | int | None = None, job_id: str | None = None) -> JSON:
-        """direction in {"runtime_to_ida", "ida_to_runtime", "runtime_to_rva", "rva_to_runtime"}."""
+        """direction in {"runtime_to_ida", "ida_to_runtime", "runtime_to_rva", "rva_to_runtime"}.
+
+        ``ida_sync.rebase`` result plus ``job_id`` and ``module_map_source`` ("live":
+        ListModules of the job's debugger; "manifest": the collected map). Raises
+        InvalidArgument for a bad address/module/direction, StateViolation without a map."""
         ...
 
-    def ida_export_annotations(self, job_id: str | None = None) -> JSON: ...
+    def ida_export_annotations(self, job_id: str | None = None) -> JSON:
+        """SaveDatabase, copy it to the host, write ``<job>/artifacts/ida_sync.json``
+        (x64dbg-ida-sync/1). {"host_path", "modules", "items", "counts", "database",
+        "module_map_source", "skipped", "warnings", "steps"}. DatabaseFormatError for an
+        unreadable (e.g. LZ4-compressed) database. Long operation (may answer in_progress)."""
+        ...
+
     def ida_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
                                ida_imagebase: str | int | None = None,
-                               job_id: str | None = None) -> JSON: ...
+                               job_id: str | None = None) -> JSON:
+        """Items ``{rva | ida_address, name?, comment?}`` (ida_sync.plan_import_report) are
+        set in the live debugger with CommentOrLabelAtAddress. {"applied", "failed",
+        "not_attempted", "operations", "items", "failures", "skipped", "warnings", ...}.
+        Long operation (may answer in_progress)."""
+        ...
 
     # ── jobs (read-only views of the serving gateway's job store) ───
     def list_jobs(self, profile: str | None = None) -> JSON:
