@@ -80,8 +80,8 @@ def test_direct_dependencies_have_a_lower_bound_the_lock_satisfies(name):
 
 def test_uv_lock_was_regenerated_for_the_declared_dependencies():
     (root,) = [p for p in _lock()["package"] if p["name"] == "x64dbg-vm-gateway"]
-    locked = {(canonicalize_name(d["name"]), d.get("specifier", "")) for d in root["metadata"]["requires-dist"]
-              if "marker" not in d}
+    requires = root["metadata"]["requires-dist"]
+    locked = {(canonicalize_name(d["name"]), d.get("specifier", "")) for d in requires if "marker" not in d}
     declared = {(n, str(r.specifier)) for n, r in _requirements().items()}
     assert {(n, frozenset(s.split(","))) for n, s in locked} == \
         {(n, frozenset(s.split(","))) for n, s in declared}
