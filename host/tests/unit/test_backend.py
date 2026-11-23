@@ -423,6 +423,41 @@ def test_cancel_while_connect_is_pending():
         lsock.close()
 
 
+def test_pending_connect_notices_cancel_flag_without_shutdown():
+    """The connect wait polls the cancel flag itself.
+
+    On Linux shutdown() also aborts a SYN_SENT socket, but that is not portable;
+    here only the flag is set (no shutdown) and the wait must still end promptly.
+    """
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(0)
+    port = lsock.getsockname()[1]
+    fillers = []
+    for _ in range(4):
+        f = socket.socket()
+        f.setblocking(False)
+        f.connect_ex(("127.0.0.1", port))
+        fillers.append(f)
+    sock = socket.socket()
+    sock.setblocking(False)
+    try:
+        sock.connect_ex(("127.0.0.1", port))
+        call = backend_mod._InFlight()
+        threading.Timer(0.2, lambda: setattr(call, "cancelled", True)).start()
+        t0 = time.monotonic()
+        with pytest.raises(backend_mod._Cancelled):
+            backend_mod._wait_connected(sock, call, time.monotonic() + 10)
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        sock.close()
+        for f in fillers:
+            f.close()
+        lsock.close()
+
+
 def test_update_token(server):
     c = make_client(server.url, token="old-wrong")
     with pytest.raises(BackendAuthError):
