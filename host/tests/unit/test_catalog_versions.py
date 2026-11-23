@@ -54,7 +54,8 @@ def test_a_backend_uses_the_builtin_of_its_version(cat):
     assert cat.set_server_version("x64", "1.10") is False  # unchanged
     assert cat.builtin_version("x64") == "1.10"
     assert cat.is_read_only("GetServerInfo", "x64") is True
-    assert cat.tool("SetArtifactDir", "x64") is not None and cat.is_read_only("SetArtifactDir", "x64") is False
+    assert cat.tool("SetArtifactDir", "x64") is not None
+    assert cat.is_read_only("SetArtifactDir", "x64") is False
     assert len(cat.tools("x64")) == 82
     # another backend keeps the default
     assert cat.tool("GetServerInfo", "x32") is None and len(cat.tools("x32")) == 80

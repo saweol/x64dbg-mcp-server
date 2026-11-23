@@ -998,7 +998,8 @@ class Gateway(GatewayApp):
                 version = rt.refresh_catalog(bid, force=True)
                 return True, f"live tool list v{version}: {len(rt.catalog.tools(bid))} tools", None
             version = rt.catalog.server_version(bid)
-            where = f"cached list v{version}" if version else "builtin list v1.9"
+            builtin = f"builtin list v{rt.catalog.builtin_version(bid)}"
+            where = f"cached list v{version}" if version else builtin
             return True, f"{where}: {len(rt.catalog.tools(bid))} tools (backend not checked live)", None
 
         check(f"catalog:{bid}", catalog)
