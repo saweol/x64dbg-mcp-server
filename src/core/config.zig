@@ -4,6 +4,11 @@
 const std = @import("std");
 const bridge = @import("bridge.zig");
 const mcp = @import("mcp_server.zig");
+const cfgjson = @import("cfgjson.zig");
+const netpolicy = @import("netpolicy.zig");
+const pathutil = @import("pathutil.zig");
+const sync = @import("sync.zig");
+const tools = @import("../mcp/tools.zig");
 
 // ── Win32 types ────────────────────────────────────────────────────
 const HWND = ?*anyopaque;
@@ -75,6 +80,13 @@ extern "kernel32" fn CreateThread(sa: ?*anyopaque, stackSize: usize, startAddr: 
 extern "kernel32" fn GlobalAlloc(uFlags: u32, dwBytes: usize) callconv(.winapi) HANDLE;
 extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.winapi) ?[*]u8;
 extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn GetFileSizeEx(h: ?*anyopaque, size: *i64) callconv(.winapi) BOOL;
+extern "kernel32" fn MoveFileExA(existing: [*:0]const u8, new: [*:0]const u8, flags: u32) callconv(.winapi) BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
 const MSG = extern struct {
     hwnd: HWND,
@@ -139,8 +151,6 @@ const CF_TEXT: u32 = 1;
 const GMEM_MOVEABLE: u32 = 0x0002;
 const WHITE_BRUSH: c_int = 0;
 
-extern "advapi32" fn SystemFunction036(buf: [*]u8, len: u32) callconv(.winapi) u8;
-
 // ── DPI awareness (runtime-resolved for Win7/8 compat) ─────────────
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
@@ -190,37 +200,56 @@ fn sd(design: c_int, dpi: u32) c_int {
     return @intCast(@divTrunc(@as(i64, design) * dpi, USER_DEFAULT_SCREEN_DPI));
 }
 
-fn generateToken(buf: *[32]u8) void {
-    var raw: [16]u8 = undefined;
-    _ = SystemFunction036(&raw, 16);
-    const hex = "0123456789abcdef";
-    for (raw, 0..) |b, i| {
-        buf[i * 2] = hex[b >> 4];
-        buf[i * 2 + 1] = hex[b & 0x0f];
-    }
+/// RtlGenRandom (SystemFunction036); false when it fails.
+fn osRandom(buf: []u8) bool {
+    std.os.windows.RtlGenRandom(buf) catch return false;
+    return true;
+}
+
+/// Generates a 32-character hex token. False when the OS random source
+/// failed; the caller must then not store any token.
+fn generateToken(buf: *[cfgjson.GENERATED_TOKEN_LEN]u8) bool {
+    return cfgjson.generateToken(osRandom, buf);
 }
 
 // ── Config data ────────────────────────────────────────────────────
-pub const Config = struct {
-    ip: [64]u8 = undefined,
-    ip_len: usize = 0,
-    port: u16 = 0,
-    auto_start: bool = true,
-    auth_token: [64]u8 = undefined,
-    auth_token_len: usize = 0,
+//
+// mcp_config.json is parsed and written by cfgjson.zig (std.json, no
+// fixed-size buffers). The dialog edits the four v1.9 fields; every other
+// key (AllowExternal, AllowedClients, MaxClients, EnableSse, ArtifactDir,
+// AuthMaxFailures, AuthLockoutSeconds and unknown keys) is file-only and is
+// preserved when the dialog saves.
+//
+// Thread-safety: load()/save() are serialised by `file_lock` (they run on
+// the plugin setup thread and on the dialog thread).
 
-    pub fn ipSlice(self: *const Config) []const u8 {
-        return self.ip[0..self.ip_len];
-    }
+pub const LoadStatus = enum {
+    /// File parsed (a missing AuthToken was generated and saved).
+    ok,
+    /// No file existed; defaults with a fresh token were written.
+    created,
+    /// The file exists but could not be read or parsed. Defaults are
+    /// returned, the file is left untouched and the server must not start.
+    invalid,
+};
 
-    pub fn tokenSlice(self: *const Config) []const u8 {
-        return self.auth_token[0..self.auth_token_len];
-    }
+pub const Loaded = struct {
+    owned: cfgjson.Owned,
+    status: LoadStatus,
+    /// Static description of why the file is invalid ("" otherwise).
+    problem: []const u8 = "",
 
-    pub fn hasAuth(self: *const Config) bool {
-        return self.auth_token_len > 0;
+    pub fn deinit(self: *Loaded) void {
+        self.owned.deinit();
     }
 };
+
+const config_allocator = std.heap.page_allocator;
+var file_lock: sync.RwLock = .{};
+
+pub fn defaultPort() u16 {
+    return if (@sizeOf(usize) == 8) 9094 else 9095;
+}
 
 var config_path: [512]u8 = undefined;
 var config_path_len: usize = 0;
@@ -230,7 +259,7 @@ fn getConfigPath() [*:0]const u8 {
 
     var module_path: [512]u8 = undefined;
     const len = GetModuleFileNameA(null, &module_path, 512);
-    if (len == 0) {
+    if (len == 0 or len >= 512) {
         const fallback = "mcp_config.json";
         @memcpy(config_path[0..fallback.len], fallback);
         config_path[fallback.len] = 0;
@@ -245,6 +274,12 @@ fn getConfigPath() [*:0]const u8 {
     }
 
     const filename = "mcp_config.json";
+    if (last_sep + 1 + filename.len + 1 > config_path.len) {
+        @memcpy(config_path[0..filename.len], filename);
+        config_path[filename.len] = 0;
+        config_path_len = filename.len;
+        return @ptrCast(&config_path);
+    }
     @memcpy(config_path[0 .. last_sep + 1], module_path[0 .. last_sep + 1]);
     @memcpy(config_path[last_sep + 1 .. last_sep + 1 + filename.len], filename);
     config_path[last_sep + 1 + filename.len] = 0;
@@ -252,119 +287,128 @@ fn getConfigPath() [*:0]const u8 {
     return @ptrCast(&config_path);
 }
 
-pub fn load() Config {
-    const default_port: u16 = if (@sizeOf(usize) == 8) 9094 else 9095;
-    var cfg = Config{ .port = default_port };
-    const default_ip = "127.0.0.1";
-    @memcpy(cfg.ip[0..default_ip.len], default_ip);
-    cfg.ip_len = default_ip.len;
+const ReadError = error{ FileNotFound, TooLarge, ReadFailed, OutOfMemory };
 
-    const path = getConfigPath();
-    const h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
-    if (h == INVALID_HANDLE or h == null) return ensureToken(&cfg);
+/// Reads the whole config file into a heap buffer owned by the caller.
+fn readConfigFile(allocator: std.mem.Allocator) ReadError![]u8 {
+    const h = CreateFileA(getConfigPath(), GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == INVALID_HANDLE or h == null) {
+        const err = GetLastError();
+        return if (err == ERROR_FILE_NOT_FOUND or err == ERROR_PATH_NOT_FOUND) error.FileNotFound else error.ReadFailed;
+    }
     defer _ = CloseHandle(h);
 
+    var size: i64 = 0;
+    if (GetFileSizeEx(h, &size) == 0 or size < 0) return error.ReadFailed;
+    if (size > cfgjson.MAX_CONFIG_BYTES) return error.TooLarge;
+    const total: usize = @intCast(size);
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    var got: usize = 0;
+    while (got < total) {
+        var n: u32 = 0;
+        if (ReadFile(h, buf[got..].ptr, @intCast(total - got), &n, null) == 0) return error.ReadFailed;
+        if (n == 0) break;
+        got += n;
+    }
+    return buf[0..got];
+}
+
+/// Stores a freshly generated token in `owned`. False (token left as it
+/// was) when no random token could be generated.
+fn generateTokenInto(owned: *cfgjson.Owned) bool {
+    var tok: [cfgjson.GENERATED_TOKEN_LEN]u8 = undefined;
+    if (!generateToken(&tok)) {
+        logLine("Could not generate a random AuthToken (RtlGenRandom failed).", .{});
+        return false;
+    }
+    owned.config.auth_token = owned.dupe(&tok) catch return false;
+    return true;
+}
+
+fn logLine(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    var bytes_read: u32 = 0;
-    if (ReadFile(h, &buf, 512, &bytes_read, null) == 0) return ensureToken(&cfg);
-
-    const json_data = buf[0..bytes_read];
-
-    // Parse "IpAddress":"<value>"
-    if (findJsonString(json_data, "IpAddress")) |ip_val| {
-        if (ip_val.len > 0 and ip_val.len < 64) {
-            @memcpy(cfg.ip[0..ip_val.len], ip_val);
-            cfg.ip_len = ip_val.len;
-        }
-    }
-
-    // Parse "Port":<number>
-    if (findJsonNumber(json_data, "Port")) |port_val| {
-        cfg.port = port_val;
-    }
-
-    // Parse "AutoStart":true/false
-    if (findJsonBool(json_data, "AutoStart")) |val| {
-        cfg.auto_start = val;
-    }
-
-    // Parse "AuthToken":"<value>"
-    if (findJsonString(json_data, "AuthToken")) |token_val| {
-        if (token_val.len > 0 and token_val.len <= 64) {
-            @memcpy(cfg.auth_token[0..token_val.len], token_val);
-            cfg.auth_token_len = token_val.len;
-        }
-    }
-
-    return ensureToken(&cfg);
+    const s = std.fmt.bufPrintZ(&buf, "[x64dbg-MCP Server] " ++ fmt, args) catch return;
+    bridge.logPuts(s.ptr);
 }
 
-fn ensureToken(cfg: *Config) Config {
-    if (cfg.auth_token_len == 0) {
-        var tok: [32]u8 = undefined;
-        generateToken(&tok);
-        @memcpy(cfg.auth_token[0..32], tok[0..32]);
-        cfg.auth_token_len = 32;
-        save(cfg);
-    }
-    return cfg.*;
+fn invalidLoaded(problem: []const u8) Loaded {
+    return .{ .owned = cfgjson.initDefault(config_allocator, defaultPort()), .status = .invalid, .problem = problem };
 }
 
-fn findJsonString(data: []const u8, key: []const u8) ?[]const u8 {
-    // Search for "key":"value"
-    var i: usize = 0;
-    while (i + key.len + 4 < data.len) : (i += 1) {
-        if (data[i] == '"' and i + 1 + key.len < data.len and
-            std.mem.eql(u8, data[i + 1 .. i + 1 + key.len], key) and
-            data[i + 1 + key.len] == '"')
-        {
-            var j = i + 2 + key.len;
-            while (j < data.len and (data[j] == ':' or data[j] == ' ')) j += 1;
-            if (j < data.len and data[j] == '"') {
-                j += 1;
-                const val_start = j;
-                while (j < data.len and data[j] != '"') j += 1;
-                return data[val_start..j];
-            }
+/// Loads mcp_config.json (next to the x64dbg executable).
+pub fn load() Loaded {
+    file_lock.lock();
+    defer file_lock.unlock();
+
+    const text = readConfigFile(config_allocator) catch |err| switch (err) {
+        error.FileNotFound => {
+            var owned = cfgjson.initDefault(config_allocator, defaultPort());
+            // Without a token the server refuses to start (MissingToken), so
+            // do not write a file that would look configured.
+            if (generateTokenInto(&owned) and !saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
+            return .{ .owned = owned, .status = .created };
+        },
+        error.TooLarge => {
+            logLine("mcp_config.json is larger than 64 KiB; ignoring it.", .{});
+            return invalidLoaded("the file is larger than 64 KiB");
+        },
+        error.ReadFailed, error.OutOfMemory => {
+            logLine("mcp_config.json could not be read.", .{});
+            return invalidLoaded("the file could not be read");
+        },
+    };
+    defer config_allocator.free(text);
+
+    var diag: cfgjson.Diagnostic = .{};
+    var owned = cfgjson.parse(config_allocator, text, defaultPort(), &diag) catch |err| {
+        if (diag.key.len > 0) {
+            logLine("mcp_config.json: \"{s}\" {s}.", .{ diag.key, diag.reason });
+        } else {
+            logLine("mcp_config.json is invalid ({s}: {s}).", .{ @errorName(err), diag.reason });
         }
+        return invalidLoaded(if (diag.reason.len > 0) diag.reason else "the file is not valid");
+    };
+    if (owned.config.auth_token.len == 0) {
+        if (generateTokenInto(&owned) and !saveLocked(&owned.config)) logLine("Could not write mcp_config.json.", .{});
     }
-    return null;
+    return .{ .owned = owned, .status = .ok };
 }
 
-fn findJsonNumber(data: []const u8, key: []const u8) ?u16 {
-    // Search for "key":<number>
-    var i: usize = 0;
-    while (i + key.len + 3 < data.len) : (i += 1) {
-        if (data[i] == '"' and i + 1 + key.len < data.len and
-            std.mem.eql(u8, data[i + 1 .. i + 1 + key.len], key) and
-            data[i + 1 + key.len] == '"')
-        {
-            var j = i + 2 + key.len;
-            while (j < data.len and (data[j] == ':' or data[j] == ' ')) j += 1;
-            const num_start = j;
-            while (j < data.len and data[j] >= '0' and data[j] <= '9') j += 1;
-            if (j > num_start) {
-                return parsePort(data[num_start..j]);
-            }
-        }
-    }
-    return null;
+/// Writes the config atomically (temp file + MoveFileEx). Returns false on
+/// failure; the previous file is then left as it was.
+pub fn save(cfg: *const cfgjson.Config) bool {
+    file_lock.lock();
+    defer file_lock.unlock();
+    return saveLocked(cfg);
 }
 
-fn findJsonBool(data: []const u8, key: []const u8) ?bool {
-    var i: usize = 0;
-    while (i + key.len + 3 < data.len) : (i += 1) {
-        if (data[i] == '"' and i + 1 + key.len < data.len and
-            std.mem.eql(u8, data[i + 1 .. i + 1 + key.len], key) and
-            data[i + 1 + key.len] == '"')
-        {
-            var j = i + 2 + key.len;
-            while (j < data.len and (data[j] == ':' or data[j] == ' ')) j += 1;
-            if (j + 4 <= data.len and std.mem.eql(u8, data[j .. j + 4], "true")) return true;
-            if (j + 5 <= data.len and std.mem.eql(u8, data[j .. j + 5], "false")) return false;
-        }
+fn saveLocked(cfg: *const cfgjson.Config) bool {
+    const text = cfgjson.serialize(config_allocator, cfg) catch return false;
+    defer config_allocator.free(text);
+
+    const path = getConfigPath();
+    var tmp_buf: [config_path.len + 8]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{std.mem.span(path)}) catch return false;
+
+    {
+        const h = CreateFileA(tmp.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+        if (h == INVALID_HANDLE or h == null) return false;
+        defer _ = CloseHandle(h);
+        var written: u32 = 0;
+        if (WriteFile(h, text.ptr, @intCast(text.len), &written, null) == 0 or written != text.len) return false;
     }
-    return null;
+    return MoveFileExA(tmp.ptr, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+/// Pushes a configuration into the running plugin (server settings and the
+/// runtime ArtifactDir). The server picks the settings up on its next start.
+pub fn applyToRuntime(cfg: *const cfgjson.Config) void {
+    mcp.applyConfig(cfg);
+    tools.artifact_dir.set(cfg.artifact_dir) catch |err| {
+        logLine("ArtifactDir ignored: {s}.", .{pathutil.describe(err)});
+    };
 }
 
 fn parsePort(s: []const u8) ?u16 {
@@ -376,46 +420,6 @@ fn parsePort(s: []const u8) ?u16 {
     }
     if (val == 0) return null;
     return @intCast(val);
-}
-
-pub fn save(cfg: *const Config) void {
-    const path = getConfigPath();
-    const h = CreateFileA(path, GENERIC_WRITE, 0, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
-    if (h == INVALID_HANDLE or h == null) return;
-    defer _ = CloseHandle(h);
-
-    var buf: [384]u8 = undefined;
-    const prefix = "{\"IpAddress\":\"";
-    @memcpy(buf[0..prefix.len], prefix);
-    var pos: usize = prefix.len;
-    @memcpy(buf[pos .. pos + cfg.ip_len], cfg.ip[0..cfg.ip_len]);
-    pos += cfg.ip_len;
-    const mid = "\",\"Port\":";
-    @memcpy(buf[pos .. pos + mid.len], mid);
-    pos += mid.len;
-    var port_buf: [6]u8 = undefined;
-    const port_len = fmtU16(cfg.port, &port_buf);
-    @memcpy(buf[pos .. pos + port_len], port_buf[0..port_len]);
-    pos += port_len;
-    const auto_str = if (cfg.auto_start) ",\"AutoStart\":true" else ",\"AutoStart\":false";
-    @memcpy(buf[pos .. pos + auto_str.len], auto_str);
-    pos += auto_str.len;
-
-    if (cfg.auth_token_len > 0) {
-        const tok_prefix = ",\"AuthToken\":\"";
-        @memcpy(buf[pos .. pos + tok_prefix.len], tok_prefix);
-        pos += tok_prefix.len;
-        @memcpy(buf[pos .. pos + cfg.auth_token_len], cfg.auth_token[0..cfg.auth_token_len]);
-        pos += cfg.auth_token_len;
-        buf[pos] = '"';
-        pos += 1;
-    }
-
-    buf[pos] = '}';
-    pos += 1;
-
-    var written: u32 = 0;
-    _ = WriteFile(h, &buf, @intCast(pos), &written, null);
 }
 
 fn fmtU16(val: u16, buf: *[6]u8) usize {
@@ -450,6 +454,9 @@ var ui_font_bold: HFONT = null;
 var ui_font_small: HFONT = null;
 var class_registered: bool = false;
 var parent_hwnd: HWND = null;
+/// Config loaded when the dialog opened; kept so Save preserves the
+/// file-only keys. Only touched by the dialog thread.
+var dialog_cfg: ?Loaded = null;
 
 const DLG_W = 450;
 const DLG_H = 370;
@@ -564,7 +571,9 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
     switch (msg) {
         WM_CREATE => {
             dlg_hwnd = hwnd;
-            const cfg = load();
+            if (dialog_cfg) |*old| old.deinit();
+            dialog_cfg = load();
+            const cfg = &dialog_cfg.?.owned.config;
 
             // Use the actual monitor DPI for the window we just created.
             cur_dpi = getDpiForWindow(hwnd);
@@ -607,7 +616,7 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
 
             // Help notes
             const notes = createCtrl("STATIC\x00",
-                "Use 0.0.0.0 to listen on all interfaces (for WSL/remote access).\r\nUse 127.0.0.1 for local-only access.\r\nSave will automatically restart the MCP server.\x00",
+                "127.0.0.1 = local only (default). Any other bind address\r\nneeds AllowExternal + AllowedClients in mcp_config.json.\r\nSave will automatically restart the MCP server.\x00",
                 0, 20, 210, 400, 52, 0);
             if (notes != null and ui_font_small != null)
                 _ = SendMessageA(notes, WM_SETFONT, @intFromPtr(ui_font_small.?), 1);
@@ -617,9 +626,10 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
             _ = createCtrl("BUTTON\x00", "Cancel\x00", WS_TABSTOP, 340, 280, 90, 30, IDC_CANCEL);
             // Set initial values
             if (edit_ip != null) {
-                var ip_z: [65]u8 = undefined;
-                @memcpy(ip_z[0..cfg.ip_len], cfg.ip[0..cfg.ip_len]);
-                ip_z[cfg.ip_len] = 0;
+                var ip_z: [cfgjson.MAX_IP_LEN + 1]u8 = undefined;
+                const n = @min(cfg.ip_address.len, cfgjson.MAX_IP_LEN);
+                @memcpy(ip_z[0..n], cfg.ip_address[0..n]);
+                ip_z[n] = 0;
                 _ = SendMessageA(edit_ip, WM_SETTEXT, 0, @bitCast(@intFromPtr(&ip_z)));
             }
             if (edit_port != null) {
@@ -628,15 +638,22 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
                 port_buf[port_len] = 0;
                 _ = SendMessageA(edit_port, WM_SETTEXT, 0, @bitCast(@intFromPtr(&port_buf)));
             }
-            if (edit_token != null and cfg.auth_token_len > 0) {
-                var tok_z: [65]u8 = undefined;
-                @memcpy(tok_z[0..cfg.auth_token_len], cfg.auth_token[0..cfg.auth_token_len]);
-                tok_z[cfg.auth_token_len] = 0;
+            if (edit_token != null and cfg.auth_token.len > 0) {
+                var tok_z: [cfgjson.MAX_TOKEN_LEN + 1]u8 = undefined;
+                const n = @min(cfg.auth_token.len, cfgjson.MAX_TOKEN_LEN);
+                @memcpy(tok_z[0..n], cfg.auth_token[0..n]);
+                tok_z[n] = 0;
                 _ = SendMessageA(edit_token, WM_SETTEXT, 0, @bitCast(@intFromPtr(&tok_z)));
             }
             updateUrlPreview();
 
             if (edit_ip != null) _ = SetFocus(edit_ip);
+
+            if (dialog_cfg.?.status == .invalid) {
+                var msg_buf: [256]u8 = undefined;
+                const text = std.fmt.bufPrintZ(&msg_buf, "mcp_config.json could not be loaded ({s}).\r\nSaving here replaces it with a new file containing these settings.", .{dialog_cfg.?.problem}) catch "mcp_config.json could not be loaded.";
+                _ = MessageBoxA(hwnd, text.ptr, "MCP Server Configuration\x00", 0x30);
+            }
             return 0;
         },
         WM_COMMAND => {
@@ -654,19 +671,21 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
             }
             if (id == IDC_GENERATE and notify == BN_CLICKED) {
                 if (edit_token != null) {
-                    var tok: [32]u8 = undefined;
-                    generateToken(&tok);
-                    var tok_z: [33]u8 = undefined;
-                    @memcpy(tok_z[0..32], tok[0..32]);
-                    tok_z[32] = 0;
+                    var tok_z: [cfgjson.GENERATED_TOKEN_LEN + 1]u8 = undefined;
+                    if (!generateToken(tok_z[0..cfgjson.GENERATED_TOKEN_LEN])) {
+                        _ = MessageBoxA(hwnd, "Could not generate a random token (the Windows random source failed). The current token is unchanged.\x00", "MCP Server Configuration\x00", 0x10);
+                        return 0;
+                    }
+                    tok_z[cfgjson.GENERATED_TOKEN_LEN] = 0;
                     _ = SendMessageA(edit_token, WM_SETTEXT, 0, @bitCast(@intFromPtr(&tok_z)));
                 }
                 return 0;
             }
             if (id == IDC_COPY_TOKEN and notify == BN_CLICKED) {
                 if (edit_token != null) {
-                    var tbuf: [64]u8 = undefined;
-                    const tlen: usize = @intCast(GetWindowTextA(edit_token, &tbuf, 64));
+                    // nMaxCount includes the NUL, so 64-char tokens need 65.
+                    var tbuf: [cfgjson.MAX_TOKEN_LEN + 1]u8 = undefined;
+                    const tlen: usize = @intCast(GetWindowTextA(edit_token, &tbuf, tbuf.len));
                     if (tlen > 0) {
                         if (OpenClipboard(hwnd) != 0) {
                             _ = EmptyClipboard();
@@ -726,6 +745,8 @@ fn wndProc(hwnd: HWND, msg: u32, wParam: WPARAM, lParam: LPARAM) callconv(.winap
         },
         WM_DESTROY => {
             dlg_hwnd = null;
+            if (dialog_cfg) |*d| d.deinit();
+            dialog_cfg = null;
             PostQuitMessage(0);
             return 0;
         },
@@ -779,8 +800,9 @@ fn updateUrlPreview() void {
     var pos: usize = prefix.len;
 
     if (ip_len == 0) {
-        @memcpy(url[pos .. pos + 7], "0.0.0.0");
-        pos += 7;
+        // An empty address is rejected on Save (it no longer means 0.0.0.0).
+        url[pos] = '?';
+        pos += 1;
     } else {
         @memcpy(url[pos .. pos + ip_len], ip_buf[0..ip_len]);
         pos += ip_len;
@@ -805,13 +827,20 @@ fn updateUrlPreview() void {
 }
 
 fn onSave(hwnd: HWND) void {
-    var ip_buf: [64]u8 = undefined;
-    const ip_len: usize = @intCast(GetWindowTextA(edit_ip, &ip_buf, 64));
+    var ip_buf: [cfgjson.MAX_IP_LEN + 1]u8 = undefined;
+    const ip_len: usize = @intCast(GetWindowTextA(edit_ip, &ip_buf, ip_buf.len));
+    const ip = ip_buf[0..ip_len];
 
     if (ip_len == 0) {
         _ = MessageBoxA(hwnd, "IP address cannot be empty.\x00", "Validation Error\x00", 0x30);
         return;
     }
+    // The server refuses to start on an unparsable address (fail closed), so
+    // catch typos here instead of silently binding nothing.
+    _ = netpolicy.parseIpv4(ip) catch {
+        _ = MessageBoxA(hwnd, "IP address must be a dotted IPv4 address such as 127.0.0.1.\x00", "Validation Error\x00", 0x30);
+        return;
+    };
 
     var port_buf: [8]u8 = undefined;
     const port_len: usize = @intCast(GetWindowTextA(edit_port, &port_buf, 8));
@@ -825,23 +854,55 @@ fn onSave(hwnd: HWND) void {
     else
         true;
 
-    var tok_buf: [64]u8 = undefined;
+    var tok_buf: [cfgjson.MAX_TOKEN_LEN + 1]u8 = undefined;
     const tok_len: usize = if (edit_token != null)
-        @intCast(GetWindowTextA(edit_token, &tok_buf, 64))
+        @intCast(GetWindowTextA(edit_token, &tok_buf, tok_buf.len))
     else
         0;
 
-    var cfg = Config{ .port = port, .auto_start = auto_start };
-    @memcpy(cfg.ip[0..ip_len], ip_buf[0..ip_len]);
-    cfg.ip_len = ip_len;
-    if (tok_len > 0) {
-        @memcpy(cfg.auth_token[0..tok_len], tok_buf[0..tok_len]);
+    // The token box is read-only, but validate anyway: never save a file
+    // that the loader would reject (that would stop the server from
+    // starting on the next x64dbg launch).
+    const tok = tok_buf[0..tok_len];
+    if (tok_len > 0 and !cfgjson.isValidToken(tok)) {
+        _ = MessageBoxA(hwnd, "Auth token must be 1-64 characters without control characters or leading/trailing spaces. Click Generate for a new one.\x00", "Validation Error\x00", 0x30);
+        return;
     }
-    cfg.auth_token_len = tok_len;
-    save(&cfg);
+
+    if (dialog_cfg == null) dialog_cfg = load();
+    const loaded = &dialog_cfg.?;
+    const cfg = &loaded.owned.config;
+    cfg.ip_address = loaded.owned.dupe(ip) catch return;
+    cfg.port = port;
+    cfg.auto_start = auto_start;
+    if (tok_len > 0) {
+        cfg.auth_token = loaded.owned.dupe(tok) catch return;
+    } else if (!generateTokenInto(&loaded.owned)) {
+        _ = MessageBoxA(hwnd, "Could not generate a random token (the Windows random source failed). Nothing was saved.\x00", "MCP Server Configuration\x00", 0x10);
+        return;
+    }
+
+    if (!save(cfg)) {
+        _ = MessageBoxA(hwnd, "Could not write mcp_config.json next to the x64dbg executable.\x00", "MCP Server Configuration\x00", 0x10);
+        return;
+    }
+
+    // Same check the server runs at start: warn now instead of letting the
+    // user find a "Refusing to start" line in the log later.
+    var diag: netpolicy.StartupDiag = .{};
+    if (netpolicy.planStartup(.{
+        .ip_address = cfg.ip_address,
+        .allow_external = cfg.allow_external,
+        .allowed_clients = cfg.allowed_clients,
+        .token = cfg.auth_token,
+    }, &diag)) |_| {} else |err| {
+        var msg_buf: [512]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&msg_buf, "{s}\r\nThe settings are saved, but the server will refuse to start until this is fixed in mcp_config.json.", .{netpolicy.describeStartupError(err)}) catch "The settings are saved, but the server will refuse to start (see the log).";
+        _ = MessageBoxA(hwnd, text.ptr, "MCP Server Configuration\x00", 0x30);
+    }
 
     mcp.stop();
-    mcp.setConfig(cfg.ip[0..cfg.ip_len], cfg.port, cfg.tokenSlice());
+    applyToRuntime(cfg);
     if (cfg.auto_start) mcp.start();
 
     bridge.logPuts("[x64dbg-MCP Server] Configuration saved.\x00");

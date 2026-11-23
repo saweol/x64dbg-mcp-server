@@ -60,14 +60,32 @@ pub fn build(b: *std.Build) void {
     b.default_step.dependOn(&install_x32.step);
     b.default_step.dependOn(&install_x64.step);
 
-    // ── Tests (host target, no Win32 deps) ───────────────────────────
+    // ── Tests (host target, no x64dbg / Win32 UI deps) ───────────────
+    // Each file below is pure logic that the plugin wires in; they must not
+    // import bridge.zig or anything that needs x64dbg at runtime.
     const test_step = b.step("test", "Run unit tests");
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/mcp/json.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
-    const run_tests = b.addRunArtifact(unit_tests);
-    test_step.dependOn(&run_tests.step);
+    const test_files = [_][]const u8{
+        "src/mcp/json.zig",
+        "src/mcp/cmdline.zig",
+        "src/mcp/serverinfo.zig",
+        "src/mcp/toolpolicy.zig",
+        "src/core/sync.zig",
+        "src/core/ring.zig",
+        "src/core/netpolicy.zig",
+        "src/core/http.zig",
+        "src/core/cfgjson.zig",
+        "src/core/pathutil.zig",
+        "src/core/launch.zig",
+        "src/core/ssehub.zig",
+    };
+    for (test_files) |path| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
+        const unit_tests = b.addTest(.{ .root_module = test_mod });
+        const run_tests = b.addRunArtifact(unit_tests);
+        test_step.dependOn(&run_tests.step);
+    }
 }

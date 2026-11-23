@@ -8,9 +8,28 @@ const json = @import("json.zig");
 const JsonWriter = json.JsonWriter;
 const main = @import("../main.zig");
 const mcp = @import("../core/mcp_server.zig");
+const pathutil = @import("../core/pathutil.zig");
+const launch = @import("../core/launch.zig");
+const cmdline = @import("cmdline.zig");
+const serverinfo = @import("serverinfo.zig");
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+/// Directory that relative filePath arguments of DumpMemory, DumpModule and
+/// SaveDatabase are resolved against. Set from mcp_config.json (ArtifactDir)
+/// and at runtime by SetArtifactDir. Internally locked.
+pub var artifact_dir: pathutil.ArtifactDirState = .{};
+
+/// Resolves a user-supplied output path (see pathutil.resolve).
+fn resolveOutputPath(buf: *[pathutil.MAX_PATH_LEN]u8, file_path: []const u8) pathutil.Error![]const u8 {
+    var dir_buf: [pathutil.MAX_PATH_LEN]u8 = undefined;
+    const dir = artifact_dir.get(&dir_buf);
+    return pathutil.resolve(buf, dir, file_path);
+}
 
 pub const ToolResult = struct {
     text: []const u8,
@@ -39,8 +58,16 @@ pub const tools = [_]ToolDef{
         .schema_fn = schemaNoParams,
     },
     .{
+        .name = "GetServerInfo",
+        .description = "Identifies this backend: returns JSON {backend, arch (x64/x32), version, pid (of the x64dbg process), debuggee_path, artifact_dir, capabilities, max_chunk}. Always available. Takes no arguments.",
+        .debug_only = false,
+        .read_only = true,
+        .handler = getServerInfo,
+        .schema_fn = schemaNoParams,
+    },
+    .{
         .name = "LoadBinary",
-        .description = "Loads an executable into the debugger for a new debugging session. Equivalent to File > Open in the GUI. If a session is already active it is terminated first. The debuggee pauses at the system breakpoint.",
+        .description = "Loads an executable into the debugger for a new debugging session (optional arguments and working directory). Equivalent to File > Open in the GUI. If a session is already active it is terminated first. Waits until the new session is active and paused (normally at the system breakpoint) or timeoutMs expires.",
         .debug_only = false,
         .read_only = false,
         .handler = loadBinary,
@@ -117,6 +144,14 @@ pub const tools = [_]ToolDef{
         .read_only = true,
         .handler = waitForEvent,
         .schema_fn = schemaWaitForEvent,
+    },
+    .{
+        .name = "SetArtifactDir",
+        .description = "Sets the directory that relative filePath arguments of DumpMemory, DumpModule and SaveDatabase are written to (absolute drive or UNC path, no '..'). An empty path clears it. Runtime only; reloading the configuration restores ArtifactDir from mcp_config.json.",
+        .debug_only = false,
+        .read_only = false,
+        .handler = setArtifactDir,
+        .schema_fn = schemaSetArtifactDir,
     },
 
     // ── Debug-only ──────────────────────────────────────────────
@@ -451,7 +486,7 @@ pub const tools = [_]ToolDef{
     },
     .{
         .name = "DumpMemory",
-        .description = "Saves a memory region to a file on disk.",
+        .description = "Saves a memory region to a file on disk. Relative filePath values are resolved against ArtifactDir.",
         .debug_only = true,
         .read_only = false,
         .handler = dumpMemory,
@@ -579,7 +614,7 @@ pub const tools = [_]ToolDef{
     },
     .{
         .name = "DumpModule",
-        .description = "Dumps an entire loaded module to a file on disk.",
+        .description = "Dumps an entire loaded module to a file on disk. Relative filePath values are resolved against ArtifactDir.",
         .debug_only = true,
         .read_only = false,
         .handler = dumpModule,
@@ -667,11 +702,11 @@ pub const tools = [_]ToolDef{
     },
     .{
         .name = "SaveDatabase",
-        .description = "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions.",
+        .description = "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions. Optional filePath saves to that file instead of the default database location (relative paths resolve against ArtifactDir).",
         .debug_only = true,
         .read_only = false,
         .handler = saveDatabase,
-        .schema_fn = schemaNoParams,
+        .schema_fn = schemaSaveDatabase,
     },
 };
 
@@ -682,7 +717,15 @@ fn schemaNoParams(w: *JsonWriter) void {
 }
 
 fn schemaLoadBinary(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\",\"description\":\"Absolute file path of the executable to debug.\"},\"arguments\":{\"type\":\"string\",\"description\":\"Optional command-line arguments.\",\"default\":\"\"}},\"required\":[\"filePath\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\",\"description\":\"Absolute file path of the executable to debug.\"},\"arguments\":{\"type\":\"string\",\"description\":\"Optional command-line arguments (appended after the quoted executable path). Must not end with a backslash.\",\"default\":\"\"},\"workingDir\":{\"type\":\"string\",\"description\":\"Optional working directory for the debuggee (default: chosen by x64dbg).\",\"default\":\"\"},\"timeoutMs\":{\"type\":\"integer\",\"description\":\"How long to wait for the new session to become active and paused (default 10000, clamped to [1000, 120000]).\",\"default\":10000}},\"required\":[\"filePath\"]}");
+}
+
+fn schemaSetArtifactDir(w: *JsonWriter) void {
+    w.raw("{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute directory (drive or UNC path, no '..'). Empty string clears it.\"}},\"required\":[\"path\"]}");
+}
+
+fn schemaSaveDatabase(w: *JsonWriter) void {
+    w.raw("{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\",\"description\":\"Optional database file path. Relative paths resolve against ArtifactDir; absolute paths are used as-is. Omit it, or pass an empty string, to use the default database location.\"}},\"required\":[]}");
 }
 
 fn schemaExecuteDebuggerCommand(w: *JsonWriter) void {
@@ -810,7 +853,7 @@ fn schemaGetArguments(w: *JsonWriter) void {
 }
 
 fn schemaDumpMemory(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Start address.\"},\"size\":{\"type\":\"integer\",\"description\":\"Bytes to dump.\"},\"filePath\":{\"type\":\"string\",\"description\":\"Output file path on disk.\"}},\"required\":[\"address\",\"size\",\"filePath\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Start address.\"},\"size\":{\"type\":\"integer\",\"description\":\"Bytes to dump.\"},\"filePath\":{\"type\":\"string\",\"description\":\"Output file path. Relative paths resolve against ArtifactDir (see GetServerInfo); absolute paths are used as-is; '..' is rejected.\"}},\"required\":[\"address\",\"size\",\"filePath\"]}");
 }
 
 fn schemaTargetAddr(w: *JsonWriter) void {
@@ -838,7 +881,7 @@ fn schemaThreadOp(w: *JsonWriter) void {
 }
 
 fn schemaDumpModule(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"module\":{\"type\":\"string\",\"description\":\"Module name to dump.\"},\"filePath\":{\"type\":\"string\",\"description\":\"Output file path.\"}},\"required\":[\"module\",\"filePath\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"module\":{\"type\":\"string\",\"description\":\"Module name to dump.\"},\"filePath\":{\"type\":\"string\",\"description\":\"Output file path. Relative paths resolve against ArtifactDir (see GetServerInfo); absolute paths are used as-is; '..' is rejected.\"}},\"required\":[\"module\",\"filePath\"]}");
 }
 
 fn schemaSetExceptionBreakpoint(w: *JsonWriter) void {
@@ -980,7 +1023,9 @@ fn getEventLog(params: ?std.json.Value, out: []u8) ToolResult {
 
     var i: usize = start_idx;
     while (i < total) : (i += 1) {
-        const evt = main.getEvent(i);
+        // Copy out under the event-log lock; never hold a pointer into it.
+        var evt_buf: [main.EVENT_MSG_SIZE]u8 = undefined;
+        const evt = main.copyEvent(i, &evt_buf);
         if (pos + evt.len + 2 > out.len) break;
         @memcpy(out[pos .. pos + evt.len], evt);
         pos += evt.len;
@@ -1043,22 +1088,117 @@ fn getCurrentAddress(_: ?std.json.Value, out: []u8) ToolResult {
     return fmtResult(out, "address: 0x{X}\nmodule: {s}\nlabel: {s}\ncomment: {s}", .{ cip, mod_name, label, comment });
 }
 
+// ── GetServerInfo ───────────────────────────────────────────────────
+fn getServerInfo(_: ?std.json.Value, out: []u8) ToolResult {
+    var dir_buf: [pathutil.MAX_PATH_LEN]u8 = undefined;
+    const dir = artifact_dir.get(&dir_buf);
+    var cur: launch.Launch = .{};
+    main.launch_state.snapshot(&cur);
+    const debuggee: ?[]const u8 = if (bridge.isDebugging() and cur.path_len > 0) cur.path() else null;
+
+    var w = JsonWriter.init(out);
+    serverinfo.write(&w, .{
+        .arch = serverinfo.archName(),
+        .version = mcp.SERVER_VERSION,
+        .pid = std.os.windows.GetCurrentProcessId(),
+        .debuggee_path = debuggee,
+        .artifact_dir = if (dir.len > 0) dir else null,
+    });
+    if (w.overflow) return errResult(out, "Error: server info does not fit in the output buffer.");
+    return .{ .text = w.slice() };
+}
+
+// ── SetArtifactDir ──────────────────────────────────────────────────
+fn dirExists(path: []const u8) bool {
+    var wide: [pathutil.MAX_PATH_LEN + 1]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..pathutil.MAX_PATH_LEN], path) catch return false;
+    wide[n] = 0;
+    const attrs = GetFileAttributesW(wide[0..n :0].ptr);
+    return attrs != INVALID_FILE_ATTRIBUTES and (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+fn setArtifactDir(params: ?std.json.Value, out: []u8) ToolResult {
+    const path = getParamStr(params, "path") orelse
+        return errResult(out, "Error: path is required (use \"\" to clear).");
+    artifact_dir.set(path) catch |err|
+        return fmtErr(out, "Error: invalid ArtifactDir: {s}.", .{pathutil.describe(err)});
+    if (path.len == 0)
+        return result(out, "ArtifactDir cleared. Relative filePath values are passed to x64dbg unchanged.");
+    if (!dirExists(path))
+        return fmtResult(out, "ArtifactDir set to \"{s}\" (warning: the directory does not exist yet; create it before dumping).", .{path});
+    return fmtResult(out, "ArtifactDir set to \"{s}\".", .{path});
+}
+
 // ── LoadBinary ──────────────────────────────────────────────────────
+const LOAD_DEFAULT_TIMEOUT_MS: i64 = 10_000;
+const LOAD_POLL_MS: u32 = 50;
+
+const quote_error_text = "Error: filePath/arguments/workingDir contain text x64dbg cannot quote (control characters, a backslash directly before a double quote, or arguments ending with a backslash).";
+
 fn loadBinary(params: ?std.json.Value, out: []u8) ToolResult {
     const path = getParamStr(params, "filePath") orelse
         return errResult(out, "Error: filePath is required.");
+    const args = getParamStr(params, "arguments") orelse "";
+    const workdir = getParamStr(params, "workingDir") orelse "";
+    var timeout_ms: i64 = LOAD_DEFAULT_TIMEOUT_MS;
+    if (getParamInt(params, "timeoutMs")) |t| timeout_ms = @min(@max(t, 1000), 120000);
 
-    var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "init \"{s}\"\x00", .{path}) catch
-        return errResult(out, "Error: path too long.");
-    _ = bridge.cmdExec(@ptrCast(cmd.ptr));
-    Sleep(500);
+    var cmd_buf: [3 * launch.MAX_LEN + 64]u8 = undefined;
+    const cmd = cmdline.buildInit(&cmd_buf, path, args, workdir) catch |err| return switch (err) {
+        error.Unrepresentable => errResult(out, quote_error_text),
+        error.BufferTooSmall => errResult(out, "Error: filePath/arguments/workingDir too long."),
+    };
+    main.launch_state.setPending(path, args, workdir, main.tickMs()) catch
+        return errResult(out, "Error: filePath/arguments/workingDir too long.");
 
-    if (bridge.isDebugging()) {
-        const cip = bridge.valFromString("cip");
-        return fmtResult(out, "SUCCESS: Binary loaded. Paused at 0x{X}. Use 'run' to continue.", .{cip});
+    const seq_before = main.initDebugSeq();
+    if (!bridge.cmdExec(cmd.ptr)) {
+        main.launch_state.clearPending();
+        return errResult(out, "Error: x64dbg rejected the init command.");
     }
-    return result(out, "Binary init command sent. The debuggee may still be loading.");
+    return waitForNewSession(out, seq_before, timeout_ms, args, workdir);
+}
+
+/// Note appended to a LoadBinary result when x64dbg started the session but
+/// the arguments / working directory were not recorded for RestartDebug
+/// (e.g. x64dbg reported a different executable name).
+fn launchNote(args: []const u8, workdir: []const u8) []const u8 {
+    if (args.len == 0 and workdir.len == 0) return "";
+    var cur: launch.Launch = .{};
+    main.launch_state.snapshot(&cur);
+    if (std.mem.eql(u8, cur.args(), args) and std.mem.eql(u8, cur.workdir(), workdir)) return "";
+    return " Note: x64dbg reported a different executable name, so RestartDebug will not reuse these arguments / working directory.";
+}
+
+/// Waits until a debug session started after `seq_before` is active and
+/// paused (the system breakpoint, normally). Replaces the old fixed
+/// Sleep(500), which raced with slow loads and could report the previous
+/// session as the new one.
+fn waitForNewSession(out: []u8, seq_before: u32, timeout_ms: i64, args: []const u8, workdir: []const u8) ToolResult {
+    const start: i64 = @intCast(GetTickCount64());
+    var started = false;
+    while (true) {
+        const elapsed = @as(i64, @intCast(GetTickCount64())) - start;
+        if (main.initDebugSeq() != seq_before and bridge.isDebugging()) {
+            started = true;
+            if (!bridge.isRunning()) {
+                const pid = bridge.valFromString("$pid");
+                if (pid != 0) {
+                    const cip = bridge.valFromString("cip");
+                    return fmtResult(out, "SUCCESS: Binary loaded. PID {d}, paused at 0x{X} after {d}ms. Use 'run' to continue.{s}", .{ pid, cip, elapsed, launchNote(args, workdir) });
+                }
+            }
+        }
+        if (elapsed >= timeout_ms) break;
+        Sleep(LOAD_POLL_MS);
+    }
+    if (started) {
+        return fmtResult(out, "LOADED_NOT_PAUSED: the debug session started but the target did not pause within {d}ms (system breakpoint disabled in x64dbg's event options?). Call WaitForPause or PauseDebug.{s}", .{ timeout_ms, launchNote(args, workdir) });
+    }
+    // The pending launch is kept: a slow load may still start the session,
+    // and it then keeps its arguments for RestartDebug (it expires after
+    // launch.PENDING_TTL_MS).
+    return fmtErr(out, "Error: no new debug session became active within {d}ms. Check filePath and the x64dbg log, or call WaitForPause if the load is just slow.", .{timeout_ms});
 }
 
 // ── ExecuteDebuggerCommand ──────────────────────────────────────────
@@ -1070,7 +1210,12 @@ const mcp_tool_names = [_][]const u8{
     "SetRegister",      "GetThreads",        "GetImports",        "GetExports",
     "FindPattern",      "GetStrings",        "SearchSymbols",     "EvalExpression",
     "AttachProcess",    "PauseDebug",        "StopDebug",         "RestartDebug",
+    "GetServerInfo",    "SetArtifactDir",
 };
+
+/// How long ExecuteDebuggerCommand waits for a command that resumed the
+/// target to pause again.
+const EXEC_RESUME_WAIT_MS: i64 = 300_000;
 
 fn isMcpToolName(cmd: []const u8) bool {
     for (&mcp_tool_names) |name| {
@@ -1100,13 +1245,16 @@ fn executeDebuggerCommand(params: ?std.json.Value, out: []u8) ToolResult {
     const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
     Sleep(250);
 
-    // If command resumed execution, block until target pauses again (up to 120s)
+    // If command resumed execution, block until target pauses again.
     if (ok and was_paused and bridge.isRunning()) {
         const start = @as(i64, @intCast(GetTickCount64()));
-        const timeout: i64 = 300000;
+        const timeout: i64 = EXEC_RESUME_WAIT_MS;
         while (@as(i64, @intCast(GetTickCount64())) - start < timeout) {
             if (!bridge.isDebugging())
                 return result(out, "Command executed. TARGET_EXITED — debug session ended.");
+            // Nobody is waiting for the answer any more: release the tool lock.
+            if (mcp.requestAbandoned())
+                return result(out, "Command executed. ABANDONED: the client disconnected; stopped waiting. Target still RUNNING.");
             if (!bridge.isRunning()) {
                 const elapsed = @as(i64, @intCast(GetTickCount64())) - start;
                 var pos: usize = 0;
@@ -1117,7 +1265,7 @@ fn executeDebuggerCommand(params: ?std.json.Value, out: []u8) ToolResult {
             }
             Sleep(100);
         }
-        return result(out, "Command executed. Target still RUNNING after 5 minutes. Call run to keep monitoring — do NOT go idle.");
+        return fmtResult(out, "Command executed. Target still RUNNING after {d}ms. Call WaitForPause (or run) to keep monitoring — do NOT go idle.", .{timeout});
     }
 
     var pos: usize = 0;
@@ -1350,6 +1498,9 @@ fn runTarget(params: ?std.json.Value, out: []u8) ToolResult {
     while (@as(i64, @intCast(GetTickCount64())) - start < timeout_ms) {
         if (!bridge.isDebugging())
             return result(out, "TARGET_EXITED. The debug session ended while running.");
+        // Nobody is waiting for the answer any more: release the tool lock.
+        if (mcp.requestAbandoned())
+            return result(out, "ABANDONED: the client disconnected; stopped waiting. Target still RUNNING.");
 
         if (!bridge.isRunning()) {
             const elapsed = @as(i64, @intCast(GetTickCount64())) - start;
@@ -1361,7 +1512,7 @@ fn runTarget(params: ?std.json.Value, out: []u8) ToolResult {
         }
         Sleep(100);
     }
-    return result(out, "TIMEOUT after 5 minutes — target still running. Call run again to keep monitoring — do NOT go idle or ask the user.");
+    return fmtResult(out, "TIMEOUT after {d}ms — target still running. Call run again to keep monitoring — do NOT go idle or ask the user.", .{timeout_ms});
 }
 
 // ── Step context helper ─────────────────────────────────────────────
@@ -1474,25 +1625,33 @@ fn restartDebug(_: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging())
         return errResult(out, "Error: No active debug session.");
 
-    const path = main.getCurrentDebuggeePath();
-    if (path.len == 0)
+    // Repeat the launch with the same arguments / working directory that
+    // LoadBinary used (see core/launch.zig).
+    var cur: launch.Launch = .{};
+    main.launch_state.snapshot(&cur);
+    if (cur.path_len == 0)
         return errResult(out, "Error: Current debuggee path is unknown.");
 
     const old_pid = bridge.valFromString("$pid");
 
-    var cmd_buf: [1024]u8 = undefined;
-    const cmd = std.fmt.bufPrint(
-        &cmd_buf,
-        "init \"{s}\"\x00",
-        .{path},
-    ) catch return errResult(out, "Error: debuggee path too long.");
+    var cmd_buf: [3 * launch.MAX_LEN + 64]u8 = undefined;
+    const cmd = cmdline.buildInit(&cmd_buf, cur.path(), cur.args(), cur.workdir()) catch |err| return switch (err) {
+        error.Unrepresentable => errResult(out, quote_error_text),
+        error.BufferTooSmall => errResult(out, "Error: debuggee path/arguments too long."),
+    };
+    main.launch_state.setPending(cur.path(), cur.args(), cur.workdir(), main.tickMs()) catch
+        return errResult(out, "Error: debuggee path/arguments too long.");
 
-    if (!bridge.cmdExec(@ptrCast(cmd.ptr)))
+    if (!bridge.cmdExec(cmd.ptr)) {
+        main.launch_state.clearPending();
         return errResult(out, "Error: Failed to submit restart command.");
+    }
 
     // A successful restart must result in a different process ID.
     // Allow up to 5 seconds for the old debuggee to terminate and the
-    // replacement process to reach its initial debug break.
+    // replacement process to reach its initial debug break. On timeout the
+    // pending launch is kept (the session may still start; see
+    // core/launch.zig), so a late session keeps its arguments.
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 100) {
         Sleep(100);
@@ -1500,10 +1659,11 @@ fn restartDebug(_: ?std.json.Value, out: []u8) ToolResult {
         if (bridge.isDebugging()) {
             const new_pid = bridge.valFromString("$pid");
             if (new_pid != 0 and new_pid != old_pid) {
+                const kept = if (cur.args_len > 0 or cur.workdir_len > 0) " Arguments and working directory were reused." else "";
                 return fmtResult(
                     out,
-                    "Debug session restarted successfully. PID {d} -> {d}.",
-                    .{ old_pid, new_pid },
+                    "Debug session restarted successfully. PID {d} -> {d}.{s}",
+                    .{ old_pid, new_pid, kept },
                 );
             }
         }
@@ -3093,12 +3253,15 @@ fn dumpMemory(params: ?std.json.Value, out: []u8) ToolResult {
         return errResult(out, "Error: size is required.");
     const file_path = getParamStr(params, "filePath") orelse
         return errResult(out, "Error: filePath is required.");
+    var path_buf: [pathutil.MAX_PATH_LEN]u8 = undefined;
+    const resolved = resolveOutputPath(&path_buf, file_path) catch |err|
+        return fmtErr(out, "Error: invalid filePath: {s}.", .{pathutil.describe(err)});
 
-    var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "savedata \"{s}\", {s}, {d}\x00", .{ file_path, addr_str, size }) catch
-        return errResult(out, "Error: input too long.");
-    const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
-    return fmtResult(out, "{s}", .{if (ok) "Memory dumped to file." else "Failed to dump memory."});
+    var cmd_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
+    const cmd = cmdline.buildSaveData(&cmd_buf, resolved, addr_str, size) catch
+        return errResult(out, "Error: input too long or filePath cannot be quoted.");
+    const ok = bridge.cmdExec(cmd.ptr);
+    return fmtResult(out, "{s} \"{s}\".", .{ if (ok) "Memory dumped to" else "Failed to dump memory to", resolved });
 }
 
 // ── AllocateMemory ────────────────────────────────────────────────
@@ -3495,11 +3658,14 @@ fn dumpModule(params: ?std.json.Value, out: []u8) ToolResult {
         return errResult(out, "Error: module is required.");
     const file_path = getParamStr(params, "filePath") orelse
         return errResult(out, "Error: filePath is required.");
+    var path_buf: [pathutil.MAX_PATH_LEN]u8 = undefined;
+    const resolved = resolveOutputPath(&path_buf, file_path) catch |err|
+        return fmtErr(out, "Error: invalid filePath: {s}.", .{pathutil.describe(err)});
 
-    var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "modexport {s}, \"{s}\"\x00", .{ mod_name, file_path }) catch
-        return errResult(out, "Error: input too long.");
-    const ok = bridge.cmdExecDirect(@ptrCast(cmd.ptr));
+    var cmd_buf: [pathutil.MAX_PATH_LEN + 512]u8 = undefined;
+    const cmd = cmdline.buildModExport(&cmd_buf, mod_name, resolved) catch
+        return errResult(out, "Error: input too long or filePath cannot be quoted.");
+    const ok = bridge.cmdExecDirect(cmd.ptr);
     if (!ok) {
         var base_buf: [128]u8 = undefined;
         const base_expr = std.fmt.bufPrint(&base_buf, "{s}:0\x00", .{mod_name}) catch return errResult(out, "Error: expression too long.");
@@ -3508,13 +3674,16 @@ fn dumpModule(params: ?std.json.Value, out: []u8) ToolResult {
         const mod_size_expr = std.fmt.bufPrint(&cmd_buf, "mod.size({s}:0)\x00", .{mod_name}) catch return errResult(out, "Error: expression too long.");
         const mod_size = bridge.valFromString(@ptrCast(mod_size_expr.ptr));
         if (mod_size == 0) return fmtErr(out, "Error: Could not determine size of \"{s}\".", .{mod_name});
-        var save_buf: [512]u8 = undefined;
-        const save_cmd = std.fmt.bufPrint(&save_buf, "savedata \"{s}\", 0x{X}, 0x{X}\x00", .{ file_path, mod_base, mod_size }) catch
+        var addr_buf: [24]u8 = undefined;
+        const addr_expr = std.fmt.bufPrint(&addr_buf, "0x{X}", .{mod_base}) catch return errResult(out, "Error: expression too long.");
+        var save_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
+        const save_cmd = cmdline.buildSaveData(&save_buf, resolved, addr_expr, @intCast(mod_size)) catch
             return errResult(out, "Error: path too long.");
-        const save_ok = bridge.cmdExec(@ptrCast(save_cmd.ptr));
-        return fmtResult(out, "{s}", .{if (save_ok) "Module dumped to file." else "Error: Failed to dump module."});
+        const save_ok = bridge.cmdExec(save_cmd.ptr);
+        if (!save_ok) return errResult(out, "Error: Failed to dump module.");
+        return fmtResult(out, "Module dumped to \"{s}\".", .{resolved});
     }
-    return fmtResult(out, "Module \"{s}\" dumped to \"{s}\".", .{ mod_name, file_path });
+    return fmtResult(out, "Module \"{s}\" dumped to \"{s}\".", .{ mod_name, resolved });
 }
 
 // ── AnalyzeModule ─────────────────────────────────────────────────
@@ -3871,8 +4040,19 @@ fn setBreakpointFastResume(params: ?std.json.Value, out: []u8) ToolResult {
 }
 
 // ── SaveDatabase ─────────────────────────────────────────────────
-fn saveDatabase(_: ?std.json.Value, out: []u8) ToolResult {
+fn saveDatabase(params: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging()) return errResult(out, "Error: No active debug session.");
-    const ok = bridge.cmdExec("dbsave\x00");
-    return fmtResult(out, "{s}", .{if (ok) "Database saved." else "Failed to save database."});
+    // "" means "the default location", like omitting filePath.
+    const file_path = (if (params) |p| json.getOptionalStringField(p, "filePath") else null) orelse {
+        const ok = bridge.cmdExec("dbsave\x00");
+        return fmtResult(out, "{s}", .{if (ok) "Database saved." else "Failed to save database."});
+    };
+    var path_buf: [pathutil.MAX_PATH_LEN]u8 = undefined;
+    const resolved = resolveOutputPath(&path_buf, file_path) catch |err|
+        return fmtErr(out, "Error: invalid filePath: {s}.", .{pathutil.describe(err)});
+    var cmd_buf: [pathutil.MAX_PATH_LEN + 32]u8 = undefined;
+    const cmd = cmdline.buildDbSave(&cmd_buf, resolved) catch
+        return errResult(out, "Error: filePath too long or cannot be quoted.");
+    const ok = bridge.cmdExec(cmd.ptr);
+    return fmtResult(out, "{s} \"{s}\".", .{ if (ok) "Database saved to" else "Failed to save database to", resolved });
 }
