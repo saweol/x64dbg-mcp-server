@@ -16,13 +16,13 @@ from typing import Any
 import anyio
 import pytest
 from mcp import Client
-from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOL_NAMES, TOOLS_BY_NAME, RiskTier
 
 from tests.fakes.fake_app import FakeApp, blocking_result
 from x64dbg_vm_gateway.app_api import GatewayApp
 from x64dbg_vm_gateway.contracts import ToolInfo
 from x64dbg_vm_gateway.errors import BackendRestarted, StateViolation
 from x64dbg_vm_gateway.frontends import mcp_server
+from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOL_NAMES, TOOLS_BY_NAME, RiskTier
 
 MODES = ["legacy", "auto"]
 
@@ -367,6 +367,18 @@ def test_list_mirrored_failure_still_lists_gateway_tools(app, caplog):
     app.fail["list_mirrored_tools"] = RuntimeError("catalog exploded")
     res = drive(mcp_server.build_server(app), lambda c: c.list_tools())
     assert {t.name for t in res.tools} == set(GATEWAY_TOOL_NAMES)
+
+
+def test_instructions_fall_back_to_builtin_loop_rules():
+    class NoInstructions(FakeApp):
+        def instructions(self) -> str:
+            raise RuntimeError("backend instructions not cached")
+
+    async def go(c: Client) -> Any:
+        return c.instructions
+
+    text = drive(mcp_server.build_server(NoInstructions()), go)
+    assert "analysis_start" in text and "analysis_collect" in text
 
 
 def test_run_stdio_is_exported():

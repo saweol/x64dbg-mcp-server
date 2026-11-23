@@ -153,6 +153,12 @@ def test_global_options_after_the_subcommand(cfg_path, wiring, fake, capsys):
     assert fake.called("doctor") == [{"profile": "win10"}]
 
 
+def test_doctor_tolerates_malformed_checks(cfg_path, wiring, fake, capsys):
+    fake.results["doctor"] = {"ok": False, "checks": ["not-a-dict", {"name": "vmx", "ok": False}]}
+    assert run(["--config", str(cfg_path), "doctor"]) == 1
+    assert "vmx" in capsys.readouterr().out
+
+
 def test_status_prints_json(cfg_path, wiring, fake, capsys):
     fake.results["session_status"] = {"vm": {"power": "running"}, "job": {"id": JOB_ID}}
     assert run(["--config", str(cfg_path), "--json", "status"]) == 0

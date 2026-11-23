@@ -186,7 +186,8 @@ def cmd_serve(args: argparse.Namespace, out: _Output) -> int:
 
 
 def _format_doctor(result: Any) -> str:
-    checks = result.get("checks", []) if isinstance(result, Mapping) else []
+    raw = result.get("checks") if isinstance(result, Mapping) else None
+    checks = [c for c in raw if isinstance(c, Mapping)] if isinstance(raw, list) else []
     lines = []
     for check in checks:
         ok = bool(check.get("ok"))

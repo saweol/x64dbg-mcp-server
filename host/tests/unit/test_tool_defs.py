@@ -6,12 +6,12 @@ import inspect
 
 import jsonschema
 import pytest
-from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOLS, TOOLS_BY_NAME, RiskTier
 
 from x64dbg_vm_gateway import policy
 from x64dbg_vm_gateway.app_api import GatewayApp
 from x64dbg_vm_gateway.errors import GatewayError
 from x64dbg_vm_gateway.frontends import tool_defs
+from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOLS, TOOLS_BY_NAME, RiskTier
 
 EXPECTED = {
     "session_status", "gateway_doctor", "vm_snapshots_list", "vm_snapshot_take", "vm_snapshot_revert",
