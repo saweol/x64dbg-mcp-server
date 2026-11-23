@@ -568,15 +568,18 @@ class Gateway(GatewayApp):
                 rt.connect(bid)
                 return rt.proxy.call(bid, tool, arguments, job_id=job.id if job else None)
         except BackendRestarted as e:
+            # reload_on_restart: the relaunched debugger gets the sample again before the client
+            # hears about the restart; details.reloaded tells whether it is loaded now
             job = self._sync_job(rt, job)
             reload = self._maybe_reload(rt, bid, job)
             if reload is not None:
                 e.details["reload"] = reload
-                if reload.get("ok"):
-                    e.hint = (
-                        f"{e.hint or 'call session_status to acknowledge'}; the sample was reloaded "
-                        "(reload_on_restart): addresses may differ (ASLR)"
-                    )
+            e.details["reloaded"] = self._reloaded_now(rt, bid, job)
+            if e.details["reloaded"]:
+                e.hint = (
+                    f"{e.hint or 'call session_status to acknowledge'}; the sample was reloaded "
+                    "(reload_on_restart) and is paused at its start: addresses may differ (ASLR)"
+                )
             raise
         except CrashLoop as e:
             self._record_crash_loop(job, e)
@@ -1418,6 +1421,7 @@ class Gateway(GatewayApp):
         reload = self._maybe_reload(rt, bid, job)
         if reload is not None:
             out["reload"] = reload
+        out["reloaded"] = self._reloaded_now(rt, bid, job)
         return out
 
     @staticmethod
@@ -1819,7 +1823,8 @@ class Gateway(GatewayApp):
         return list(waited.texts), None
 
     def _reload_sample(self, rt: Runtime, bid: str, job: Job) -> dict[str, Any]:
-        """LoadBinary + WaitForPause on a relaunched debugger (reload_on_restart).
+        """SetArtifactDir (when the plugin has it) + LoadBinary + WaitForPause on a relaunched
+        debugger (reload_on_restart), like ``_load_sample`` at analysis_start.
 
         Direct client calls on purpose: the proxy refuses mutating calls until the
         client acknowledges the new epoch, and this reload is what the client will
@@ -1832,11 +1837,26 @@ class Gateway(GatewayApp):
         )
         with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
             client = rt.connect(bid)
+            if rt.catalog.tool("SetArtifactDir", bid) is not None:
+                out_dir = _gjoin(job.guest_root, "out")
+                if client.call_tool("SetArtifactDir", {"path": out_dir}, LOAD_CALL_TIMEOUT_S).is_error:
+                    warnings.append("SetArtifactDir failed; dumps need absolute paths under the out dir")
             res = client.call_tool("LoadBinary", largs, LOAD_CALL_TIMEOUT_S)
             if res.is_error:
                 return {"ok": False, "detail": "LoadBinary failed", "warnings": warnings}
             waited = client.call_tool("WaitForPause", {"timeoutMs": LOAD_WAIT_MS}, LOAD_WAIT_MS / 1000 + 15)
         return {"ok": True, "paused": not waited.is_error, "warnings": warnings}
+
+    def _reloaded_now(self, rt: Runtime, bid: str, job: Job | None) -> bool:
+        """True when reload_on_restart loaded the job's sample into ``bid``'s current debugger."""
+        if job is None or not job.flags.get("reload_on_restart") or job.backend_id != bid:
+            return False
+        try:
+            flags = self._jobs().get(job.id).flags
+            epoch = rt.supervisor.epoch(bid)
+        except GatewayError:
+            return False
+        return flags.get("reload_epoch") == epoch and flags.get("loaded_epoch") == epoch
 
     def _maybe_reload(self, rt: Runtime, bid: str, job: Job | None) -> dict[str, Any] | None:
         """After a debugger relaunch: reload the job's sample if it asked for it, once per epoch."""
