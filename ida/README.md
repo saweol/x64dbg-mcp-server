@@ -13,7 +13,7 @@ There are two parts:
 
 | Part | Where | What it does |
 |---|---|---|
-| `x64dbg_vm_gateway.ida_sync` | host gateway (`host/src/…/ida_sync.py`) | Parses `ListModules` into a module map, rebases addresses, parses x64dbg databases (`.dd64`/`.dd32`), builds export documents and import plans. It is a pure library; the gateway exposes it as `ida_rebase`, `ida_export_annotations` and `ida_import_annotations` (see `app_api.GatewayApp`) once those are wired. |
+| `x64dbg_vm_gateway.ida_sync` | host gateway (`host/src/…/ida_sync.py`) | Parses `ListModules` into a module map, rebases addresses, parses x64dbg databases (`.dd64`/`.dd32`), builds export documents and import plans. It is a pure library; the gateway exposes it as the MCP tools `ida_rebase`, `ida_export_annotations` and `ida_import_annotations` (`app.Gateway`). |
 | `ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Menu actions to import an export document into the IDB, and to export the IDB's names/comments for x64dbg. |
 
 ## Using it with ida-multi-mcp (AI workflow)
@@ -25,11 +25,16 @@ ida-multi-mcp edits the IDB.
 **Dynamic finding → IDA** (for example a decryption routine found at a breakpoint):
 
 1. Gateway: `ida_rebase(address="0x7FF6A1231234", direction="runtime_to_ida", ida_imagebase="0x140000000")`.
-   The module is found from the live module map (`ListModules`), and the result is
-   `{"module": "sample.exe", "rva": "0x1234", "ida": "0x140001234", ...}`.
+   The module is found in the job's module map, and the result is
+   `{"module": "sample.exe", "rva": "0x1234", "ida": "0x140001234", "module_map_source": "live", ...}`.
+   The map is a live `ListModules` of the job's debugger while the sample is loaded
+   (a direct read-only call: a dead debugger is never restarted for a rebase), else the
+   map `analysis_collect` recorded in the job manifest (`"manifest"`).
    `ida_imagebase` is the IDB's image base, `idaapi.get_imagebase()` in IDA. If it is
    omitted, the module's preferred (PE) image base is used, but only when the gateway
-   knows it. Without that, the call fails and asks for it.
+   knows it: it does for the sample (read from its PE header on the host). Without that,
+   the call fails and asks for it. `rva_to_runtime` / `ida_to_runtime` default `module`
+   to the sample (its guest name, `<sha12>.exe`).
 2. ida-multi-mcp: call `rename` / `set_comments` (or `decompile`) at `0x140001234` on the
    instance that holds `sample.exe`, then `idb_save`.
 
@@ -38,23 +43,29 @@ ida-multi-mcp edits the IDB.
 1. Collect `{rva | ida_address, name?, comment?}` items, either from ida-multi-mcp
    output or from the *Export* action below (its `items` can be passed as-is).
 2. Gateway: `ida_import_annotations(items, module="sample.exe", ida_imagebase="0x140000000")`.
-   It returns `[{runtime_address, rva, label, comment}]`, with labels and comments already
-   made x64dbg-safe. Items that carry only `bookmark` / `breakpoint` data produce no entry.
-   By default one invalid item rejects the whole batch (`items[3]: …`). For a best-effort
-   import, the library's `plan_import_report(..., on_error="skip")` plans the valid items
-   and lists the others under `skipped` with the reason. This is useful for IDA exports
-   that contain items past the end of the runtime module.
-3. Gateway (mirrored tool): `CommentOrLabelAtAddress(address=runtime_address, value=label, mode="Label")`,
-   and the same call with `mode="Comment"`.
+   It needs the job's live debugger (the sample loaded): the items are rebased onto the
+   module's current runtime base, labels and comments are made x64dbg-safe, and each one
+   is set through the plugin tool `CommentOrLabelAtAddress(address, value, mode="Label" |
+   "Comment")`. The result counts `applied`, `failed` (with the plugin's error text in
+   `failures`) and `not_attempted` operations. Items that carry only `bookmark` /
+   `breakpoint` data are listed under `skipped`. One invalid item rejects the whole batch
+   before anything is set (`items[3]: …`). For a best-effort import, the library's
+   `plan_import_report(..., on_error="skip")` plans the valid items and lists the others
+   under `skipped` with the reason. This is useful for IDA exports that contain items past
+   the end of the runtime module.
 
 **x64dbg database → IDA** (all labels, comments, bookmarks and breakpoints of a session):
 
-1. Gateway (mirrored tool): `SaveDatabase(filePath="…\\out\\sample.dd64")`. With an explicit
-   path x64dbg writes **uncompressed** JSON (`dbsave <path>` skips LZ4). The default
-   location is LZ4-compressed and is rejected by the parser.
-2. `analysis_collect` brings the file to the host, and `ida_export_annotations` turns it
-   into an `x64dbg-ida-sync/1` document.
-3. Open the document in IDA with the *Import* action, or let the AI apply the items through
+1. Gateway: `ida_export_annotations()`. It calls `SaveDatabase` (plugin v1.10: into the job
+   out directory with `filePath`, which x64dbg writes **uncompressed**; older plugins:
+   x64dbg's default `<x64dbg>\db\<file>.dd64`), copies the file to
+   `<job host dir>/artifacts/ida_sync.dd64` and writes the `x64dbg-ida-sync/1` document to
+   `<job host dir>/artifacts/ida_sync.json` (0600). Without a debug session it uses the
+   database `analysis_collect` brought to the host. The default database location is
+   LZ4-compressed unless `[Engine] DisableDatabaseCompression=1` is set in the debugger's
+   ini file (`x64dbg-vm-gateway provision` sets it); a compressed file is refused with
+   `DATABASE_FORMAT` and a hint saying so.
+2. Open the document in IDA with the *Import* action, or let the AI apply the items through
    ida-multi-mcp (`rename` / `set_comments` at `ida_imagebase + rva`).
 
 Rebase directions (`ida_rebase` / `ida_sync.rebase`):
@@ -178,7 +189,8 @@ untrusted:
 
 Not handled:
 
-* The default LZ4-compressed x64dbg databases. Save with an explicit path instead.
+* The default LZ4-compressed x64dbg databases. Save with an explicit path (plugin v1.10)
+  or turn compression off (`[Engine] DisableDatabaseCompression=1`) instead.
 * Function ranges (they are parsed, but not exported).
 * DLL and exception breakpoints, which are not bound to an address.
 * More than one module per IDB.

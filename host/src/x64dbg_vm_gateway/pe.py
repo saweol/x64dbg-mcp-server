@@ -59,6 +59,8 @@ class PeInfo:
     machine: raw IMAGE_FILE_HEADER.Machine, None for non-PE.
     clr_flags: IMAGE_COR20_HEADER.Flags for .NET images when the CLR header is
         backed by file data, else None.
+    image_base: the optional header's ImageBase (the preferred load address, IDA's
+        default image base), None for non-PE content.
     """
 
     kind: str
@@ -67,6 +69,7 @@ class PeInfo:
     is_dotnet: bool
     machine: int | None
     clr_flags: int | None = None
+    image_base: int | None = None
 
     @property
     def dotnet_anycpu(self) -> bool:
@@ -145,8 +148,14 @@ def _parse(read_at: _ReadAt) -> PeInfo:
             clr_flags = _clr_flags(read_at, table, nsec, rva)
 
     kind = ("dotnet-" if is_dotnet else "") + ("dll" if is_dll else "exe")
+    # ImageBase: u64 at +24 (PE32+) or u32 at +28 (PE32); both end within the first 32 bytes,
+    # which dd_off (96/112) <= size_opt already guarantees
+    if _u16(opt, 0) == _PE32_PLUS_MAGIC:
+        image_base = int(struct.unpack_from("<Q", opt, 24)[0])
+    else:
+        image_base = _u32(opt, 28)
     return PeInfo(kind=kind, arch=_ARCH_BY_MACHINE.get(machine), is_dll=is_dll, is_dotnet=is_dotnet,
-                  machine=machine, clr_flags=clr_flags)
+                  machine=machine, clr_flags=clr_flags, image_base=image_base)
 
 
 def detect_pe(path: str | os.PathLike[str]) -> PeInfo:

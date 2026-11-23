@@ -145,6 +145,13 @@ class UnsafeArchiveError(TransferError):
     code = "UNSAFE_ARCHIVE"
 
 
+class DatabaseFormatError(GatewayError):
+    """An x64dbg database (.dd64/.dd32) cannot be read: LZ4-compressed (x64dbg's default
+    unless ``[Engine] DisableDatabaseCompression=1``), not UTF-8 or not a JSON object."""
+
+    code = "DATABASE_FORMAT"
+
+
 class PathNotAllowed(GatewayError):
     code = "PATH_NOT_ALLOWED"
 

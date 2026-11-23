@@ -54,6 +54,7 @@ VM or backend I/O happens under the gateway lock.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -70,8 +71,8 @@ from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from . import ida_sync, policy, transfer
 from . import platform as gw_platform
-from . import policy, transfer
 from .app_api import GatewayApp
 from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
@@ -95,6 +96,7 @@ from .errors import (
     BackendThrottled,
     ConfigError,
     CrashLoop,
+    DatabaseFormatError,
     GatewayError,
     GuestOperationError,
     InvalidArgument,
@@ -163,7 +165,16 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # session." (-32602) or "Error: No active debug session." (tool text): nothing to save then.
 _NO_SESSION_RE = re.compile(r"\bactive debug session\b", re.IGNORECASE)
 _POSIX = os.name == "posix"
+_TMP_SEQ = itertools.count()  # unique temp file names within this process
 LOAD_CALL_TIMEOUT_S = 60.0
+# IDA integration
+IDA_SYNC_FILE = "ida_sync.json"  # x64dbg-ida-sync/1 export under <job>/artifacts/
+IDA_LIST_MODULES_TIMEOUT_S = 10.0
+#: job states in which the job's debugger still holds the sample (live module map, imports)
+IDA_LIVE_STATES = frozenset({JobState.ANALYZING, JobState.COLLECTED, JobState.COLLECTED_PARTIAL})
+IMPORT_TOOL = "CommentOrLabelAtAddress"  # plugin tool: {address, value, mode: Comment|Label}
+MAX_IMPORT_FAILURES_LISTED = 50
+MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 RECOVERY_HINTS = {
     JobState.CREATED: "interrupted while starting: ask the user to discard it "
     "(x64dbg-vm-gateway discard <job>)",
@@ -232,6 +243,24 @@ def _chmod_private(path: Path) -> None:
 
 def _fold(name: str) -> str:
     return name.strip().casefold()
+
+
+def _write_private_json(path: Path, doc: Any) -> None:
+    """Write ``doc`` as JSON to ``path`` atomically (temp file 0600 + fsync + replace)."""
+    tmp = path.with_name(f".{path.name}.{next(_TMP_SEQ)}-{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=1, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    _chmod_private(path)
 
 
 def _parse_now(clock: Clock) -> datetime:
@@ -1947,7 +1976,7 @@ class Gateway(GatewayApp):
             bid = job.backend_id if job.backend_id in rt.backends else None
             if bid is not None:
                 with steps.step("save_database", soft=True) as st:
-                    detail, extra = self._save_database(rt, bid, job)
+                    detail, extra, _saved = self._save_database(rt, bid, job)
                     st["detail"] = detail
                     if extra:
                         db_extras.append(extra)
@@ -2067,13 +2096,16 @@ class Gateway(GatewayApp):
             )
         return out
 
-    def _save_database(self, rt: Runtime, bid: str, job: Job) -> tuple[str, str | None]:
-        """SaveDatabase. Returns (detail, extra guest path to collect or None).
+    def _save_database(
+        self, rt: Runtime, bid: str, job: Job, *, stage: str = "collect"
+    ) -> tuple[str, str | None, str | None]:
+        """SaveDatabase. Returns (detail, extra guest path to collect or None, guest path of
+        the saved database file or None).
 
         v1.10 (``filePath`` in the schema) saves into the job out dir; older plugins
         save to x64dbg's default ``<exe dir>\\db\\<debuggee file name>.dd64``, which is
         then collected as an extra file. Raises BackendError when the save failed;
-        a debugger without a debug session has nothing to save.
+        a debugger without a debug session has nothing to save (both paths None).
         """
         cfg = rt.backend(bid)
         ext = "dd64" if cfg.arch == "x64" else "dd32"
@@ -2082,7 +2114,7 @@ class Gateway(GatewayApp):
         extra: str | None = None
         if "filePath" in props:
             sha12 = job.sample.sha256[:12] if job.sample else job.id
-            target = _gjoin(_gjoin(job.guest_root, "out"), f"{sha12}.{ext}")
+            target: str | None = _gjoin(_gjoin(job.guest_root, "out"), f"{sha12}.{ext}")
             res = self._call(rt, bid, "SaveDatabase", {"filePath": target}, job)
             saved = f"saved to {target}"
         else:
@@ -2090,17 +2122,19 @@ class Gateway(GatewayApp):
             if job.sample is not None and job.sample.guest_path and cfg.exe:
                 db_dir = _gjoin(str(PureWindowsPath(cfg.exe).parent), "db")
                 extra = _gjoin(db_dir, f"{PureWindowsPath(job.sample.guest_path).name}.{ext}")
+            target = extra
             saved = f"saved; collecting {extra}" if extra else "saved"
         if _no_session(res):
-            return "no debug session: nothing to save", None
+            return "no debug session: nothing to save", None, None
         if res.is_error:
+            again = "analysis_collect" if stage == "collect" else stage
             raise BackendError(
                 "SaveDatabase failed",
-                stage="collect",
+                stage=stage,
                 details={"texts": [_clip(t) for t in res.texts[:2]]},
-                hint="check the debugger with GetDebugState, then call analysis_collect again",
+                hint=f"check the debugger with GetDebugState, then call {again} again",
             )
-        return saved, extra
+        return saved, extra, target
 
     def analysis_finish(
         self,
@@ -2241,13 +2275,106 @@ class Gateway(GatewayApp):
                 deleted.append(name)
         return deleted
 
-    # ── IDA integration (later step) ────────────────────────────────
+    # ── IDA integration (plan 6.4, interpretation D) ────────────────
+    # Module map: a live ListModules of the job's debugger (a direct read-only call: a
+    # rebase never relaunches a dead debugger) while the job has its sample loaded, else
+    # the map analysis_collect recorded in the manifest. The sample module gets its PE
+    # image base as preferred base (IDA's default image base). Imports need the live map:
+    # they set labels at today's runtime addresses.
     @staticmethod
-    def _ida_pending() -> GatewayError:
-        return GatewayError(
-            "IDA integration is wired in a later step",
-            stage="ida",
-            hint="use the mirrored x64dbg tools and analysis_collect's module_map for now",
+    def _sample_module(job: Job) -> str | None:
+        s = job.sample
+        return PureWindowsPath(s.guest_path).name if s is not None and s.guest_path else None
+
+    @staticmethod
+    def _sample_image_base(job: Job) -> int | None:
+        if job.sample is None:
+            return None
+        try:
+            return detect_pe(job.sample.host_path).image_base or None
+        except OSError:
+            return None
+
+    def _with_sample_base(self, job: Job, modules: dict[str, ida_sync.ModuleInfo]) -> dict[str, Any]:
+        name, base = self._sample_module(job), self._sample_image_base(job)
+        if not name or base is None:
+            return modules
+        lname = name.lower()
+        return {
+            key: dataclasses.replace(mod, preferred_base=base)
+            if mod.name.lower() == lname and mod.preferred_base is None
+            else mod
+            for key, mod in modules.items()
+        }
+
+    def _live_modules(self, rt: Runtime, job: Job) -> dict[str, ida_sync.ModuleInfo] | None:
+        bid = job.backend_id
+        if bid not in rt.backends or JobState(job.state) not in IDA_LIVE_STATES:
+            return None
+        try:
+            if rt.profile.mode == "vmware" and rt.vm.power_state() != PowerState.RUNNING:
+                return None
+            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+                res = rt.connect(str(bid)).call_tool("ListModules", {}, IDA_LIST_MODULES_TIMEOUT_S)
+        except GatewayError as e:
+            log.info("job %s: no live module map (%s)", job.id, e.code)
+            return None
+        if res.is_error:
+            return None
+        try:
+            modules = ida_sync.parse_module_list("\n".join(sanitize_untrusted_text(t) for t in res.texts))
+        except ValueError:
+            return None
+        return modules or None
+
+    @staticmethod
+    def _manifest_doc(job: Job) -> dict[str, Any] | None:
+        if not job.manifest_path:
+            return None
+        try:
+            with open(job.manifest_path, "rb") as f:
+                data = f.read(MAX_MANIFEST_BYTES + 1)
+            if len(data) > MAX_MANIFEST_BYTES:
+                return None
+            doc = json.loads(data.decode("utf-8", errors="replace"))
+        except (OSError, ValueError, RecursionError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    def _manifest_modules(self, job: Job) -> dict[str, ida_sync.ModuleInfo] | None:
+        doc = self._manifest_doc(job)
+        mm = doc.get("module_map") if doc is not None else None
+        raw = mm.get("raw") if isinstance(mm, dict) else None
+        if not isinstance(raw, str):
+            return None
+        try:
+            return ida_sync.parse_module_list(raw) or None
+        except ValueError:
+            return None
+
+    def _ida_modules(self, rt: Runtime, job: Job, *, live_only: bool = False) -> tuple[dict[str, Any], str]:
+        """(module map, "live" | "manifest"). Raises StateViolation when there is none."""
+        live = self._live_modules(rt, job)
+        if live:
+            return self._with_sample_base(job, live), "live"
+        state = JobState(job.state).value
+        if live_only:
+            raise StateViolation(
+                f"job {job.id} ({state}) has no live debug session to apply annotations to",
+                stage="ida", details={"job_id": job.id, "state": state},
+                hint="annotations are set in the running debugger: the job must be ANALYZING (or collected) "
+                     "with its sample loaded; see session_status",
+                next_tool="session_status",
+            )
+        saved = self._manifest_modules(job)
+        if saved:
+            return self._with_sample_base(job, saved), "manifest"
+        raise StateViolation(
+            f"no module map for job {job.id}: its debugger has no debug session and no collection "
+            "recorded one",
+            stage="ida", details={"job_id": job.id, "state": state},
+            hint="load the sample (analysis_start) or run analysis_collect, which records the module map",
+            next_tool="session_status",
         )
 
     def ida_rebase(
@@ -2259,10 +2386,158 @@ class Gateway(GatewayApp):
         ida_imagebase: str | int | None = None,
         job_id: str | None = None,
     ) -> dict[str, Any]:
-        raise self._ida_pending()
+        if direction not in ida_sync.DIRECTIONS:
+            raise InvalidArgument(f"direction must be one of {', '.join(ida_sync.DIRECTIONS)}")
+        job = self._resolve_job(job_id)
+        rt = self.runtime(job.profile)
+        modules, source = self._ida_modules(rt, job)
+        if module is None and direction in ("rva_to_runtime", "ida_to_runtime"):
+            module = self._sample_module(job)
+            if module is None:
+                raise InvalidArgument(f"module is required for {direction}: job {job.id} has no sample")
+        try:
+            out = ida_sync.rebase(address, direction=direction, module_map=modules, module=module,
+                                  ida_imagebase=ida_imagebase)
+        except ValueError as e:
+            raise InvalidArgument(
+                _clip(str(e), 500), stage="ida_rebase",
+                hint="check the module and the address against the module map (ListModules)",
+            ) from None
+        return {**out, "job_id": job.id, "module_map_source": source}
 
     def ida_export_annotations(self, job_id: str | None = None) -> dict[str, Any]:
-        raise self._ida_pending()
+        job = self._resolve_job(job_id)
+        rt = self.runtime(job.profile)
+
+        def work(progress: Progress) -> dict[str, Any]:
+            return self._ida_export(rt, job.id, progress)
+
+        # On the runner: it saves the debugger database and reads artifacts a collection rewrites.
+        return self._ops(rt).run("ida_export_annotations", job.id, work, wait_s=self._wait(None),
+                                 job_id=job.id)
+
+    def _ida_export(self, rt: Runtime, job_id: str, progress: Progress) -> dict[str, Any]:
+        job = self._jobs().get(job_id)
+        steps = _Steps(self._clock, progress)
+        art = Path(job.host_root) / "artifacts"
+        _private_dirs(art)
+        database: dict[str, Any] | None = None
+        bid = job.backend_id if job.backend_id in rt.backends else None
+        if bid is not None and rt.channel is not None and JobState(job.state) in IDA_LIVE_STATES:
+            with steps.step("save_database") as st:
+                detail, _extra, guest_db = self._save_database(rt, bid, job, stage="ida_export_annotations")
+                st["detail"] = detail
+            if guest_db is not None:
+                with steps.step("fetch_database") as st:
+                    database = self._fetch_database(rt, job, guest_db, art)
+                    st["detail"] = f"{database['size']} bytes"
+        if database is None:
+            with steps.step("collected_database") as st:
+                database = self._collected_database(job, art)
+                st["detail"] = str(database["original_path"])
+        db_path = Path(database["host_path"])
+        with steps.step("parse") as st:
+            if db_path.stat().st_size > ida_sync.MAX_DB_BYTES:
+                raise DatabaseFormatError(
+                    f"the database is larger than {ida_sync.MAX_DB_BYTES} bytes",
+                    stage="ida_export_annotations", details={"host_path": str(db_path)},
+                )
+            try:
+                ann = ida_sync.parse_x64dbg_db(db_path.read_bytes())
+            except ValueError as e:
+                raise self._database_format_error(e, database) from None
+            st["detail"] = f"{len(ann.labels)} labels, {len(ann.comments)} comments"
+        modules: dict[str, Any] | None = None
+        source: str | None = None
+        try:
+            modules, source = self._ida_modules(rt, job)
+        except StateViolation as e:
+            steps.warnings.append(f"no module map, base_runtime is null: {e.message}")
+        doc = ida_sync.export_for_ida(ann, modules)
+        target = art / IDA_SYNC_FILE
+        with steps.step("write") as st:
+            _write_private_json(target, doc)
+            st["detail"] = str(target)
+        return {
+            "job_id": job.id,
+            "host_path": str(target),
+            "schema": doc["schema"],
+            "modules": len(doc["modules"]),
+            "items": sum(len(m["items"]) for m in doc["modules"].values()),
+            "counts": {
+                "labels": len(ann.labels),
+                "comments": len(ann.comments),
+                "bookmarks": len(ann.bookmarks),
+                "breakpoints": len(ann.breakpoints),
+                "functions": len(ann.functions),
+                "skipped": ann.skipped,
+            },
+            "skipped": doc["skipped"],
+            "database": database,
+            "module_map_source": source,
+            "warnings": list(ann.warnings) + list(doc["warnings"]) + steps.warnings,
+            "steps": steps.items,
+        }
+
+    def _fetch_database(self, rt: Runtime, job: Job, guest_db: str, art: Path) -> dict[str, Any]:
+        """Copy the saved database from the guest to ``artifacts/ida_sync.<dd64|dd32>`` (0600)."""
+        assert rt.channel is not None
+        src = validate_guest_path(guest_db)
+        dest = art / f"{PureWindowsPath(IDA_SYNC_FILE).stem}{PureWindowsPath(src).suffix.lower()}"
+        limits = transfer.FetchLimits(max_file_bytes=ida_sync.MAX_DB_BYTES,
+                                      min_host_free_bytes=self._fetch_limits.min_host_free_bytes)
+        with tempfile.TemporaryDirectory(prefix=".ida-", dir=job.host_root) as scratch:
+            # transfer's bounded fetch, as file_download uses it (size probe, free space, 0600)
+            fetcher = transfer._BoundedFetch(
+                rt.channel, POWERSHELL_EXE, job.guest_root, limits, Path(scratch)
+            )
+            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+                digest, size = fetcher.fetch(src, dest)
+        return {"source": "saved", "guest_path": src, "original_path": src, "host_path": str(dest),
+                "size": size, "sha256": digest}
+
+    def _collected_database(self, job: Job, art: Path) -> dict[str, Any]:
+        """The newest .dd64/.dd32 that analysis_collect extracted for the job."""
+        doc = self._manifest_doc(job)
+        entries = doc.get("entries") if doc is not None else None
+        for e in reversed(entries if isinstance(entries, list) else []):
+            if not isinstance(e, dict) or e.get("status") != "ok":
+                continue
+            original, stored = e.get("original_path"), e.get("stored_name")
+            if not (isinstance(original, str) and isinstance(stored, str)):
+                continue
+            if not original.lower().endswith((".dd64", ".dd32")):
+                continue
+            path = art / stored
+            if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(art.resolve()):
+                return {"source": "collected", "guest_path": None, "original_path": _clip(original, 400),
+                        "host_path": str(path), "size": path.stat().st_size, "sha256": e.get("sha256")}
+        raise StateViolation(
+            f"no x64dbg database for job {job.id}: its debugger has no debug session to save one and no "
+            "collection brought one to the host",
+            stage="ida_export_annotations", details={"job_id": job.id, "state": JobState(job.state).value},
+            hint="export while the sample is loaded, or run analysis_collect first (on Windows hosts "
+                 "collections are not extracted: pass extract=true)",
+            next_tool="analysis_collect",
+        )
+
+    @staticmethod
+    def _database_format_error(exc: ValueError, database: Mapping[str, Any]) -> DatabaseFormatError:
+        message = str(exc)
+        compressed = "compress" in message.lower()
+        hint = (
+            "x64dbg saved the database LZ4-compressed. Set [Engine] DisableDatabaseCompression=1 in the "
+            "debugger's ini file next to x64dbg.exe / x32dbg.exe (x64dbg-vm-gateway provision writes it; "
+            "restart the debugger afterwards), or use plugin v1.10, whose SaveDatabase(filePath) always "
+            "writes plain JSON; then export again"
+            if compressed
+            else "the file is not an x64dbg JSON database; see details.host_path"
+        )
+        return DatabaseFormatError(
+            _clip(message, 400), stage="ida_export_annotations", hint=hint,
+            details={"host_path": database.get("host_path"), "guest_path": database.get("guest_path"),
+                     "compressed": compressed},
+        )
 
     def ida_import_annotations(
         self,
@@ -2272,7 +2547,105 @@ class Gateway(GatewayApp):
         ida_imagebase: str | int | None = None,
         job_id: str | None = None,
     ) -> dict[str, Any]:
-        raise self._ida_pending()
+        if isinstance(items, str | bytes | Mapping) or not isinstance(items, Sequence):
+            raise InvalidArgument("items must be a list of objects ({rva | ida_address, name?, comment?})")
+        if not isinstance(module, str) or not module.strip():
+            raise InvalidArgument("module must be a module name such as 'sample.exe'")
+        job = self._resolve_job(job_id)
+        rt = self.runtime(job.profile)
+        batch = [dict(i) if isinstance(i, Mapping) else i for i in items]
+        try:
+            blob = json.dumps([batch, module, ida_imagebase], sort_keys=True, default=str)
+        except (TypeError, ValueError, RecursionError):
+            raise InvalidArgument("items must be JSON objects") from None
+        key = (job.id, hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest())
+
+        def work(progress: Progress) -> dict[str, Any]:
+            return self._ida_import(rt, job.id, batch, module, ida_imagebase, progress)
+
+        return self._ops(rt).run("ida_import_annotations", key, work, wait_s=self._wait(None), job_id=job.id)
+
+    def _ida_import(
+        self,
+        rt: Runtime,
+        job_id: str,
+        items: list[Any],
+        module: str,
+        ida_imagebase: str | int | None,
+        progress: Progress,
+    ) -> dict[str, Any]:
+        job = self._jobs().get(job_id)
+        bid = job.backend_id
+        if bid not in rt.backends or JobState(job.state) not in IDA_LIVE_STATES:
+            state = JobState(job.state).value
+            raise StateViolation(
+                f"job {job.id} is {state}: annotations are applied to its running debugger, which needs "
+                "the sample loaded (ANALYZING, COLLECTED or COLLECTED_PARTIAL)",
+                stage="ida_import_annotations", details={"job_id": job.id, "state": state},
+                next_tool="session_status",
+            )
+        bid = str(bid)
+        tool = rt.catalog.tool(IMPORT_TOOL, bid)
+        props = (tool.input_schema.get("properties") or {}) if tool else {}
+        if not {"address", "value", "mode"} <= set(props):
+            raise BackendError(
+                f"backend {bid} has no {IMPORT_TOOL}(address, value, mode) tool",
+                stage="ida_import_annotations", details={"backend": bid},
+                hint="update the plugin (x64dbg-vm-gateway install-plugin)",
+            )
+        modules, source = self._ida_modules(rt, job, live_only=True)
+        try:
+            report = ida_sync.plan_import_report(items, module=module, module_map=modules,
+                                                 ida_imagebase=ida_imagebase)
+        except ValueError as e:
+            raise InvalidArgument(
+                _clip(str(e), 500), stage="ida_import_annotations",
+                hint="items need rva or ida_address (with ida_imagebase) and a name and/or comment; nothing "
+                     "was applied",
+            ) from None
+        ops: list[tuple[dict[str, Any], str, str]] = []
+        for entry in report["plan"]:
+            if entry["label"]:
+                ops.append((entry, "Label", entry["label"]))
+            if entry["comment"]:
+                ops.append((entry, "Comment", entry["comment"]))
+        applied = failed = 0
+        failures: list[dict[str, Any]] = []
+        stopped: dict[str, Any] | None = None
+        for n, (entry, mode, value) in enumerate(ops, 1):
+            progress(f"apply {n}/{len(ops)}")
+            args = {"address": entry["runtime_address"], "value": value, "mode": mode}
+            try:
+                res = self._call(rt, bid, IMPORT_TOOL, args, job)
+            except GatewayError as e:
+                if applied == 0 and failed == 0:
+                    raise  # nothing changed yet: the error says it all (e.g. BACKEND_RESTARTED)
+                stopped = {k: v for k, v in e.to_dict().items() if k != "details"}
+                break
+            if not res.is_error:
+                applied += 1
+                continue
+            failed += 1
+            if len(failures) < MAX_IMPORT_FAILURES_LISTED:
+                failures.append({
+                    "runtime_address": entry["runtime_address"], "rva": entry["rva"], "mode": mode,
+                    "error": _clip(" ".join(res.texts[:2]), 300),
+                })
+        return {
+            "job_id": job.id,
+            "backend_id": bid,
+            "module": report["module"],
+            "module_map_source": source,
+            "items": len(report["plan"]),
+            "operations": len(ops),
+            "applied": applied,
+            "failed": failed,
+            "not_attempted": len(ops) - applied - failed,
+            "failures": failures,
+            "skipped": report["skipped"],
+            "warnings": report["warnings"],
+            "stopped": stopped,
+        }
 
     # ── human-only ──────────────────────────────────────────────────
     def discard_job(self, job_id: str, actor: str) -> dict[str, Any]:
