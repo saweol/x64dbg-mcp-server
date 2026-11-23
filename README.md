@@ -325,10 +325,10 @@ dist/
     │   ├── netpolicy.zig         # bind policy, allowlist, token, lockout (tested)
     │   ├── pathutil.zig          # ArtifactDir path resolution (tested)
     │   ├── ring.zig              # locked event queues (tested)
-    │   ├── ssehub.zig            # SSE client table and send queues (tested)
+    │   ├── ssehub.zig            # SSE client table and per-client send buffers (tested)
     │   └── sync.zig              # SRWLOCK wrapper (tested)
     ├── mcp/
-    │   ├── cmdline.zig           # x64dbg command quoting (tested)
+    │   ├── cmdline.zig           # x64dbg command quoting and numbers (tested)
     │   ├── json.zig              # JSON writer and parser helpers (tested)
     │   ├── serverinfo.zig        # GetServerInfo payload (tested)
     │   ├── toolpolicy.zig        # which tools are serialised (tested)
