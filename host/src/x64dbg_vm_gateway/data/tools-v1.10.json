@@ -25,6 +25,24 @@
    }
   },
   {
+   "name": "ProbeFile",
+   "description": "Diagnostics: checks a file from inside the x64dbg process exactly like the 'init' command does (GetFileAttributesW, CreateFileW with GENERIC_READ + FILE_SHARE_READ, final path, PE machine). Use it when LoadBinary reports that no debug session became active. Read-only; always available.",
+   "debug_only": false,
+   "read_only": true,
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Absolute path of the file to check (as it would be passed to LoadBinary)."
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
    "name": "LoadBinary",
    "description": "Loads an executable into the debugger for a new debugging session (optional arguments and working directory). Equivalent to File > Open in the GUI. If a session is already active it is terminated first. Waits until the new session is active and paused (normally at the system breakpoint) or timeoutMs expires.",
    "debug_only": false,
@@ -68,6 +86,11 @@
      "command": {
       "type": "string",
       "description": "The x64dbg command to execute."
+     },
+     "direct": {
+      "type": "boolean",
+      "description": "Run synchronously (DbgCmdExecDirect) and report whether the command itself succeeded. Default false (queued, like typing in the command bar).",
+      "default": false
      }
     },
     "required": [

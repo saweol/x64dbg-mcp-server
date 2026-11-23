@@ -115,6 +115,7 @@ GetPatches              — see all active patches
 ### Save artifacts (dumps, database) to a known directory
 ```
 GetServerInfo                         — arch, version, x64dbg pid, debuggee_path, artifact_dir
+ProbeFile(path)                       — why LoadBinary cannot open a file (checks it like x64dbg's init does)
 SetArtifactDir (path)                 — e.g. the job output folder (absolute drive or UNC path)
 DumpModule (module, filePath: "unpacked.bin")   — relative paths land in artifact_dir
 DumpMemory (address, size, filePath: "region.bin")

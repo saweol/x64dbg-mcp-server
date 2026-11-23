@@ -16,6 +16,11 @@ const serverinfo = @import("serverinfo.zig");
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn ReadFile(hFile: ?*anyopaque, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetFinalPathNameByHandleW(hFile: ?*anyopaque, lpszFilePath: [*]u16, cchFilePath: u32, dwFlags: u32) callconv(.winapi) u32;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
@@ -64,6 +69,14 @@ pub const tools = [_]ToolDef{
         .read_only = true,
         .handler = getServerInfo,
         .schema_fn = schemaNoParams,
+    },
+    .{
+        .name = "ProbeFile",
+        .description = "Diagnostics: checks a file from inside the x64dbg process exactly like the 'init' command does (GetFileAttributesW, CreateFileW with GENERIC_READ + FILE_SHARE_READ, final path, PE machine). Use it when LoadBinary reports that no debug session became active. Read-only; always available.",
+        .debug_only = false,
+        .read_only = true,
+        .handler = probeFile,
+        .schema_fn = schemaProbeFile,
     },
     .{
         .name = "LoadBinary",
@@ -729,7 +742,7 @@ fn schemaSaveDatabase(w: *JsonWriter) void {
 }
 
 fn schemaExecuteDebuggerCommand(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The x64dbg command to execute.\"}},\"required\":[\"command\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The x64dbg command to execute.\"},\"direct\":{\"type\":\"boolean\",\"description\":\"Run synchronously (DbgCmdExecDirect) and report whether the command itself succeeded. Default false (queued, like typing in the command bar).\",\"default\":false}},\"required\":[\"command\"]}");
 }
 
 fn schemaListCommandsByCategory(w: *JsonWriter) void {
@@ -1108,6 +1121,78 @@ fn getServerInfo(_: ?std.json.Value, out: []u8) ToolResult {
     return .{ .text = w.slice() };
 }
 
+fn schemaProbeFile(w: *JsonWriter) void {
+    w.raw("{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute path of the file to check (as it would be passed to LoadBinary).\"}},\"required\":[\"path\"]}");
+}
+
+// ── ProbeFile ───────────────────────────────────────────────────────
+const GENERIC_READ: u32 = 0x8000_0000;
+const FILE_SHARE_READ: u32 = 0x1;
+const FILE_SHARE_WRITE: u32 = 0x2;
+const OPEN_EXISTING: u32 = 3;
+
+fn probeFile(params: ?std.json.Value, out: []u8) ToolResult {
+    const path = getParamStr(params, "path") orelse
+        return errResult(out, "Error: path is required.");
+    var wide: [pathutil.MAX_PATH_LEN + 1]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..pathutil.MAX_PATH_LEN], path) catch
+        return errResult(out, "Error: path is not valid UTF-8 or too long.");
+    wide[n] = 0;
+    const wpath = wide[0..n :0].ptr;
+
+    var pos: usize = 0;
+    const attrs = GetFileAttributesW(wpath);
+    const attr_err: u32 = if (attrs == INVALID_FILE_ATTRIBUTES) GetLastError() else 0;
+    pos += (std.fmt.bufPrint(out[pos..], "GetFileAttributesW: 0x{X} (err {d})\n", .{ attrs, attr_err }) catch return errResult(out, "Error")).len;
+
+    // Same flags as x64dbg's cbDebugInit: GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING.
+    const h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+    const invalid: usize = std.math.maxInt(usize);
+    if (h == null or @intFromPtr(h) == invalid) {
+        const e = GetLastError();
+        pos += (std.fmt.bufPrint(out[pos..], "CreateFileW(GENERIC_READ, FILE_SHARE_READ): FAILED err {d}\n", .{e}) catch return errResult(out, "Error")).len;
+        const h2 = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_EXISTING, 0, null);
+        if (h2 == null or @intFromPtr(h2) == invalid) {
+            pos += (std.fmt.bufPrint(out[pos..], "CreateFileW(GENERIC_READ, FILE_SHARE_READ|WRITE): FAILED err {d}\n", .{GetLastError()}) catch return errResult(out, "Error")).len;
+        } else {
+            _ = CloseHandle(h2);
+            pos += (std.fmt.bufPrint(out[pos..], "CreateFileW(GENERIC_READ, FILE_SHARE_READ|WRITE): OK (another process holds the file open for writing)\n", .{}) catch return errResult(out, "Error")).len;
+        }
+        return .{ .text = out[0..pos] };
+    }
+    defer _ = CloseHandle(h);
+    pos += (std.fmt.bufPrint(out[pos..], "CreateFileW(GENERIC_READ, FILE_SHARE_READ): OK\n", .{}) catch return errResult(out, "Error")).len;
+
+    var final_w: [1024]u16 = undefined;
+    const fl = GetFinalPathNameByHandleW(h, &final_w, final_w.len, 0);
+    if (fl > 0 and fl < final_w.len) {
+        var final_u8: [3072]u8 = undefined;
+        const fn8 = std.unicode.utf16LeToUtf8(&final_u8, final_w[0..fl]) catch 0;
+        pos += (std.fmt.bufPrint(out[pos..], "final path: {s}\n", .{final_u8[0..fn8]}) catch return errResult(out, "Error")).len;
+    } else {
+        pos += (std.fmt.bufPrint(out[pos..], "final path: FAILED err {d}\n", .{GetLastError()}) catch return errResult(out, "Error")).len;
+    }
+
+    var hdr: [0x400]u8 = undefined;
+    var got: u32 = 0;
+    if (ReadFile(h, &hdr, hdr.len, &got, null) == 0) {
+        pos += (std.fmt.bufPrint(out[pos..], "ReadFile: FAILED err {d}\n", .{GetLastError()}) catch return errResult(out, "Error")).len;
+        return .{ .text = out[0..pos] };
+    }
+    if (got >= 0x40 and hdr[0] == 'M' and hdr[1] == 'Z') {
+        const lfanew = std.mem.readInt(u32, hdr[0x3C..0x40], .little);
+        if (lfanew + 6 <= got and std.mem.eql(u8, hdr[lfanew .. lfanew + 4], "PE\x00\x00")) {
+            const machine = std.mem.readInt(u16, hdr[lfanew + 4 ..][0..2], .little);
+            pos += (std.fmt.bufPrint(out[pos..], "PE: e_lfanew=0x{X} machine=0x{X} (read {d} bytes)\n", .{ lfanew, machine, got }) catch return errResult(out, "Error")).len;
+        } else {
+            pos += (std.fmt.bufPrint(out[pos..], "PE: MZ but no PE signature within {d} bytes (e_lfanew=0x{X})\n", .{ got, lfanew }) catch return errResult(out, "Error")).len;
+        }
+    } else {
+        pos += (std.fmt.bufPrint(out[pos..], "PE: not an MZ file (read {d} bytes)\n", .{got}) catch return errResult(out, "Error")).len;
+    }
+    return .{ .text = out[0..pos] };
+}
+
 // ── SetArtifactDir ──────────────────────────────────────────────────
 fn dirExists(path: []const u8) bool {
     var wide: [pathutil.MAX_PATH_LEN + 1]u16 = undefined;
@@ -1210,7 +1295,7 @@ const mcp_tool_names = [_][]const u8{
     "SetRegister",      "GetThreads",        "GetImports",        "GetExports",
     "FindPattern",      "GetStrings",        "SearchSymbols",     "EvalExpression",
     "AttachProcess",    "PauseDebug",        "StopDebug",         "RestartDebug",
-    "GetServerInfo",    "SetArtifactDir",
+    "GetServerInfo",    "SetArtifactDir",    "ProbeFile",
 };
 
 /// How long ExecuteDebuggerCommand waits for a command that resumed the
@@ -1242,6 +1327,16 @@ fn executeDebuggerCommand(params: ?std.json.Value, out: []u8) ToolResult {
     var cmd_buf: [512]u8 = undefined;
     const cmd = std.fmt.bufPrint(&cmd_buf, "{s}\x00", .{command}) catch
         return errResult(out, "Error: command too long.");
+    // direct=true runs the command synchronously (DbgCmdExecDirect) and reports
+    // the command's own success/failure instead of "queued".
+    if (getParamBool(params, "direct") orelse false) {
+        const direct_ok = bridge.cmdExecDirect(@ptrCast(cmd.ptr));
+        var dpos: usize = 0;
+        const dhdr = std.fmt.bufPrint(out[dpos..], "Command executed directly: {s}.", .{if (direct_ok) "returned true" else "returned FALSE (the command reported failure; see the x64dbg log)"}) catch return errResult(out, "Error");
+        dpos += dhdr.len;
+        if (bridge.isDebugging() and !bridge.isRunning()) appendStepContext(out, &dpos);
+        return .{ .text = out[0..dpos], .is_error = !direct_ok };
+    }
     const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
     Sleep(250);
 

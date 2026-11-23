@@ -15,7 +15,7 @@
 | V15 | revert 직후 플러그인 응답 | **재기동 없이** start 후 0.1~0.2 s에 L2(`GetDebugState`)가 성공했다. 메모리 스냅샷에서 x64dbg가 복원된다. | 클린 스냅샷 계약은 "x64dbg 실행 중 메모리 스냅샷"으로 유지한다. |
 | V6 | revert 후 IP | 게스트 메모리가 복원되므로 IP는 그대로다(192.168.56.128). 다만 start 직후에는 `getGuestIPAddress`가 `Error: The VMware Tools are not running`을 낸다. | ready 판정을 Tools 상태에 묶지 않는다. 직전 IP로 L2를 먼저 시도하고, Tools와 IP 확인은 보조로 둔다. |
 | V3 | 디렉터리 복사 | 미검증. | zip(Compress-Archive/tar)으로 묶어 복사하는 것을 구현 규칙으로 한다. |
-| V4 | 게스트 PowerShell 출력 회수 | `-Command`에 큰따옴표가 들어간 스크립트는 vmrun이 인자를 한 줄로 이어 붙이면서 따옴표가 사라져 실패했다(exit 1). `-EncodedCommand`(UTF-16LE base64)와 결과 파일 복사는 동작했다. | 복잡한 스크립트는 `-EncodedCommand`나 `-File`로 실행한다(ps.py). |
+| V4 | 게스트 PowerShell 출력 회수, vmrun 인자 전달 | **정정(E2E에서 실측):** vmrun은 각 인자를 큰따옴표로 감싸 커맨드라인을 만들고 내부 따옴표를 이스케이프하지 않는다. 게스트 `[Environment]::CommandLine`에서 `"a b" "c"d" "plain" "e\f"` 형태로 확인했다. 그래서 인자 안의 `"`와 끝의 `\`는 깨지고, `cmd.exe /c ...`도 따옴표 처리 때문에 실패한다. 처음 기록했던 "공백으로 이어 붙인다"는 해석은 틀렸다. `-EncodedCommand`(UTF-16LE base64)와 결과 파일 복사는 동작한다. | 복잡한 스크립트는 `-EncodedCommand`나 `-File`로 실행한다(ps.py). VixChannel은 인자를 미리 따옴표로 감싸지 말고 MSVCRT 내부 이스케이프만 한다. cmd.exe는 쓰지 않는다. |
 | V5 | x64dbg 명령(`LogRedirect`, `dbsave <path>`, `init` 3인자) | 미검증. Wave 3 E2E에서 확인한다. | — |
 | V7 | vmrun 동시 호출 | 미검증. | VM별 lock으로 직렬화한다(보수적 기본값). |
 | V8 | Claude Code 툴 timeout | 미검증. | `max_call_s` 기본 110 s. |
@@ -39,3 +39,21 @@
 - **프로비저닝:** `guest/provision.ps1` 실행으로 자동 로그온, 예약 작업 2개, 설정 재작성(x32 토큰 재생성, 0.0.0.0 바인드), job 루트를 구성했다. 재부팅 후 44 s 만에 두 플러그인이 401(인증 요구)로 응답했다. 토큰으로 `initialize`, `tools/list`, `GetDebugState` 호출이 성공했다.
 - **golden fixture:** `host/tests/fixtures/plugin_v1.3/*.http`. 토큰은 들어 있지 않다.
 - **클린 스냅샷:** 스파이크 VM에 `MCP_CLEAN`을 만들었다(전원 켜짐, 메모리 포함, x64dbg·x32dbg 실행 중).
+
+## E2E 중 추가로 확인한 사실 (2026-11-23 밤)
+
+- **중복 VM 인스턴스 사고**
+  - 경위: revert 직후 VM이 `vmrun list`에 없다는 이유로 `start`를 호출했다. 그런데 같은 vmx의 이전 `vmware-vmx` 프로세스가 고아로 남아 있었고, 두 인스턴스가 같은 MAC과 IP로 동시에 돌았다.
+  - 증상: 고아(20:29 시작)가 IP .128과 v1.3 플러그인을 쥐고 있었다. 그래서 HTTP는 고아로 가고 vmrun 게스트 작업은 등록된 인스턴스로 갔다. 결과적으로 "업로드한 새 파일이 LoadBinary로 열리지 않는" 것처럼 보였다.
+  - 부수 피해: 등록된 인스턴스는 DHCP 충돌로 APIPA(169.254.x.x)를 받았다.
+  - 조치: 고아 프로세스를 종료하고 재부팅했다.
+  - 결정: 게이트웨이는 start 전에 같은 vmx의 `vmware-vmx` 프로세스를 host에서 검사한다. `doctor`도 단일 인스턴스를 점검한다.
+- **재부팅 감지:** 재부팅은 약 14 s 만에 끝나서 5 s 폴링으로는 "다운" 구간을 놓쳤다. 재부팅 감지는 LastBootUpTime 비교로 한다.
+- **`-interactive` 실행:** `runProgramInGuest -interactive`는 사용자 세션(session 1)에서 실행된다.
+- **로그 리다이렉트 명령:** x64dbg 2025-08 빌드에 `LogRedirect`/`RedirectLog` 명령이 있다(문자열 확인). 내부적으로 GUI 쪽 `GuiLogRedirect`를 쓴다.
+- **DB 압축 설정 키:** `x64dbg.ini`의 `[Engine] DisableDatabaseCompression` 키가 존재한다(기본 0, 즉 압축).
+- **플러그인 v1.10 기동:** `AllowExternal=true`, `AllowedClients=["192.168.56.1"]` 설정(provision이 host IP를 자동 감지해 기록)으로 0.0.0.0 바인드가 정상 기동했다. `GetServerInfo` 응답도 확인했다.
+- **`install_plugin` 실측:** 17 s 걸렸다(디버거 종료 → 백업 → 복사 → `schtasks` 재기동 → 포트 응답).
+- **로드 확인:** 새로 업로드한 샘플이 `LoadBinary`(v1.10)에서 250 ms 만에 시스템 BP에서 정지했다.
+- **게스트 Defender:** 실시간 보호는 꺼져 있었다(`RealTimeProtectionEnabled=False`).
+- **검사 도구 제한:** Sysinternals Process Monitor로 게스트를 추적하려던 시도는 auto mode 분류기가 차단했다(Undermining Oversight). 그 대신 플러그인에 진단 툴 `ProbeFile`과 `ExecuteDebuggerCommand(direct=true)`를 추가했다.

@@ -124,6 +124,7 @@ AI: [calls StepOver x3, GetCallStack]
 |------|-------------|
 | `GetDebugState` | Current debugger state, PID, instruction pointer |
 | `GetServerInfo` | Identify the backend: arch, version, x64dbg PID, debuggee path, ArtifactDir (JSON) |
+| `ProbeFile` | Diagnostics: check a file from inside x64dbg exactly like `init` does (attributes, open with `FILE_SHARE_READ`, final path, PE machine) |
 | `LoadBinary` | Load an executable (optional arguments / working directory) and wait until it is paused |
 | `SetArtifactDir` | Set the directory that relative dump/database paths are written to |
 | `ExecuteDebuggerCommand` | Run any x64dbg command |
