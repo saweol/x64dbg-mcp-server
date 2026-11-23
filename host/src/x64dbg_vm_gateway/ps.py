@@ -1,16 +1,19 @@
 """Run PowerShell in the guest through any ``contracts.GuestChannel``.
 
-Phase 0 findings (spike VM, vmrun 1.17.0) this module is built around:
+Findings (spike VM, vmrun 1.17.0; Phase 0 and E3 in docs/PHASE0_RESULTS.md) this
+module is built around:
 
-- vmrun joins ``runProgramInGuest`` arguments into one Windows command line and
-  inner double quotes are lost, so ``-Command "<script>"`` breaks on any script
-  containing ``"``. Scripts are therefore sent as ``-EncodedCommand`` (base64 of
-  UTF-16LE), whose alphabet needs no quoting at all.
+- vmrun builds the ``runProgramInGuest`` command line by wrapping every argument
+  in double quotes without escaping anything (E3). ``guest.VixChannel`` escapes
+  each argument for that (``guest.escape_for_vmrun``), but scripts are still
+  sent as ``-EncodedCommand`` (base64 of UTF-16LE): its alphabet needs no
+  quoting, so the script text never depends on any command-line rule, and
+  PowerShell does not re-parse it as ``-Command`` would.
 - ``runProgramInGuest`` returns no program output. The script is wrapped so that
   every output stream (``*>&1``) is written as UTF-8 to a unique guest temp file,
   which is copied back to the host and deleted.
 - A long script would exceed the Windows command-line limit (32767 characters,
-  minus vmrun's own quoting), so above :data:`MAX_ENCODED_CHARS` the wrapper is
+  including vmrun's own quotes), so above :data:`MAX_ENCODED_CHARS` the wrapper is
   copied to a guest temp ``.ps1`` (UTF-8 with BOM, which Windows PowerShell 5.1
   needs to read non-ASCII text) and run with ``-File``.
 
@@ -216,7 +219,9 @@ def _check_tmp_dir(path: str) -> str:
     """Validate the guest temp directory; it must also be safe on a vmrun command line."""
     norm = validate_guest_path(path)
     if any(ch.isspace() for ch in norm):
-        # A -File path with spaces would need double quotes, which vmrun drops.
+        # vmrun quotes every argument (E3), so a -File path with spaces would arrive
+        # intact through VixChannel; kept strict for channels that pass argv verbatim
+        # (VixChannel(quote_args=False)), where a blank would split the path.
         raise PathNotAllowed(f"guest temp directory must not contain whitespace: {norm!r}",
                              stage="validate", details={"reason": "whitespace", "path": norm})
     return norm
@@ -449,8 +454,9 @@ def run_powershell_file(
 
     The script is invoked as ``& '<guest copy>' <params> <args>`` from a small
     wrapper sent with ``-EncodedCommand`` (deliberately not ``powershell -File``,
-    whose arguments would be command-line text that vmrun's quoting can break):
-    every value becomes a single-quoted PowerShell literal.
+    whose arguments go through vmrun's quoting (E3) and PowerShell's own -File
+    argument binding, which e.g. reads ``-Name`` as a parameter): every value
+    becomes a single-quoted PowerShell literal.
 
     ``params`` maps parameter names (without the dash) to values: a str/int
     gives ``-Name 'value'`` (a value starting with ``-`` stays a value), True a

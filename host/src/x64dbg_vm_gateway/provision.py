@@ -11,15 +11,21 @@ plus the VM provider, so it is unit-testable with FakeGuest / FakeVm.
   debugger's ini file, elevated ``MCP-x64dbg`` / ``MCP-x32dbg`` logon tasks,
   auto-logon, power settings), optionally reboots and waits until every
   provisioned backend port answers, and optionally (re)takes the clean snapshot.
-- :func:`install_plugin` replaces the plugin DLLs with a new build (backing the
-  original up once), relaunches the debuggers through the logon tasks and
-  reports what answers.
+- :func:`install_plugin` replaces the plugin DLLs with a new build (backing
+  every replaced build up once in ``<root>\\<arch>\\plugins_backup``, never in
+  ``plugins\\``), relaunches the debuggers through the logon tasks and reports
+  what answers.
+- :func:`guest_boot_time` reads the guest's ``LastBootUpTime``; the reboot wait
+  compares it with the value read before the reboot (E2).
 
-Phase 0 facts behind the design: vmrun mangles double quotes in program
-arguments (hence ``ps.run_powershell*``); there is no interactive session before
-auto-logon, so debuggers are (re)started through the scheduled tasks; after a
-reboot both plugins answered within 44 s; ``GET /`` without a token answers 401
-on plugins up to v1.10, which already proves the HTTP server is up.
+Facts behind the design (Phase 0 and the E2E run, docs/PHASE0_RESULTS.md): vmrun
+wraps every program argument in double quotes without escaping (E3, handled by
+``guest.escape_for_vmrun``; scripts go through ``ps.run_powershell*``); there is
+no interactive session before auto-logon, so debuggers are (re)started through
+the scheduled tasks; after a reboot both plugins answered within 44 s; a reboot
+can be over between two 5 s polls (E2), hence the boot-time comparison;
+``GET /`` without a token answers 401 on plugins up to v1.10, which already
+proves the HTTP server is up.
 
 Plugin v1.10 (this repo) counts every unauthenticated request from a non-loopback
 address as a failed login and answers 429 for ``AuthLockoutSeconds`` (default
@@ -70,6 +76,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PureWindowsPath
@@ -89,7 +96,7 @@ from .errors import (
     TransferError,
     VmNotReady,
 )
-from .guest import GUEST_ENV_ERRORS, validate_guest_path
+from .guest import GUEST_ENV_ERRORS, fold_case, validate_guest_path
 from .pe import sha256_file
 from .ps import DEFAULT_GUEST_TMP_DIR, fetch_guest_text, ps_quote, run_powershell, run_powershell_file
 from .supervisor import SCHTASKS_EXE
@@ -110,6 +117,7 @@ __all__ = [
     "default_info_probe",
     "default_local_ip_for",
     "discover_x64dbg",
+    "guest_boot_time",
     "install_plugin",
     "packaged_provision_script",
     "provision_guest",
@@ -166,6 +174,42 @@ _DARK_ROUNDS = 2
 #: While waiting for the reboot, a port is probed until it has answered this often
 #: (each unauthenticated answer is a failed login for the plugin; 5 lock the host out).
 _DOWN_PHASE_ANSWERS = 3
+#: ``Win32_OperatingSystem.LastBootUpTime`` as ISO-8601 UTC (.NET round-trip format "o").
+_BOOT_MARKER = "MCPBOOT:"
+_BOOT_SCRIPT = (
+    "$os = Get-CimInstance -ClassName Win32_OperatingSystem -Property LastBootUpTime\n"
+    f"'{_BOOT_MARKER}' + $os.LastBootUpTime.ToUniversalTime().ToString('o')"
+)
+_BOOT_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,7}))?Z")
+#: Upper bound for one boot-time read (PowerShell start-up in a loaded guest can be slow).
+_BOOT_READ_TIMEOUT_S = 60.0
+#: A reboot moves the boot time forward by at least the guest's uptime; a smaller move
+#: (rounding of the computed value) or a move backwards (clock set back) is no reboot.
+_BOOT_TIME_TOLERANCE_S = 1.0
+#: Plugin backups live in ``<root>\<arch>\plugins_backup`` (E7: never in plugins\, which
+#: x64dbg scans for plugins), named ``<plugin>.<UTC yyyymmddTHHMMSSZ>.bak``.
+BACKUP_DIR_NAME = "plugins_backup"
+_BACKUP_STAMP = "%Y%m%dT%H%M%SZ"
+#: Later seconds tried when a backup name is already taken (same second, or a file left there).
+_BACKUP_NAME_TRIES = 120
+_BACKUP_HASH_TIMEOUT_S = 120.0
+_BACKUP_HASH_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$dirs = @(__DIRS__)
+$rows = New-Object System.Collections.Generic.List[object]
+foreach ($d in $dirs) {
+    if (-not (Test-Path -LiteralPath $d -PathType Container)) { continue }
+    foreach ($f in @(Get-ChildItem -LiteralPath $d -File -Force)) {
+        if (-not $f.Name.EndsWith('.bak', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $h = $null
+        try {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+        } catch { }
+        $rows.Add([pscustomobject]@{ dir = $d; name = $f.Name; sha256 = $h })
+    }
+}
+'MCPJSON:' + (ConvertTo-Json -InputObject @($rows) -Depth 3 -Compress)
+"""
 
 
 @runtime_checkable
@@ -553,38 +597,147 @@ def _wait_up(runtime: RuntimeLike, targets: Mapping[str, int], *, deadline: floa
     )
 
 
-def _wait_reboot(runtime: RuntimeLike, targets: Mapping[str, int], *, wait_ready_s: float, poll_s: float,
-                 probe: HttpProbe, probe_timeout_s: float) -> tuple[float, _Observation]:
-    """Wait until the guest is seen going down, then until every target answers.
+def _boot_datetime(value: str | None) -> datetime | None:
+    """Parse a boot time from :func:`guest_boot_time` (ISO-8601 UTC, up to 7 fraction digits)."""
+    m = _BOOT_RE.fullmatch(value) if isinstance(value, str) else None
+    if m is None:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    return dt + timedelta(microseconds=int(((m.group(2) or "") + "000000")[:6]))
 
-    Down means VMware reporting Tools as not running, or every port dark for
+
+def guest_boot_time(channel: GuestChannel, *, timeout_s: float = _BOOT_READ_TIMEOUT_S,
+                    guest_tmp_dir: str = DEFAULT_GUEST_TMP_DIR) -> str | None:
+    """The guest's last boot time as an ISO-8601 UTC string (e.g. ``2026-11-23T13:16:44.5000000Z``).
+
+    Reads ``(Get-CimInstance Win32_OperatingSystem).LastBootUpTime`` with
+    :func:`ps.run_powershell`. Returns None when the script ran but gave no
+    usable value (non-zero exit, no or malformed ``MCPBOOT:`` line). Raises the
+    channel's errors (Tools not running, vmrun timeout, ...), so "the guest did
+    not answer" stays distinguishable from "it answered nothing usable".
+    """
+    res = run_powershell(channel, _BOOT_SCRIPT, timeout_s=_positive("timeout_s", timeout_s),
+                         guest_tmp_dir=guest_tmp_dir)
+    if not res.ok:
+        return None
+    lines = [ln.strip() for ln in res.output.splitlines() if ln.strip().startswith(_BOOT_MARKER)]
+    if not lines:
+        return None
+    value = lines[-1][len(_BOOT_MARKER):].strip()
+    return value if _boot_datetime(value) is not None else None
+
+
+def _boot_time_before_reboot(channel: GuestChannel) -> str | None:
+    """Boot time read before the reboot request; None (logged) when it cannot be read."""
+    try:
+        value = guest_boot_time(channel)
+    except GatewayError as exc:
+        log.warning("could not read the guest boot time before the reboot (%s); only the guest going "
+                    "down can show the reboot, and a fast reboot may be missed", exc.code)
+        return None
+    if value is None:
+        log.warning("the guest reported no usable boot time; only the guest going down can show the "
+                    "reboot, and a fast reboot may be missed")
+    return value
+
+
+@dataclass
+class _RebootWatch:
+    before: str | None  # boot time read before the reboot was requested
+    signal: str | None = None  # "boot_time" | "down": what showed the reboot
+    after: str | None = None  # the new boot time, when that showed the reboot
+    last: str | None = None  # last boot time read while waiting
+
+    def __post_init__(self) -> None:
+        self.before_dt = _boot_datetime(self.before)
+
+    def read(self, channel: GuestChannel, remaining_s: float) -> bool:
+        """Read the boot time once; True when it moved forward past the tolerance.
+
+        A failed read (guest going down, Tools starting, vmrun timeout) is no
+        evidence either way and returns False.
+        """
+        if self.before_dt is None or remaining_s <= 0:
+            return False
+        try:
+            value = guest_boot_time(channel, timeout_s=min(_BOOT_READ_TIMEOUT_S, remaining_s))
+        except GatewayError as exc:
+            log.debug("guest boot time not readable while waiting for the reboot (%s)", exc.code)
+            return False
+        now = _boot_datetime(value)
+        if now is None:
+            return False
+        self.last = value
+        if (now - self.before_dt).total_seconds() > _BOOT_TIME_TOLERANCE_S:
+            self.after = value
+            return True
+        return False
+
+
+def _wait_reboot(runtime: RuntimeLike, targets: Mapping[str, int], *, wait_ready_s: float, poll_s: float,
+                 probe: HttpProbe, probe_timeout_s: float,
+                 boot_before: str | None) -> tuple[float, _Observation, _RebootWatch]:
+    """Wait until the guest has rebooted, then until every target answers.
+
+    Primary signal (E2): the guest's boot time (:func:`guest_boot_time`) moved
+    forward by more than ``_BOOT_TIME_TOLERANCE_S`` from ``boot_before``, which
+    was read before the reboot was requested. It is read once per poll while
+    VMware reports Tools running; failed reads are skipped. A guest that is down
+    for less than one poll interval is still seen this way (the E2 failure:
+    LastBootUpTime moved 22:16:44 -> 22:22:29, yet no poll saw the guest down).
+
+    Secondary signal (the only one when ``boot_before`` is None): the guest seen
+    going down: VMware reporting Tools as not running, or every port dark for
     ``_DARK_ROUNDS`` polls in a row while Tools still run. A failed or UNKNOWN
     Tools query and a missing guest IP are no evidence either way: polling goes
     on, so the still-running old debuggers can never pass for the rebooted ones.
+
+    Both share one deadline, ``wait_ready_s`` after the call.
     """
     clock = runtime.clock
     start = clock.monotonic()
     deadline = start + wait_ready_s
     prober = _PortProber(probe, probe_timeout_s, answers=_DOWN_PHASE_ANSWERS)
+    watch = _RebootWatch(boot_before)
     dark_rounds = 0
 
-    def went_down() -> bool:
+    def rebooted() -> bool:
         nonlocal dark_rounds
         obs = _observe(runtime, targets, prober)
-        if obs.tools_down:
-            return True
         dark_rounds = dark_rounds + 1 if obs.ports_dark else 0
-        return dark_rounds >= _DARK_ROUNDS
+        if obs.tools_running and watch.read(runtime.channel, deadline - clock.monotonic()):
+            watch.signal = "boot_time"
+            return True
+        if obs.tools_down or dark_rounds >= _DARK_ROUNDS:
+            watch.signal = "down"
+            return True
+        return False
 
-    if not _poll_until(clock, deadline, poll_s, went_down):
+    if not _poll_until(clock, deadline, poll_s, rebooted):
+        if watch.before is None:
+            raise VmNotReady(
+                f"the guest did not go down within {wait_ready_s:g}s after the reboot was requested "
+                "(its boot time could not be read, so only going down could show the reboot)",
+                stage="reboot", details={"phase": "down", "timeout_s": wait_ready_s, "boot_time": None},
+                hint="the old debugger instances are still answering; check that shutdown.exe can run",
+            )
+        last = f" (last read: {watch.last})" if watch.last and watch.last != watch.before else ""
+        unread = "" if watch.last else "; it could not be read again since"
         raise VmNotReady(
-            f"the guest did not go down within {wait_ready_s:g}s after the reboot was requested",
-            stage="reboot", details={"phase": "down", "timeout_s": wait_ready_s},
-            hint="the old debugger instances are still answering; check that shutdown.exe can run",
+            f"the guest did not reboot within {wait_ready_s:g}s after the reboot was requested: "
+            f"its boot time is still {watch.before}{last}{unread}",
+            stage="reboot",
+            details={"phase": "down", "timeout_s": wait_ready_s, "boot_time": watch.before,
+                     "last_boot_time": watch.last},
+            hint="shutdown.exe /r may have been refused or the guest hangs while shutting down; "
+                 "take a screenshot (vm_screenshot)",
         )
     obs = _wait_up(runtime, targets, deadline=deadline, poll_s=poll_s, probe=probe,
                    probe_timeout_s=probe_timeout_s, stage="reboot", timeout_s=wait_ready_s)
-    return clock.monotonic() - start, obs
+    return clock.monotonic() - start, obs, watch
 
 
 # ── clean snapshot ──────────────────────────────────────────────────
@@ -758,9 +911,13 @@ def provision_guest(
     from ``runtime.backends``, job root defaulting to ``profile.job_root_guest``)
     and run the packaged provision.ps1 as a file; read
     ``provision.result.json`` / ``provision.log``. Then, unless ``dry_run``:
-    reboot (``shutdown.exe /r /t 2 /f``, not awaited) and wait for the guest to
-    go down and for VMware Tools plus every provisioned backend port (HTTP 200,
-    401 or 429) within ``wait_ready_s``; finally take ``clean_snapshot``. An
+    read the guest's boot time, reboot (``shutdown.exe /r /t 2 /f``, not
+    awaited) and wait until the boot time has changed (or, as a secondary
+    signal, the guest was seen going down) and VMware Tools plus every
+    provisioned backend port answer (HTTP 200, 401 or 429), all within
+    ``wait_ready_s``; finally take ``clean_snapshot``. The summary's
+    ``reboot_signal`` ("boot_time" / "down") and ``boot_time`` (``before`` /
+    ``after``) say how the reboot was recognised. An
     existing snapshot of that name is refused unless ``overwrite_snapshot``,
     which deletes it first; protected snapshots and the profile's clean
     snapshot are never deleted, even then. Without a reboot the readiness wait
@@ -863,6 +1020,8 @@ def provision_guest(
         "backends": backends,
         "skipped": [a for a in skipped if a in ARCH_SPECS],
         "rebooted": False,
+        "reboot_signal": None,  # "boot_time" | "down": what showed the reboot
+        "boot_time": None,  # {"before": ISO | None, "after": ISO | None} after a reboot
         "ready_s": None,
         "readiness": {},
         "snapshot": None,
@@ -884,11 +1043,16 @@ def provision_guest(
     targets = {b.id: b.port for b in runtime.backends.values() if b.port is not None and b.arch in backends}
 
     if reboot:
+        boot_before = _boot_time_before_reboot(channel)
         channel.run_program(SHUTDOWN_EXE, list(REBOOT_ARGS), wait=False)
-        log.info("guest reboot requested; waiting up to %gs for %s", wait_ready_s, ", ".join(targets))
-        ready_s, obs = _wait_reboot(runtime, targets, wait_ready_s=wait_ready_s, poll_s=poll_s,
-                                    probe=http_probe, probe_timeout_s=probe_timeout_s)
-        summary.update(rebooted=True, ready_s=round(ready_s, 1), readiness=dict(obs.statuses))
+        log.info("guest reboot requested (boot time %s); waiting up to %gs for %s",
+                 boot_before or "unknown", wait_ready_s, ", ".join(targets))
+        ready_s, obs, watch = _wait_reboot(runtime, targets, wait_ready_s=wait_ready_s, poll_s=poll_s,
+                                           probe=http_probe, probe_timeout_s=probe_timeout_s,
+                                           boot_before=boot_before)
+        summary.update(rebooted=True, ready_s=round(ready_s, 1), readiness=dict(obs.statuses),
+                       reboot_signal=watch.signal,
+                       boot_time={"before": watch.before, "after": watch.after})
     elif snap_plan is not None:
         start = runtime.clock.monotonic()
         obs = _wait_up(runtime, targets, deadline=start + wait_ready_s, poll_s=poll_s, probe=http_probe,
@@ -932,50 +1096,179 @@ def _kill_debuggers(runtime: RuntimeLike, images: Iterable[str], *, kill_wait_s:
     return sorted(killed)
 
 
-def _replace_plugin(channel: GuestChannel, local: Path, target: str) -> str:
-    """Swap in ``local`` as ``target`` via ``target.new``; back the original up to ``.bak`` once.
+def _utc_now(clock: Clock) -> datetime:
+    """The clock's UTC time, whole seconds (backup names); the host clock if it cannot be parsed."""
+    try:
+        now = datetime.fromisoformat(clock.now_iso())
+    except (TypeError, ValueError):
+        now = datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now.astimezone(UTC).replace(microsecond=0)
 
-    The current plugin is moved aside (to ``.bak`` when there is no backup yet,
-    otherwise to ``.old``, deleted afterwards) before ``.new`` is renamed into
-    place; if that rename fails it is moved back, so a failure never leaves the
-    debugger without a plugin unless the move back fails too (the error's
-    details then name ``previous_plugin``).
 
-    Returns "created" (this call made the backup), "kept" (an earlier backup was
-    left untouched) or "none" (there was nothing to back up).
+def _known_backups(channel: GuestChannel, dirs: Sequence[str]) -> dict[str, dict[str, str | None]] | None:
+    """``{folded dir: {file name: sha256 or None}}`` of the ``*.bak`` files in ``dirs``.
+
+    Hashed in the guest (one PowerShell run for all folders, Get-FileHash). None
+    when the listing failed or is unreadable: then every replaced plugin gets a
+    new backup (a duplicate is harmless, a missing backup is not). Guest
+    environment errors propagate.
     """
-    new, bak, old = target + ".new", target + ".bak", target + ".old"
+    script = _BACKUP_HASH_SCRIPT.replace("__DIRS__", ", ".join(ps_quote(d) for d in dirs))
+    try:
+        res = run_powershell(channel, script, timeout_s=_BACKUP_HASH_TIMEOUT_S)
+    except GatewayError as exc:
+        if isinstance(exc, GUEST_ENV_ERRORS):
+            raise
+        log.warning("could not list the existing plugin backups (%s); every replaced plugin is backed up",
+                    exc.code)
+        return None
+    lines = [line for line in res.output.splitlines() if line.startswith(_MARKER)]
+    rows: Any = None
+    if res.ok and lines:
+        try:
+            rows = json.loads(lines[-1][len(_MARKER):])
+        except ValueError:
+            rows = None
+    if isinstance(rows, dict):
+        rows = [rows]  # Windows PowerShell may unwrap a one-element array
+    if not isinstance(rows, list):
+        log.warning("could not list the existing plugin backups (exit code %d); every replaced plugin "
+                    "is backed up", res.exit_code)
+        return None
+    known: dict[str, dict[str, str | None]] = {fold_case(d): {} for d in dirs}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        d, name, sha = row.get("dir"), row.get("name"), row.get("sha256")
+        if not isinstance(d, str) or fold_case(d) not in known or not isinstance(name, str) \
+                or not name or "\\" in name or "/" in name:
+            continue
+        digest = sha.lower() if isinstance(sha, str) else ""
+        known[fold_case(d)][name] = digest if _SHA256_RE.fullmatch(digest) else None
+    return known
+
+
+@dataclass
+class _Backups:
+    """The backups of one plugin in its ``plugins_backup`` folder (names as listed)."""
+
+    directory: str
+    plugin: str  # plugin file name, e.g. x64dbg-MCP-Server.dp64
+    stamp: datetime
+    hashes: dict[str, str | None] = field(default_factory=dict)  # file name -> sha256 (None: unknown)
+
+    def same_as(self, sha: str) -> str | None:
+        """Path of an existing backup with this SHA-256, if any."""
+        for name in sorted(self.hashes):
+            if self.hashes[name] == sha:
+                return _gjoin(self.directory, name)
+        return None
+
+    def _free_path(self, channel: GuestChannel) -> str:
+        taken = {fold_case(n) for n in self.hashes}
+        for i in range(_BACKUP_NAME_TRIES):
+            name = f"{self.plugin}.{(self.stamp + timedelta(seconds=i)).strftime(_BACKUP_STAMP)}.bak"
+            path = _gjoin(self.directory, name)
+            if fold_case(name) in taken or channel.file_exists(path):
+                continue
+            return path
+        raise GuestOperationError(f"no free backup name in {self.directory}", stage="install_plugin",
+                                  details={"backup_dir": self.directory},
+                                  hint=f"clean up old backups in {self.directory}")
+
+    def store(self, channel: GuestChannel, local: Path, sha: str) -> tuple[str, bool]:
+        """Back ``local`` (a host copy of a guest plugin) up; returns (path, created).
+
+        Nothing is written when a backup with the same SHA-256 exists already.
+        """
+        same = self.same_as(sha)
+        if same is not None:
+            return same, False
+        channel.mkdir(self.directory)
+        path = self._free_path(channel)
+        channel.copy_to_guest(local, path)
+        self.hashes[PureWindowsPath(path).name] = sha
+        return path, True
+
+
+def _fetch_and_hash(channel: GuestChannel, guest_path: str, local: Path) -> str:
+    channel.copy_from_guest(guest_path, local)
+    return sha256_file(local)
+
+
+def _adopt_legacy_backup(channel: GuestChannel, legacy: str, backups: _Backups, tmp: Path) -> str | None:
+    """Move a ``<plugin>.bak`` left in plugins\\ by earlier versions into ``plugins_backup``.
+
+    Best effort (the install does not depend on it): an identical backup that
+    exists already makes it a plain delete. Returns the backup path, or None
+    (logged) when it could not be moved. Guest environment errors propagate.
+    """
+    try:
+        local = tmp / "legacy.bak"
+        path, _created = backups.store(channel, local, _fetch_and_hash(channel, legacy, local))
+        channel.delete_file(legacy)
+    except GatewayError as exc:
+        if isinstance(exc, GUEST_ENV_ERRORS):
+            raise
+        log.warning("could not move the old plugin backup %s into %s (%s); x64dbg may still see it",
+                    legacy, backups.directory, exc.code)
+        return None
+    log.info("moved the old plugin backup %s to %s", legacy, path)
+    return path
+
+
+def _replace_plugin(channel: GuestChannel, local: Path, target: str, backups: _Backups) -> dict[str, Any]:
+    """Swap in ``local`` as ``target``; back the replaced build up in ``plugins_backup`` first.
+
+    Steps: upload ``target.new``; move a ``target.bak`` left by earlier versions
+    into the backup folder; copy the current plugin to the host, hash it and copy
+    it to ``<backup dir>\\<plugin>.<UTC stamp>.bak`` unless a backup with the same
+    SHA-256 exists; only then rename ``target`` to ``target.old`` and ``.new``
+    into place, and delete ``.old``. When the second rename fails, ``.old`` is
+    moved back, so a failure never leaves the debugger without a plugin unless
+    the move back fails too (the error's details then name ``previous_plugin``).
+    Nothing but the plugin itself stays in plugins\\ (E7).
+
+    Returns ``backup`` ("created": this call stored it; "kept": an identical
+    backup existed; "none": there was no plugin to back up), ``backup_path`` and
+    ``legacy_backup`` (where an old ``.bak`` from plugins\\ went, else None).
+    """
+    new, old, legacy = target + ".new", target + ".old", target + ".bak"
+    result: dict[str, Any] = {"backup": "none", "backup_path": None, "legacy_backup": None}
     _delete_if_exists(channel, new)
     channel.copy_to_guest(local, new)  # upload first: the old plugin stays until the copy worked
-    has_backup = channel.file_exists(bak)
-    if not channel.file_exists(target):
-        channel.rename(new, target)
-        return "kept" if has_backup else "none"
-    aside = old if has_backup else bak
-    if has_backup:
-        _delete_if_exists(channel, old)  # left over from an interrupted install
-    channel.rename(target, aside)
+    # A .old is only ever a second copy (its build was backed up before the swap).
+    _delete_if_exists(channel, old)
+    with tempfile.TemporaryDirectory(prefix="x64dbg-gw-plugin-") as tmp:
+        if channel.file_exists(legacy):
+            result["legacy_backup"] = _adopt_legacy_backup(channel, legacy, backups, Path(tmp))
+        if not channel.file_exists(target):
+            channel.rename(new, target)
+            return result
+        current = Path(tmp) / "current.bin"
+        path, created = backups.store(channel, current, _fetch_and_hash(channel, target, current))
+    result.update(backup="created" if created else "kept", backup_path=path)
+    channel.rename(target, old)
     try:
         channel.rename(new, target)
     except GatewayError as exc:
         try:
-            channel.rename(aside, target)
+            channel.rename(old, target)
             restored = True
         except GatewayError as undo:
             restored = False
-            log.error("plugin swap failed and %s could not be moved back to %s (%s)",
-                      aside, target, undo.code)
-        exc.details.update({"target": target, "uploaded": new, "restored": restored})
+            log.error("plugin swap failed and %s could not be moved back to %s (%s)", old, target, undo.code)
+        exc.details.update({"target": target, "uploaded": new, "restored": restored, "backup_path": path})
         if not restored:
-            exc.details["previous_plugin"] = aside
+            exc.details["previous_plugin"] = old
         raise
-    if has_backup:
-        try:
-            channel.delete_file(old)
-        except GatewayError as exc:
-            log.warning("could not delete %s (%s); the next install removes it", old, exc.code)
-        return "kept"
-    return "created"
+    try:
+        channel.delete_file(old)
+    except GatewayError as exc:
+        log.warning("could not delete %s (%s); the next install removes it", old, exc.code)
+    return result
 
 
 def _task_for(arch: str, by_arch: Mapping[str, BackendConfig]) -> str:
@@ -1019,9 +1312,16 @@ def install_plugin(
     ``x32/plugins/x64dbg-MCP-Server.dp32``. For each architecture present
     under ``x64dbg_root`` in the guest: running ``x64dbg.exe`` / ``x32dbg.exe``
     processes are killed (matched by image name) and awaited, the new file is
-    uploaded as ``<plugin>.new``, the current plugin is renamed to
-    ``<plugin>.bak`` if no backup exists yet (otherwise it is deleted, so the
-    backup always holds the original build), and ``.new`` is renamed into place.
+    uploaded as ``<plugin>.new``, the current plugin is backed up to
+    ``<root>\\<arch>\\plugins_backup\\<plugin>.<UTC yyyymmddTHHMMSSZ>.bak``
+    unless a backup with the same SHA-256 is there already (a taken name moves
+    to the next free second), and ``.new`` is renamed into place. A
+    ``<plugin>.bak`` that earlier versions left in ``plugins\\`` is moved to
+    ``plugins_backup`` too (E7: x64dbg scans ``plugins\\``). The SHA-256 of the
+    existing backups is computed in the guest by one PowerShell run before the
+    debuggers are killed; when that fails, every replaced plugin is backed up.
+    ``installed[arch]`` reports ``backup`` ("created" / "kept" / "none"),
+    ``backup_path`` and ``legacy_backup``.
 
     With ``relaunch`` the logon tasks (``launch_task`` of the backend, default
     MCP-x64dbg / MCP-x32dbg) are started with ``schtasks /run`` and every
@@ -1064,6 +1364,10 @@ def install_plugin(
     by_arch: dict[str, BackendConfig] = {}
     for b in runtime.backends.values():
         by_arch.setdefault(b.arch, b)
+    # Read-only steps before the debuggers die: what is backed up already, and the stamp.
+    backup_dirs = {a: _gjoin(root, a, BACKUP_DIR_NAME) for a in present}
+    known = _known_backups(channel, [backup_dirs[a] for a in present])
+    stamp = _utc_now(clock)
     killed = _kill_debuggers(runtime, [ARCH_SPECS[a].exe for a in present], kill_wait_s=kill_wait_s)
 
     installed: dict[str, dict[str, Any]] = {}
@@ -1073,15 +1377,19 @@ def install_plugin(
             spec = ARCH_SPECS[arch]
             plugin_dir = _gjoin(root, arch, "plugins")
             target = _gjoin(plugin_dir, spec.plugin)
+            prefix = fold_case(spec.plugin + ".")
+            listed = known.get(fold_case(backup_dirs[arch]), {}) if known is not None else {}
+            backups = _Backups(backup_dirs[arch], spec.plugin, stamp,
+                               {n: h for n, h in listed.items() if fold_case(n).startswith(prefix)})
             try:
                 channel.mkdir(plugin_dir)
-                backup = _replace_plugin(channel, local[arch], target)
+                result = _replace_plugin(channel, local[arch], target, backups)
             except GatewayError as exc:
                 exc.details.setdefault("target", target)
                 raise
-            installed[arch] = {"guest_path": target, "backup": backup,
-                               "backup_path": target + ".bak" if backup != "none" else None, **builds[arch]}
-            log.info("plugin %s installed at %s (backup: %s)", arch, target, backup)
+            installed[arch] = {"guest_path": target, **result, **builds[arch]}
+            log.info("plugin %s installed at %s (backup: %s %s)", arch, target, result["backup"],
+                     result["backup_path"] or "-")
     except GatewayError as exc:
         # The debuggers are dead and an upload/swap failed: say what was done, and bring the
         # debuggers back (each plugin file is either the new build or the one it replaced).

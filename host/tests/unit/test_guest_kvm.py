@@ -288,7 +288,7 @@ def test_run_powershell_argv_round_trips(wired, fake_guest, tmp_path, monkeypatc
     chan, emu, _ = wired
     GuestPowerShell(fake_guest, lambda body: (0, "ok"))
     res = ps.run_powershell(chan, "Write-Output \"a b\" 'c' \\\\x\\")
-    assert res.output == "ok\n"
+    assert res.ok and res.output == "ok"
     (received,) = emu.received
     assert received[:4] == ps.PS_BASE_ARGS and received[4] == "-EncodedCommand"
 

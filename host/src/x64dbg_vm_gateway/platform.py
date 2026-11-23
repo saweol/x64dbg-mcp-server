@@ -11,17 +11,21 @@ are safe to call concurrently.
 
 from __future__ import annotations
 
+import base64
 import codecs
+import json
 import ntpath
 import os
 import platform as _stdlib_platform
+import posixpath
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .errors import ConfigError, VmrunNotFound
+from .errors import ConfigError, GatewayError, VmrunNotFound
 
 LINUX_VMRUN = "/usr/bin/vmrun"
 MACOS_VMRUN = "/Applications/VMware Fusion.app/Contents/Library/vmrun"
@@ -39,6 +43,17 @@ VMRUN_TYPES = ("ws", "fusion")
 
 RegistryReader = Callable[[str, str], "str | None"]
 Which = Callable[..., "str | None"]
+#: ``subprocess.run``-compatible callable (argv, capture_output=, timeout=, check=, ...).
+Runner = Callable[..., Any]
+
+#: Image names of the VMware hypervisor process that runs one VM (``-debug`` / ``-stats``
+#: are the diagnostic builds Workstation ships next to it; they run a VM just the same).
+VMX_PROCESS_NAMES = frozenset({"vmware-vmx", "vmware-vmx-debug", "vmware-vmx-stats"})
+#: Seconds a host process listing (``ps`` / PowerShell) may take.
+PROCESS_SCAN_TIMEOUT_S = 20.0
+_PROC_MARKER = "MCPPROC:"
+_MAC_PS = "/bin/ps"
+_PS_LINE_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
 
 
 def host_system(system: str | None = None) -> str:
@@ -200,3 +215,266 @@ def secure_file(path: Path | str, *, system: str | None = None,
                 chmod: Callable[[Any, int], None] = os.chmod) -> bool:
     """chmod 0600 (no exec bit) on POSIX hosts. Returns False (no-op) on Windows."""
     return _secure(path, 0o600, system, chmod)
+
+
+# ── hypervisor processes of one VM (E1: duplicate VM instances) ─────
+def _scan_failed(message: str, **details: Any) -> GatewayError:
+    return GatewayError(
+        message, stage="platform", details=details,
+        hint="the host process table could not be read, so it is unknown whether the VM already "
+             "runs; do not start it until this works (check the VM with the hypervisor's own tools)",
+    )
+
+
+def split_windows_command_line(cmdline: str) -> list[str]:
+    """Split a Windows command line into argv (MSVCRT / ``CommandLineToArgvW`` rules).
+
+    argv[0] ends at its closing quote (no escapes) or at the first blank. Later
+    arguments: blanks outside quotes separate; 2n backslashes before a quote give
+    n backslashes and the quote toggles quoting, 2n+1 give n backslashes and a
+    literal quote; other backslashes are literal; ``""`` inside quotes is a quote.
+    """
+    argv: list[str] = []
+    n = len(cmdline)
+    i = 0
+    while i < n and cmdline[i] in " \t":
+        i += 1
+    if i >= n:
+        return argv
+    if cmdline[i] == '"':
+        end = cmdline.find('"', i + 1)
+        end = n if end < 0 else end
+        argv.append(cmdline[i + 1:end])
+        i = end + 1
+    else:
+        start = i
+        while i < n and cmdline[i] not in " \t":
+            i += 1
+        argv.append(cmdline[start:i])
+    while True:
+        while i < n and cmdline[i] in " \t":
+            i += 1
+        if i >= n:
+            return argv
+        arg: list[str] = []
+        quoted = False
+        while i < n:
+            ch = cmdline[i]
+            if ch == "\\":
+                j = i
+                while j < n and cmdline[j] == "\\":
+                    j += 1
+                if j < n and cmdline[j] == '"':
+                    arg.append("\\" * ((j - i) // 2))
+                    if (j - i) % 2:
+                        arg.append('"')
+                        j += 1
+                else:
+                    arg.append("\\" * (j - i))
+                i = j
+            elif ch == '"':
+                if quoted and i + 1 < n and cmdline[i + 1] == '"':
+                    arg.append('"')
+                    i += 2
+                else:
+                    quoted = not quoted
+                    i += 1
+            elif ch in " \t" and not quoted:
+                break
+            else:
+                arg.append(ch)
+                i += 1
+        argv.append("".join(arg))
+
+
+def _norm_posix(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _norm_windows(path: str, *, resolve: bool) -> str:
+    return ntpath.normcase(ntpath.normpath(os.path.realpath(path) if resolve else path))
+
+
+def _is_vmx_image(arg0: str, *, windows: bool) -> bool:
+    if windows:
+        base = ntpath.basename(arg0).lower()
+        base = base[:-4] if base.endswith(".exe") else base
+    else:
+        base = posixpath.basename(arg0)
+    return base in VMX_PROCESS_NAMES
+
+
+def _linux_cmdline(entry: str) -> list[str] | None:
+    try:
+        with open(os.path.join(entry, "cmdline"), "rb") as f:
+            raw = f.read(1 << 20)
+    except OSError:  # vanished, permission denied, not a regular file ...
+        return None
+    if not raw:
+        return None  # kernel thread or zombie
+    return [part.decode("utf-8", errors="surrogateescape") for part in raw.rstrip(b"\0").split(b"\0")]
+
+
+def _scan_linux(vmx_path: str, proc_root: str) -> list[int]:
+    try:
+        names = os.listdir(proc_root)
+    except OSError as e:
+        raise _scan_failed(f"cannot list {proc_root}: {e.strerror or type(e).__name__}",
+                           proc_root=proc_root) from None
+    target = _norm_posix(vmx_path)
+    found: list[int] = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        entry = os.path.join(proc_root, name)
+        argv = _linux_cmdline(entry)
+        if not argv or not _is_vmx_image(argv[0], windows=False):
+            continue
+        for arg in argv[1:]:
+            if not arg.lower().endswith(".vmx"):
+                continue
+            if not os.path.isabs(arg):
+                try:
+                    cwd = os.readlink(os.path.join(entry, "cwd"))
+                except OSError:
+                    continue  # cannot tell what a relative path meant
+                arg = os.path.join(cwd, arg)
+            if _norm_posix(arg) == target:
+                found.append(int(name))
+                break
+    return sorted(found)
+
+
+def _run_scan(run: Runner, argv: list[str], what: str, sysname: str) -> bytes:
+    try:
+        res = run(argv, capture_output=True, timeout=PROCESS_SCAN_TIMEOUT_S, check=False,
+                  **subprocess_kwargs(sysname))
+    except subprocess.TimeoutExpired:
+        raise _scan_failed(f"{what} did not finish within {PROCESS_SCAN_TIMEOUT_S:g}s",
+                           command=what) from None
+    except OSError as e:
+        raise _scan_failed(f"cannot run {what}: {e.strerror or type(e).__name__}", command=what) from None
+    if res.returncode != 0:
+        raise _scan_failed(f"{what} exited with code {res.returncode}", command=what,
+                           returncode=res.returncode)
+    out = res.stdout
+    return out if isinstance(out, bytes) else str(out or "").encode("utf-8")
+
+
+# The image path at the start of a ps command: no " -" / " /" (the start of an argument)
+# before the image name, so ".../VMware Fusion.app/.../vmware-vmx" matches and
+# "vim /x/vmware-vmx" does not.
+_MAC_IMAGE_RE = re.compile(r"^(?:(?:(?!\s[-/]).)*/)?(vmware-vmx(?:-debug|-stats)?)(?=\s|$)")
+
+
+def _scan_macos(vmx_path: str, run: Runner) -> list[int]:
+    # ps joins argv with spaces (no quoting), so the .vmx path is matched as a whole
+    # token (start or blank before it, blank or end after it), not split out of argv.
+    out = _run_scan(run, [_MAC_PS, "-axww", "-o", "pid=,command="], "ps", "Darwin")
+    paths = {vmx_path, os.path.realpath(vmx_path)}
+    patterns = [re.compile(r"(?:^|\s)" + re.escape(p) + r"(?:\s|$)") for p in paths]
+    found: list[int] = []
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        m = _PS_LINE_RE.match(line)
+        if not m:
+            continue
+        command = m.group(2)
+        if _MAC_IMAGE_RE.match(command) and any(p.search(command) for p in patterns):
+            found.append(int(m.group(1)))
+    return sorted(found)
+
+
+_WINDOWS_SCAN_SCRIPT = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n"
+    "$names = @(" + ", ".join(f"'{n}.exe'" for n in sorted(VMX_PROCESS_NAMES)) + ")\n"
+    "$rows = @(Get-CimInstance -ClassName Win32_Process | Where-Object { $names -contains $_.Name } |\n"
+    "    ForEach-Object {\n"
+    "        [pscustomobject]@{ ProcessId = [int]$_.ProcessId; CommandLine = $_.CommandLine }\n"
+    "    })\n"
+    f"'{_PROC_MARKER}' + (ConvertTo-Json -InputObject $rows -Compress)\n"
+)
+
+
+def _windows_powershell(env: Mapping[str, str]) -> str:
+    root = env.get("SystemRoot") or env.get("SYSTEMROOT") or "C:\\Windows"
+    return ntpath.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+def _scan_windows(vmx_path: str, run: Runner, env: Mapping[str, str]) -> list[int]:
+    encoded = base64.b64encode(_WINDOWS_SCAN_SCRIPT.encode("utf-16-le")).decode("ascii")
+    argv = [_windows_powershell(env), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", encoded]
+    text = _run_scan(run, argv, "powershell", "Windows").decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith(_PROC_MARKER)]
+    if not lines:
+        raise _scan_failed("the Windows process query printed no result", command="powershell")
+    payload = lines[-1][len(_PROC_MARKER):].strip()
+    try:
+        rows = json.loads(payload) if payload else []
+    except ValueError:
+        raise _scan_failed("the Windows process query printed unreadable JSON",
+                           command="powershell") from None
+    if isinstance(rows, dict):
+        rows = [rows]  # Windows PowerShell may unwrap a one-element array
+    if not isinstance(rows, list):
+        raise _scan_failed("the Windows process query printed an unexpected result", command="powershell")
+    resolve = _stdlib_platform.system() == "Windows"  # realpath only means something on Windows
+    target = _norm_windows(vmx_path, resolve=resolve)
+    found: list[int] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid, cmdline = row.get("ProcessId"), row.get("CommandLine")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or not isinstance(cmdline, str):
+            continue  # another user's process: CommandLine is null without the rights to read it
+        argv = split_windows_command_line(cmdline)
+        if not argv or not _is_vmx_image(argv[0], windows=True):
+            continue
+        if any(a.lower().endswith(".vmx") and _norm_windows(a, resolve=resolve) == target for a in argv[1:]):
+            found.append(pid)
+    return sorted(found)
+
+
+def find_vmx_processes(
+    vmx_path: str,
+    *,
+    system: str | None = None,
+    proc_root: str = "/proc",
+    run: Runner = subprocess.run,
+    env: Mapping[str, str] | None = None,
+) -> list[int]:
+    """PIDs of the hypervisor processes (``vmware-vmx``) that run exactly ``vmx_path``.
+
+    ``vmrun list`` only shows the VMs VMware knows about. After a revert an older
+    ``vmware-vmx`` of the same .vmx can survive unlisted (E1, docs/PHASE0_RESULTS.md),
+    and ``vmrun start`` then runs a second instance with the same MAC and IP. This
+    scan asks the host's process table instead:
+
+    - Linux (and any host that is neither Windows nor macOS):
+      ``<proc_root>/<pid>/cmdline`` whose argv[0] is a ``vmware-vmx`` image and
+      one of whose ``*.vmx`` arguments resolves (realpath, normcase) to
+      ``vmx_path``; a relative argument is resolved against
+      ``<proc_root>/<pid>/cwd``. Entries that cannot be read are skipped, never
+      raised.
+    - macOS (Fusion): ``ps -axww -o pid=,command=``; the image must be
+      ``vmware-vmx`` and the .vmx path (as given or resolved) a whole token of
+      the command (ps does not quote, so argv cannot be split exactly).
+    - Windows: Windows PowerShell + CIM ``Win32_Process`` for the ``vmware-vmx``
+      images, ``CommandLine`` split with the MSVCRT rules and the .vmx argument
+      compared case-insensitively. Processes whose command line this user may
+      not read are skipped.
+
+    Subprocesses run with a timeout (:data:`PROCESS_SCAN_TIMEOUT_S`). Returns the
+    PIDs sorted. Raises GatewayError (stage ``platform``) when the process table
+    itself cannot be read (no ``proc_root``, ``ps`` / PowerShell failed or timed
+    out, unreadable output): the answer is then unknown, not "none". On Linux a
+    ``/proc`` mounted with ``hidepid`` hides other users' processes, which this
+    scan cannot detect.
+    """
+    sysname = host_system(system)
+    if sysname == "Windows":
+        return _scan_windows(vmx_path, run, os.environ if env is None else env)
+    if sysname == "Darwin":
+        return _scan_macos(vmx_path, run)
+    return _scan_linux(vmx_path, proc_root)

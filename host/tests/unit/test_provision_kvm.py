@@ -15,6 +15,8 @@ import hashlib
 import json
 import logging
 import re
+import shutil
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -44,6 +46,7 @@ from tests.unit.test_ps import GuestPowerShell
 from x64dbg_vm_gateway.contracts import Secret
 from x64dbg_vm_gateway.errors import GuestOperationError, ToolsNotRunning, VmNotReady, VmrunTimeout
 from x64dbg_vm_gateway.provision import guest_boot_time, provision_guest
+from x64dbg_vm_gateway.ps import decode_command
 
 BOOT0 = datetime(2026, 11, 23, 13, 16, 44, 500000, tzinfo=UTC)
 
@@ -284,9 +287,12 @@ def test_boot_time_reads_are_bounded_by_the_remaining_budget(rt, timeline, host_
     _, _, emu = _setup(rt, timeline, reboot_s=0, reboots=False)
     with pytest.raises(VmNotReady):
         _provision(rt, probe, wait_ready_s=20)
-    boot_runs = [r for r in emu.runs if is_boot_query(r["body"])]
-    assert boot_runs
-    assert all(0 < r["kw"]["timeout_s"] <= 60 for r in boot_runs)
+    timeouts = [kw["timeout_s"] for (exe, args), kw in rt.channel.calls_of("run_program")
+                if exe.endswith("powershell.exe") and args[4] == "-EncodedCommand"
+                and is_boot_query(decode_command(args[5]))]
+    assert len(timeouts) >= 2  # before the request, then while waiting
+    assert all(0 < t <= 60 for t in timeouts)
+    assert timeouts[-1] <= 20  # never more than what is left of wait_ready_s
 
 
 def test_slow_debuggers_after_a_detected_reboot_still_time_out_as_up_phase(rt, timeline, fake_clock,
@@ -321,7 +327,8 @@ def test_no_reboot_summary_has_no_boot_time(rt, timeline, host_tmp) -> None:
 X64_BACKUPS = f"{ROOT}\\x64\\plugins_backup"
 X32_BACKUPS = f"{ROOT}\\x32\\plugins_backup"
 X64_PLUGINS = f"{ROOT}\\x64\\plugins"
-_STAMP_RE = re.compile(r"^x64dbg-mcp-server\.dp(64|32)\.(\d{8}T\d{6}Z)\.bak$")
+# FakeGuest keeps names lower-cased (Windows paths are case-insensitive).
+_STAMP_RE = re.compile(r"^x64dbg-mcp-server\.dp(64|32)\.(\d{8}T\d{6}Z)\.bak$", re.IGNORECASE)
 
 
 class BackupHashes:
@@ -501,3 +508,40 @@ def test_backup_happens_before_the_swap(rt, timeline, tmp_path) -> None:
     backup = min(i for i, c in enumerate(calls) if c[0] == "copy_to_guest" and "plugins_backup" in c[1][1])
     swap = min(i for i, c in enumerate(calls) if c[0] == "rename" and c[1][0].lower() == X64_PLUGIN.lower())
     assert backup < swap
+
+
+# ── the new PowerShell parses (only where PowerShell 7 is installed) ─
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) is not installed")
+def test_kvm_powershell_parses(tmp_path: Path) -> None:
+    # Syntax only (PowerShell 7 parser); behaviour on 5.1 needs the spike VM (tests/vm).
+    from x64dbg_vm_gateway import platform as plat
+    from x64dbg_vm_gateway import provision as prov
+    from x64dbg_vm_gateway.ps import ps_quote
+
+    scripts = {
+        "boot.ps1": prov._BOOT_SCRIPT,
+        "backups.ps1": prov._BACKUP_HASH_SCRIPT.replace(
+            "__DIRS__", ", ".join(ps_quote(d) for d in (X64_BACKUPS, X32_BACKUPS))),
+        "vmx_scan.ps1": plat._WINDOWS_SCAN_SCRIPT,
+    }
+    paths = []
+    for name, text in scripts.items():
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        paths.append(str(p))
+    checker = tmp_path / "check.ps1"
+    checker.write_text(
+        "$failed = 0\n"
+        "foreach ($path in $args) {\n"
+        "    $tokens = $null; $errors = $null\n"
+        "    [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)"
+        " | Out-Null\n"
+        "    foreach ($e in $errors) {\n"
+        "        Write-Output ('{0}:{1}: {2}' -f $path, $e.Extent.StartLineNumber, $e.Message)\n"
+        "        $failed = 1\n"
+        "    }\n"
+        "}\n"
+        "exit $failed\n", encoding="utf-8")
+    res = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(checker), *paths],
+                         capture_output=True, text=True, timeout=50, check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
