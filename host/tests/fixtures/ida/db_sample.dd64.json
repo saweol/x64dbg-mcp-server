@@ -1,0 +1,152 @@
+{
+ "comments": [
+  {
+   "module": "sample.exe",
+   "address": "0x1010",
+   "manual": true,
+   "text": "decrypts the embedded config"
+  },
+  {
+   "module": "sample.exe",
+   "address": "0x2040",
+   "manual": false,
+   "text": "auto: string reference"
+  },
+  {
+   "module": "",
+   "address": "0x1F0000",
+   "manual": true,
+   "text": "heap buffer outside any module"
+  }
+ ],
+ "labels": [
+  {
+   "module": "sample.exe",
+   "address": "0x1000",
+   "manual": true,
+   "text": "decrypt_config"
+  },
+  {
+   "module": "sample.exe",
+   "address": "0x1500",
+   "manual": true,
+   "text": "c2 beacon loop"
+  },
+  {
+   "module": "helper.dll",
+   "address": "0x3000",
+   "manual": true,
+   "text": "helper_init"
+  }
+ ],
+ "bookmarks": [
+  {
+   "module": "sample.exe",
+   "address": "0x1010",
+   "manual": true
+  }
+ ],
+ "functions": [
+  {
+   "module": "sample.exe",
+   "start": "0x1000",
+   "end": "0x10FF",
+   "manual": true,
+   "icount": "0x2A",
+   "parent": "0x1000"
+  }
+ ],
+ "breakpoints": [
+  {
+   "address": "0x1000",
+   "enabled": true,
+   "oldbytes": "0x4855",
+   "type": 0,
+   "titantype": "0x0",
+   "name": "",
+   "module": "sample.exe",
+   "breakCondition": "",
+   "logText": "",
+   "logCondition": "",
+   "commandText": "",
+   "commandCondition": "",
+   "logFile": "",
+   "fastResume": false,
+   "silent": false
+  },
+  {
+   "address": "0x1500",
+   "enabled": false,
+   "type": 1,
+   "titantype": "0x4",
+   "name": "hw_beacon",
+   "module": "sample.exe",
+   "breakCondition": "rcx==1",
+   "logText": "beacon {rcx}",
+   "logCondition": "",
+   "commandText": "",
+   "commandCondition": "",
+   "logFile": "",
+   "fastResume": false,
+   "silent": false
+  },
+  {
+   "address": "0x2000",
+   "enabled": true,
+   "memsize": "0x1000",
+   "type": 2,
+   "titantype": "0x0",
+   "name": "",
+   "module": "sample.exe",
+   "breakCondition": "",
+   "logText": "",
+   "logCondition": "",
+   "commandText": "",
+   "commandCondition": "",
+   "logFile": "",
+   "fastResume": false,
+   "silent": false
+  },
+  {
+   "address": "0x0",
+   "enabled": true,
+   "type": 3,
+   "titantype": "0x0",
+   "name": "",
+   "module": "helper.dll",
+   "breakCondition": "",
+   "logText": "",
+   "logCondition": "",
+   "commandText": "",
+   "commandCondition": "",
+   "logFile": "",
+   "fastResume": false,
+   "silent": false
+  },
+  {
+   "address": "0xC0000005",
+   "enabled": true,
+   "type": 4,
+   "titantype": "0x0",
+   "name": "",
+   "breakCondition": "",
+   "logText": "",
+   "logCondition": "",
+   "commandText": "",
+   "commandCondition": "",
+   "logFile": "",
+   "fastResume": false,
+   "silent": false
+  }
+ ],
+ "xrefs": [
+  {
+   "module": "sample.exe",
+   "address": "0x1000",
+   "references": []
+  }
+ ],
+ "notes": "synthetic test database (no real sample)",
+ "hashAlgorithm": "murmurhash",
+ "hash": "0x1234ABCD"
+}

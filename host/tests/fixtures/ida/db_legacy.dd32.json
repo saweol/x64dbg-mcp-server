@@ -1,0 +1,36 @@
+{
+ "labels": [
+  {
+   "module": "old.exe",
+   "address": "0x1000",
+   "text": "legacy_start"
+  }
+ ],
+ "autolabels": [
+  {
+   "module": "old.exe",
+   "address": "0x1200",
+   "text": "auto_label"
+  }
+ ],
+ "autocomments": [
+  {
+   "module": "old.exe",
+   "address": "0x1204",
+   "text": "auto comment"
+  }
+ ],
+ "autobookmarks": [
+  {
+   "module": "old.exe",
+   "address": "0x1300"
+  }
+ ],
+ "autofunctions": [
+  {
+   "module": "old.exe",
+   "address": "0x1000",
+   "end": "0x1050"
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+<untrusted_guest_output>
+0x7FF6A1230000 | 0x2A000 | sample.exe
+0x7FFE0F2D0000 | 0x1F8000 | ntdll.dll
+0x7FFE0E510000 | 0xBF000 | kernel32.dll
+0x7FFE0C8F0000 | 0x2C8000 | KERNELBASE.dll
+0x6FFF0000 | 0x14000 | helper.dll
+
+</untrusted_guest_output>
+<untrusted_guest_output>
+[event:info] System breakpoint hit. Target is now PAUSED at entry point.
+</untrusted_guest_output>
+<untrusted_guest_output>
+[state] PAUSED at 0x7FFE0F3A0B54 (ntdll.dll) | int3
+</untrusted_guest_output>
+[gateway] epoch=2 backend=x64 retried=false
