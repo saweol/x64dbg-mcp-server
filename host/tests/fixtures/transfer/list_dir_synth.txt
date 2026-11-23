@@ -1,0 +1,5 @@
+Directory list: 4
+0123456789ab.exe
+dump 1.bin
+notes,v2.txt
+sub
