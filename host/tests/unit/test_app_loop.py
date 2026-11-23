@@ -9,9 +9,9 @@ import stat
 from pathlib import Path
 
 import pytest
-from x64dbg_vm_gateway.app import Gateway
 
 from tests.fakes.fake_runtime import EXE, GUEST_ROOT, make_lab
+from x64dbg_vm_gateway.app import Gateway
 from x64dbg_vm_gateway.app_api import GatewayApp
 from x64dbg_vm_gateway.contracts import JobState, Snapshot
 from x64dbg_vm_gateway.errors import StateViolation
@@ -271,3 +271,17 @@ def test_debugger_exe_dir_db_path_for_x32(tmp_path):
         assert entry["status"] == "ok"
     finally:
         lab.close()
+
+
+def test_gateway_subclasses_the_facade_with_matching_signatures():
+    import inspect
+
+    assert GatewayApp in Gateway.__mro__
+    for name, proto in inspect.getmembers(GatewayApp, inspect.isfunction):
+        if name.startswith("_"):
+            continue
+        impl = getattr(Gateway, name)
+        assert impl is not proto, f"{name} is not implemented"
+        want = [(p.name, p.kind, p.default) for p in inspect.signature(proto).parameters.values()]
+        got = [(p.name, p.kind, p.default) for p in inspect.signature(impl).parameters.values()]
+        assert got == want, name

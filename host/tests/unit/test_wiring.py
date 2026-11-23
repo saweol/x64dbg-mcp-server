@@ -9,7 +9,20 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from tests.fakes.fake_guest import FakeGuest
+from tests.fakes.fake_plugin_server import FakePluginServer
+from tests.fakes.fake_runtime import CFG, PW_ENV, make_lab, token_for
+from tests.fakes.fake_vm import FakeClock, FakeVm
+from x64dbg_vm_gateway import wiring
 from x64dbg_vm_gateway.app import Gateway
+from x64dbg_vm_gateway.backend import HttpBackendClient
+from x64dbg_vm_gateway.catalog import ToolCatalog
+from x64dbg_vm_gateway.config import BackendConfig, GatewayConfig, ProfileConfig, load_config
+from x64dbg_vm_gateway.contracts import Secret
+from x64dbg_vm_gateway.errors import BackendAuthError, ConfigError, GuestOperationError, VmNotReady
+from x64dbg_vm_gateway.guest import VixChannel
+from x64dbg_vm_gateway.vmrun import NullProvider, VmrunCli, VmrunProvider
 from x64dbg_vm_gateway.wiring import (
     PROVISION_HINT,
     Runtime,
@@ -22,19 +35,6 @@ from x64dbg_vm_gateway.wiring import (
     read_env_file,
     resolve_environ,
 )
-
-from tests.fakes.fake_guest import FakeGuest
-from tests.fakes.fake_plugin_server import FakePluginServer
-from tests.fakes.fake_runtime import CFG, PW_ENV, make_lab, token_for
-from tests.fakes.fake_vm import FakeClock, FakeVm
-from x64dbg_vm_gateway import wiring
-from x64dbg_vm_gateway.backend import HttpBackendClient
-from x64dbg_vm_gateway.catalog import ToolCatalog
-from x64dbg_vm_gateway.config import BackendConfig, GatewayConfig, ProfileConfig, load_config
-from x64dbg_vm_gateway.contracts import Secret
-from x64dbg_vm_gateway.errors import BackendAuthError, ConfigError, GuestOperationError, VmNotReady
-from x64dbg_vm_gateway.guest import VixChannel
-from x64dbg_vm_gateway.vmrun import NullProvider, VmrunCli, VmrunProvider
 
 POSIX = os.name == "posix"
 GOOD = "0123456789abcdef0123456789abcdef"
@@ -406,6 +406,133 @@ def test_vm_write_lock_cancels_in_flight_backend_calls(lab):
         pass
     t.join(5)
     assert Spy.cancelled >= 1
+
+
+# ── slow guest I/O does not block other users of the runtime (review finding) ──
+def _block_token_copy(lab, rt):
+    """Make the next guest copy of the token config block until the returned event is set."""
+    entered, release = threading.Event(), threading.Event()
+    real = lab.guest.copy_from_guest
+
+    def slow_copy(guest_path, host_path):
+        if guest_path.lower() == CFG["x64"].lower():
+            entered.set()
+            assert release.wait(10)
+        return real(guest_path, host_path)
+
+    lab.guest.copy_from_guest = slow_copy  # type: ignore[method-assign]
+    return entered, release
+
+
+def _in_thread(fn):
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 - handed back to the test
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, box
+
+
+def test_resolved_url_does_not_wait_for_a_token_read(lab):
+    rt = lab.runtime()
+    entered, release = _block_token_copy(lab, rt)
+    reader, _ = _in_thread(lambda: rt.connect("x64"))
+    try:
+        assert entered.wait(5)
+        t, box = _in_thread(lambda: rt.resolved_url("x64"))
+        t.join(2)
+        assert not t.is_alive(), "resolved_url blocked behind the guest token copy"
+        assert box == {"value": None}
+        t, box = _in_thread(lambda: rt.guest_ip())
+        t.join(2)
+        assert not t.is_alive(), "guest_ip blocked behind the guest token copy"
+    finally:
+        release.set()
+        reader.join(10)
+    assert rt.resolved_url("x64") is not None
+
+
+def test_connect_without_waiting_refuses_while_another_thread_reads_the_token(lab):
+    rt = lab.runtime()
+    entered, release = _block_token_copy(lab, rt)
+    reader, rbox = _in_thread(lambda: rt.connect("x64"))
+    try:
+        assert entered.wait(5)
+        t, box = _in_thread(lambda: rt.connect("x64", wait=False))
+        t.join(2)
+        assert not t.is_alive()
+        assert isinstance(box.get("error"), VmNotReady)
+    finally:
+        release.set()
+        reader.join(10)
+    assert isinstance(rbox["value"], HttpBackendClient)
+    # the waiting form gets the client the other thread resolved, without a second copy
+    assert rt.connect("x64") is rbox["value"]
+    copies = [a for a, _ in lab.guest.calls_of("copy_from_guest") if a[0].lower() == CFG["x64"].lower()]
+    assert len(copies) <= 1  # slow_copy bypasses the recorder; the real copy ran once
+
+
+def test_guest_ip_lookup_does_not_hold_the_runtime_mutex(lab):
+    rt = lab.runtime()
+    entered, release = threading.Event(), threading.Event()
+    real = lab.vm.guest_ip
+
+    def slow_ip(*, wait=False, timeout_s=60.0):
+        entered.set()
+        assert release.wait(10)
+        return real(wait=wait, timeout_s=timeout_s)
+
+    lab.vm.guest_ip = slow_ip  # type: ignore[method-assign]
+    t1, _ = _in_thread(lambda: rt.connect("x64"))
+    try:
+        assert entered.wait(5)
+        t, _box = _in_thread(lambda: rt.resolved_url("x64"))
+        t.join(2)
+        assert not t.is_alive(), "resolved_url blocked behind the guest IP lookup"
+    finally:
+        release.set()
+        t1.join(10)
+
+
+def test_a_token_read_racing_with_a_revert_is_not_cached(lab):
+    """A token read that started before a revert must not be cached or used afterwards."""
+    rt = lab.runtime()
+    entered, release = threading.Event(), threading.Event()
+    real = lab.guest.copy_from_guest
+
+    def stale_copy(guest_path, host_path):
+        data = lab.guest.read(guest_path)  # the content before the revert ...
+        if guest_path.lower() == CFG["x64"].lower() and not entered.is_set():
+            entered.set()
+            assert release.wait(10)
+            Path(host_path).write_bytes(data)  # ... arrives after it
+            return None
+        return real(guest_path, host_path)
+
+    lab.guest.copy_from_guest = stale_copy  # type: ignore[method-assign]
+    reader, rbox = _in_thread(lambda: rt.connect("x64"))
+    try:
+        assert entered.wait(5)
+        # the revert brings a guest whose plugin uses another token
+        new = "e" * 32
+        lab.servers["x64"].token = new
+        cfg = json.loads(lab.guest.read(CFG["x64"]))
+        cfg["AuthToken"] = new
+        lab.guest.write(CFG["x64"], json.dumps(cfg).encode())
+        t, _box = _in_thread(lambda: rt.invalidate_clients(drop_tokens=True, reason="VM reverted"))
+        t.join(2)
+        assert not t.is_alive(), "invalidate_clients blocked behind the guest token copy"
+    finally:
+        release.set()
+        reader.join(10)
+    client = rbox["value"]
+    assert client.endpoint.token.reveal() == new
+    assert rt.connect("x64") is client and client.health_l1() is True
 
 
 def test_vmware_env_token_source(tmp_path):

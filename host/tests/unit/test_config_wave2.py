@@ -77,6 +77,10 @@ def test_empty_upload_roots_is_allowed(tmp_path):
         ('upload_roots = "~"', "gateway.upload_roots"),
         ('upload_roots = ["~", ""]', "gateway.upload_roots[1]"),
         ('upload_roots = ["~", "  "]', "gateway.upload_roots[1]"),
+        # relative roots would depend on the gateway's working directory (policy drops them)
+        ('upload_roots = ["samples"]', "gateway.upload_roots[0]"),
+        ('upload_roots = ["~", "./x"]', "gateway.upload_roots[1]"),
+        ('upload_roots = ["~user-without-slash/../x", "~/ok", "rel/x"]', "gateway.upload_roots[2]"),
     ],
 )
 def test_invalid_gateway_additions(tmp_path, extra, key):
@@ -114,3 +118,24 @@ def test_env_file_value_is_not_read_by_the_loader(tmp_path):
     # The loader only records the path; wiring reads and checks the file.
     cfg = load_text(tmp_path, doc(gateway_extra='env_file = "/does/not/exist.env"'))
     assert cfg.env_file == "/does/not/exist.env"
+
+
+@pytest.mark.parametrize("root", ["~", "~/samples", "~other/samples", "HOST_ABSOLUTE"])
+def test_absolute_and_home_upload_roots_are_accepted(tmp_path, root):
+    if root == "HOST_ABSOLUTE":
+        root = str(tmp_path / "samples")  # absolute in this host's syntax
+    # TOML literal strings (single quotes) keep backslashes as they are
+    cfg = load_text(tmp_path, doc(gateway_extra=f"upload_roots = ['{root}']"))
+    assert cfg.upload_roots == (root,)
+
+
+def test_new_profile_field_is_appended_after_the_wave1_fields():
+    """Positional construction of ProfileConfig keeps its wave-1 meaning."""
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(ProfileConfig)]
+    wave1 = ["name", "mode", "vmx", "vmrun", "vmrun_type", "clean_snapshot", "protected_snapshots",
+             "guest_user", "guest_password_env", "guest_host", "job_root_guest", "require_isolation",
+             "token_source", "snapshot_prefix", "retention", "backends", "relaunch_mode"]
+    assert names[: len(wave1)] == wave1
+    assert names[len(wave1):] == ["guest_user_env"]

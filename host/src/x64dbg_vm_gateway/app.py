@@ -18,11 +18,24 @@ Hard rules enforced here (not delegated to the MCP client):
   ``session_status`` acknowledges it;
 - guest-provided text is sanitised (the proxy wraps tool output in
   ``<untrusted_guest_output>``); host paths are checked against
-  ``gateway.upload_roots`` and guest paths against the job / debugger dirs.
+  ``gateway.upload_roots`` (hidden files/directories below a root and the
+  gateway's own config / env file are refused) and guest paths against the job
+  / debugger dirs;
+- the debugger state is part of a collection: a failed SaveDatabase or module
+  list leaves the job COLLECTED_PARTIAL (no debug session = nothing to save).
 
-Long operations (analysis_start/collect/finish, snapshot and power tools) run
-on the profile's ``ops.OperationRunner`` and answer ``{"state": "in_progress"}``
-when they outlast ``wait_s``.
+Recovery after a gateway restart (``recover_scan`` flags live jobs with
+``needs_recovery``; nothing is resumed automatically): a job left COLLECTING is
+collected again by ``analysis_collect``, a job left REVERTING is finished by
+``analysis_finish`` (the revert is redone), ANALYZING / COLLECTED(_PARTIAL) /
+DISCARDED jobs continue normally, and jobs interrupted while starting
+(CREATED..LOADING) need a human discard. ``session_status`` lists each with a
+``recovery_hint``.
+
+Long operations (analysis_start/collect/finish, snapshot and power tools,
+file_download) run on the profile's ``ops.OperationRunner`` and answer
+``{"state": "in_progress"}`` when they outlast ``wait_s``. The runner serialises
+them, so a download can never race with a collection that clears ``raw/extra``.
 
 Host layout of a job (``<jobs_root>/<job_id>/``): ``input/sample.bin`` (the
 sample copy that is uploaded), ``screens/`` (screenshots), ``artifacts/``
@@ -48,7 +61,6 @@ import logging
 import math
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -60,6 +72,7 @@ from typing import Any
 
 from . import platform as gw_platform
 from . import policy, transfer
+from .app_api import GatewayApp
 from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
 from .contracts import (
@@ -89,7 +102,7 @@ from .errors import (
     TransferError,
     VmNotReady,
 )
-from .guest import is_reserved_name, validate_guest_path
+from .guest import POWERSHELL_EXE, is_reserved_name, validate_guest_path
 from .jobs import Job, JobStore
 from .ops import OperationRunner, Progress
 from .pe import detect_pe
@@ -104,7 +117,12 @@ __all__ = ["LOOP_RULES", "Gateway", "InvalidArgument", "probe_vmrun_version"]
 
 
 class InvalidArgument(GatewayError):
-    """A tool argument is malformed (local error code; see contract_change_requests)."""
+    """A tool argument is malformed.
+
+    Defined here because errors.py is a shared contract file; moving this code
+    there is requested as a contract change (front-ends map it like any other
+    ``GatewayError`` through ``to_dict()``).
+    """
 
     code = "INVALID_ARGUMENT"
 
@@ -149,7 +167,26 @@ _TOOL_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 _VMRUN_VERSION_RE = re.compile(r"vmrun version\s+([0-9][0-9.]*(?:\s+build-\d+)?)", re.IGNORECASE)
 _EXTRA_INDEX_RE = re.compile(r"^(\d{4})_")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# x64dbg answers debug-only tools without a debuggee with "Tool requires an active debug
+# session." (-32602) or "Error: No active debug session." (tool text): nothing to save then.
+_NO_SESSION_RE = re.compile(r"\bactive debug session\b", re.IGNORECASE)
 _POSIX = os.name == "posix"
+LOAD_CALL_TIMEOUT_S = 60.0
+RECOVERY_HINTS = {
+    JobState.CREATED: "interrupted while starting: ask the user to discard it "
+    "(x64dbg-vm-gateway discard <job>)",
+    JobState.PREPARING_VM: "interrupted while starting: ask the user to discard it",
+    JobState.VM_READY: "interrupted while starting: ask the user to discard it",
+    JobState.UPLOADING: "interrupted while starting: ask the user to discard it",
+    JobState.UPLOADED: "interrupted while starting: ask the user to discard it",
+    JobState.LOADING: "interrupted while starting: ask the user to discard it",
+    JobState.ANALYZING: "continue the analysis, then analysis_collect and analysis_finish",
+    JobState.COLLECTING: "the collection was interrupted: call analysis_collect to collect again",
+    JobState.COLLECTED: "call analysis_finish (or analysis_collect again)",
+    JobState.COLLECTED_PARTIAL: "call analysis_collect again, then analysis_finish",
+    JobState.DISCARDED: "call analysis_finish to revert the VM",
+    JobState.REVERTING: "the revert was interrupted: call analysis_finish to redo it",
+}
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -217,6 +254,12 @@ class _Steps:
         self._clock = clock
         self._progress = progress
 
+    def soft_fail(self, rec: dict[str, Any], detail: str) -> None:
+        """Mark a step that completed as not ok (``detail`` is also recorded as a warning)."""
+        rec["_soft_failed"] = True
+        rec["detail"] = _clip(detail)
+        self.warnings.append(f"{rec['name']}: {rec['detail']}")
+
     @contextmanager
     def step(self, name: str, *, soft: bool = False) -> Iterator[dict[str, Any]]:
         """Run one step. ``soft`` steps record GatewayError/OSError as a warning instead of raising."""
@@ -238,8 +281,9 @@ class _Steps:
                 raise
             self.warnings.append(f"{name}: {rec['detail']}")
         else:
-            rec["ok"] = True
+            rec["ok"] = not rec.get("_soft_failed", False)
         finally:
+            rec.pop("_soft_failed", None)
             rec["ms"] = round((self._clock.monotonic() - t0) * 1000.0, 1)
 
 
@@ -293,6 +337,29 @@ def _preserve_downloads(art: Path) -> list[str]:
     return moved
 
 
+def _hidden_below(path: Path, root: Path) -> bool:
+    """True if a component of ``path`` below ``root`` is hidden (``.ssh``, ``.env``, ...)."""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(part.startswith(".") for part in rel.parts)
+
+
+def _resolved(path: str | os.PathLike[str] | None) -> Path | None:
+    if not path:
+        return None
+    try:
+        p = Path(path).expanduser()
+        return p.resolve(strict=False) if p.is_absolute() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _no_session(res: ToolCallResult) -> bool:
+    return bool(res.is_error) and any(_NO_SESSION_RE.search(t) for t in res.texts)
+
+
 def _attach(exc: BaseException, job_id: str | None, steps: _Steps) -> None:
     if isinstance(exc, GatewayError):
         exc.details.setdefault("job_id", job_id)
@@ -300,12 +367,13 @@ def _attach(exc: BaseException, job_id: str | None, steps: _Steps) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════
-class Gateway:
+class Gateway(GatewayApp):
     """``app_api.GatewayApp`` implementation. Build it with ``wiring.build_app``.
 
     ``runtime_factory(profile_name)`` builds a profile's runtime on first use.
     ``find_vmrun`` / ``vmrun_version`` / ``host_system`` exist for tests and for
-    the doctor checks; ``start_join_s`` bounds the wait on a blocking ``vmrun start``.
+    the doctor checks; ``start_join_s`` bounds the wait on a blocking ``vmrun start``;
+    ``fetch_limits`` bounds file_download (default ``transfer.DEFAULT_FETCH_LIMITS``).
     """
 
     def __init__(
@@ -319,6 +387,7 @@ class Gateway:
         find_vmrun: Callable[..., str] | None = None,
         vmrun_version: Callable[[str], str] | None = None,
         start_join_s: float = VM_START_JOIN_S,
+        fetch_limits: transfer.FetchLimits | None = None,
     ) -> None:
         self.config = config
         self._factory = runtime_factory
@@ -328,7 +397,9 @@ class Gateway:
         self._find_vmrun = find_vmrun or gw_platform.find_vmrun
         self._vmrun_version = vmrun_version or probe_vmrun_version
         self._start_join_s = start_join_s
+        self._fetch_limits = fetch_limits or transfer.DEFAULT_FETCH_LIMITS
         self._lock = threading.RLock()
+        self._reload_lock = threading.Lock()
         self._runtimes: dict[str, Runtime] = {}
         self._runners: dict[str, OperationRunner] = {}
         self._selected: dict[str, str] = {}
@@ -495,8 +566,16 @@ class Gateway:
             with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
                 rt.connect(bid)
                 return rt.proxy.call(bid, tool, arguments, job_id=job.id if job else None)
-        except BackendRestarted:
-            self._sync_job(rt, job)
+        except BackendRestarted as e:
+            job = self._sync_job(rt, job)
+            reload = self._maybe_reload(rt, bid, job)
+            if reload is not None:
+                e.details["reload"] = reload
+                if reload.get("ok"):
+                    e.hint = (
+                        f"{e.hint or 'call session_status to acknowledge'}; the sample was reloaded "
+                        "(reload_on_restart): addresses may differ (ASLR)"
+                    )
             raise
         except CrashLoop as e:
             self._record_crash_loop(job, e)
@@ -601,6 +680,12 @@ class Gateway:
             )
         return {"power": PowerState.RUNNING.value, "ip": ip, "started": started}
 
+    @staticmethod
+    def _start_loses_state(power: PowerState) -> bool:
+        """Starting from ``power`` loses the debuggee state: OFF/unknown yes, RUNNING no, and
+        SUSPENDED no (VMware resumes the saved memory, debugger and debuggee included)."""
+        return power not in (PowerState.RUNNING, PowerState.SUSPENDED)
+
     def _state_lost(self, rt: Runtime, reason: str) -> None:
         """Debuggee state is gone (revert/start): new epoch everywhere, no cached tokens/clients."""
         rt.invalidate_clients(drop_tokens=True, reason=reason)
@@ -658,13 +743,21 @@ class Gateway:
             except GatewayError as e:
                 isolation = [f"isolation could not be checked: {e.code}"]
         recovery: list[dict[str, Any]] = [
-            v
+            {**v, "recovery_hint": RECOVERY_HINTS.get(JobState(j.state), "")}
             for j in store.list(name)
             if not j.terminal and j.flags.get("needs_recovery") and (v := self._job_view(j)) is not None
         ]
         recovery += [c.to_json() for c in store.corrupt_jobs() if c.profile in (None, name)]
-        for bid, entry in backends.items():  # acknowledge after looking: mutating calls are accepted again
-            entry["acked_epoch"] = rt.proxy.ack(bid)
+        runner = self._ops(rt)
+        op_running = runner.busy()
+        for bid, entry in backends.items():
+            # Acknowledge after looking, so mutating calls are accepted again - but only for a
+            # real health report outside a running operation: an epoch seen mid-revert must
+            # still surface as BACKEND_RESTARTED once the operation is over.
+            if op_running or entry["health"] in (None, "PAUSED", "UNRESOLVED"):
+                entry["acked_epoch"] = rt.proxy.acked_epoch(bid)
+            else:
+                entry["acked_epoch"] = rt.proxy.ack(bid)
         return {
             "profile": name,
             "mode": rt.profile.mode,
@@ -672,7 +765,7 @@ class Gateway:
             "backends": backends,
             "selected_backend": routed,
             "job": self._job_view(job),
-            "operation": self._ops(rt).current(),
+            "operation": runner.current(deliver=True),  # the client sees the outcome here
             "needs_recovery": recovery,
             "isolation_warnings": isolation,
             "warnings": warnings,
@@ -713,7 +806,7 @@ class Gateway:
                 report = rt.supervisor.check(bid)  # VM_DOWN without touching the guest
             else:
                 with rt.lock.read(timeout_s=STATUS_LOCK_TIMEOUT_S):
-                    rt.connect(bid)
+                    rt.connect(bid, wait=False)  # never wait behind another thread's token read
                     report = rt.supervisor.check(bid)
         except GatewayError as e:
             entry["health"] = "UNRESOLVED"
@@ -941,7 +1034,16 @@ class Gateway:
 
     # ── VM ──────────────────────────────────────────────────────────
     def _guard_vm_op(self, rt: Runtime, op: policy.VmOp) -> None:
-        policy.assert_vm_op_allowed(op, self._active_job(rt.profile.name))
+        job = self._active_job(rt.profile.name)
+        try:
+            policy.assert_vm_op_allowed(op, job)
+        except StateViolation as e:
+            stranded = job is not None and JobState(job.state) == JobState.REVERTING
+            if stranded and job is not None and job.flags.get("needs_recovery"):
+                # left by an earlier gateway process: nothing will ever move it on by itself
+                e.hint = f"job {job.id} was interrupted while reverting; finish it with analysis_finish"
+                e.next_tool = "analysis_finish"
+            raise
 
     def vm_snapshots_list(self, profile: str | None = None) -> dict[str, Any]:
         rt = self.runtime(profile)
@@ -1072,14 +1174,19 @@ class Gateway:
                 if action == "suspend":
                     rt.vm.suspend()
                     return {"action": action, "power": rt.vm.power_state().value}
-                was_running = rt.vm.power_state() == PowerState.RUNNING
+                before = rt.vm.power_state()
                 if action == "reset":
                     rt.vm.stop(hard=True)
-                    was_running = False
-                if not was_running:
+                    before = PowerState.OFF
+                if self._start_loses_state(before):
                     self._state_lost(rt, f"VM {action}")
                 info = self._ready_vm(rt, progress)
-                return {"action": action, **info, "epochs": self._epochs(rt)}
+                return {
+                    "action": action,
+                    **info,
+                    "resumed": before == PowerState.SUSPENDED,
+                    "epochs": self._epochs(rt),
+                }
 
         return self._ops(rt).run("vm_power", action, work, wait_s=wait)
 
@@ -1097,7 +1204,33 @@ class Gateway:
 
     # ── files ───────────────────────────────────────────────────────
     def _host_source(self, host_path: str) -> Path:
+        """A host file that may be sent into the (malware) VM.
+
+        Besides ``upload_roots`` (default: the home directory), hidden files and
+        directories below the matching root (``.ssh``, ``.gnupg``, ``.env``, ...)
+        and the gateway's own config / env file are refused: a prompt injected via
+        guest output must not be able to make the client ship host secrets.
+        """
         src = policy.host_path_allowed(host_path, list(self.config.upload_roots))
+        roots = [r for r in (_resolved(x) for x in self.config.upload_roots) if r is not None]
+        containing = [r for r in roots if src.is_relative_to(r)]
+        if containing and all(_hidden_below(src, r) for r in containing):
+            raise PathNotAllowed(
+                "hidden files and directories under an upload root are not sent to the guest",
+                stage="validate",
+                details={"path": _clip(host_path), "reason": "hidden"},
+                hint="copy the sample to a regular directory under the upload roots",
+            )
+        gateway_files = [self.config.env_file, self.config.config_path]
+        if self.config.env_file and self.config.config_path and not Path(self.config.env_file).is_absolute():
+            config_dir = Path(self.config.config_path).expanduser().parent
+            gateway_files.append(str(config_dir / self.config.env_file))
+        if any(src == q for q in (_resolved(x) for x in gateway_files) if q is not None):
+            raise PathNotAllowed(
+                "the gateway's configuration and env file are not sent to the guest",
+                stage="validate",
+                details={"path": _clip(host_path), "reason": "gateway-secret"},
+            )
         if not src.is_file():
             raise PathNotAllowed(
                 "host path is not a regular file", stage="validate", details={"path": _clip(host_path)}
@@ -1132,6 +1265,7 @@ class Gateway:
         with src.open("rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 digest.update(chunk)
+        self._ops(rt).settle()  # the guest changes: an unreported VM-op result is stale now
         with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
             rt.channel.mkdir(gdir)
             rt.channel.copy_to_guest(src, dest)
@@ -1147,47 +1281,41 @@ class Gateway:
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
         self._require_vm(rt)
-        assert rt.channel is not None
         roots = [job.guest_root] + [str(PureWindowsPath(b.exe).parent) for b in rt.backends.values() if b.exe]
         src = validate_guest_path(guest_path, must_be_under=roots)
+
+        def work(progress: Progress) -> dict[str, Any]:
+            progress("download")
+            return self._download(rt, job, src)
+
+        # On the runner: never concurrent with analysis_collect, which clears raw/extra.
+        return self._ops(rt).run(
+            "file_download", (job.id, src.casefold()), work, wait_s=self._wait(None), job_id=job.id
+        )
+
+    def _download(self, rt: Runtime, job: Job, src: str) -> dict[str, Any]:
+        assert rt.channel is not None
         extra = Path(job.host_root) / "artifacts" / "raw" / "extra"
         _private_dirs(extra)
-        limits = transfer.DEFAULT_FETCH_LIMITS
-        free = shutil.disk_usage(extra).free
-        if free < limits.min_host_free_bytes:
-            raise TransferError(
-                "not enough free host disk space",
-                stage="download",
-                details={"free": free, "needed": limits.min_host_free_bytes},
-            )
         dest = self._reserve_extra_slot(extra, _safe_name(PureWindowsPath(src).name))
-        part = dest.with_name(dest.name + ".part")
         try:
-            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-                rt.channel.copy_from_guest(src, part)
-            size = part.stat().st_size
-            if size > limits.max_file_bytes:
-                raise TransferError(
-                    "guest file exceeds the download size limit",
-                    stage="download",
-                    details={"size": size, "limit": limits.max_file_bytes},
+            with tempfile.TemporaryDirectory(prefix=".dl-", dir=job.host_root) as scratch:
+                # transfer's bounded fetch: guest-side size probe before the copy, host free-space
+                # check, size check of what arrived, 0600 and an atomic rename onto ``dest``
+                fetcher = transfer._BoundedFetch(  # reuse, see contract change requests
+                    rt.channel, POWERSHELL_EXE, job.guest_root, self._fetch_limits, Path(scratch)
                 )
-            _chmod_private(part)
-            os.replace(part, dest)
+                with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+                    digest, size = fetcher.fetch(src, dest)
         except BaseException:
-            for p in (part, dest):
-                with contextlib.suppress(OSError):
-                    p.unlink()
+            with contextlib.suppress(OSError):
+                dest.unlink()
             raise
-        digest = hashlib.sha256()
-        with dest.open("rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                digest.update(chunk)
         return {
             "guest_path": src,
             "host_path": str(dest),
             "size": size,
-            "sha256": digest.hexdigest(),
+            "sha256": digest,
             "job_id": job.id,
         }
 
@@ -1227,36 +1355,70 @@ class Gateway:
         return out
 
     def debugger_restart(self, backend_id: str | None = None, reason: str = "requested") -> dict[str, Any]:
+        """Kill the backend's debugger (if running) and relaunch it.
+
+        The relaunch configuration and the restart budget are checked before
+        anything is killed. Requested restarts use the supervisor's per-backend
+        budget for relaunches without a job (reset by a VM revert), not the active
+        job's crash-loop budget, which stays reserved for debuggers the sample kills.
+        """
         rt = self.runtime()
         self._require_vm(rt)
         assert rt.channel is not None
+        self._ops(rt).settle()
         job = self._active_or_none(rt)
         bid = self._route(rt, backend_id, job)
         cfg = rt.backend(bid)
+        self._check_relaunch_config(rt, bid)
         why = _clip(reason, 200)
         killed: list[int] = []
-        try:
-            with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-                rt.connect(bid)
-                before = rt.supervisor.epoch(bid)
-                if cfg.exe:
-                    killed = self._kill_debugger(rt, PureWindowsPath(cfg.exe).name.lower())
-                epoch = rt.supervisor.ensure_alive(
-                    bid, job_id=job.id if job else None, reason=f"debugger_restart: {why}"
+        with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+            rt.connect(bid)
+            before = rt.supervisor.epoch(bid)
+            used = rt.supervisor.jobless_restarts(bid)
+            if used >= rt.restart_limit:
+                raise CrashLoop(
+                    f"debugger_restart refused: backend {bid} was relaunched {used} time(s) recently by "
+                    "debugger_restart or without a job; the debugger was left running",
+                    stage="debugger_restart",
+                    hint="check the debugger (vm_screenshot, GetDebugState); a VM revert resets the count",
+                    next_tool="session_status",
+                    details={"backend": bid, "restarts": used, "limit": rt.restart_limit},
                 )
-                if epoch == before and killed:
-                    epoch = rt.supervisor.bump_epoch(bid, f"debugger killed by debugger_restart: {why}")
-        except CrashLoop as e:
-            self._record_crash_loop(job, e)
-            raise
-        self._sync_job(rt, job)
-        return {
+            if cfg.exe:
+                killed = self._kill_debugger(rt, PureWindowsPath(cfg.exe).name.lower())
+            epoch = rt.supervisor.ensure_alive(bid, job_id=None, reason=f"debugger_restart: {why}")
+            if epoch == before and killed:
+                epoch = rt.supervisor.bump_epoch(bid, f"debugger killed by debugger_restart: {why}")
+        job = self._sync_job(rt, job)
+        out: dict[str, Any] = {
             "backend_id": bid,
             "epoch": epoch,
             "previous_epoch": before,
             "killed": killed,
             "note": "debuggee state is gone; call session_status before mutating calls",
         }
+        reload = self._maybe_reload(rt, bid, job)
+        if reload is not None:
+            out["reload"] = reload
+        return out
+
+    @staticmethod
+    def _check_relaunch_config(rt: Runtime, bid: str) -> None:
+        """What the supervisor needs to relaunch ``bid`` (checked before a kill)."""
+        cfg = rt.backend(bid)
+        if rt.profile.relaunch_mode == "task" and not cfg.launch_task:
+            raise ConfigError(
+                f"backend {bid}: relaunch_mode 'task' needs launch_task",
+                stage="debugger_restart",
+                hint=f"set profiles.{rt.profile.name}.backends.{bid}.launch_task (guest/provision.ps1)",
+            )
+        if rt.profile.relaunch_mode == "direct" and not cfg.exe:
+            raise ConfigError(
+                f"backend {bid}: relaunch needs the guest path of the debugger exe",
+                stage="debugger_restart",
+                hint=f"set profiles.{rt.profile.name}.backends.{bid}.exe",
+            )
 
     def _kill_debugger(self, rt: Runtime, image: str) -> list[int]:
         assert rt.channel is not None
@@ -1293,6 +1455,7 @@ class Gateway:
         if arguments is not None and not isinstance(arguments, Mapping):
             raise InvalidArgument("arguments must be an object")
         rt = self.runtime()
+        self._ops(rt).settle()  # the guest may change: an unreported VM-op result is stale now
         job = self._active_or_none(rt)
         bid = self._route(rt, backend_id, job)
         return self._call_result(bid, self._call(rt, bid, tool, arguments, job))
@@ -1323,6 +1486,8 @@ class Gateway:
         self._require_vm(rt)
         src = self._host_source(sample_path)
         guest_cwd = validate_guest_path(cwd) if cwd else None
+        if snapshot is not None and not revert:
+            raise InvalidArgument("snapshot is only used with revert=True; drop one of them")
         target = (snapshot or rt.profile.clean_snapshot) if revert else None
         if revert and not target:
             raise InvalidArgument(
@@ -1402,8 +1567,7 @@ class Gateway:
                     st["detail"] = f"reverted to {opts['target']}; guest IP {info['ip']}"
                 else:
                     with rt.supervisor.paused(), rt.lock.write(timeout_s=WRITE_LOCK_TIMEOUT_S):
-                        running = rt.vm.power_state() == PowerState.RUNNING
-                        if not running:
+                        if self._start_loses_state(rt.vm.power_state()):
                             self._state_lost(rt, f"analysis_start {job.id}: VM started")
                         info = self._ready_vm(rt, progress)
                     st["detail"] = f"no revert; guest IP {info['ip']}"
@@ -1442,20 +1606,39 @@ class Gateway:
                 )
                 st["detail"] = guest_path
             debugger_state: list[str] = []
+            paused: bool | None = None
+            loaded = bool(do_load and bid is not None)
             with steps.step("load") as st:
                 job = store.transition(
                     job.id, JobState.LOADING, reason="loading the sample", expect_from=JobState.UPLOADED
                 )
-                if do_load and bid is not None:
-                    debugger_state = self._load_sample(rt, bid, job, guest_path, opts, steps)
-                    st["detail"] = "paused after LoadBinary"
+                if loaded:
+                    assert bid is not None
+                    load_warnings: list[str] = []
+                    debugger_state, problem = self._load_sample(
+                        rt, bid, job, guest_path, opts["args"], opts["cwd"], load_warnings
+                    )
+                    steps.warnings.extend(load_warnings)
+                    paused = problem is None
+                    if paused:
+                        st["detail"] = "paused after LoadBinary"
+                    else:
+                        steps.soft_fail(
+                            st,
+                            f"loaded, but WaitForPause failed ({problem}): check GetDebugState before "
+                            "continuing; the sample may be running",
+                        )
                 else:
                     st["detail"] = "skipped: sample uploaded only"
                 job = store.transition(
                     job.id,
                     JobState.ANALYZING,
-                    reason="sample loaded" if do_load else "sample uploaded (not loaded)",
+                    reason="sample loaded" if loaded else "sample uploaded (not loaded)",
                     expect_from=JobState.LOADING,
+                    set_flags={
+                        "loaded": loaded,
+                        "loaded_epoch": rt.supervisor.epoch(bid) if loaded and bid is not None else None,
+                    },
                 )
             progress("done")
         except BaseException as exc:
@@ -1479,7 +1662,8 @@ class Gateway:
             },
             "state": JobState(job.state).value,
             "epoch": epoch,
-            "loaded": bool(do_load and bid),
+            "loaded": loaded,
+            "paused": paused,
             "steps": steps.items,
             "debugger_state": debugger_state,
             "warnings": steps.warnings,
@@ -1569,22 +1753,41 @@ class Gateway:
                 steps.warnings.append(f"tool list refresh failed ({e.code}); using the cached/builtin list")
         return epoch
 
+    @staticmethod
+    def _load_args(
+        rt: Runtime, bid: str, guest_path: str, args: str | None, cwd: str | None, warnings: list[str]
+    ) -> dict[str, Any]:
+        load_tool = rt.catalog.tool("LoadBinary", bid)
+        props = (load_tool.input_schema.get("properties") or {}) if load_tool else {}
+        largs: dict[str, Any] = {"filePath": guest_path, "arguments": args or ""}
+        if cwd:
+            if "workingDir" in props:
+                largs["workingDir"] = cwd
+            else:
+                warnings.append("this plugin's LoadBinary has no workingDir parameter; cwd was ignored")
+        return largs
+
     def _load_sample(
-        self, rt: Runtime, bid: str, job: Job, guest_path: str, opts: dict[str, Any], steps: _Steps
-    ) -> list[str]:
+        self,
+        rt: Runtime,
+        bid: str,
+        job: Job,
+        guest_path: str,
+        args: str | None,
+        cwd: str | None,
+        warnings: list[str],
+    ) -> tuple[list[str], str | None]:
+        """LoadBinary + WaitForPause. Returns (texts, problem); problem is None once paused.
+
+        v1.3's LoadBinary does not wait, so WaitForPause is what tells whether the
+        debuggee stopped (system breakpoint) or might be running.
+        """
         out_dir = _gjoin(job.guest_root, "out")
         if rt.catalog.tool("SetArtifactDir", bid) is not None:
             res = self._call(rt, bid, "SetArtifactDir", {"path": out_dir}, job)
             if res.is_error:
-                steps.warnings.append("SetArtifactDir failed; dumps need absolute paths under the out dir")
-        load_tool = rt.catalog.tool("LoadBinary", bid)
-        props = (load_tool.input_schema.get("properties") or {}) if load_tool else {}
-        largs: dict[str, Any] = {"filePath": guest_path, "arguments": opts["args"] or ""}
-        if opts["cwd"]:
-            if "workingDir" in props:
-                largs["workingDir"] = opts["cwd"]
-            else:
-                steps.warnings.append("this plugin's LoadBinary has no workingDir parameter; cwd was ignored")
+                warnings.append("SetArtifactDir failed; dumps need absolute paths under the out dir")
+        largs = self._load_args(rt, bid, guest_path, args, cwd, warnings)
         res = self._call(rt, bid, "LoadBinary", largs, job)
         if res.is_error:
             raise BackendError(
@@ -1594,7 +1797,56 @@ class Gateway:
                 hint="check the debugger with GetDebugState; the sample may not be loadable",
             )
         waited = self._call(rt, bid, "WaitForPause", {"timeoutMs": LOAD_WAIT_MS}, job)
-        return list(waited.texts)
+        if waited.is_error:
+            return list(waited.texts), _clip(" ".join(waited.texts[:1]) or "error result", 120)
+        return list(waited.texts), None
+
+    def _reload_sample(self, rt: Runtime, bid: str, job: Job) -> dict[str, Any]:
+        """LoadBinary + WaitForPause on a relaunched debugger (reload_on_restart).
+
+        Direct client calls on purpose: the proxy refuses mutating calls until the
+        client acknowledges the new epoch, and this reload is what the client will
+        find when it does.
+        """
+        assert job.sample is not None and job.sample.guest_path
+        warnings: list[str] = []
+        largs = self._load_args(
+            rt, bid, job.sample.guest_path, job.flags.get("args"), job.flags.get("cwd"), warnings
+        )
+        with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+            client = rt.connect(bid)
+            res = client.call_tool("LoadBinary", largs, LOAD_CALL_TIMEOUT_S)
+            if res.is_error:
+                return {"ok": False, "detail": "LoadBinary failed", "warnings": warnings}
+            waited = client.call_tool("WaitForPause", {"timeoutMs": LOAD_WAIT_MS}, LOAD_WAIT_MS / 1000 + 15)
+        return {"ok": True, "paused": not waited.is_error, "warnings": warnings}
+
+    def _maybe_reload(self, rt: Runtime, bid: str, job: Job | None) -> dict[str, Any] | None:
+        """After a debugger relaunch: reload the job's sample if it asked for it, once per epoch."""
+        if job is None or not job.flags.get("reload_on_restart") or not job.flags.get("loaded"):
+            return None
+        if job.backend_id != bid or JobState(job.state) != JobState.ANALYZING:
+            return None  # LOADING / COLLECTING / ...: the orchestrator is busy with the debugger
+        if job.sample is None or not job.sample.guest_path:
+            return None
+        with self._reload_lock:
+            try:
+                job = self._jobs().get(job.id)
+            except GatewayError:
+                return None
+            epoch = rt.supervisor.epoch(bid)
+            if epoch in (job.flags.get("loaded_epoch"), job.flags.get("reload_epoch")):
+                return None  # loaded in this epoch already, or tried (no retry loop)
+            try:
+                info = self._reload_sample(rt, bid, job)
+            except GatewayError as e:
+                info = {"ok": False, "detail": _clip(f"{e.code}: {e.message}")}
+            flags: dict[str, Any] = {"reload_epoch": epoch}
+            if info["ok"]:
+                flags["loaded_epoch"] = epoch
+            with contextlib.suppress(GatewayError, OSError, ValueError):
+                self._jobs().update(job.id, set_flags=flags)
+        return {**info, "epoch": epoch}
 
     def analysis_collect(
         self, job_id: str | None = None, extra_guest_paths: Sequence[str] = (), extract: bool | None = None
@@ -1625,6 +1877,15 @@ class Gateway:
             job = store.transition(
                 job_id, JobState.ANALYZING, reason="collecting again", expect_from=JobState.COLLECTED
             )
+        elif state == JobState.COLLECTING and job.flags.get("needs_recovery"):
+            # Left by an earlier gateway process (this one runs collections on the runner, one at a
+            # time): that collection is lost, the artifacts are still in the guest.
+            job = store.transition(
+                job_id,
+                JobState.COLLECTED_PARTIAL,
+                reason="collection interrupted by a gateway restart; collecting again",
+                expect_from=JobState.COLLECTING,
+            )
         elif state not in (JobState.ANALYZING, JobState.COLLECTED_PARTIAL):
             raise StateViolation(
                 f"job {job_id} is {state.value}; analysis_collect needs ANALYZING, COLLECTED "
@@ -1637,22 +1898,40 @@ class Gateway:
             JobState.COLLECTING,
             reason="collecting artifacts",
             expect_from=(JobState.ANALYZING, JobState.COLLECTED_PARTIAL),
+            # handled by this process now; a crash from here on is flagged again at the next start
+            clear_flags=["needs_recovery"],
         )
         try:
             db_extras: list[str] = []
             module_map: Any = None
+            # Debugger state is lost by the revert, so it counts like any artifact (fail closed):
+            # a failure here makes the collection partial; no debug session = nothing to lose.
+            debugger_errors: list[dict[str, Any]] = []
             bid = job.backend_id if job.backend_id in rt.backends else None
             if bid is not None:
                 with steps.step("save_database", soft=True) as st:
-                    extra = self._save_database(rt, bid, job)
-                    st["detail"] = extra or "saved into the out dir"
+                    detail, extra = self._save_database(rt, bid, job)
+                    st["detail"] = detail
                     if extra:
                         db_extras.append(extra)
+                if not st["ok"]:
+                    debugger_errors.append({"step": "save_database", "error": st["detail"]})
                 with steps.step("module_map", soft=True) as st:
                     with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
                         res = rt.connect(bid).call_tool("ListModules", {}, LIST_MODULES_TIMEOUT_S)
-                    module_map = {"backend": bid, "raw": sanitize_untrusted_text("\n".join(res.texts))}
-                    st["detail"] = f"{len(res.texts)} text item(s)"
+                    if _no_session(res):
+                        st["detail"] = "no debug session: no module map"
+                    elif res.is_error:
+                        raise BackendError(
+                            "ListModules failed",
+                            stage="collect",
+                            details={"texts": [_clip(t) for t in res.texts[:2]]},
+                        )
+                    else:
+                        module_map = {"backend": bid, "raw": sanitize_untrusted_text("\n".join(res.texts))}
+                        st["detail"] = f"{len(res.texts)} text item(s)"
+                if not st["ok"]:
+                    debugger_errors.append({"step": "module_map", "error": st["detail"]})
             shot: Path | None = None
             with steps.step("screenshot", soft=True) as st:
                 shot = self._screenshot_path(Path(job.host_root) / "screens", "collect")
@@ -1687,14 +1966,16 @@ class Gateway:
                         clock=self._clock,
                     )
                 st["detail"] = f"{len(manifest.entries)} entries, partial={manifest.partial}"
-            final = JobState.COLLECTED_PARTIAL if manifest.partial else JobState.COLLECTED
+            partial = manifest.partial or bool(debugger_errors)
+            final = JobState.COLLECTED_PARTIAL if partial else JobState.COLLECTED
             job = store.transition(
                 job_id,
                 final,
-                reason=f"artifacts collected (partial={manifest.partial})",
+                reason=f"artifacts collected (partial={partial})",
                 expect_from=JobState.COLLECTING,
                 manifest_path=manifest.manifest_path,
                 error=None,
+                set_flags={"debugger_state_missing": [e["step"] for e in debugger_errors]},
                 clear_flags=["needs_recovery"],
             )
         except BaseException as exc:
@@ -1724,10 +2005,11 @@ class Gateway:
             }
             for e in manifest.entries
         ]
-        return {
+        out: dict[str, Any] = {
             "job_id": job_id,
             "state": JobState(job.state).value,
-            "partial": manifest.partial,
+            "partial": partial,
+            "manifest_partial": manifest.partial,
             "manifest_path": manifest.manifest_path,
             "artifacts_dir": str(art),
             "raw_zip": str(art / manifest.raw_zip) if manifest.raw_zip else None,
@@ -1735,45 +2017,53 @@ class Gateway:
             "extracted": manifest.extracted,
             "file_count": len(files),
             "files": files[:MAX_LISTED_FILES],
-            "errors": manifest.errors,
+            "errors": list(manifest.errors) + debugger_errors,
             "screenshot": manifest.screenshot,
             "preserved_downloads": preserved,
             "warnings": steps.warnings,
             "steps": steps.items,
         }
+        if partial:
+            out["hint"] = (
+                "the collection is partial and blocks the revert: fix the cause and call analysis_collect "
+                "again (after BACKEND_RESTARTED, call session_status first)"
+            )
+        return out
 
-    def _save_database(self, rt: Runtime, bid: str, job: Job) -> str | None:
-        """SaveDatabase; returns an extra guest path to collect (None when saved into the out dir)."""
+    def _save_database(self, rt: Runtime, bid: str, job: Job) -> tuple[str, str | None]:
+        """SaveDatabase. Returns (detail, extra guest path to collect or None).
+
+        v1.10 (``filePath`` in the schema) saves into the job out dir; older plugins
+        save to x64dbg's default ``<exe dir>\\db\\<debuggee file name>.dd64``, which is
+        then collected as an extra file. Raises BackendError when the save failed;
+        a debugger without a debug session has nothing to save.
+        """
         cfg = rt.backend(bid)
         ext = "dd64" if cfg.arch == "x64" else "dd32"
         tool = rt.catalog.tool("SaveDatabase", bid)
         props = (tool.input_schema.get("properties") or {}) if tool else {}
+        extra: str | None = None
         if "filePath" in props:
             sha12 = job.sample.sha256[:12] if job.sample else job.id
-            res = self._call(
-                rt,
-                bid,
-                "SaveDatabase",
-                {"filePath": _gjoin(_gjoin(job.guest_root, "out"), f"{sha12}.{ext}")},
-                job,
-            )
-            if res.is_error:
-                raise BackendError(
-                    "SaveDatabase failed",
-                    stage="collect",
-                    details={"texts": [_clip(t) for t in res.texts[:2]]},
-                )
-            return None
-        res = self._call(rt, bid, "SaveDatabase", {}, job)
+            target = _gjoin(_gjoin(job.guest_root, "out"), f"{sha12}.{ext}")
+            res = self._call(rt, bid, "SaveDatabase", {"filePath": target}, job)
+            saved = f"saved to {target}"
+        else:
+            res = self._call(rt, bid, "SaveDatabase", {}, job)
+            if job.sample is not None and job.sample.guest_path and cfg.exe:
+                db_dir = _gjoin(str(PureWindowsPath(cfg.exe).parent), "db")
+                extra = _gjoin(db_dir, f"{PureWindowsPath(job.sample.guest_path).name}.{ext}")
+            saved = f"saved; collecting {extra}" if extra else "saved"
+        if _no_session(res):
+            return "no debug session: nothing to save", None
         if res.is_error:
             raise BackendError(
-                "SaveDatabase failed", stage="collect", details={"texts": [_clip(t) for t in res.texts[:2]]}
+                "SaveDatabase failed",
+                stage="collect",
+                details={"texts": [_clip(t) for t in res.texts[:2]]},
+                hint="check the debugger with GetDebugState, then call analysis_collect again",
             )
-        if job.sample is None or not job.sample.guest_path or not cfg.exe:
-            return None
-        # x64dbg's default database location: <exe dir>\db\<debuggee file name>.dd64
-        db_dir = _gjoin(str(PureWindowsPath(cfg.exe).parent), "db")
-        return _gjoin(db_dir, f"{PureWindowsPath(job.sample.guest_path).name}.{ext}")
+        return saved, extra
 
     def analysis_finish(
         self,
@@ -1783,9 +2073,14 @@ class Gateway:
         keep_snapshot: bool = False,
         wait_s: float | None = None,
     ) -> dict[str, Any]:
+        if job_id is None:
+            # a client polling by repeating the call: the job of the finish it started
+            pending = self._ops(self.runtime()).pending_key("analysis_finish")
+            job_id = pending if isinstance(pending, str) else None
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
-        self._check_finishable(job, revert)
+        if self._ops(rt).pending_key("analysis_finish") != job.id:
+            self._check_finishable(job, revert)  # else run() answers in_progress / the outcome
         if revert or keep_snapshot:
             self._require_vm(rt)
         if revert and not rt.profile.clean_snapshot:
@@ -1799,6 +2094,16 @@ class Gateway:
 
     @staticmethod
     def _check_finishable(job: Job, revert: bool) -> None:
+        state = JobState(job.state)
+        if state == JobState.REVERTING:
+            if job.flags.get("needs_recovery"):
+                return  # interrupted by a gateway restart (it was COLLECTED/DISCARDED): finish it
+            raise StateViolation(
+                f"job {job.id} is already being finished",
+                details={"job_id": job.id, "state": state.value},
+                hint="poll session_status",
+                next_tool="session_status",
+            )
         if revert:
             policy.assert_revert_for_job(job)
         elif JobState(job.state) not in policy.REVERT_READY_STATES:
@@ -1818,19 +2123,28 @@ class Gateway:
         steps = _Steps(self._clock, progress)
         job = store.get(job_id)
         self._check_finishable(job, revert)
+        resumed = JobState(job.state) == JobState.REVERTING  # left by an earlier gateway process
         snapshot: str | None = None
-        if keep_snapshot:
+        if keep_snapshot and resumed:
+            steps.warnings.append(
+                "keep_snapshot ignored: the interrupted revert may already have changed the VM"
+            )
+        elif keep_snapshot:
             with steps.step("keep_snapshot") as st:
                 snapshot = policy.gateway_snapshot_name("job", job_id, prof.snapshot_prefix)
                 with rt.supervisor.paused(), rt.lock.write(timeout_s=WRITE_LOCK_TIMEOUT_S):
                     rt.vm.take_snapshot(snapshot)
                 st["detail"] = snapshot
-        job = store.transition(
-            job_id,
-            JobState.REVERTING,
-            reason="finishing: reverting the VM" if revert else "finishing without a revert",
-            expect_from=tuple(policy.REVERT_READY_STATES),
-        )
+        if not resumed:
+            # jobs.TRANSITIONS has no COLLECTED -> DONE edge, so revert=False passes REVERTING too
+            job = store.transition(
+                job_id,
+                JobState.REVERTING,
+                reason="finishing: reverting the VM" if revert else "finishing without a revert",
+                expect_from=tuple(policy.REVERT_READY_STATES),
+                # handled by this process now (REVERTING + needs_recovery means "interrupted")
+                clear_flags=["needs_recovery"],
+            )
         try:
             if revert:
                 target = str(prof.clean_snapshot)
@@ -1843,6 +2157,7 @@ class Gateway:
                 reason="VM reverted to the clean snapshot" if revert else "finished; VM left as is",
                 expect_from=JobState.REVERTING,
                 set_flags={"reverted": revert, "kept_snapshot": snapshot},
+                clear_flags=["needs_recovery"],
             )
         except BaseException as exc:
             self._fail_job(job_id, exc, "analysis_finish revert")
@@ -1860,6 +2175,7 @@ class Gateway:
             "job_id": job_id,
             "state": JobState(job.state).value,
             "reverted": revert,
+            "resumed": resumed,
             "snapshot": snapshot,
             "deleted_snapshots": deleted,
             "warnings": steps.warnings,

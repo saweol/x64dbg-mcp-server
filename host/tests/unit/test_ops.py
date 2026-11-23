@@ -5,10 +5,10 @@ from __future__ import annotations
 import threading
 
 import pytest
-from x64dbg_vm_gateway.ops import OperationRunner
 
 from tests.fakes.fake_vm import FakeClock
 from x64dbg_vm_gateway.errors import GatewayError, StateViolation, VmNotReady
+from x64dbg_vm_gateway.ops import OperationRunner
 
 SHORT = 0.05  # real seconds a caller waits when the test wants an in-progress answer
 LONG = 5.0  # real seconds a caller waits when the test expects the work to finish
@@ -211,3 +211,100 @@ def test_error_details_are_json_ready(runner):
     with pytest.raises(GatewayError):
         runner.run("op", 1, fn, wait_s=LONG)
     assert runner.current()["error"]["details"] == {"a": 1}
+
+
+# ── replay of an undelivered outcome is bounded (review finding) ────
+def _finish_in_background(runner, op_name, key, calls, result="r"):
+    gate, started = threading.Event(), threading.Event()
+
+    def fn(progress):
+        calls.append(1)
+        started.set()
+        gate.wait(LONG)
+        return result
+
+    rec = runner.run(op_name, key, fn, wait_s=SHORT)
+    assert rec["state"] == "in_progress"
+    assert started.wait(LONG)
+    gate.set()
+    assert runner.wait_idle(LONG)
+    return fn
+
+
+def test_outcome_reported_by_current_with_deliver_is_not_replayed(runner):
+    calls = []
+    fn = _finish_in_background(runner, "vm_snapshot_revert", "MCP_CLEAN", calls)
+    cur = runner.current(deliver=True)  # session_status shows the outcome to the client
+    assert cur["state"] == "done" and cur["result"] == "r"
+    # a later identical call is a new request: the work runs again
+    assert runner.run("vm_snapshot_revert", "MCP_CLEAN", fn, wait_s=LONG) == "r"
+    assert len(calls) == 2
+
+
+def test_plain_current_does_not_consume_the_outcome(runner):
+    calls = []
+    fn = _finish_in_background(runner, "vm_power", "start", calls)
+    runner.current()
+    assert runner.run("vm_power", "start", fn, wait_s=LONG) == "r"
+    assert len(calls) == 1
+
+
+def test_undelivered_outcome_expires(tmp_path):
+    clock = FakeClock()
+    runner = OperationRunner(clock, replay_ttl_s=60.0)
+    calls = []
+    fn = _finish_in_background(runner, "vm_snapshot_revert", "MCP_CLEAN", calls)
+    clock.advance(61.0)
+    assert runner.run("vm_snapshot_revert", "MCP_CLEAN", fn, wait_s=LONG) == "r"
+    assert len(calls) == 2
+
+
+def test_undelivered_outcome_is_replayed_within_its_ttl():
+    clock = FakeClock()
+    runner = OperationRunner(clock, replay_ttl_s=60.0)
+    calls = []
+    fn = _finish_in_background(runner, "vm_snapshot_revert", "MCP_CLEAN", calls)
+    clock.advance(59.0)
+    assert runner.run("vm_snapshot_revert", "MCP_CLEAN", fn, wait_s=LONG) == "r"
+    assert len(calls) == 1
+
+
+def test_settle_drops_an_undelivered_outcome(runner):
+    calls = []
+    fn = _finish_in_background(runner, "vm_snapshot_revert", "MCP_CLEAN", calls)
+    runner.settle()  # other activity changed the state the old outcome described
+    runner.run("vm_snapshot_revert", "MCP_CLEAN", fn, wait_s=LONG)
+    assert len(calls) == 2
+
+
+def test_settle_does_not_touch_a_running_operation(runner):
+    gate, started = threading.Event(), threading.Event()
+    first = runner.run("analysis_start", "k", blocking(gate, started), wait_s=SHORT)
+    assert started.wait(LONG)
+    runner.settle()
+    again = runner.run("analysis_start", "k", lambda p: None, wait_s=SHORT)
+    assert again["op_id"] == first["op_id"] and again["state"] == "in_progress"
+    gate.set()
+    runner.wait_idle(LONG)
+
+
+def test_running_reports_the_active_operation(runner):
+    gate, started = threading.Event(), threading.Event()
+    assert runner.running("analysis_finish", "j") is False
+    runner.run("analysis_finish", "j", blocking(gate, started), wait_s=SHORT)
+    assert started.wait(LONG)
+    assert runner.running("analysis_finish", "j") is True
+    assert runner.running("analysis_finish", "other") is False
+    gate.set()
+    runner.wait_idle(LONG)
+    assert runner.running("analysis_finish", "j") is False
+
+
+def test_pending_key_names_a_running_or_replayable_operation(runner):
+    assert runner.pending_key("analysis_finish") is None
+    calls = []
+    _finish_in_background(runner, "analysis_finish", "job-1", calls)
+    assert runner.pending_key("analysis_finish") == "job-1"  # finished, not yet delivered
+    assert runner.pending_key("vm_power") is None
+    runner.current(deliver=True)
+    assert runner.pending_key("analysis_finish") is None

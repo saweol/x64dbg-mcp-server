@@ -28,15 +28,14 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from x64dbg_vm_gateway.app import Gateway
-from x64dbg_vm_gateway.wiring import Runtime, build_runtime
-
 from tests.fakes.fake_guest import FakeGuest
 from tests.fakes.fake_plugin_server import FakePluginServer
 from tests.fakes.fake_powershell import GuestPowerShell, is_powershell
 from tests.fakes.fake_vm import FakeClock, FakeVm
+from x64dbg_vm_gateway.app import Gateway
 from x64dbg_vm_gateway.config import BackendConfig, GatewayConfig, ProfileConfig
 from x64dbg_vm_gateway.contracts import Snapshot
+from x64dbg_vm_gateway.wiring import Runtime, build_runtime
 
 PROFILE = "lab"
 PW_ENV = "GW_TEST_GUEST_PW"

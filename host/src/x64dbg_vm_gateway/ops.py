@@ -10,11 +10,20 @@ daemon thread and waits up to ``wait_s`` seconds for it:
 One operation runs at a time per runner (the gateway keeps one runner per VM
 profile). While it runs, ``run()`` with the same ``(op_name, key)`` returns the
 same in-progress record (idempotent retry), and any other operation is refused
-with ``StateViolation``. When an operation finishes after its caller already got
-an in-progress record, its outcome is kept *undelivered*: the next ``run()``
-with the same ``(op_name, key)`` returns that result (or raises that error)
-instead of starting the work again. ``current()`` reports the running or last
-operation for ``session_status``.
+with ``StateViolation``. ``current()`` reports the running or last operation for
+``session_status``.
+
+Undelivered outcomes: when an operation finishes after its caller already got
+an in-progress record, its outcome is kept *undelivered*, so a client that
+repeats the call to poll gets that result (or error) instead of starting the
+work a second time. The replay is bounded, because a stale "done" must never
+stand in for new work (a later deliberate revert would otherwise do nothing):
+
+- it happens at most once, and only within ``replay_ttl_s`` of the finish;
+- ``current(deliver=True)`` (what ``session_status`` reports to the client)
+  counts as delivery;
+- ``settle()`` drops it; the gateway calls it when other activity (a debugger
+  call, an upload, a restart) changed the state the old outcome described.
 
 ``progress(stage, *, job_id=None)`` records the current stage (and the job id
 once the operation knows it).
@@ -35,7 +44,10 @@ from typing import Any
 from .contracts import Clock, SystemClock
 from .errors import GatewayError, StateViolation
 
-__all__ = ["OperationRunner", "Progress"]
+__all__ = ["DEFAULT_REPLAY_TTL_S", "OperationRunner", "Progress"]
+
+DEFAULT_REPLAY_TTL_S = 120.0
+"""How long an undelivered outcome answers a repeated identical call (seconds)."""
 
 
 class Progress:
@@ -62,6 +74,7 @@ class _Op:
     stage: str = "starting"
     state: str = "running"  # running | done | failed
     finished_at: str | None = None
+    finished_mono: float | None = None
     result: Any = None
     error: BaseException | None = None
     delivered: bool = False
@@ -84,9 +97,12 @@ def _error_dict(exc: BaseException) -> dict[str, Any]:
 
 
 class OperationRunner:
-    def __init__(self, clock: Clock | None = None, *, name: str = "ops") -> None:
+    def __init__(
+        self, clock: Clock | None = None, *, name: str = "ops", replay_ttl_s: float = DEFAULT_REPLAY_TTL_S
+    ) -> None:
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._name = name
+        self._replay_ttl_s = max(0.0, float(replay_ttl_s))
         self._lock = threading.Lock()
         self._op: _Op | None = None
         self._ids = itertools.count(1)
@@ -123,7 +139,7 @@ class OperationRunner:
                         "requested": op_name,
                     },
                 )
-            if cur is not None and not cur.delivered and (cur.op, cur.key) == (op_name, key):
+            if cur is not None and self._replayable(cur, op_name, key):
                 cur.delivered = True
                 return self._outcome(cur)
             op = _Op(
@@ -146,12 +162,18 @@ class OperationRunner:
             op.delivered = True
         return self._outcome(op)
 
-    def current(self) -> dict[str, Any] | None:
-        """The running or last operation, or None before the first one."""
+    def current(self, *, deliver: bool = False) -> dict[str, Any] | None:
+        """The running or last operation, or None before the first one.
+
+        ``deliver=True`` marks a finished outcome as delivered (the caller shows it
+        to the client), so a later identical ``run()`` starts the work again.
+        """
         with self._lock:
             op = self._op
             if op is None:
                 return None
+            if deliver and op.state != "running":
+                op.delivered = True
             out: dict[str, Any] = {
                 "op_id": op.op_id,
                 "op": op.op,
@@ -171,6 +193,28 @@ class OperationRunner:
         with self._lock:
             return self._op is not None and self._op.state == "running"
 
+    def running(self, op_name: str, key: Hashable) -> bool:
+        """True while the operation ``(op_name, key)`` runs."""
+        with self._lock:
+            op = self._op
+            return op is not None and op.state == "running" and (op.op, op.key) == (op_name, key)
+
+    def pending_key(self, op_name: str) -> Hashable | None:
+        """Key of the last operation if it is ``op_name`` and still running or replayable."""
+        with self._lock:
+            op = self._op
+            if op is None or op.op != op_name:
+                return None
+            if op.state == "running" or self._replayable(op, op.op, op.key):
+                return op.key
+            return None
+
+    def settle(self) -> None:
+        """Drop an undelivered outcome of the last (finished) operation; see the module docstring."""
+        with self._lock:
+            if self._op is not None and self._op.state != "running":
+                self._op.delivered = True
+
     def wait_idle(self, timeout_s: float | None = None) -> bool:
         """Wait until no operation runs; True if idle (used by close() and tests)."""
         with self._lock:
@@ -185,12 +229,20 @@ class OperationRunner:
             with self._lock:
                 op.error, op.state = exc, "failed"
                 op.finished_at = self._clock.now_iso()
+                op.finished_mono = self._clock.monotonic()
         else:
             with self._lock:
                 op.result, op.state = result, "done"
                 op.finished_at = self._clock.now_iso()
+                op.finished_mono = self._clock.monotonic()
         finally:
             op.done.set()
+
+    def _replayable(self, op: _Op, op_name: str, key: Hashable) -> bool:
+        """Caller holds the lock. See "Undelivered outcomes" in the module docstring."""
+        if op.delivered or (op.op, op.key) != (op_name, key) or op.finished_mono is None:
+            return False
+        return self._clock.monotonic() - op.finished_mono <= self._replay_ttl_s
 
     @staticmethod
     def _in_progress(op: _Op) -> dict[str, Any]:

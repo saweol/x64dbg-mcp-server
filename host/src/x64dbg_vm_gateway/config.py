@@ -66,9 +66,7 @@ class ProfileConfig:
     protected_snapshots: tuple[str, ...] = ()
     guest_user: str | None = None
     guest_password_env: str | None = None
-    guest_host: str = "auto"
-    # env var holding the guest user name (alternative to guest_user; guest_user wins when both are set)
-    guest_user_env: str | None = None  # "auto" (vmrun getGuestIPAddress) or a fixed host/IP
+    guest_host: str = "auto"  # "auto" (vmrun getGuestIPAddress) or a fixed host/IP
     job_root_guest: str = "C:\\mcp\\jobs"
     require_isolation: bool = True
     token_source: str = "guest-config"  # noqa: S105 - "guest-config" | "env", not a secret
@@ -76,6 +74,9 @@ class ProfileConfig:
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     backends: tuple[BackendConfig, ...] = ()
     relaunch_mode: str = "task"  # "task" (schtasks /run) | "direct" (runProgramInGuest -interactive)
+    # env var holding the guest user name (alternative to guest_user; guest_user wins when both are set).
+    # Appended after the wave-1 fields so positional construction keeps its meaning.
+    guest_user_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +363,10 @@ class _Parser:
         for i, root in enumerate(values.get("upload_roots", ())):
             if not root.strip():
                 raise self.error(f"gateway.upload_roots[{i}]", "must not be empty")
+            if not (root.startswith("~") or Path(root).is_absolute()):
+                # policy.host_path_allowed ignores relative roots (they would depend on the cwd)
+                raise self.error(f"gateway.upload_roots[{i}]",
+                                 "must be an absolute path or start with ~ (home directory)")
 
         http = self.http(self.table(data.get("http", {}), "http"))
 

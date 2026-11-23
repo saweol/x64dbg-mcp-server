@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 
 import pytest
-from x64dbg_vm_gateway.app import Gateway, InvalidArgument
-from x64dbg_vm_gateway.wiring import PROVISION_HINT, build_runtime
 
 from tests.fakes.fake_plugin_server import FakePluginServer
 from tests.fakes.fake_runtime import make_lab
+from x64dbg_vm_gateway.app import Gateway, InvalidArgument
 from x64dbg_vm_gateway.config import BackendConfig, GatewayConfig, ProfileConfig
 from x64dbg_vm_gateway.contracts import IsolationReport, PowerState
 from x64dbg_vm_gateway.errors import ConfigError, GatewayError, VmrunNotFound
+from x64dbg_vm_gateway.wiring import PROVISION_HINT, build_runtime
 
 
 @pytest.fixture

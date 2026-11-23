@@ -8,10 +8,9 @@ import threading
 from pathlib import Path
 
 import pytest
-from x64dbg_vm_gateway.app import Gateway, InvalidArgument
-from x64dbg_vm_gateway.wiring import build_runtime
 
 from tests.fakes.fake_runtime import make_lab
+from x64dbg_vm_gateway.app import Gateway, InvalidArgument
 from x64dbg_vm_gateway.config import BackendConfig, GatewayConfig, ProfileConfig
 from x64dbg_vm_gateway.contracts import PowerState, Snapshot, ToolsState
 from x64dbg_vm_gateway.errors import (
@@ -22,6 +21,7 @@ from x64dbg_vm_gateway.errors import (
     StateViolation,
     VmNotReady,
 )
+from x64dbg_vm_gateway.wiring import build_runtime
 
 POSIX = os.name == "posix"
 
@@ -229,3 +229,20 @@ def test_vm_tools_in_endpoint_mode_raise_config_error(tmp_path):
                 call()
     finally:
         gw.close()
+
+
+def test_power_start_from_suspended_keeps_the_debuggee_state(lab):
+    gw = lab.gateway()
+    gw.session_status()
+    gw.vm_power("suspend")
+    out = gw.vm_power("start")
+    assert out["power"] == "running" and out["resumed"] is True
+    assert gw.session_status()["backends"]["x64"]["epoch"] == 0
+    assert gw.call_mirrored("StepOver")["epoch"] == 0  # no BACKEND_RESTARTED
+
+
+def test_start_without_revert_from_suspended_keeps_the_epoch(lab):
+    gw = lab.gateway()
+    lab.vm.power = PowerState.SUSPENDED
+    res = gw.analysis_start(str(lab.sample()), revert=False)
+    assert res["epoch"] == 0

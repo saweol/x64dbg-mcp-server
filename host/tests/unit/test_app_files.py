@@ -134,3 +134,85 @@ def test_downloads_survive_a_later_collection(lab):
     # files the previous collection fetched itself are not mistaken for downloads
     col2 = gw.analysis_collect()
     assert col2["preserved_downloads"] == []
+
+
+# ── host secrets stay on the host (review finding) ──────────────────
+@pytest.mark.parametrize("rel", [".ssh/id_rsa", ".gnupg/private.key", "proj/.env", ".netrc"])
+def test_upload_of_hidden_files_under_a_root_is_refused(lab, rel):
+    p = lab.samples / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"secret")
+    gw = lab.gateway()
+    with pytest.raises(PathNotAllowed):
+        gw.file_upload(str(p), guest_dir="C:\\Tools")
+    with pytest.raises(PathNotAllowed):
+        gw.analysis_start(str(p))
+    assert not lab.guest.calls_of("copy_to_guest")
+
+
+def test_upload_of_the_gateway_env_file_and_config_is_refused(lab):
+    env = lab.samples / "gw.env"
+    env.write_bytes(b"GW_TEST_GUEST_PW=guest-pw\n")
+    conf = lab.samples / "config.toml"
+    conf.write_bytes(b"[gateway]\n")
+    lab.set_config(env_file=str(env), config_path=str(conf))
+    gw = lab.gateway()
+    for p in (env, conf):
+        with pytest.raises(PathNotAllowed):
+            gw.file_upload(str(p), guest_dir="C:\\Tools")
+    assert not lab.guest.calls_of("copy_to_guest")
+
+
+def test_upload_from_a_hidden_root_itself_is_allowed(lab, tmp_path):
+    root = tmp_path / ".samples"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"a")
+    lab.set_config(upload_roots=(str(root),))
+    out = lab.gateway().file_upload(str(root / "a.bin"), guest_dir="C:\\Tools")
+    assert out["guest_path"] == "C:\\Tools\\a.bin"
+
+
+# ── download size limit and serialisation with collect ──────────────
+def test_download_over_the_size_limit_is_refused_before_copying(lab):
+    from x64dbg_vm_gateway.errors import TransferError
+    from x64dbg_vm_gateway.transfer import FetchLimits
+
+    gw = lab.gateway(fetch_limits=FetchLimits(max_file_bytes=10, min_host_free_bytes=0))
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    guest = f"{GUEST_ROOT}\\{job_id}\\out\\big.bin"
+    lab.guest.write(guest, b"x" * 20)
+    with pytest.raises(TransferError) as ei:
+        gw.file_download(guest)
+    assert ei.value.details["reason"] == "too-large"
+    assert not [a for a, _ in lab.guest.calls_of("copy_from_guest") if a[0] == guest]
+    extra = Path(lab.config.jobs_root) / job_id / "artifacts" / "raw" / "extra"
+    assert not extra.exists() or list(extra.iterdir()) == []
+
+
+def test_download_is_refused_while_a_collection_runs(lab):
+    import threading
+
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    guest = f"{GUEST_ROOT}\\{job_id}\\out\\a.bin"
+    lab.guest.write(guest, b"A")
+    entered, release = threading.Event(), threading.Event()
+    real = lab.vm.screenshot
+
+    def slow_screenshot(path):
+        entered.set()
+        assert release.wait(10)
+        real(path)
+
+    lab.vm.screenshot = slow_screenshot  # type: ignore[method-assign]
+    t = threading.Thread(target=gw.analysis_collect, daemon=True)
+    t.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(StateViolation) as ei:
+            gw.file_download(guest)
+        assert "analysis_collect" in ei.value.hint
+    finally:
+        release.set()
+        t.join(10)
+    assert Path(gw.file_download(guest)["host_path"]).read_bytes() == b"A"

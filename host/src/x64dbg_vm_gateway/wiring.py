@@ -20,12 +20,18 @@ reports itself unhealthy and refuses calls with ``VmNotReady``; callers must
 ``connect`` before asking the supervisor to recover a backend.
 
 Thread-safety: ``Runtime`` guards its caches (guest IP, tokens, resolved
-clients) with one re-entrant lock. That lock may be held across one guest file
-copy (token read) but never while waiting for ``VmOpLock``.
+clients) with one re-entrant lock that is held only for in-memory work, never
+across guest or VM I/O (token copies, ``getGuestIPAddress``) and never while
+waiting for ``VmOpLock``. Token reads of one backend are serialised by a
+per-backend lock, so a slow read never blocks ``resolved_url``/``guest_ip`` or
+``session_status``. A token generation counter (bumped whenever tokens are
+dropped, e.g. after a revert) keeps a read that raced with the drop from being
+cached or published.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -95,8 +101,14 @@ MIN_TOKEN_LEN = 32
 MAX_TOKEN_LEN = 64  # cfgjson.zig MAX_TOKEN_LEN
 MAX_GUEST_CONFIG_BYTES = 64 * 1024
 GUEST_IP_TIMEOUT_S = 120.0
+#: How long ``connect`` waits for another thread's token read of the same backend.
+TOKEN_READ_WAIT_S = 180.0
+_CONNECT_ATTEMPTS = 3
 BUILTIN_V1_9 = "data/tools-v1.9.json"
 BUILTIN_V1_10 = "data/tools-v1.10.json"
+
+#: the supervisor's default crash-loop limit (read from its signature, not copied)
+_SUPERVISOR_MAX_RESTARTS = int(inspect.signature(Supervisor).parameters["max_restarts_per_job"].default)
 
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _VERSION_RE = re.compile(r"\s*v?(\d+)\.(\d+)(?:\.\d+)*\s*")
@@ -341,9 +353,13 @@ class Runtime:
     client_factory: Callable[..., BackendClient] = field(default=HttpBackendClient, repr=False)
     #: set by the orchestrator: called with (backend_id, report) before a hung debugger is killed
     hang_listener: Callable[[str, HealthReport], None] | None = field(default=None, repr=False)
+    #: crash-loop limit of the supervisor (relaunches per job / per backend window)
+    restart_limit: int = 3
     _mutex: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _ip: str | None = field(default=None, init=False, repr=False)
     _tokens: dict[str, Secret] = field(default_factory=dict, init=False, repr=False)
+    _token_gen: int = field(default=0, init=False, repr=False)
+    _token_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False, repr=False)
     _resolved: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # backend -> url
     _catalog_epoch: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
@@ -361,9 +377,12 @@ class Runtime:
         return next(iter(self.backends), None)
 
     def resolved_url(self, backend_id: str) -> str | None:
-        """URL of the connected client, or None while the backend is unresolved."""
-        with self._mutex:
-            return self._resolved.get(backend_id)
+        """URL of the connected client, or None while the backend is unresolved.
+
+        Lock-free on purpose (a dict read is atomic): status polling must never
+        wait behind a token read or an IP lookup.
+        """
+        return self._resolved.get(backend_id)
 
     # ── guest IP ────────────────────────────────────────────────────
     def _lookup_ip(self, wait: bool) -> str | None:
@@ -400,24 +419,59 @@ class Runtime:
             return ip
 
     # ── tokens ──────────────────────────────────────────────────────
-    def _token(self, cfg: BackendConfig) -> Secret:
+    def _token_lock(self, backend_id: str) -> threading.Lock:
         with self._mutex:
-            cached = self._tokens.get(cfg.id)
+            return self._token_locks.setdefault(backend_id, threading.Lock())
+
+    def _token(self, cfg: BackendConfig, *, wait: bool = True) -> tuple[Secret, int]:
+        """The backend's token and the token generation it belongs to.
+
+        Reads it (env or guest copy) outside the runtime mutex; one reader per
+        backend at a time. ``wait=False`` raises VmNotReady instead of waiting for
+        another thread's read. A read that raced with ``drop_tokens`` /
+        ``invalidate_clients(drop_tokens=True)`` is returned but not cached; callers
+        compare the generation before publishing anything built from it.
+        """
+        with self._mutex:
+            cached, gen = self._tokens.get(cfg.id), self._token_gen
+        if cached is not None:
+            return cached, gen
+        lock = self._token_lock(cfg.id)
+        acquired = lock.acquire(timeout=TOKEN_READ_WAIT_S) if wait else lock.acquire(blocking=False)
+        if not acquired:
+            raise VmNotReady(
+                f"backend {cfg.id}: its token is being read from the guest",
+                stage="token",
+                hint="retry in a few seconds; see session_status",
+                next_tool="session_status",
+                details={"backend": cfg.id},
+                retryable=True,
+            )
+        try:
+            with self._mutex:  # another thread may have read it while we waited
+                cached, gen = self._tokens.get(cfg.id), self._token_gen
             if cached is not None:
-                return cached
-            if self.profile.token_source == "env":  # noqa: S105 - token source kind, not a secret
-                token = resolve_secret(cfg.token_env, dict(self.environ))
-                if token is None:
-                    raise BackendAuthError(
-                        f"backend {cfg.id}: environment variable {cfg.token_env} is not set",
-                        stage="token",
-                        hint="export it or add it to gateway.env_file",
-                        details={"backend": cfg.id, "env": cfg.token_env},
-                    )
-            else:
-                token = self._read_guest_token(cfg)
-            self._tokens[cfg.id] = token
+                return cached, gen
+            token = self._load_token(cfg)
+            with self._mutex:
+                if gen == self._token_gen:
+                    self._tokens[cfg.id] = token
+            return token, gen
+        finally:
+            lock.release()
+
+    def _load_token(self, cfg: BackendConfig) -> Secret:
+        if self.profile.token_source == "env":  # noqa: S105 - token source kind, not a secret
+            token = resolve_secret(cfg.token_env, dict(self.environ))
+            if token is None:
+                raise BackendAuthError(
+                    f"backend {cfg.id}: environment variable {cfg.token_env} is not set",
+                    stage="token",
+                    hint="export it or add it to gateway.env_file",
+                    details={"backend": cfg.id, "env": cfg.token_env},
+                )
             return token
+        return self._read_guest_token(cfg)
 
     def _read_guest_token(self, cfg: BackendConfig) -> Secret:
         if self.channel is None:
@@ -451,7 +505,10 @@ class Runtime:
         cfg = self.backend(backend_id)
         with self._mutex:
             self._tokens.pop(backend_id, None)
-            token = self._token(cfg)
+        token, gen = self._token(cfg)  # guest I/O outside the mutex
+        with self._mutex:
+            if gen != self._token_gen:
+                return  # tokens were dropped meanwhile (revert): the next connect reads afresh
             client = self.clients.get(backend_id)
             update = getattr(client, "update_token", None)
             if backend_id in self._resolved and callable(update):
@@ -460,14 +517,22 @@ class Runtime:
     def drop_tokens(self) -> None:
         with self._mutex:
             self._tokens.clear()
+            self._token_gen += 1
 
     # ── clients ─────────────────────────────────────────────────────
-    def backend_url(self, backend_id: str) -> str:
-        cfg = self.backend(backend_id)
+    @staticmethod
+    def _url_for(cfg: BackendConfig, ip: str | None) -> str | None:
         if cfg.url:
             return cfg.url
-        ip = self.guest_ip()
         if not ip:
+            return None
+        host = f"[{ip}]" if ":" in ip else ip
+        return f"http://{host}:{cfg.port}/"
+
+    def backend_url(self, backend_id: str) -> str:
+        cfg = self.backend(backend_id)
+        url = self._url_for(cfg, None if cfg.url else self.guest_ip())
+        if url is None:
             raise VmNotReady(
                 f"backend {backend_id}: the guest IP address is unknown",
                 stage="connect",
@@ -475,8 +540,7 @@ class Runtime:
                 next_tool="session_status",
                 details={"backend": backend_id},
             )
-        host = f"[{ip}]" if ":" in ip else ip
-        return f"http://{host}:{cfg.port}/"
+        return url
 
     def _make_client(self, cfg: BackendConfig, url: str, token: Secret) -> BackendClient:
         endpoint = BackendEndpoint(
@@ -490,32 +554,48 @@ class Runtime:
         )
         return self.client_factory(endpoint, clock=self.clock)
 
-    def connect(self, backend_id: str) -> BackendClient:
+    def connect(self, backend_id: str, *, wait: bool = True) -> BackendClient:
         """Return a usable client for ``backend_id``, resolving URL and token if needed.
 
-        Raises VmNotReady (no guest IP), BackendAuthError (token unavailable or
-        unusable), ConfigError, or guest-channel errors while reading the token.
+        The guest IP lookup and the token read run outside the runtime mutex; the
+        client is published only if neither the tokens nor the guest IP changed
+        meanwhile (else it resolves again). ``wait=False`` refuses with VmNotReady
+        instead of waiting for another thread's token read (status polling).
+
+        Raises VmNotReady (no guest IP, endpoint keeps changing, read in progress),
+        BackendAuthError (token unavailable or unusable), ConfigError, or
+        guest-channel errors while reading the token.
         """
         cfg = self.backend(backend_id)
-        with self._mutex:
-            url = self.backend_url(backend_id)
-            if self._resolved.get(backend_id) == url:
-                return self.clients[backend_id]
-            client = self._make_client(cfg, url, self._token(cfg))
-            self.clients[backend_id] = client
-            self._resolved[backend_id] = url
-            return client
+        for _ in range(_CONNECT_ATTEMPTS):
+            url = self.backend_url(backend_id)  # may look the guest IP up (no mutex held)
+            with self._mutex:
+                if self._resolved.get(backend_id) == url:
+                    return self.clients[backend_id]
+            token, gen = self._token(cfg, wait=wait)  # may copy from the guest (no mutex held)
+            with self._mutex:
+                current = self._url_for(cfg, self._ip)
+                if gen != self._token_gen or current != url:
+                    continue  # a revert / IP change raced with this resolution: start over
+                if self._resolved.get(backend_id) == url:
+                    return self.clients[backend_id]  # another thread published it meanwhile
+                client = self._make_client(cfg, url, token)
+                self.clients[backend_id] = client
+                self._resolved[backend_id] = url
+                return client
+        raise VmNotReady(
+            f"backend {backend_id}: the endpoint changed while it was being resolved",
+            stage="connect",
+            hint="the VM is changing state; call session_status and retry",
+            next_tool="session_status",
+            details={"backend": backend_id},
+        )
 
     def _rebuild_clients(self, reason: str) -> None:
         """Caller holds the mutex. Rebuild resolved clients whose token is cached, else placeholders."""
         for bid, cfg in self.backends.items():
             token = self._tokens.get(bid)
-            url: str | None = None
-            if token is not None:
-                try:
-                    url = self.backend_url(bid)
-                except VmNotReady:
-                    url = None
+            url = self._url_for(cfg, self._ip) if token is not None else None
             if token is not None and url is not None:
                 self.clients[bid] = self._make_client(cfg, url, token)
                 self._resolved[bid] = url
@@ -529,6 +609,7 @@ class Runtime:
         with self._mutex:
             if drop_tokens:
                 self._tokens.clear()
+                self._token_gen += 1
             for bid, cfg in self.backends.items():
                 self.clients[bid] = _placeholder(cfg, reason)
             self._resolved.clear()
@@ -635,6 +716,7 @@ def build_runtime(
     def hang_hook(backend_id: str, report: HealthReport) -> None:
         holder["rt"]._on_hang(backend_id, report)
 
+    sup_opts = dict(supervisor_options or {})
     supervisor = Supervisor(
         vm=sup_vm,
         guest=channel,
@@ -644,7 +726,7 @@ def build_runtime(
         token_refresher=refresher,
         clock=clk,
         hang_hook=hang_hook,
-        **dict(supervisor_options or {}),
+        **sup_opts,
     )
     proxy = Proxy(catalog, clients, supervisor, max_call_s=config.max_call_s, clock=clk)
     rt = Runtime(
@@ -661,6 +743,7 @@ def build_runtime(
         clock=clk,
         environ=env,
         client_factory=client_factory or HttpBackendClient,
+        restart_limit=int(sup_opts.get("max_restarts_per_job", _SUPERVISOR_MAX_RESTARTS)),
     )
     holder["rt"] = rt
     lock.add_preempt_hook(rt.cancel_backend_calls)

@@ -162,10 +162,30 @@ def test_slow_start_returns_in_progress_and_is_idempotent(lab):
     finally:
         gate.set()
     wait_until(lambda: gw.session_status()["operation"]["state"] != "running")
-    assert gw.session_status()["operation"]["state"] == "done"
-    # the repeated call now gets the final result of the same run
-    final = gw.analysis_start(sample, wait_s=5)
-    assert final["state"] == JobState.ANALYZING and final["job_id"] == job_id
+    op = gw.session_status()["operation"]
+    # the final result is reported by session_status ...
+    assert op["state"] == "done" and op["result"]["state"] == JobState.ANALYZING
+    assert op["result"]["job_id"] == job_id
+    # ... so a repeated call afterwards is a new request, refused while the job is live
+    with pytest.raises(StateViolation) as ei:
+        gw.analysis_start(sample, wait_s=5)
+    assert ei.value.details["job_id"] == job_id
+    assert len(jobs(lab)) == 1
+
+
+def test_repeating_a_slow_start_without_polling_status_returns_its_result(lab):
+    gate = threading.Event()
+    lab.ps.gate = gate
+    gw = lab.gateway()
+    sample = str(lab.sample())
+    try:
+        first = gw.analysis_start(sample, wait_s=0.05)
+        assert first["state"] == "in_progress"
+    finally:
+        gate.set()
+    gw._ops(gw.runtime()).wait_idle(10)
+    final = gw.analysis_start(sample, wait_s=5)  # the client polls by repeating the call
+    assert final["state"] == JobState.ANALYZING and final["job_id"]
     assert len(jobs(lab)) == 1
 
 
@@ -240,3 +260,243 @@ def test_discard_requires_the_human_actor(lab):
     job_id = gw.analysis_start(str(lab.sample()))["job_id"]
     with pytest.raises(StateViolation):
         gw.discard_job(job_id, "mcp")
+
+
+# ── fail-closed collection of the debugger state (review findings) ──
+def test_failed_save_database_makes_the_collection_partial_and_blocks_the_revert(lab):
+    from tests.fakes.fake_plugin_server import ToolError
+
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+
+    def broken_save(args):
+        raise ToolError("SaveDatabase failed: disk full")
+
+    working_save = lab.servers["x64"]._handler_for("SaveDatabase")
+    lab.servers["x64"].on_tool("SaveDatabase", broken_save)
+    col = gw.analysis_collect()
+    assert col["state"] == JobState.COLLECTED_PARTIAL and col["partial"] is True
+    assert any(e.get("step") == "save_database" for e in col["errors"])
+    reverts = sum(1 for c in lab.vm.calls if c[0] == "revert_snapshot")
+    with pytest.raises(StateViolation):
+        gw.analysis_finish()
+    assert sum(1 for c in lab.vm.calls if c[0] == "revert_snapshot") == reverts
+    # fixed: the retry completes the collection
+    lab.servers["x64"].on_tool("SaveDatabase", working_save)
+    assert gw.analysis_collect()["state"] == JobState.COLLECTED
+
+
+def test_save_database_after_an_unacknowledged_restart_is_partial(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+    lab.kill_debugger("x64")
+    with pytest.raises(BackendRestarted):
+        gw.call_mirrored("StepOver")  # relaunched; the client has not acknowledged yet
+    col = gw.analysis_collect()
+    assert col["state"] == JobState.COLLECTED_PARTIAL
+    gw.session_status()
+    assert gw.analysis_collect()["state"] == JobState.COLLECTED
+
+
+def test_failed_module_list_makes_the_collection_partial(lab):
+    from tests.fakes.fake_plugin_server import ToolError
+
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+
+    def broken(args):
+        raise ToolError("ListModules failed")
+
+    lab.servers["x64"].on_tool("ListModules", broken)
+    col = gw.analysis_collect()
+    assert col["state"] == JobState.COLLECTED_PARTIAL
+    assert any(e.get("step") == "module_map" for e in col["errors"])
+
+
+def test_no_debug_session_means_nothing_to_save(lab):
+    """A sample that exited (or was never loaded) leaves no database to lose."""
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()), load=False)
+    srv = lab.servers["x64"]
+    srv.debugging = False
+    srv.on_tool("SaveDatabase", None)  # back to the plugin's own "requires an active debug session"
+    srv.on_tool("ListModules", None)
+    col = gw.analysis_collect()
+    assert col["state"] == JobState.COLLECTED and col["partial"] is False
+    steps = {s["name"]: s for s in col["steps"]}
+    assert steps["save_database"]["ok"] and "no debug session" in steps["save_database"]["detail"]
+
+
+def test_exception_during_collect_leaves_the_job_collected_partial(lab, monkeypatch):
+    from x64dbg_vm_gateway import transfer
+    from x64dbg_vm_gateway.errors import TransferError
+
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    real = transfer.collect_artifacts
+
+    def boom(*a, **kw):
+        raise TransferError("host disk vanished", stage="host_fs")
+
+    monkeypatch.setattr(transfer, "collect_artifacts", boom)
+    with pytest.raises(TransferError) as ei:
+        gw.analysis_collect()
+    assert ei.value.details["job_id"] == job_id
+    (job,) = jobs(lab)
+    assert job["state"] == JobState.COLLECTED_PARTIAL and job["error"]["code"] == "TRANSFER_FAILED"
+    with pytest.raises(StateViolation):
+        gw.analysis_finish()
+    monkeypatch.setattr(transfer, "collect_artifacts", real)
+    assert gw.analysis_collect()["state"] == JobState.COLLECTED
+
+
+def test_failed_finish_revert_marks_the_job_failed_with_a_revert_hint(lab):
+    from x64dbg_vm_gateway.errors import VmrunError
+
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    gw.analysis_collect()
+
+    def broken_revert(name):
+        raise VmrunError("vmrun revertToSnapshot failed")
+
+    lab.vm.revert_snapshot = broken_revert  # type: ignore[method-assign]
+    with pytest.raises(VmrunError) as ei:
+        gw.analysis_finish()
+    assert "vm_snapshot_revert" in ei.value.hint
+    (job,) = [j for j in jobs(lab) if j["job_id"] == job_id]
+    assert job["state"] == JobState.FAILED and job["error"]["code"] == "VMRUN_ERROR"
+
+
+@pytest.mark.parametrize(("system", "extracted"), [("Windows", False), ("Linux", True), ("Darwin", True)])
+def test_collect_extracts_by_default_except_on_windows_hosts(lab, system, extracted):
+    gw = lab.gateway(host_system=system)
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    lab.guest.write(f"{GUEST_ROOT}\\{job_id}\\out\\a.bin", b"a")
+    assert gw.analysis_collect()["extracted"] is extracted
+
+
+# ── loading ─────────────────────────────────────────────────────────
+def test_wait_for_pause_failure_is_reported(lab):
+    from tests.fakes.fake_plugin_server import ToolError
+
+    def timeout(args):
+        raise ToolError("Timeout waiting for pause")
+
+    lab.servers["x64"].on_tool("WaitForPause", timeout)
+    res = lab.gateway().analysis_start(str(lab.sample()))
+    load = [s for s in res["steps"] if s["name"] == "load"][0]
+    assert load["ok"] is False and "WaitForPause" in load["detail"]
+    assert res["paused"] is False
+    assert any("WaitForPause" in w and "GetDebugState" in w for w in res["warnings"])
+    assert res["state"] == JobState.ANALYZING
+
+
+def test_snapshot_without_revert_is_rejected(lab):
+    from x64dbg_vm_gateway.app import InvalidArgument
+
+    with pytest.raises(InvalidArgument):
+        lab.gateway().analysis_start(str(lab.sample()), snapshot="BASE", revert=False)
+    assert jobs(lab) == []
+
+
+# ── crash loops and debugger_restart ────────────────────────────────
+def test_crash_loop_records_debugger_killed_by_target(lab):
+    from x64dbg_vm_gateway.errors import CrashLoop
+
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    for _ in range(3):
+        lab.kill_debugger("x64")
+        with pytest.raises(BackendRestarted):
+            gw.call_mirrored("StepOver")
+        gw.session_status()
+    lab.kill_debugger("x64")
+    with pytest.raises(CrashLoop):
+        gw.call_mirrored("StepOver")
+    (job,) = [j for j in jobs(lab) if j["job_id"] == job_id]
+    assert job["flags"]["debugger_killed_by_target"] == 3
+
+
+def test_debugger_restart_checks_the_relaunch_config_before_killing(lab):
+    from dataclasses import replace
+
+    from x64dbg_vm_gateway.errors import ConfigError
+
+    lab.set_profile(backends=tuple(replace(b, launch_task=None) for b in lab.profile.backends))
+    gw = lab.gateway()
+    before = [p.pid for p in lab.guest.processes if p.image_name == "x64dbg.exe"]
+    with pytest.raises(ConfigError):
+        gw.debugger_restart()
+    assert [p.pid for p in lab.guest.processes if p.image_name == "x64dbg.exe"] == before
+    assert not lab.guest.calls_of("kill_process")
+
+
+def test_manual_restarts_do_not_use_the_jobs_crash_budget(lab):
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    for _ in range(2):
+        lab.servers["x64"].stop()
+        gw.debugger_restart(reason="user asked")
+    assert gw.runtime().supervisor.restarts(job_id) == 0
+    # the sample may still kill the debugger the full number of times
+    for _ in range(3):
+        lab.kill_debugger("x64")
+        with pytest.raises(BackendRestarted):
+            gw.call_mirrored("StepOver")
+        gw.session_status()
+
+
+def test_manual_restart_limit_never_leaves_the_debugger_dead(lab):
+    from x64dbg_vm_gateway.errors import CrashLoop
+
+    gw = lab.gateway()
+    for _ in range(3):
+        lab.servers["x64"].stop()
+        gw.debugger_restart()
+    alive = [p.pid for p in lab.guest.processes if p.image_name == "x64dbg.exe"]
+    kills = len(lab.guest.calls_of("kill_process"))
+    with pytest.raises(CrashLoop) as ei:
+        gw.debugger_restart()
+    assert "debugger_restart" in ei.value.message
+    assert [p.pid for p in lab.guest.processes if p.image_name == "x64dbg.exe"] == alive
+    assert len(lab.guest.calls_of("kill_process")) == kills
+
+
+# ── reload_on_restart ───────────────────────────────────────────────
+def test_reload_on_restart_reloads_the_sample_after_a_relaunch(lab):
+    gw = lab.gateway()
+    res = gw.analysis_start(str(lab.sample()), reload_on_restart=True, args="-x")
+    srv = lab.servers["x64"]
+    lab.kill_debugger("x64")
+    with pytest.raises(BackendRestarted) as ei:
+        gw.call_mirrored("StepOver")
+    assert ei.value.details["reload"]["ok"] is True
+    loads = srv.tool_calls("LoadBinary")
+    assert len(loads) == 2 and loads[-1].arguments["filePath"] == res["sample"]["guest_path"]
+    assert loads[-1].arguments["arguments"] == "-x"
+    # repeated refusals before the acknowledgement do not load it again
+    with pytest.raises(BackendRestarted):
+        gw.call_mirrored("StepOver")
+    assert len(srv.tool_calls("LoadBinary")) == 2
+    gw.session_status()
+    gw.call_mirrored("StepOver")
+
+
+def test_without_reload_on_restart_the_sample_is_not_reloaded(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+    lab.kill_debugger("x64")
+    with pytest.raises(BackendRestarted) as ei:
+        gw.call_mirrored("StepOver")
+    assert "reload" not in ei.value.details
+    assert len(lab.servers["x64"].tool_calls("LoadBinary")) == 1
+
+
+def test_debugger_restart_reloads_when_asked(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()), reload_on_restart=True)
+    lab.servers["x64"].stop()
+    out = gw.debugger_restart()
+    assert out["reload"]["ok"] is True
+    assert len(lab.servers["x64"].tool_calls("LoadBinary")) == 2
