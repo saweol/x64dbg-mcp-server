@@ -1,5 +1,5 @@
-//! Builders for x64dbg command strings that embed quoted arguments
-//! (pure, host-testable).
+//! Builders for x64dbg command strings that embed quoted arguments or
+//! numbers (pure, host-testable).
 //!
 //! x64dbg's command parser (src/dbg/command.cpp) treats a backslash inside a
 //! quoted argument as an escape for the next character: `\"` yields a
@@ -19,6 +19,13 @@
 //! tests below encode it as an executable reference tokenizer (with both
 //! space variants) so V5 only has to confirm that model.
 //!
+//! Numbers: x64dbg reads a bare numeric argument as HEXADECIMAL ("4096" is
+//! 0x4096); only a leading '.' marks decimal (valfromstring_noexpr in
+//! src/dbg/value.cpp tries isdecnumber, which requires the '.', before
+//! ishexnumber). Never format a number with a plain {d} into a command:
+//! sizes are written as 0x<hex>, thread and process ids as .<decimal>.
+//! The tests model this rule too (numberModel).
+//!
 //! All functions are pure and thread-safe. Outputs are NUL-terminated.
 
 const std = @import("std");
@@ -26,7 +33,7 @@ const std = @import("std");
 /// Errors of the builders that only quote strings.
 pub const QuoteError = error{ Unrepresentable, BufferTooSmall };
 /// Errors of the builders that also take numeric or enumerated arguments.
-pub const Error = QuoteError || error{ InvalidNumber, InvalidArgument, NotImplemented };
+pub const Error = QuoteError || error{ InvalidNumber, InvalidArgument };
 
 /// True when `s` can be embedded in a quoted x64dbg argument.
 pub fn isRepresentable(s: []const u8) bool {
@@ -124,46 +131,71 @@ pub fn buildModExport(buf: []u8, module: []const u8, path: []const u8) QuoteErro
     return b.finish();
 }
 
-/// `savedata "<path>",<addr_expr>,<size>`.
+/// `savedata "<path>",<addr_expr>,0x<size>`. `size` must be positive.
 pub fn buildSaveData(buf: []u8, path: []const u8, addr_expr: []const u8, size: i64) Error![:0]const u8 {
+    const n = try positive(size);
     var b: Builder = .{ .buf = buf };
     try b.raw("savedata ");
     try b.quoted(path);
-    try b.print(",{s},{d}", .{ addr_expr, size });
+    try b.print(",{s},0x{X}", .{ addr_expr, n });
     return b.finish();
 }
 
-/// `alloc <size>` (RED-phase stub).
+/// `alloc 0x<size>`. `size` must be positive.
 pub fn buildAlloc(buf: []u8, size: i64) Error![:0]const u8 {
-    _ = buf;
-    _ = size;
-    return error.NotImplemented;
+    const n = try positive(size);
+    var b: Builder = .{ .buf = buf };
+    try b.print("alloc 0x{X}", .{n});
+    return b.finish();
 }
 
-/// `<verb> .<id>` (RED-phase stub).
+/// `<verb> .<id>` for commands that take a thread or process id
+/// (switchthread, suspendthread, resumethread, attach). Ids are written in
+/// decimal with x64dbg's '.' prefix, the form ListThreads reports them in.
+/// `id` must be a non-zero 32-bit value.
 pub fn buildIdCommand(buf: []u8, verb: []const u8, id: i64) Error![:0]const u8 {
-    _ = buf;
-    _ = verb;
-    _ = id;
-    return error.NotImplemented;
+    if (id <= 0 or id > std.math.maxInt(u32)) return error.InvalidNumber;
+    var b: Builder = .{ .buf = buf };
+    try b.print("{s} .{d}", .{ verb, id });
+    return b.finish();
 }
 
-/// `bphws <addr>,<type>,<size>` (RED-phase stub).
+/// `bphws <addr_expr>,<r|w|x>,<size>`.
+/// x64dbg looks only at the first letter of the type (r = read/write,
+/// w = write, x = execute) and silently replaces any size other than
+/// 1, 2, 4 (and 8 on x64) with 1, so both are validated here: the type's
+/// first letter must be r, w, x or e (execute), and the size one of those
+/// values. A single-digit size reads the same in hex and decimal.
 pub fn buildHardwareBp(buf: []u8, addr_expr: []const u8, bp_type: []const u8, size: i64, is_x64: bool) Error![:0]const u8 {
-    _ = buf;
-    _ = addr_expr;
-    _ = bp_type;
-    _ = size;
-    _ = is_x64;
-    return error.NotImplemented;
+    if (bp_type.len == 0) return error.InvalidArgument;
+    const letter: u8 = switch (std.ascii.toLower(bp_type[0])) {
+        'r' => 'r',
+        'w' => 'w',
+        'x', 'e' => 'x',
+        else => return error.InvalidArgument,
+    };
+    switch (size) {
+        1, 2, 4 => {},
+        8 => if (!is_x64) return error.InvalidNumber,
+        else => return error.InvalidNumber,
+    }
+    var b: Builder = .{ .buf = buf };
+    try b.print("bphws {s},{c},{d}", .{ addr_expr, letter, size });
+    return b.finish();
 }
 
-/// `SetExceptionBPX <code>,<chance>` (RED-phase stub).
+/// `SetExceptionBPX <code>,<chance>` with chance 1 (first), 2 (second) or
+/// 3 (all), the values x64dbg accepts (single digits, same in hex).
 pub fn buildSetExceptionBpx(buf: []u8, code: []const u8, chance: i64) Error![:0]const u8 {
-    _ = buf;
-    _ = code;
-    _ = chance;
-    return error.NotImplemented;
+    if (chance < 1 or chance > 3) return error.InvalidNumber;
+    var b: Builder = .{ .buf = buf };
+    try b.print("SetExceptionBPX {s},{d}", .{ code, chance });
+    return b.finish();
+}
+
+fn positive(v: i64) error{InvalidNumber}!u64 {
+    if (v <= 0) return error.InvalidNumber;
+    return @intCast(v);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
 //! - CIDR parsing and matching, client allowlist evaluation
 //! - startup validation of bind address / AllowExternal / token length
 //! - constant-time bearer token comparison
-//! - per-IP authentication failure lockout driven by an injected clock
-//!   (loopback peers are exempt)
+//! - authentication failure lockout driven by an injected clock (per IP for
+//!   remote peers, one short shared lockout for loopback peers)
 //! - connection admission (allowlist, then bounded concurrent client slots)
 //! - request receive deadlines (header / total budget)
 //! - bounded retry of a bind() that fails with "address in use"
@@ -256,15 +256,49 @@ pub fn tokenEql(expected: []const u8, presented: []const u8) bool {
     return (@intFromBool(bytes_equal) & @intFromBool(len_equal)) == 1;
 }
 
-/// Per-IP authentication failure tracking with temporary lockout.
-/// `max_failures` failures within `window_ms` lock the address for
-/// `lockout_ms`. Time is injected (milliseconds from any monotonic clock).
+/// Hint shown next to the bind address in the configuration dialog. Every
+/// address it names must start with the settings the dialog can edit
+/// (no AllowExternal / AllowedClients), see the test below.
+pub const BIND_ADDRESS_HINT = "(127.0.0.1 = local only)";
+
+/// Lockout applied to loopback peers (capped by the configured lockout).
+/// Much shorter than the remote default: it only has to slow down a local
+/// token guesser, while every local process shares the loopback bucket and
+/// could otherwise keep the real client locked out for minutes.
+pub const LOOPBACK_LOCKOUT_MS: u64 = 5_000;
+
+/// Kind of a failed authentication.
+pub const Failure = enum {
+    /// The request had no Authorization header at all.
+    no_credentials,
+    /// An Authorization header was sent but did not carry the right token.
+    bad_credentials,
+};
+
+/// Seconds for a Retry-After header: the remaining lockout rounded up,
+/// at least 1.
+pub fn retryAfterSeconds(remaining_ms: u64) u64 {
+    return @max(1, remaining_ms / 1000 + @intFromBool(remaining_ms % 1000 != 0));
+}
+
+/// Authentication failure tracking with temporary lockout.
+/// `max_failures` failures within `window_ms` lock the peer out; time is
+/// injected (milliseconds from any monotonic clock). A locked-out peer is
+/// still admitted and its request read, then answered with 429 (see
+/// http.route), so it can tell "locked out" from "server down".
 ///
-/// Loopback peers are exempt: every local process, and any web page the
-/// user visits (through the browser), shares 127.0.0.1, so counting their
-/// failures would let them lock the legitimate local client out. Locally
-/// the bearer token (128-bit when generated) is the boundary; a short
-/// loopback token only produces a startup warning.
+/// Remote peers are tracked per IPv4 address and locked for `lockout_ms`.
+///
+/// Loopback peers (127.0.0.0/8) share ONE bucket, kept outside the remote
+/// table (a remote flood cannot evict it), because a local process can pick
+/// any 127.x.y.z source address. Their lockout is LOOPBACK_LOCKOUT_MS (at
+/// most `lockout_ms`): enough to throttle a local token guesser, short
+/// enough that whoever shares 127.0.0.1 cannot lock the real client out for
+/// long. Loopback requests without any Authorization header are not
+/// counted: a web page can make the browser send those (simple requests,
+/// CORS preflights), but cannot add an Authorization header to a
+/// cross-origin request without a preflight this server never approves,
+/// so ordinary web pages cannot trigger the loopback lockout.
 /// Not thread-safe.
 pub const AuthLimiter = struct {
     pub const CAPACITY = 128;
@@ -282,23 +316,38 @@ pub const AuthLimiter = struct {
     window_ms: u64,
     lockout_ms: u64,
     entries: [CAPACITY]Entry = [_]Entry{.{}} ** CAPACITY,
+    /// Shared bucket for every loopback peer.
+    loopback: Entry = .{ .ip = .{ 127, 0, 0, 1 }, .used = true },
 
     pub fn init(max_failures: u32, window_ms: u64, lockout_ms: u64) AuthLimiter {
         return .{ .max_failures = @max(max_failures, 1), .window_ms = window_ms, .lockout_ms = lockout_ms };
     }
 
     pub fn isLocked(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) bool {
-        if (isLoopback(ip)) return false;
-        const i = self.indexOf(ip) orelse return false;
-        return self.entries[i].locked_until > now_ms;
+        return self.lockRemainingMs(ip, now_ms) > 0;
+    }
+
+    /// Milliseconds until the lockout of `ip` ends; 0 when it is not locked.
+    pub fn lockRemainingMs(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) u64 {
+        const e: *const Entry = if (isLoopback(ip))
+            &self.loopback
+        else
+            &self.entries[self.indexOf(ip) orelse return 0];
+        return e.locked_until -| now_ms;
+    }
+
+    /// Lockout duration that applies to `ip`.
+    pub fn lockoutMsFor(self: *const AuthLimiter, ip: Ipv4) u64 {
+        return if (isLoopback(ip)) @min(self.lockout_ms, LOOPBACK_LOCKOUT_MS) else self.lockout_ms;
     }
 
     /// Records a failed authentication. Returns true when this failure
-    /// started a lockout.
+    /// started a lockout (of lockoutMsFor(ip)).
     pub fn recordFailure(self: *AuthLimiter, ip: Ipv4, now_ms: u64, failure: Failure) bool {
-        _ = failure;
-        if (isLoopback(ip)) return false;
-        const e = self.findOrClaim(ip, now_ms);
+        const e = if (isLoopback(ip)) blk: {
+            if (failure == .no_credentials) return false;
+            break :blk &self.loopback;
+        } else self.findOrClaim(ip, now_ms);
         e.last_seen = now_ms;
         if (e.locked_until > now_ms) return false; // already locked
         if (e.failures == 0 or now_ms -| e.window_start >= self.window_ms) {
@@ -308,28 +357,20 @@ pub const AuthLimiter = struct {
         e.failures += 1;
         if (e.failures >= self.max_failures) {
             e.failures = 0;
-            e.locked_until = now_ms +| self.lockout_ms;
+            e.locked_until = now_ms +| self.lockoutMsFor(ip);
             return true;
         }
         return false;
     }
 
-    pub fn lockRemainingMs(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) u64 {
-        _ = self;
-        _ = ip;
-        _ = now_ms;
-        return 0;
-    }
-
-    pub fn lockoutMsFor(self: *const AuthLimiter, ip: Ipv4) u64 {
-        _ = ip;
-        return self.lockout_ms;
-    }
-
+    /// A successful request from a remote peer forgets its failure history
+    /// (it never lifts an active lockout: it could not have been served).
+    /// For loopback peers this is a no-op: the bucket is shared, so a
+    /// success (perhaps from the real client) must not wipe the failures of
+    /// another local process; they expire with the window instead.
     pub fn recordSuccess(self: *AuthLimiter, ip: Ipv4) void {
+        if (isLoopback(ip)) return;
         const i = self.indexOf(ip) orelse return;
-        // A successful request never lifts an active lockout (it could not
-        // have been served), so just forget the failure history.
         self.entries[i].failures = 0;
     }
 
@@ -364,15 +405,6 @@ pub const AuthLimiter = struct {
         return victim;
     }
 };
-
-/// RED-phase stubs (replaced by the implementation).
-pub const LOOPBACK_LOCKOUT_MS: u64 = 5_000;
-pub const Failure = enum { no_credentials, bad_credentials };
-pub const BIND_ADDRESS_HINT = "(0.0.0.0, 127.0.0.1, etc.)";
-pub fn retryAfterSeconds(remaining_ms: u64) u64 {
-    _ = remaining_ms;
-    return 0;
-}
 
 /// Bounded counter of concurrently served client connections.
 pub const ClientSlots = struct {
@@ -749,12 +781,19 @@ test "AuthLimiter treats every loopback address as one peer" {
     try testing.expect(lim.isLocked(.{ 127, 9, 9, 9 }, 13));
     try testing.expect(lim.isLocked(.{ 127, 0, 0, 1 }, 13));
     try testing.expect(!lim.isLocked(.{ 10, 0, 0, 1 }, 13));
-    // A success from any loopback address forgets the failure history.
+    // The bucket is shared, so a success (perhaps from the real client)
+    // must not wipe the failures of another local process; they expire
+    // with the window instead.
     lim = AuthLimiter.init(3, 60_000, 300_000);
     _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 10, .bad_credentials);
     _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 11, .bad_credentials);
     lim.recordSuccess(.{ 127, 0, 0, 5 });
-    try testing.expect(!lim.recordFailure(.{ 127, 0, 0, 1 }, 12, .bad_credentials));
+    lim.recordSuccess(.{ 127, 0, 0, 1 });
+    try testing.expect(lim.recordFailure(.{ 127, 0, 0, 1 }, 12, .bad_credentials));
+    lim = AuthLimiter.init(3, 1000, 300_000);
+    _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 10, .bad_credentials);
+    _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 11, .bad_credentials);
+    try testing.expect(!lim.recordFailure(.{ 127, 0, 0, 1 }, 2000, .bad_credentials));
 }
 
 test "AuthLimiter keeps the loopback bucket out of the remote table" {

@@ -158,7 +158,7 @@ pub const RouteInput = struct {
     path: []const u8,
     /// The bearer token matched.
     authorized: bool,
-    /// The peer is currently locked out (never true for loopback peers).
+    /// The peer is currently locked out (see netpolicy.AuthLimiter).
     locked_out: bool,
     sse_enabled: bool,
 };
@@ -180,6 +180,18 @@ pub fn route(in: RouteInput) Route {
     }
     if (std.mem.eql(u8, p, "/messages")) return if (in.sse_enabled) .sse_message else .not_found;
     return .json_rpc;
+}
+
+/// Buffer size that always fits lockedOutResponse.
+pub const LOCKED_OUT_RESPONSE_MAX = 320;
+
+/// The complete "429 Too Many Requests" answer for a locked-out peer, with
+/// the remaining lockout as Retry-After (seconds) and in the JSON body.
+pub fn lockedOutResponse(buf: *[LOCKED_OUT_RESPONSE_MAX]u8, retry_after_s: u64) []const u8 {
+    var body_buf: [128]u8 = undefined;
+    // Both prints fit by construction (u64 has at most 20 digits).
+    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":\"Too many failed authentication attempts\",\"retry_after_s\":{d}}}", .{retry_after_s}) catch unreachable;
+    return std.fmt.bufPrint(buf, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {d}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ retry_after_s, body.len, body }) catch unreachable;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -323,4 +335,24 @@ test "queryParam and pathOnly" {
     try testing.expectEqual(@as(?[]const u8, null), queryParam("/m?flag&x", "flag"));
     try testing.expectEqualStrings("/messages", pathOnly("/messages?a=1"));
     try testing.expectEqualStrings("/", pathOnly("/"));
+}
+
+test "lockedOutResponse is a complete 429 with Retry-After and a JSON error" {
+    var buf: [LOCKED_OUT_RESPONSE_MAX]u8 = undefined;
+    const resp = lockedOutResponse(&buf, 5);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 429 Too Many Requests\r\n"));
+    const head_end = findHeaderEnd(resp).?;
+    const head = resp[0..head_end];
+    const body = resp[head_end + 4 ..];
+    try testing.expectEqualStrings("5", headerValue(head, "Retry-After").?);
+    try testing.expectEqualStrings("application/json", headerValue(head, "Content-Type").?);
+    try testing.expectEqualStrings("close", headerValue(head, "Connection").?);
+    try testing.expectEqual(body.len, try contentLength(head));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Too many failed authentication attempts", parsed.value.object.get("error").?.string);
+    try testing.expectEqual(@as(i64, 5), parsed.value.object.get("retry_after_s").?.integer);
+    // The largest value still fits the buffer.
+    const big = lockedOutResponse(&buf, std.math.maxInt(u64));
+    try testing.expect(std.mem.indexOf(u8, big, "Retry-After: 18446744073709551615\r\n") != null);
 }

@@ -1,12 +1,21 @@
-//! SSE client table with per-client bounded outbound queues
+//! SSE client table with per-client bounded outbound buffers
 //! (pure, host-testable).
 //!
 //! Producers (the x64dbg callback thread via notifyEvent, HTTP threads
-//! answering POST /messages) only *enqueue* frames; they never touch a
+//! answering POST /messages) only *queue* frames; they never touch a
 //! socket, so a stalled SSE client can never block the debugger. Each SSE
-//! connection's own thread pops frames and writes them with a send timeout.
-//! A client whose queue overflows (by count or bytes) is marked dead and its
-//! owner thread closes the connection.
+//! connection's own thread reads the queued bytes and writes them with a
+//! send timeout.
+//!
+//! Each client owns one fixed byte ring of `Limits.max_queued_bytes`,
+//! allocated once by `add` (on the HTTP thread accepting the SSE
+//! connection). Queueing a frame only copies bytes into that ring under the
+//! lock: it never allocates, so the debugger callback thread does no
+//! VirtualAlloc per event. A frame is queued whole or not at all; a client
+//! whose unsent bytes would exceed its ring is marked dead and its owner
+//! thread closes the connection. Readers see a plain byte stream (SSE needs
+//! no frame boundaries); when `read` returns nothing, the stream is at a
+//! frame boundary.
 //!
 //! Slots carry a generation number so a stale handle held by an exiting
 //! thread can never remove or kill a newer client that reused the slot.
@@ -15,8 +24,7 @@
 //! live clients), so one client cannot guess another client's id and push
 //! frames into its stream through POST /messages.
 //!
-//! Thread-safety: all methods are internally locked. Frames returned by
-//! `pop` are owned by the caller and must be released with `free`.
+//! Thread-safety: all methods are internally locked.
 
 const std = @import("std");
 const sync = @import("sync.zig");
@@ -27,7 +35,9 @@ pub const MAX_CLIENTS = 8;
 pub const SESSION_ID_MAX = 16;
 
 pub const Limits = struct {
-    max_queued_frames: usize = 64,
+    /// Size of each client's outbound ring (allocated when it connects).
+    /// It must hold the largest frame (a tools/call response of up to
+    /// 128 KiB pushed through POST /messages) plus a backlog.
     max_queued_bytes: usize = 1 << 20,
 };
 
@@ -40,8 +50,12 @@ const Slot = struct {
     gen: u32 = 0,
     session_buf: [SESSION_ID_MAX]u8 = undefined,
     session_len: usize = 0,
-    queue: std.ArrayListUnmanaged([]u8) = .{},
-    queued_bytes: usize = 0,
+    /// Outbound byte ring; owned by the slot from add() until remove().
+    ring: []u8 = &.{},
+    /// Index of the oldest unsent byte.
+    head: usize = 0,
+    /// Number of unsent bytes.
+    len: usize = 0,
 };
 
 pub const Hub = struct {
@@ -62,24 +76,37 @@ pub const Hub = struct {
         return .{ .allocator = allocator, .limits = limits, .random = random };
     }
 
-    /// Frees every queued frame. No other thread may use the hub afterwards.
+    /// Frees every client buffer. No other thread may use the hub afterwards.
     pub fn deinit(self: *Hub) void {
-        for (&self.slots) |*s| self.clearQueue(s);
+        for (&self.slots) |*s| {
+            self.allocator.free(s.ring);
+            s.* = .{ .gen = s.gen };
+        }
     }
 
-    /// Registers a new client; null when the table is full.
+    /// Registers a new client; null when the table is full or its buffer
+    /// cannot be allocated.
     pub fn add(self: *Hub) ?Handle {
-        self.lock.lock();
-        defer self.lock.unlock();
-        for (&self.slots, 0..) |*s, i| {
-            if (s.state != .free) continue;
-            self.newSessionId(&s.session_buf);
-            s.session_len = SESSION_ID_MAX;
-            s.state = .active;
-            s.gen +%= 1;
-            return .{ .idx = @intCast(i), .gen = s.gen };
-        }
-        return null;
+        // Allocate before taking the lock so producers never wait for it.
+        const ring = self.allocator.alloc(u8, self.limits.max_queued_bytes) catch return null;
+        const handle: ?Handle = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            for (&self.slots, 0..) |*s, i| {
+                if (s.state != .free) continue;
+                self.newSessionId(&s.session_buf);
+                s.session_len = SESSION_ID_MAX;
+                s.state = .active;
+                s.gen +%= 1;
+                s.ring = ring;
+                s.head = 0;
+                s.len = 0;
+                break :blk .{ .idx = @intCast(i), .gen = s.gen };
+            }
+            break :blk null;
+        };
+        if (handle == null) self.allocator.free(ring);
+        return handle;
     }
 
     /// Copies the client's session id into `out`.
@@ -91,14 +118,17 @@ pub const Hub = struct {
         return out[0..s.session_len];
     }
 
-    /// Releases the slot (no-op for a stale handle) and frees its queue.
+    /// Releases the slot and its buffer (no-op for a stale handle).
     pub fn remove(self: *Hub, h: Handle) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const s = self.slotFor(h) orelse return;
-        self.clearQueue(s);
-        s.state = .free;
-        s.session_len = 0;
+        const ring: []u8 = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const s = self.slotFor(h) orelse return;
+            const r = s.ring;
+            s.* = .{ .gen = s.gen };
+            break :blk r;
+        };
+        self.allocator.free(ring);
     }
 
     pub fn isAlive(self: *Hub, h: Handle) bool {
@@ -112,7 +142,7 @@ pub const Hub = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const s = self.slotFor(h) orelse return;
-        self.kill(s);
+        kill(s);
     }
 
     /// Marks every client dead (server shutdown).
@@ -120,55 +150,54 @@ pub const Hub = struct {
         self.lock.lock();
         defer self.lock.unlock();
         for (&self.slots) |*s| {
-            if (s.state == .active) self.kill(s);
+            if (s.state == .active) kill(s);
         }
     }
 
     /// Queues "event: <event>\ndata: <data>\n\n" for every live client.
-    /// Returns how many clients accepted the frame.
+    /// Returns how many clients accepted the frame. Never allocates.
     pub fn broadcast(self: *Hub, event: []const u8, data: []const u8) usize {
         self.lock.lock();
         defer self.lock.unlock();
         var n: usize = 0;
         for (&self.slots) |*s| {
             if (s.state != .active) continue;
-            if (self.enqueue(s, event, data)) n += 1;
+            if (enqueue(s, event, data)) n += 1;
         }
         return n;
     }
 
-    /// Queues a frame for the live client with `session_id`.
+    /// Queues a frame for the live client with `session_id`. Never allocates.
     pub fn sendTo(self: *Hub, session_id: []const u8, event: []const u8, data: []const u8) bool {
         self.lock.lock();
         defer self.lock.unlock();
         for (&self.slots) |*s| {
             if (s.state != .active) continue;
             if (!std.mem.eql(u8, s.session_buf[0..s.session_len], session_id)) continue;
-            return self.enqueue(s, event, data);
+            return enqueue(s, event, data);
         }
         return false;
     }
 
-    /// Takes the oldest queued frame of a live client.
-    pub fn pop(self: *Hub, h: Handle) ?[]u8 {
+    /// Moves up to `out.len` of the oldest unsent bytes of a live client
+    /// into `out` and returns them; empty when nothing is queued or the
+    /// handle is dead or stale. Frames may be split across calls.
+    pub fn read(self: *Hub, h: Handle, out: []u8) []u8 {
         self.lock.lock();
         defer self.lock.unlock();
-        const s = self.slotFor(h) orelse return null;
-        if (s.state != .active or s.queue.items.len == 0) return null;
-        const f = s.queue.orderedRemove(0);
-        s.queued_bytes -= f.len;
-        return f;
-    }
-
-    /// RED-phase stub (replaced by the implementation).
-    pub fn read(self: *Hub, h: Handle, out: []u8) []u8 {
-        _ = self;
-        _ = h;
-        return out[0..0];
-    }
-
-    pub fn free(self: *Hub, frame: []u8) void {
-        self.allocator.free(frame);
+        const s = self.slotFor(h) orelse return out[0..0];
+        if (s.state != .active) return out[0..0];
+        const n = @min(out.len, s.len);
+        if (n == 0) return out[0..0];
+        const first = @min(n, s.ring.len - s.head);
+        @memcpy(out[0..first], s.ring[s.head..][0..first]);
+        @memcpy(out[first..n], s.ring[0 .. n - first]);
+        s.head = (s.head + n) % s.ring.len;
+        s.len -= n;
+        // Start again at the front once drained, so an attentive client
+        // keeps touching only the first pages of its buffer.
+        if (s.len == 0) s.head = 0;
+        return out[0..n];
     }
 
     pub fn activeCount(self: *Hub) usize {
@@ -212,39 +241,36 @@ pub const Hub = struct {
         return s;
     }
 
-    fn kill(self: *Hub, s: *Slot) void {
+    /// Marks the client dead and drops what it had not received yet.
+    fn kill(s: *Slot) void {
         s.state = .dead;
-        self.clearQueue(s);
+        s.head = 0;
+        s.len = 0;
     }
 
-    fn clearQueue(self: *Hub, s: *Slot) void {
-        for (s.queue.items) |f| self.allocator.free(f);
-        s.queue.deinit(self.allocator);
-        s.queue = .{};
-        s.queued_bytes = 0;
-    }
-
-    /// Appends a frame; on overflow or allocation failure the client is
-    /// killed (a half-delivered stream is useless) and false is returned.
-    fn enqueue(self: *Hub, s: *Slot, event: []const u8, data: []const u8) bool {
-        const size = "event: ".len + event.len + "\ndata: ".len + data.len + "\n\n".len;
-        if (s.queue.items.len + 1 > self.limits.max_queued_frames or
-            s.queued_bytes + size > self.limits.max_queued_bytes)
-        {
-            self.kill(s);
+    /// Copies a whole frame into the client's ring; when it does not fit
+    /// the client is killed (a half-delivered stream is useless) and false
+    /// is returned.
+    fn enqueue(s: *Slot, event: []const u8, data: []const u8) bool {
+        const parts = [_][]const u8{ "event: ", event, "\ndata: ", data, "\n\n" };
+        var size: usize = 0;
+        for (parts) |p| size += p.len;
+        if (size > s.ring.len - s.len) {
+            kill(s);
             return false;
         }
-        const f = std.fmt.allocPrint(self.allocator, "event: {s}\ndata: {s}\n\n", .{ event, data }) catch {
-            self.kill(s);
-            return false;
-        };
-        s.queue.append(self.allocator, f) catch {
-            self.allocator.free(f);
-            self.kill(s);
-            return false;
-        };
-        s.queued_bytes += f.len;
+        for (parts) |p| ringWrite(s, p);
         return true;
+    }
+
+    /// Appends `bytes` behind the unsent data. The caller checked the room.
+    fn ringWrite(s: *Slot, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        const tail = (s.head + s.len) % s.ring.len;
+        const first = @min(bytes.len, s.ring.len - tail);
+        @memcpy(s.ring[tail..][0..first], bytes[0..first]);
+        @memcpy(s.ring[0 .. bytes.len - first], bytes[first..]);
+        s.len += bytes.len;
     }
 };
 
@@ -382,14 +408,23 @@ test "the client buffer wraps around without corrupting frames" {
     var chunk: [5]u8 = undefined;
     var got = std.ArrayList(u8).init(testing.allocator);
     defer got.deinit();
-    for (0..200) |_| {
+    var wrapped = false;
+    for (0..200) |i| {
         try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "0123456789"));
-        // Drain only part of the queue so the write position keeps moving.
-        try got.appendSlice(hub.read(h, &chunk));
-        try got.appendSlice(hub.read(h, &chunk));
-        try got.appendSlice(hub.read(h, &chunk));
-        try got.appendSlice(hub.read(h, &chunk));
+        // Read a little less than was queued so unsent bytes stay behind
+        // and the write position travels around the ring; drain fully now
+        // and then before the backlog outgrows the buffer.
+        for (0..5) |_| try got.appendSlice(hub.read(h, &chunk));
+        if (hub.slots[h.idx].head + hub.slots[h.idx].len > hub.slots[h.idx].ring.len) wrapped = true;
+        if (i % 10 == 9) {
+            while (true) {
+                const n = hub.read(h, &chunk);
+                if (n.len == 0) break;
+                try got.appendSlice(n);
+            }
+        }
     }
+    try testing.expect(wrapped);
     while (true) {
         const n = hub.read(h, &chunk);
         if (n.len == 0) break;
