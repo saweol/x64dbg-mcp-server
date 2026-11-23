@@ -1,0 +1,503 @@
+"""E2 (reboot detection by guest boot time) and E7 (plugin backups outside plugins\\).
+
+E2 real-VM evidence: provision_guest(reboot=True) raised VmNotReady "the guest
+did not go down within 300s" although LastBootUpTime moved from 22:16:44 to
+22:22:29: the guest was down (no Tools, no port) for less than the 5 s poll
+interval, so the down/up observation never saw it.
+
+E7 real-VM evidence: install_plugin left ``x64dbg-MCP-Server.dp64.bak`` inside
+the plugins folder that x64dbg scans for plugins.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from tests.fakes.fake_guest import FakeGuest
+from tests.fakes.fake_vm import FakeClock
+from tests.unit.test_provision import (
+    HOST_IP,
+    PASSWORD,
+    ROOT,
+    SCHTASKS,
+    SHUTDOWN,
+    X32_PLUGIN,
+    X64_PLUGIN,
+    FakeRuntime,
+    Probe,
+    ProvisionScript,
+    Timeline,
+    TimelineVm,
+    _dist,
+    _install,
+    _profile,
+    _seed_install,
+)
+from tests.unit.test_ps import GuestPowerShell
+from x64dbg_vm_gateway.contracts import Secret
+from x64dbg_vm_gateway.errors import GuestOperationError, ToolsNotRunning, VmNotReady, VmrunTimeout
+from x64dbg_vm_gateway.provision import guest_boot_time, provision_guest
+
+BOOT0 = datetime(2026, 11, 23, 13, 16, 44, 500000, tzinfo=UTC)
+
+
+def _iso(dt: datetime) -> str:
+    """.NET ``ToString('o')`` of a UTC DateTime: 7 fractional digits and ``Z``."""
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+
+
+# ── guest emulation ─────────────────────────────────────────────────
+class GuestBoot:
+    """``LastBootUpTime`` of the emulated guest: a new boot at the end of every reboot window.
+
+    ``fail_at``: exceptions raised by given reads (1 = first); ``shift_s``: offsets added to
+    the reported value (jitter or a clock step without a reboot); ``output``:
+    replaces the whole output (malformed answers). Reads are logged in ``reads``.
+    """
+
+    def __init__(self, timeline: Timeline) -> None:
+        self.timeline = timeline
+        self.base_t = timeline.clock.t - 3600.0  # the guest has been up for an hour
+        self.fail_at: dict[int, Exception] = {}  # read number (1 = first) -> exception
+        self.shift_s: list[float] = []
+        self.output: str | None = None
+        self.reads: list[tuple[float, str | None]] = []
+
+    def boot_dt(self) -> datetime:
+        t = self.timeline.clock.t
+        ends = [e for s, e in self.timeline.windows if e <= t]
+        boot_t = max(ends) if ends else self.base_t
+        return BOOT0 + timedelta(seconds=boot_t - self.base_t)
+
+    def __call__(self, body: str) -> tuple[int, str]:
+        t = self.timeline.clock.t
+        self.reads.append((t, None))
+        if self.timeline.down():
+            raise ToolsNotRunning("Error: The VMware Tools are not running in the virtual machine")
+        exc = self.fail_at.get(len(self.reads))
+        if exc is not None:
+            raise exc
+        if self.output is not None:
+            return 0, self.output
+        shift = self.shift_s.pop(0) if self.shift_s else 0.0
+        value = _iso(self.boot_dt() + timedelta(seconds=shift))
+        self.reads[-1] = (t, value)
+        return 0, f"MCPBOOT:{value}\r\n"
+
+
+class RebootProbe(Probe):
+    """Plugin ports: the old debuggers answer until the reboot starts, the new ones
+    ``delay_s`` after the guest is back (auto-logon + logon task)."""
+
+    def __init__(self, timeline: Timeline, *, delay_s: float = 0.0, **kw) -> None:
+        super().__init__(timeline, **kw)
+        self.delay_s = delay_s
+
+    def _status(self, port: int) -> int | None:
+        t = self.timeline.clock.t
+        if any(s <= t < e + self.delay_s for s, e in self.timeline.windows):
+            return None
+        return super()._status(port)
+
+
+def is_boot_query(body: str) -> bool:
+    return "LastBootUpTime" in body and "Win32_OperatingSystem" in body
+
+
+def _setup(rt: FakeRuntime, timeline: Timeline, *, reboot_s: float, stale_s: float = 1.0,
+           reboots: bool = True, boot: bool = True,
+           **script_kw) -> tuple[ProvisionScript, GuestBoot, GuestPowerShell]:
+    script = ProvisionScript(rt.channel, **script_kw)
+    gboot = GuestBoot(timeline)
+
+    def handler(body: str):
+        if is_boot_query(body):
+            return gboot(body) if boot else (0, "")
+        return script(body)
+
+    def other(exe: str, args: tuple, **kw):
+        if exe == SHUTDOWN:
+            if reboots:
+                timeline.reboot(stale_s=stale_s, reboot_s=reboot_s)
+            return None
+        return 0 if kw.get("wait", True) else None
+
+    emu = GuestPowerShell(rt.channel, handler, other)
+    return script, gboot, emu
+
+
+def _provision(rt: FakeRuntime, probe: Probe, **kw):
+    args = {"x64dbg_root": ROOT, "user": "analyst", "password": Secret(PASSWORD), "reboot": True,
+            "http_probe": probe, "local_ip_for": lambda ip: HOST_IP, "poll_s": 5.0}
+    args.update(kw)
+    return provision_guest(rt, **args)
+
+
+@pytest.fixture
+def host_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    d = tmp_path / "hosttmp"
+    d.mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(d))
+    return d
+
+
+@pytest.fixture
+def timeline(fake_clock: FakeClock) -> Timeline:
+    return Timeline(fake_clock)
+
+
+@pytest.fixture
+def vm(timeline: Timeline) -> TimelineVm:
+    return TimelineVm(timeline)
+
+
+@pytest.fixture
+def rt(vm: TimelineVm, fake_guest: FakeGuest, fake_clock: FakeClock) -> FakeRuntime:
+    return FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(), clock=fake_clock)
+
+
+# ── guest_boot_time ─────────────────────────────────────────────────
+def test_guest_boot_time_reads_last_boot_up_time_through_powershell(fake_guest, host_tmp) -> None:
+    answer = "WARNING: x\r\nMCPBOOT:2026-11-23T13:16:44.5000000Z\r\n"
+    emu = GuestPowerShell(fake_guest, lambda body: (0, answer))
+    assert guest_boot_time(fake_guest) == "2026-11-23T13:16:44.5000000Z"
+    (run,) = emu.runs
+    assert run["mode"] == "encoded"
+    assert "Win32_OperatingSystem" in run["body"] and "LastBootUpTime" in run["body"]
+    assert "ToUniversalTime()" in run["body"]
+
+
+@pytest.mark.parametrize("answer", [(0, ""), (0, "MCPBOOT:yesterday"), (1, "MCPBOOT:2026-11-23T13:16:44Z"),
+                                    (0, "MCPBOOT:2026-13-45T99:00:00Z")])
+def test_guest_boot_time_none_for_unusable_answers(fake_guest, host_tmp, answer) -> None:
+    GuestPowerShell(fake_guest, lambda body: answer)
+    assert guest_boot_time(fake_guest) is None
+
+
+def test_guest_boot_time_propagates_guest_environment_errors(fake_guest, host_tmp) -> None:
+    def down(body):
+        raise ToolsNotRunning("Error: The VMware Tools are not running")
+
+    GuestPowerShell(fake_guest, down)
+    with pytest.raises(ToolsNotRunning):
+        guest_boot_time(fake_guest)
+
+
+# ── E2 regression: a reboot faster than the poll interval ──────────
+# The E2 mechanism: the old debuggers keep answering for the first polls (each port
+# is asked at most three times while waiting for the reboot, to stay clear of the
+# plugin's auth lockout, and then its last answer is reused), and VMware reports
+# Tools as not running only for a window shorter than the 5 s poll interval.
+E2_STALE_S = 12.0  # shutdown /t 2 plus Windows shutting down: three polls see the old debuggers
+E2_DOWN_S = 3.0  # no Tools, no ports: shorter than one poll interval, between two polls
+
+
+def test_fast_reboot_between_two_polls_is_detected_by_boot_time(rt, timeline, fake_clock, host_tmp) -> None:
+    probe = RebootProbe(timeline, delay_s=20)
+    _setup(rt, timeline, stale_s=E2_STALE_S, reboot_s=E2_DOWN_S)
+    t0 = fake_clock.t
+    summary = _provision(rt, probe, wait_ready_s=300)
+    start, end = timeline.windows[0]
+    assert end - start < 5
+    assert summary["rebooted"] is True
+    assert summary["reboot_signal"] == "boot_time"
+    before, after = summary["boot_time"]["before"], summary["boot_time"]["after"]
+    assert before == _iso(BOOT0) and after is not None and after != before
+    assert fake_clock.t >= end + 20  # waited for the new debuggers, not the old ones
+    assert summary["ready_s"] <= E2_STALE_S + E2_DOWN_S + 20 + 2 * 5
+    assert summary["readiness"] == {"x64": 401, "x32": 401}
+    assert fake_clock.t - t0 < 300
+
+
+def test_control_without_boot_time_the_fast_reboot_is_missed(rt, timeline, fake_clock, host_tmp) -> None:
+    # Same timeline, boot time unavailable: only the old down/up observation remains,
+    # and it misses the reboot (the E2 failure). Shows that the boot time detects it.
+    probe = RebootProbe(timeline, delay_s=20)
+    _setup(rt, timeline, stale_s=E2_STALE_S, reboot_s=E2_DOWN_S, boot=False)
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=120)
+    assert ei.value.details["phase"] == "down"
+    assert ei.value.details.get("boot_time") is None
+
+
+def test_boot_time_is_read_before_the_reboot_is_requested(rt, timeline, host_tmp) -> None:
+    probe = RebootProbe(timeline)
+    _, gboot, emu = _setup(rt, timeline, stale_s=1, reboot_s=3)
+    _provision(rt, probe)
+    calls = [(a[0], a[1]) for a, _ in rt.channel.calls_of("run_program")]
+    shut = next(i for i, (exe, _) in enumerate(calls) if exe == SHUTDOWN)
+    ps_before = [i for i, (exe, _) in enumerate(calls[:shut]) if exe.endswith("powershell.exe")]
+    assert len(ps_before) >= 2  # provision.ps1, then the boot-time read
+    assert gboot.reads[0] == (gboot.reads[0][0], _iso(BOOT0))
+    assert gboot.reads[0][0] <= timeline.windows[0][0]
+
+
+def test_reboot_that_never_happens_reports_the_unchanged_boot_time(rt, timeline, fake_clock,
+                                                                   host_tmp) -> None:
+    probe = RebootProbe(timeline)
+    _, gboot, _ = _setup(rt, timeline, reboot_s=0, reboots=False)
+    t0 = fake_clock.t
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=60)
+    before = _iso(BOOT0)
+    assert before in ei.value.message
+    assert "did not reboot" in ei.value.message
+    d = ei.value.details
+    assert d["phase"] == "down" and d["boot_time"] == before and d["timeout_s"] == 60
+    assert d["last_boot_time"] == before
+    assert 60 <= fake_clock.t - t0 <= 60 + 5
+    assert len([r for r in gboot.reads if r[1] is not None]) >= 3  # it kept polling
+
+
+@pytest.mark.parametrize("shift", [0.4, -0.4, 1.0, -30.0, -3600.0])
+def test_jitter_or_a_backward_clock_step_is_not_a_reboot(rt, timeline, host_tmp, shift) -> None:
+    probe = RebootProbe(timeline)
+    _, gboot, _ = _setup(rt, timeline, reboot_s=0, reboots=False)
+    gboot.shift_s = [0.0] + [shift] * 50  # first read (before) exact, later ones shifted
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=30)
+    assert ei.value.details["phase"] == "down"
+
+
+def test_failed_boot_time_reads_during_the_reboot_are_tolerated(fake_guest, fake_clock, timeline,
+                                                                host_tmp) -> None:
+    vm = TimelineVm(timeline, tools_follow=False)  # Tools never report the reboot
+    rt = FakeRuntime(vm=vm, channel=fake_guest, profile=_profile(), clock=fake_clock)
+    probe = RebootProbe(timeline, delay_s=10)
+    _, gboot, _ = _setup(rt, timeline, stale_s=1, reboot_s=3)
+    gboot.fail_at = {2: VmrunTimeout("vmrun runProgramInGuest timed out"),
+                     3: GuestOperationError("Error: Guest program exited with non-zero exit code: 1")}
+    summary = _provision(rt, probe, wait_ready_s=120)
+    assert summary["rebooted"] is True and summary["reboot_signal"] == "boot_time"
+    assert [v is None for _, v in gboot.reads[:3]] == [False, True, True]
+
+
+def test_boot_time_reads_are_bounded_by_the_remaining_budget(rt, timeline, host_tmp) -> None:
+    probe = RebootProbe(timeline)
+    _, _, emu = _setup(rt, timeline, reboot_s=0, reboots=False)
+    with pytest.raises(VmNotReady):
+        _provision(rt, probe, wait_ready_s=20)
+    boot_runs = [r for r in emu.runs if is_boot_query(r["body"])]
+    assert boot_runs
+    assert all(0 < r["kw"]["timeout_s"] <= 60 for r in boot_runs)
+
+
+def test_slow_debuggers_after_a_detected_reboot_still_time_out_as_up_phase(rt, timeline, fake_clock,
+                                                                           host_tmp) -> None:
+    probe = RebootProbe(timeline, delay_s=10_000)
+    _setup(rt, timeline, stale_s=1, reboot_s=3)
+    t0 = fake_clock.t
+    with pytest.raises(VmNotReady) as ei:
+        _provision(rt, probe, wait_ready_s=90)
+    assert ei.value.details["phase"] == "up"
+    assert fake_clock.t - t0 <= 90 + 5
+
+
+def test_down_observation_remains_a_secondary_signal(rt, timeline, host_tmp) -> None:
+    # Boot time unreadable, a long reboot: Tools going down still proves the reboot.
+    probe = RebootProbe(timeline)
+    _setup(rt, timeline, stale_s=2, reboot_s=60, boot=False)
+    summary = _provision(rt, probe)
+    assert summary["rebooted"] is True
+    assert summary["reboot_signal"] == "down"
+    assert summary["boot_time"] == {"before": None, "after": None}
+
+
+def test_no_reboot_summary_has_no_boot_time(rt, timeline, host_tmp) -> None:
+    probe = RebootProbe(timeline)
+    _setup(rt, timeline, reboot_s=3)
+    summary = _provision(rt, probe, reboot=False)
+    assert summary["reboot_signal"] is None and summary["boot_time"] is None
+
+
+# ── E7: plugin backups live in <root>\<arch>\plugins_backup ─────────
+X64_BACKUPS = f"{ROOT}\\x64\\plugins_backup"
+X32_BACKUPS = f"{ROOT}\\x32\\plugins_backup"
+X64_PLUGINS = f"{ROOT}\\x64\\plugins"
+_STAMP_RE = re.compile(r"^x64dbg-mcp-server\.dp(64|32)\.(\d{8}T\d{6}Z)\.bak$")
+
+
+class BackupHashes:
+    """Emulates the guest-side SHA-256 listing of the plugins_backup folders."""
+
+    def __init__(self, guest: FakeGuest) -> None:
+        self.guest = guest
+        self.queries = 0
+        self.answer: tuple[int, str] | None = None  # override (exit code, output)
+
+    @staticmethod
+    def matches(body: str) -> bool:
+        return "plugins_backup" in body and "Get-FileHash" in body
+
+    def __call__(self, body: str) -> tuple[int, str]:
+        self.queries += 1
+        if self.answer is not None:
+            return self.answer
+        rows = []
+        for d in re.findall(r"'([^']*plugins_backup)'", body):
+            prefix = d.lower() + "\\"
+            for key, data in sorted(self.guest.files.items()):
+                rest = key[len(prefix):] if key.startswith(prefix) else None
+                if rest and "\\" not in rest and rest.endswith(".bak"):
+                    rows.append({"dir": d, "name": rest, "sha256": hashlib.sha256(data).hexdigest()})
+        return 0, "MCPJSON:" + json.dumps(rows)
+
+
+def _files_in(guest: FakeGuest, directory: str) -> dict[str, bytes]:
+    prefix = directory.lower() + "\\"
+    return {k[len(prefix):]: v for k, v in guest.files.items()
+            if k.startswith(prefix) and "\\" not in k[len(prefix):]}
+
+
+def _emu(guest: FakeGuest) -> BackupHashes:
+    hashes = BackupHashes(guest)
+    GuestPowerShell(guest, lambda body: hashes(body) if hashes.matches(body) else (0, ""))
+    return hashes
+
+
+def _stamp(clock: FakeClock, plus_s: int = 0) -> str:
+    dt = datetime.fromisoformat(clock.now_iso()) + timedelta(seconds=plus_s)
+    return dt.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def test_backup_goes_to_plugins_backup_with_a_utc_stamp(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    stamp = _stamp(fake_clock)
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    x64 = summary["installed"]["x64"]
+    assert x64["backup"] == "created"
+    assert x64["backup_path"] == f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.{stamp}.bak"
+    assert rt.channel.read(x64["backup_path"]) == b"old64"
+    assert rt.channel.read(f"{X32_BACKUPS}\\x64dbg-MCP-Server.dp32.{stamp}.bak") == b"old32"
+    # nothing but the plugin itself is left in the plugins folders
+    assert _files_in(rt.channel, X64_PLUGINS) == {"x64dbg-mcp-server.dp64": b"new64"}
+    assert _files_in(rt.channel, f"{ROOT}\\x32\\plugins") == {"x64dbg-mcp-server.dp32": b"new32"}
+
+
+def test_every_distinct_replaced_build_is_backed_up(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    _install(rt, Probe(timeline), _dist(tmp_path, b"v1"))
+    fake_clock.advance(61)
+    rt.channel.add_process(f"{ROOT}\\x64\\x64dbg.exe")
+    summary = _install(rt, Probe(timeline), _dist(tmp_path, b"v2"))
+    assert summary["installed"]["x64"]["backup"] == "created"
+    backups = _files_in(rt.channel, X64_BACKUPS)
+    assert sorted(backups.values()) == [b"old64", b"v164"]
+    assert all(_STAMP_RE.match(n) for n in backups)
+    assert rt.channel.read(X64_PLUGIN) == b"v264"
+
+
+def test_backup_is_skipped_when_an_identical_one_exists(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    hashes = _emu(rt.channel)
+    existing = f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.20260101T000000Z.bak"
+    rt.channel.mkdir(X64_BACKUPS)
+    rt.channel.write(existing, b"old64")
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    x64 = summary["installed"]["x64"]
+    assert x64["backup"] == "kept"
+    assert x64["backup_path"].lower() == existing.lower()
+    assert list(_files_in(rt.channel, X64_BACKUPS).values()) == [b"old64"]  # no duplicate
+    assert summary["installed"]["x32"]["backup"] == "created"
+    assert hashes.queries == 1  # one guest-side query for both architectures
+
+
+def test_reinstalling_the_same_build_keeps_a_single_backup_of_it(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    for _ in range(3):
+        _install(rt, Probe(timeline), _dist(tmp_path, b"v1"))
+        fake_clock.advance(61)
+        rt.channel.add_process(f"{ROOT}\\x64\\x64dbg.exe")
+    assert sorted(_files_in(rt.channel, X64_BACKUPS).values()) == [b"old64", b"v164"]
+
+
+def test_legacy_bak_in_plugins_is_moved_to_plugins_backup(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    rt.channel.write(X64_PLUGIN + ".bak", b"orig64")
+    _emu(rt.channel)
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    assert not rt.channel.file_exists(X64_PLUGIN + ".bak")
+    backups = _files_in(rt.channel, X64_BACKUPS)
+    assert sorted(backups.values()) == [b"old64", b"orig64"]
+    assert len(set(backups)) == 2  # same second, still two names
+    assert all(_STAMP_RE.match(n) for n in backups)
+    legacy = summary["installed"]["x64"]["legacy_backup"]
+    assert legacy is not None and rt.channel.read(legacy) == b"orig64"
+    assert summary["installed"]["x32"]["legacy_backup"] is None
+    assert _files_in(rt.channel, X64_PLUGINS) == {"x64dbg-mcp-server.dp64": b"new64"}
+
+
+def test_legacy_bak_identical_to_an_existing_backup_is_not_duplicated(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    rt.channel.write(X64_PLUGIN + ".bak", b"old64")  # the same build as the current plugin
+    _emu(rt.channel)
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    assert not rt.channel.file_exists(X64_PLUGIN + ".bak")
+    assert list(_files_in(rt.channel, X64_BACKUPS).values()) == [b"old64"]
+    assert summary["installed"]["x64"]["backup"] == "kept"
+
+
+def test_unknown_backup_hashes_fail_open_to_a_new_backup(rt, timeline, fake_clock, tmp_path,
+                                                         caplog: pytest.LogCaptureFixture) -> None:
+    _seed_install(rt.channel)
+    hashes = _emu(rt.channel)
+    hashes.answer = (1, "ERROR: access denied")
+    rt.channel.mkdir(X64_BACKUPS)
+    rt.channel.write(f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.20260101T000000Z.bak", b"old64")
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    assert summary["installed"]["x64"]["backup"] == "created"
+    assert len(_files_in(rt.channel, X64_BACKUPS)) == 2
+    assert any("backup" in r.getMessage() and r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_stamp_collision_picks_the_next_free_second(rt, timeline, fake_clock, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    taken = f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.{_stamp(fake_clock)}.bak"
+    rt.channel.mkdir(X64_BACKUPS)
+    rt.channel.write(taken, b"something else")
+    summary = _install(rt, Probe(timeline), _dist(tmp_path))
+    assert summary["installed"]["x64"]["backup_path"] == \
+        f"{X64_BACKUPS}\\x64dbg-MCP-Server.dp64.{_stamp(fake_clock, 1)}.bak"
+    assert rt.channel.read(taken) == b"something else"
+
+
+def test_failed_backup_leaves_the_plugin_untouched(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    orig = rt.channel.copy_to_guest
+
+    def copy(host_path: Path, guest_path: str) -> None:
+        if "plugins_backup" in guest_path:
+            raise GuestOperationError("Error: disk full")
+        orig(host_path, guest_path)
+
+    rt.channel.copy_to_guest = copy  # type: ignore[method-assign]
+    with pytest.raises(GuestOperationError) as ei:
+        _install(rt, Probe(timeline), _dist(tmp_path))
+    assert rt.channel.read(X64_PLUGIN) == b"old64" and rt.channel.read(X32_PLUGIN) == b"old32"
+    assert ei.value.details["failed_arch"] == "x64"
+    assert ei.value.details["relaunched"] == ["MCP-x64dbg", "MCP-x32dbg"]
+    assert not any(k.endswith((".old", ".bak")) and "\\plugins\\" in k for k in rt.channel.files)
+    runs = [a for a, _ in rt.channel.calls_of("run_program") if a[0] == SCHTASKS]
+    assert len(runs) == 2
+
+
+def test_backup_happens_before_the_swap(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    _emu(rt.channel)
+    _install(rt, Probe(timeline), _dist(tmp_path))
+    calls = rt.channel.calls
+    backup = min(i for i, c in enumerate(calls) if c[0] == "copy_to_guest" and "plugins_backup" in c[1][1])
+    swap = min(i for i, c in enumerate(calls) if c[0] == "rename" and c[1][0].lower() == X64_PLUGIN.lower())
+    assert backup < swap

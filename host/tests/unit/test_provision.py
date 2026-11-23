@@ -1100,6 +1100,16 @@ def _install(rt: FakeRuntime, probe: Probe, dist: Path, **kw):
     return install_plugin(rt, dist_dir=dist, x64dbg_root=ROOT, http_probe=probe, **kw)
 
 
+def _backups(guest: FakeGuest, arch: str = "x64") -> list[bytes]:
+    """Contents of ``<root>\\<arch>\\plugins_backup\\*.bak`` (E7: backups never live in plugins\\)."""
+    prefix = f"{ROOT}\\{arch}\\plugins_backup\\".lower()
+    return sorted(v for k, v in guest.files.items() if k.startswith(prefix) and k.endswith(".bak"))
+
+
+def _plugins_leftovers(guest: FakeGuest) -> list[str]:
+    return [k for k in guest.files if "\\plugins\\" in k and k.endswith((".bak", ".old", ".new"))]
+
+
 def test_install_requires_both_dist_plugins(rt: FakeRuntime, timeline: Timeline, tmp_path: Path) -> None:
     _seed_install(rt.channel)
     with pytest.raises(TransferError) as ei:
@@ -1116,9 +1126,9 @@ def test_install_kills_debuggers_backs_up_once_and_relaunches(rt: FakeRuntime, t
 
     assert [p.image_name for p in rt.channel.processes] == ["notepad.exe"]
     assert rt.channel.read(X64_PLUGIN) == b"new64" and rt.channel.read(X32_PLUGIN) == b"new32"
-    assert rt.channel.read(X64_PLUGIN + ".bak") == b"old64"
-    assert rt.channel.read(X32_PLUGIN + ".bak") == b"old32"
-    assert not any(k.endswith(".new") for k in rt.channel.files)
+    # E7 (K-vm): the backup lives in plugins_backup, never next to the plugin
+    assert _backups(rt.channel, "x64") == [b"old64"] and _backups(rt.channel, "x32") == [b"old32"]
+    assert _plugins_leftovers(rt.channel) == []
     runs = [a for a, _ in rt.channel.calls_of("run_program") if a[0] == SCHTASKS]
     assert runs == [(SCHTASKS, ("/run", "/tn", "MCP-x64dbg")), (SCHTASKS, ("/run", "/tn", "MCP-x32dbg"))]
     kill_idx = max(i for i, c in enumerate(rt.channel.calls) if c[0] == "kill_process")
@@ -1133,17 +1143,19 @@ def test_install_kills_debuggers_backs_up_once_and_relaunches(rt: FakeRuntime, t
     assert summary["backends"]["x32"]["status"] == 401
 
 
-def test_second_install_keeps_the_original_backup(rt: FakeRuntime, timeline: Timeline,
+def test_second_install_keeps_the_original_backup(rt: FakeRuntime, timeline: Timeline, fake_clock: FakeClock,
                                                   tmp_path: Path) -> None:
+    # E7 (K-vm): every distinct replaced build is backed up once (was: only the first one).
     _seed_install(rt.channel)
     GuestPowerShell(rt.channel)
     _install(rt, Probe(timeline), _dist(tmp_path, b"v1"))
+    fake_clock.advance(61)
     rt.channel.add_process(f"{ROOT}\\x64\\x64dbg.exe")
     summary = _install(rt, Probe(timeline), _dist(tmp_path, b"v2"))
-    assert rt.channel.read(X64_PLUGIN + ".bak") == b"old64"
+    assert _backups(rt.channel, "x64") == [b"old64", b"v164"]
     assert rt.channel.read(X64_PLUGIN) == b"v264"
     assert rt.channel.read(X32_PLUGIN) == b"v232"
-    assert summary["installed"]["x64"]["backup"] == "kept"
+    assert summary["installed"]["x64"]["backup"] == "created"
 
 
 def test_install_without_existing_plugin_makes_no_backup(rt: FakeRuntime, timeline: Timeline,
@@ -1152,7 +1164,8 @@ def test_install_without_existing_plugin_makes_no_backup(rt: FakeRuntime, timeli
     GuestPowerShell(rt.channel)
     summary = _install(rt, Probe(timeline), _dist(tmp_path))
     assert summary["installed"]["x64"]["backup"] == "none"
-    assert not rt.channel.file_exists(X64_PLUGIN + ".bak")
+    assert summary["installed"]["x64"]["backup_path"] is None
+    assert _backups(rt.channel) == [] and _plugins_leftovers(rt.channel) == []
     assert rt.channel.read(X64_PLUGIN) == b"new64"
 
 
@@ -1277,13 +1290,14 @@ def test_failed_swap_with_an_existing_backup_restores_the_previous_plugin(swap_r
     guest = swap_rt.channel
     _seed_install(guest)
     GuestPowerShell(guest)
-    _install(swap_rt, Probe(timeline), _dist(tmp_path, b"v1"))  # creates the .bak backups
+    _install(swap_rt, Probe(timeline), _dist(tmp_path, b"v1"))  # creates the backups
     guest.swap_failures = 1
     with pytest.raises(GuestOperationError) as ei:
         _install(swap_rt, Probe(timeline), _dist(tmp_path, b"v2"))
     assert guest.read(X64_PLUGIN) == b"v164"  # the previous build is back in place
-    assert guest.read(X64_PLUGIN + ".bak") == b"old64"
+    assert b"old64" in _backups(guest)  # E7 (K-vm): backups live in plugins_backup
     assert not guest.file_exists(X64_PLUGIN + ".old")
+    assert not guest.file_exists(X64_PLUGIN + ".bak")
     d = ei.value.details
     assert d["failed_arch"] == "x64" and d["target"] == X64_PLUGIN and d["restored"] is True
     assert d["installed"] == {}
@@ -1299,6 +1313,7 @@ def test_failed_swap_without_a_backup_restores_the_original(swap_rt: FakeRuntime
         _install(swap_rt, Probe(timeline), _dist(tmp_path))
     assert guest.read(X64_PLUGIN) == b"old64"
     assert not guest.file_exists(X64_PLUGIN + ".bak")
+    assert not guest.file_exists(X64_PLUGIN + ".old")
     assert ei.value.details["restored"] is True
 
 

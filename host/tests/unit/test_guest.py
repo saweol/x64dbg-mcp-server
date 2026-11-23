@@ -202,19 +202,20 @@ def test_run_program_flags_precede_program(runner, chan):
     assert c["params"] == ("-noWait", "-activeWindow", "-interactive", "C:\\x64dbg\\x64dbg.exe", "a")
 
 
-def test_run_program_quotes_args_for_the_guest_command_line(runner, chan):
+def test_run_program_escapes_args_for_vmrun_quoting(runner, chan):
+    # E3 (K-vm): vmrun wraps every argument in double quotes itself, so VixChannel only
+    # escapes (MSVCRT in-quote rules) and never adds outer quotes (was: list2cmdline).
     chan.run_program("C:\\ps.exe", ["-Command", "(Get-Item 'C:\\a b').Length", "", 'say "hi"'])
     (c,) = runner.calls
-    assert c["params"] == ("C:\\ps.exe", "-Command", "\"(Get-Item 'C:\\a b').Length\"", '""',
-                           '"say \\"hi\\""')
+    assert c["params"] == ("C:\\ps.exe", "-Command", "(Get-Item 'C:\\a b').Length", "",
+                           'say \\"hi\\"')
 
 
-def test_vix_channel_documents_the_observed_vmrun_argument_joining():
+def test_vix_channel_documents_the_observed_vmrun_argument_quoting():
     doc = " ".join((VixChannel.__doc__ or "").split())
-    assert "observed on vmrun 1.17.0" in doc
-    assert "not re-quoted" in doc
-    assert "quote_args=True is required" in doc
-    assert "pending" in doc  # end-to-end confirmation still belongs to the VM test suite
+    assert "vmrun 1.17.0" in doc
+    assert "wraps every program argument in double quotes" in doc
+    assert "escape_for_vmrun" in doc
 
 
 def test_run_program_quoting_can_be_disabled(runner):
