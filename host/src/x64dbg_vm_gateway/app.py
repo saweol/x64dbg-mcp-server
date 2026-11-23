@@ -179,6 +179,15 @@ RECOVERY_HINTS = {
     JobState.DISCARDED: "call analysis_finish to revert the VM",
     JobState.REVERTING: "the revert was interrupted: call analysis_finish to redo it",
 }
+#: The tool that moves a job flagged ``needs_recovery`` on (None: a human must discard it).
+RECOVERY_NEXT_TOOL = {
+    JobState.ANALYZING: "analysis_collect",
+    JobState.COLLECTING: "analysis_collect",
+    JobState.COLLECTED: "analysis_finish",
+    JobState.COLLECTED_PARTIAL: "analysis_collect",
+    JobState.DISCARDED: "analysis_finish",
+    JobState.REVERTING: "analysis_finish",
+}
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -735,7 +744,11 @@ class Gateway(GatewayApp):
             except GatewayError as e:
                 isolation = [f"isolation could not be checked: {e.code}"]
         recovery: list[dict[str, Any]] = [
-            {**v, "recovery_hint": RECOVERY_HINTS.get(JobState(j.state), "")}
+            {
+                **v,
+                "recovery_hint": RECOVERY_HINTS.get(JobState(j.state), ""),
+                "next_tool": RECOVERY_NEXT_TOOL.get(JobState(j.state)),
+            }
             for j in store.list(name)
             if not j.terminal and j.flags.get("needs_recovery") and (v := self._job_view(j)) is not None
         ]
@@ -2135,14 +2148,15 @@ class Gateway(GatewayApp):
                 with rt.supervisor.paused(), rt.lock.write(timeout_s=WRITE_LOCK_TIMEOUT_S):
                     rt.vm.take_snapshot(snapshot)
                 st["detail"] = snapshot
-        if not resumed:
-            # jobs.TRANSITIONS has no COLLECTED -> DONE edge, so revert=False passes REVERTING too
+        if revert:
+            # COLLECTED/DISCARDED -> REVERTING, or REVERTING -> REVERTING when redoing a revert
+            # that an earlier gateway process left unfinished. Either way this process handles
+            # it now (REVERTING + needs_recovery means "interrupted"), so the flag goes.
             job = store.transition(
                 job_id,
                 JobState.REVERTING,
-                reason="finishing: reverting the VM" if revert else "finishing without a revert",
-                expect_from=tuple(policy.REVERT_READY_STATES),
-                # handled by this process now (REVERTING + needs_recovery means "interrupted")
+                reason="redoing the interrupted revert" if resumed else "finishing: reverting the VM",
+                expect_from=JobState.REVERTING if resumed else tuple(policy.REVERT_READY_STATES),
                 clear_flags=["needs_recovery"],
             )
         try:
@@ -2151,11 +2165,12 @@ class Gateway(GatewayApp):
                 with steps.step("revert") as st:
                     info = self._revert_and_ready(rt, target, progress, f"analysis_finish {job_id}: reverted")
                     st["detail"] = f"reverted to {target}; guest IP {info['ip']}"
+            # revert=False: COLLECTED/DISCARDED (or an interrupted REVERTING) -> DONE directly
             job = store.transition(
                 job_id,
                 JobState.DONE,
                 reason="VM reverted to the clean snapshot" if revert else "finished; VM left as is",
-                expect_from=JobState.REVERTING,
+                expect_from=JobState.REVERTING if revert or resumed else tuple(policy.REVERT_READY_STATES),
                 set_flags={"reverted": revert, "kept_snapshot": snapshot},
                 clear_flags=["needs_recovery"],
             )
