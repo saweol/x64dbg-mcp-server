@@ -14,6 +14,8 @@ E6  session_status answers from short-lived VM observations, checks the backends
 from __future__ import annotations
 
 import json
+import logging
+import threading
 import time
 from importlib import resources
 from typing import Any
@@ -178,11 +180,82 @@ def test_a_provider_with_only_vm_process_ids_is_guarded_too(tmp_path):
         lab.close()
 
 
-def test_an_unusable_instance_report_does_not_block_the_start(ilab):
-    ilab.vm.report_error = VmrunError("pgrep is not available")
+# Review (fail closed): a provider that has an instance view but cannot answer refuses the
+# start (K-vm contract: "then the answer is unknown: do not start"). This replaces the
+# earlier fail-open test test_an_unusable_instance_report_does_not_block_the_start.
+def test_a_failing_instance_report_refuses_the_start(ilab):
+    ilab.vm.report_error = VmrunError("the host process table cannot be read")
     ilab.vm.stop()
-    out = ilab.gateway().vm_power("start")
-    assert out["started"] is True and starts(ilab) == 1
+    with pytest.raises(VmLocked) as ei:
+        ilab.gateway().vm_power("start")
+    err = ei.value
+    assert starts(ilab) == 0
+    assert err.stage == "vm_start" and err.retryable is True and err.next_tool == "gateway_doctor"
+    assert err.details["cause"] == "VMRUN_ERROR"
+    assert "cannot tell" in err.message
+
+
+def test_a_failing_instance_report_with_an_orphan_present_refuses_the_start(ilab):
+    ilab.vm.stop()
+    ilab.vm.add_orphan(exit_after_polls=None)  # the E1 orphan the scan cannot see right now
+    ilab.vm.report_error = VmrunError("ps timed out")
+    with pytest.raises(VmLocked):
+        ilab.gateway().vm_power("start")
+    assert starts(ilab) == 0
+
+
+@pytest.mark.parametrize("report", [
+    ["not", "a", "dict"],
+    {"pids": [5001], "orphans": []},  # no "listed"
+    {"listed": False, "pids": ["abc"], "orphans": []},
+    {"listed": False, "pids": 5001, "orphans": []},
+    {"listed": True, "pids": [5001], "orphans": [True]},
+])
+def test_a_malformed_instance_report_refuses_the_start(ilab, report):
+    ilab.vm.stop()
+    ilab.vm.instance_report = lambda: report  # type: ignore[method-assign]
+    with pytest.raises(VmLocked) as ei:
+        ilab.gateway().vm_power("start")
+    assert starts(ilab) == 0 and ei.value.details["cause"] == "VMRUN_ERROR"
+
+
+def test_a_failing_instance_report_after_the_start_is_refused(ilab):
+    ilab.vm.stop()
+    real_start = ilab.vm.start
+
+    def start(*, gui: bool = False) -> None:
+        real_start(gui=gui)
+        ilab.vm.report_error = VmrunError("the host process table cannot be read")
+
+    ilab.vm.start = start  # type: ignore[method-assign]
+    with pytest.raises(VmLocked) as ei:
+        ilab.gateway().vm_power("start")
+    assert "cannot tell" in ei.value.message
+
+
+class KvmStyleVm(InstanceVm):
+    """``instance_report`` as VmrunProvider (K-vm) answers it: with more than one process
+    every pid is an orphan, since which one vmrun drives cannot be told from the host."""
+
+    def instance_report(self) -> dict[str, Any]:
+        rep = super().instance_report()
+        pids = rep["pids"]
+        rep["orphans"] = list(pids) if pids and (not rep["listed"] or len(pids) > 1) else []
+        return rep
+
+
+def test_a_duplicate_whose_registered_instance_is_unknown_is_not_called_an_orphan(tmp_path):
+    lab = instance_lab(tmp_path, KvmStyleVm)
+    try:
+        lab.vm.stop()
+        lab.vm.start_duplicates = True
+        with pytest.raises(VmLocked) as ei:
+            lab.gateway().vm_power("start")
+        err = ei.value
+        assert len(err.details["pids"]) == 2
+        assert "not both" in (err.hint or "")
+    finally:
+        lab.close()
 
 
 def test_doctor_single_vm_instance_ok(ilab):
@@ -204,6 +277,40 @@ def test_doctor_single_vm_instance_reports_an_orphan_of_a_stopped_vm(ilab):
     orphan = ilab.vm.add_orphan(exit_after_polls=None)
     c = checks(ilab.gateway().doctor())["single_vm_instance"]
     assert c["ok"] is False and str(orphan) in c["detail"]
+
+
+def test_doctor_single_vm_instance_reports_a_failing_report(ilab):
+    ilab.vm.report_error = VmrunError("the host process table cannot be read")
+    c = checks(ilab.gateway().doctor())["single_vm_instance"]
+    assert c["ok"] is False and "VMRUN_ERROR" in c["detail"]
+
+
+@pytest.mark.parametrize("report", [
+    ["not", "a", "dict"],
+    {"listed": True, "pids": ["abc"], "orphans": []},
+    {"listed": "yes", "pids": [5001], "orphans": []},
+])
+def test_doctor_single_vm_instance_reports_a_malformed_report(ilab, report):
+    ilab.vm.instance_report = lambda: report  # type: ignore[method-assign]
+    rep = ilab.gateway().doctor()  # never raises for a failing check
+    c = checks(rep)["single_vm_instance"]
+    assert c["ok"] is False and "VMRUN_ERROR" in c["detail"] and "instance report" in c["detail"]
+    assert rep["ok"] is False
+
+
+def test_doctor_single_vm_instance_when_the_registered_instance_is_unknown(ilab):
+    ilab.vm.instance_report = lambda: {"listed": True, "pids": [11, 12], "orphans": [11, 12]}  # type: ignore[method-assign]
+    c = checks(ilab.gateway().doctor())["single_vm_instance"]
+    assert c["ok"] is False and "11" in c["detail"] and "12" in c["detail"]
+    assert "unknown" in c["detail"] and "besides the instance vmrun lists" not in c["detail"]
+    assert "not both" in c["hint"]
+
+
+def test_doctor_single_vm_instance_listed_without_a_host_process(ilab):
+    ilab.vm.instance_report = lambda: {"listed": True, "pids": [], "orphans": []}  # type: ignore[method-assign]
+    c = checks(ilab.gateway().doctor())["single_vm_instance"]
+    assert c["ok"] is False and "not running" not in c["detail"]
+    assert "no host vmware-vmx process" in c["detail"]
 
 
 def test_doctor_single_vm_instance_without_provider_support(lab):
@@ -266,6 +373,60 @@ def test_warm_up_never_raises(lab):
     lab.guest.fail_next("copy_from_guest", VmrunError("vmrun exploded"))
     out = lab.gateway().warm_up()
     assert out["backends"]["x64"]["error"] == "VMRUN_ERROR"
+
+
+def slow(fn: Any, seconds: float) -> Any:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(seconds)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def wait_warm_up_threads(timeout_s: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    for t in [t for t in threading.enumerate() if t.name.startswith("gw-warm-up")]:
+        t.join(max(0.0, deadline - time.monotonic()))
+
+
+def test_warm_up_looks_the_vm_up_once_for_all_backends(tmp_path):
+    """Review: one vmrun list / getGuestIPAddress for every backend, not one per thread."""
+    lab = make_lab(tmp_path, backends=("x64", "x32"), plugin_version="1.10")
+    try:
+        lab.vm.power_state = slow(lab.vm.power_state, 0.2)  # type: ignore[method-assign]
+        lab.vm.guest_ip = slow(lab.vm.guest_ip, 0.2)  # type: ignore[method-assign]
+        gw = lab.gateway()
+        out = gw.warm_up(timeout_s=5)
+        assert {b["source"] for b in out["backends"].values()} == {"live"}, out
+        assert sum(1 for c in lab.vm.calls if c[0] == "power_state") == 1
+        assert sum(1 for c in lab.vm.calls if c[0] == "guest_ip") == 1
+    finally:
+        wait_warm_up_threads()
+        lab.close()
+
+
+def test_warm_up_never_holds_the_vm_lock_while_it_looks_the_guest_ip_up(lab):
+    """Review: a warm-up thread that outlives its budget must not hold the VM read lock
+    through a slow vmrun lookup (the first VM operation would wait behind it)."""
+    lab.vm.guest_ip = slow(lab.vm.guest_ip, 1.5)  # type: ignore[method-assign]
+    gw = lab.gateway()
+    try:
+        out = gw.warm_up(timeout_s=0.3)
+        assert out["backends"]["x64"].get("pending") is True
+        with gw.runtime().lock.write(timeout_s=0.5):  # a VM operation right after start-up
+            pass
+    finally:
+        wait_warm_up_threads()
+
+
+def test_a_pending_warm_up_is_logged_as_a_warning(lab, caplog):
+    lab.servers["x64"].set_delay("GET", 1.0)
+    gw = lab.gateway()
+    with caplog.at_level(logging.INFO, logger="x64dbg_vm_gateway.app"):
+        gw.warm_up(timeout_s=0.2)
+    wait_warm_up_threads()
+    pending = [r for r in caplog.records if "warm-up" in r.getMessage() and "x64" in r.getMessage()]
+    seen = [(r.levelname, r.getMessage()) for r in pending]
+    assert any(r.levelno == logging.WARNING for r in pending), seen
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -352,5 +513,32 @@ def test_session_status_checks_the_backends_in_parallel(tmp_path):
         elapsed = time.monotonic() - t0
         assert {b["health"] for b in st["backends"].values()} == {"HEALTHY"}
         assert elapsed < 2.4, elapsed  # sequential: 2 x (0.75 + 0.75) = 3.0 s
+    finally:
+        lab.close()
+
+
+def test_one_backend_failing_unexpectedly_does_not_break_session_status(tmp_path):
+    """Review: an unexpected (non-gateway) exception while checking one backend is that
+    backend's UNKNOWN entry; the other backends, the VM state and the job still report."""
+    lab = make_lab(tmp_path, backends=("x64", "x32"))
+    try:
+        gw = lab.gateway()
+        sup = gw.runtime().supervisor
+        real_check = sup.check
+
+        def check(bid: str, **kw: Any) -> Any:
+            if bid == "x32":
+                raise RuntimeError("bug in a health probe")
+            return real_check(bid, **kw)
+
+        sup.check = check  # type: ignore[method-assign]
+        acked_before = gw.runtime().proxy.acked_epoch("x32")
+        st = gw.session_status()
+        assert st["backends"]["x64"]["health"] == "HEALTHY"
+        x32 = st["backends"]["x32"]
+        assert x32["health"] == "UNKNOWN"
+        assert x32["error"]["code"] == "GATEWAY_ERROR" and "RuntimeError" in x32["error"]["message"]
+        assert x32["acked_epoch"] == acked_before  # nothing was observed: no acknowledgement
+        assert st["vm"]["power"] == "running"
     finally:
         lab.close()

@@ -420,13 +420,21 @@ class ToolCatalog:
     def tool(self, name: str, backend_id: str | None = None) -> ToolInfo | None:
         """Look ``name`` up in ``backend_id``'s list, or in any known list when omitted.
 
-        Without a backend id, live lists win over the builtin list (first match).
+        Without a backend id, the live lists that still serve win (first match), then the
+        builtin lists of the backends whose live list belongs to another build (what
+        ``tools`` serves for them), then the default builtin list: the build filter of
+        ``tools`` applies to id-less lookups too.
         """
         with self._lock:
             if backend_id is not None:
                 lists = [self.tools(backend_id)]
             else:
-                lists = [tools for _v, tools in self._live.values()] + [self._backend_builtin(None).tools]
+                known = list(self._live)
+                current = [self._current_live(bid) for bid in known]
+                lists = [live[1] for live in current if live is not None]
+                lists += [self._backend_builtin(bid).tools
+                          for bid, live in zip(known, current, strict=True) if live is None]
+                lists.append(self._backend_builtin(None).tools)
             for tools in lists:
                 for t in tools:
                     if t.name == name:

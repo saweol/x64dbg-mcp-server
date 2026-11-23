@@ -27,7 +27,9 @@ Hard rules enforced here (not delegated to the MCP client):
   host ``vmware-vmx`` processes of the .vmx that vmrun does not list are waited for
   (``ORPHAN_EXIT_WAIT_S``) and then refused with VM_LOCKED, and so is a duplicate
   seen after the start (provider ``instance_report`` / ``vm_process_ids``, feature
-  tested); ``gateway_doctor`` reports it as ``single_vm_instance``;
+  tested). A provider that has this view but cannot answer (process table unreadable,
+  malformed report) refuses the start too: unknown is not "none" (fail closed).
+  ``gateway_doctor`` reports it as ``single_vm_instance``;
 - the supervisor only judges a backend it can reach: the debugger stage of
   analysis_start resolves the client first (re-reading the token while VMware
   Tools still start after the revert, ``RESOLVE_TIMEOUT_S``), see
@@ -103,7 +105,7 @@ from typing import Any
 
 from . import ida_sync, policy, transfer
 from . import platform as gw_platform
-from .app_api import GatewayApp
+from .app_api import WARM_UP_TIMEOUT_S, GatewayApp
 from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
 from .contracts import (
@@ -137,6 +139,7 @@ from .errors import (
     TransferError,
     VmLocked,
     VmNotReady,
+    VmrunError,
 )
 from .guest import POWERSHELL_EXE, is_reserved_name, validate_guest_path
 from .jobs import Job, JobStore
@@ -185,8 +188,6 @@ RESOLVE_TIMEOUT_S = 120.0
 #: them to exit (the reverted instance takes a few seconds), and how often it looks (E1).
 ORPHAN_EXIT_WAIT_S = 15.0
 ORPHAN_POLL_S = 1.0
-#: Start-up warm-up: how long the front-end waits for the backends' plugin versions (E5).
-WARM_UP_TIMEOUT_S = 5.0
 WRITE_LOCK_TIMEOUT_S = 120.0
 READ_LOCK_TIMEOUT_S = 60.0
 STATUS_LOCK_TIMEOUT_S = 5.0
@@ -433,13 +434,45 @@ def _no_session(res: ToolCallResult) -> bool:
     return bool(res.is_error) and any(_NO_SESSION_RE.search(t) for t in res.texts)
 
 
-def _stray_vmx_pids(listed: bool, pids: list[int], orphans: list[int]) -> list[int]:
-    """vmware-vmx pids of this .vmx that are not the instance vmrun manages: all of them
-    when vmrun does not list the VM, else the provider's orphans (every pid when it found
-    more than one but could not tell which one is registered)."""
+#: What to do about a vmware-vmx process of this .vmx that VMware does not manage (E1).
+_ORPHAN_HINT = ("stop the orphan process (it is an unmanaged copy of this VM that shares its MAC/IP, so "
+                "HTTP and vmrun may reach different instances), then retry")
+#: ... when several run and which one vmrun drives cannot be told from the host.
+_AMBIGUOUS_HINT = ("only one of them is the instance VMware manages; the other is an unmanaged copy that "
+                   "shares its MAC/IP (on the spike VM it was the older process): stop that copy, not both, "
+                   "then retry")
+_INSTANCE_SCAN_HINT = ("the gateway reads the host's process table to make sure the VM never runs twice "
+                       "(Linux: /proc readable without hidepid; macOS: ps; Windows: CIM Win32_Process); "
+                       "see gateway_doctor (single_vm_instance)")
+
+
+def _stray_vmx_pids(listed: bool, pids: list[int], orphans: list[int]) -> tuple[list[int], bool]:
+    """``(stray, ambiguous)``: the vmware-vmx pids of this .vmx that are not the instance
+    vmrun manages. Not listed: all of them. Listed: the provider's orphans when they single
+    the registered instance out (a strict subset of the pids); with more than one pid and
+    no such split every pid, ``ambiguous`` (one of them is the registered instance, which
+    one is unknown, so none may be called an orphan on its own)."""
     if not listed:
-        return list(pids)
-    return list(orphans) or (list(pids) if len(pids) > 1 else [])
+        return list(pids), False
+    split = [p for p in orphans if p in pids]
+    if split and len(split) < len(pids):
+        return split, False
+    if len(pids) > 1:
+        return list(pids), True
+    return [], False
+
+
+def _bad_instance_report(problem: str) -> VmrunError:
+    return VmrunError(f"unusable instance report from the VM provider: {problem}", stage="vm_instances",
+                      hint=_INSTANCE_SCAN_HINT)
+
+
+def _pid_list(value: object, what: str) -> list[int]:
+    """Process ids of an instance report, validated (a list of positive ints, no bools)."""
+    if not isinstance(value, list | tuple) or not all(
+            isinstance(p, int) and not isinstance(p, bool) and p > 0 for p in value):
+        raise _bad_instance_report(f"{what} must be a list of process ids, got {_clip(repr(value), 120)}")
+    return [int(p) for p in value]
 
 
 def _attach(exc: BaseException, job_id: str | None, steps: _Steps) -> None:
@@ -712,73 +745,106 @@ class Gateway(GatewayApp):
                 )
             self._clock.sleep(POLL_S)
 
-    def _instances(
-        self, rt: Runtime, *, quiet: bool = True
-    ) -> tuple[bool | None, list[int], list[int]] | None:
+    def _instances(self, rt: Runtime) -> tuple[bool | None, list[int], list[int]] | None:
         """(listed, pids, orphans) of the host ``vmware-vmx`` processes running this .vmx, from
         the provider's ``instance_report()`` (or ``vm_process_ids()``: listed unknown, no
-        orphan split). None when the provider offers neither, or (``quiet``) the query failed."""
+        orphan split). None only when the provider offers neither (nothing can be checked).
+
+        A query that fails is not "no instance": the provider's GatewayError passes through,
+        an OSError and an answer outside the contract raise VmrunError, and every caller
+        treats that as unknown (the start guards refuse, gateway_doctor reports it)."""
         report_fn = getattr(rt.vm, "instance_report", None)
         pids_fn = getattr(rt.vm, "vm_process_ids", None)
+        if not callable(report_fn) and not callable(pids_fn):
+            return None
         try:
-            if callable(report_fn):
-                rep = report_fn()
-                listed = bool(rep.get("listed"))
-                pids = [int(p) for p in rep.get("pids") or ()]
-                orphans = [int(p) for p in rep.get("orphans") or ()] if listed else list(pids)
-                return listed, pids, orphans
-            if callable(pids_fn):
-                return None, [int(p) for p in pids_fn()], []
-        except (GatewayError, OSError, ValueError, TypeError, AttributeError) as e:
-            if not quiet:
-                raise
-            log.warning("profile %s: cannot list the VM's host processes (%s); not checked",
-                        rt.profile.name, type(e).__name__)
-        return None
+            answer = report_fn() if callable(report_fn) else pids_fn()  # type: ignore[misc]
+        except OSError as e:
+            raise VmrunError(
+                f"cannot list the host vmware-vmx processes of this .vmx ({type(e).__name__}: "
+                f"{_clip(e.strerror or e, 200)})",
+                stage="vm_instances", hint=_INSTANCE_SCAN_HINT,
+            ) from e
+        if not callable(report_fn):
+            return None, _pid_list(answer, "vm_process_ids()"), []
+        if not isinstance(answer, Mapping) or not isinstance(answer.get("listed"), bool):
+            raise _bad_instance_report(
+                f"expected a mapping with a boolean 'listed', got {_clip(repr(answer), 120)}")
+        listed: bool = answer["listed"]
+        pids = _pid_list(answer.get("pids"), "pids")
+        orphans = _pid_list(answer.get("orphans") or [], "orphans") if listed else list(pids)
+        return listed, pids, orphans
+
+    def _instances_or_refuse(
+        self, rt: Runtime, situation: str
+    ) -> tuple[bool | None, list[int], list[int]] | None:
+        """``_instances`` for the start guards: an unknown answer refuses (fail closed)."""
+        try:
+            return self._instances(rt)
+        except GatewayError as e:
+            raise VmLocked(
+                f"cannot tell whether {situation} ({e.code}: {_clip(e.message, 200)})",
+                stage="vm_start",
+                hint="gateway_doctor shows the single_vm_instance check; make the host process scan work "
+                     "(or stop any vmware-vmx process of this .vmx yourself) and retry",
+                next_tool="gateway_doctor",
+                details={"vmx": rt.profile.vmx, "cause": e.code},
+            ) from e
 
     def _refuse_second_instance(self, rt: Runtime) -> None:
         """Before ``vmrun start`` (E1): vmware-vmx processes of this .vmx that vmrun does not
         list are waited for (the instance a revert replaced exits within seconds); any that
         stay are an unmanaged copy of the VM and the start is refused, since a second
-        instance would share its MAC/IP (HTTP would reach one, vmrun the other)."""
+        instance would share its MAC/IP (HTTP would reach one, vmrun the other). A
+        provider that cannot answer refuses the start too (``_instances_or_refuse``)."""
         deadline = self._clock.monotonic() + ORPHAN_EXIT_WAIT_S
         max_polls = int(ORPHAN_EXIT_WAIT_S / ORPHAN_POLL_S) + 2  # in case the clock stalls
         polls = 0
         while True:
-            seen = self._instances(rt)
+            seen = self._instances_or_refuse(
+                rt, "another instance of this VM is already running; refusing to start it")
             if seen is None:
                 return
             listed, pids, orphans = seen
-            stray = _stray_vmx_pids(bool(listed), pids, orphans)
+            stray, ambiguous = _stray_vmx_pids(bool(listed), pids, orphans)
             if not stray:
                 return
             polls += 1
             if self._clock.monotonic() >= deadline or polls >= max_polls:
+                details = {"pids": stray, "vmx": rt.profile.vmx, "listed": listed,
+                           "registered_unknown": ambiguous, "waited_s": ORPHAN_EXIT_WAIT_S}
+                if ambiguous:
+                    raise VmLocked(
+                        f"{len(stray)} VM processes {stray} run this .vmx and which one VMware manages is "
+                        "unknown; refusing to start another instance",
+                        stage="vm_start", hint=_AMBIGUOUS_HINT, next_tool="gateway_doctor", details=details,
+                    )
                 raise VmLocked(
                     f"orphan VM process(es) {stray} for this .vmx are still running; refusing to start a "
                     "second instance",
-                    stage="vm_start",
-                    hint="stop the orphan process (it is an unmanaged copy of this VM) and retry",
-                    next_tool="gateway_doctor",
-                    details={"pids": stray, "vmx": rt.profile.vmx, "listed": listed,
-                             "waited_s": ORPHAN_EXIT_WAIT_S},
+                    stage="vm_start", hint=_ORPHAN_HINT, next_tool="gateway_doctor", details=details,
                 )
             self._clock.sleep(ORPHAN_POLL_S)
 
     def _refuse_duplicate_after_start(self, rt: Runtime) -> None:
-        seen = self._instances(rt)
+        seen = self._instances_or_refuse(rt, "the VM runs twice after the start; refusing to use it")
         if seen is None:
             return
         listed, pids, orphans = seen
         if len(pids) > 1:
+            stray, ambiguous = _stray_vmx_pids(bool(listed), pids, orphans)
+            if listed is None or ambiguous:
+                hint = _AMBIGUOUS_HINT
+            else:
+                hint = f"stop {stray}: not the instance vmrun lists (gateway_doctor shows them), then retry"
             raise VmLocked(
                 f"{len(pids)} VM processes {pids} run this .vmx after the start; refusing to use a "
                 "duplicated VM",
                 stage="vm_start",
-                hint="stop the process(es) that are not the instance vmrun lists (gateway_doctor shows "
-                "them), then retry",
+                hint=hint,
                 next_tool="gateway_doctor",
-                details={"pids": pids, "orphans": orphans, "listed": listed, "vmx": rt.profile.vmx},
+                details={"pids": pids, "orphans": stray, "listed": listed,
+                         "registered_unknown": listed is None or ambiguous, "vmx": rt.profile.vmx},
             )
 
     def _start_vm(self, rt: Runtime) -> None:
@@ -905,8 +971,12 @@ class Gateway(GatewayApp):
 
         def one(item: tuple[str, BackendConfig]) -> dict[str, Any]:
             bid, cfg = item
-            return self._backend_status(rt, bid, cfg, busy=busy, power=power if vmware else None,
-                                        vm_state=vm_state, selected=bid == routed)
+            try:
+                return self._backend_status(rt, bid, cfg, busy=busy, power=power if vmware else None,
+                                            vm_state=vm_state, selected=bid == routed)
+            except Exception as e:  # noqa: BLE001 - one backend's bug must not hide the whole status
+                log.warning("session_status: checking backend %s failed", bid, exc_info=True)
+                return self._backend_error_entry(rt, bid, cfg, selected=bid == routed, exc=e)
 
         items = list(rt.backends.items())
         if len(items) > 1:  # health checks of several backends run in parallel (E6)
@@ -937,7 +1007,7 @@ class Gateway(GatewayApp):
             # Acknowledge after looking, so mutating calls are accepted again - but only for a
             # real health report outside a running operation: an epoch seen mid-revert must
             # still surface as BACKEND_RESTARTED once the operation is over.
-            if op_running or entry["health"] in (None, "PAUSED", "UNRESOLVED"):
+            if op_running or entry["health"] in (None, "PAUSED", "UNRESOLVED") or entry["error"] is not None:
                 entry["acked_epoch"] = rt.proxy.acked_epoch(bid)
             else:
                 entry["acked_epoch"] = rt.proxy.ack(bid)
@@ -971,6 +1041,24 @@ class Gateway(GatewayApp):
             return self._route(rt, None, job)
         except GatewayError:
             return None
+
+    @staticmethod
+    def _backend_error_entry(rt: Runtime, bid: str, cfg: BackendConfig, *, selected: bool,
+                             exc: Exception) -> dict[str, Any]:
+        """Status entry of a backend whose check failed unexpectedly: UNKNOWN, not acknowledged."""
+        err = GatewayError(f"checking backend {bid} failed: {type(exc).__name__}", stage="status",
+                           hint="see the gateway log; call session_status again")
+        return {
+            "id": bid,
+            "arch": cfg.arch,
+            "url": rt.resolved_url(bid),
+            "health": "UNKNOWN",
+            "health_details": {},
+            "epoch": rt.supervisor.epoch(bid),
+            "acked_epoch": None,
+            "selected": selected,
+            "error": err.to_dict(),
+        }
 
     def _backend_status(
         self,
@@ -1132,21 +1220,28 @@ class Gateway(GatewayApp):
         check("guest_job_root", guest_root)
 
     def _single_instance_check(self, rt: Runtime) -> tuple[bool, str, str | None]:
-        """E1: at most one vmware-vmx process runs this .vmx, and it is the one vmrun lists."""
-        seen = self._instances(rt, quiet=False)
+        """E1: at most one vmware-vmx process runs this .vmx, and it is the one vmrun lists.
+        A failing or malformed instance report raises a GatewayError (a failed check)."""
+        seen = self._instances(rt)
         if seen is None:
             return True, "not checked: the VM provider cannot list host vmware-vmx processes", None
         listed, pids, orphans = seen
-        hint = ("stop the orphan process (it is an unmanaged copy of this VM that shares its MAC/IP, so "
-                "HTTP and vmrun may reach different instances), then retry")
         if listed is None:  # pids only: which one vmrun manages is unknown
             if len(pids) > 1:
-                return False, f"{len(pids)} vmware-vmx processes {pids} run this .vmx", hint
+                return (False, f"{len(pids)} vmware-vmx processes {pids} run this .vmx; which one VMware "
+                        "manages is unknown", _AMBIGUOUS_HINT)
             return True, f"{len(pids)} vmware-vmx process(es) {pids} run this .vmx", None
-        stray = _stray_vmx_pids(listed, pids, orphans)
+        stray, ambiguous = _stray_vmx_pids(listed, pids, orphans)
+        if ambiguous:
+            return (False, f"{len(pids)} vmware-vmx processes {pids} run this .vmx; vmrun lists the VM, but "
+                    "which process is the registered instance is unknown", _AMBIGUOUS_HINT)
         if stray:
             where = "besides the instance vmrun lists" if listed else "while vmrun does not list the VM"
-            return False, f"orphan vmware-vmx process(es) {stray} run this .vmx {where}", hint
+            return False, f"orphan vmware-vmx process(es) {stray} run this .vmx {where}", _ORPHAN_HINT
+        if listed and not pids:
+            return (False, "vmrun lists the VM, but no host vmware-vmx process of this .vmx was found: the "
+                    "host process scan cannot see it, so a second instance would go unnoticed",
+                    _INSTANCE_SCAN_HINT)
         if not pids:
             return True, "no vmware-vmx process runs this .vmx (the VM is not running)", None
         return True, f"one vmware-vmx process (pid {pids[0]}) runs this .vmx, listed by vmrun", None
@@ -1263,29 +1358,60 @@ class Gateway(GatewayApp):
         If the VM runs (or in endpoint mode) each backend is resolved in its own thread
         (token read, then ``GET /`` on first contact, which selects the builtin list of
         that version: ``catalog.set_server_version``); the call returns after
-        ``timeout_s`` at most, unfinished threads go on in the background. Otherwise
-        the catalog keeps the most recent cached version. Never raises; returns
-        ``{"profile", "backends": {id: {"version", "source": live|cache|builtin,
-        "skipped"?, "error"?, "pending"?}}}``.
+        ``timeout_s`` at most, unfinished threads go on in the background (logged as a
+        warning). Otherwise the catalog keeps the most recent cached version. Never
+        raises; returns ``{"profile", "backends": {id: {"version", "source":
+        live|cache|builtin, "skipped"?, "error"?, "pending"?}}}``.
+
+        The VM's power state and the guest IP are looked up once for all backends and
+        outside the VM operation lock (read-only vmrun queries): a slow lookup never
+        holds up a VM operation that arrives meanwhile. Only the token read (bounded by
+        what is left of ``timeout_s`` while VMware Tools start) and the version probe
+        (``GET /``, cancelled by a VM operation) run under the shared read lock.
         """
         try:
             rt = self.runtime()
         except GatewayError as e:
             return {"profile": None, "backends": {}, "error": e.code}
         budget = max(0.0, float(timeout_s))
+        deadline = time.monotonic() + budget
         results: dict[str, dict[str, Any]] = {bid: {} for bid in rt.backends}
+        vm_lock = threading.Lock()
+        vm_seen: dict[str, Any] = {}
+
+        def look_at_vm() -> dict[str, Any]:
+            """``{"skipped"?, "error"?, "ip"}``, computed by the first thread, shared by all."""
+            with vm_lock:
+                if not vm_seen:
+                    vm_seen["ip"] = None
+                    try:
+                        if rt.profile.mode == "vmware":
+                            observed = rt.vm_state if rt.vm_state is not None else rt.vm
+                            power = observed.power_state()
+                            if power != PowerState.RUNNING:
+                                vm_seen["skipped"] = f"the VM is {power.value}"
+                            elif any(not cfg.url for cfg in rt.backends.values()):
+                                vm_seen["ip"] = rt.guest_ip()  # cached for connect below
+                    except GatewayError as e:
+                        vm_seen["error"] = e.code
+                    except Exception as e:  # noqa: BLE001 - start-up must go on; the cause goes to the log
+                        vm_seen["error"] = type(e).__name__
+                        log.warning("warm-up: looking at the VM failed", exc_info=True)
+                return dict(vm_seen)
 
         def learn(bid: str) -> None:
             out = results[bid]
             try:
-                if rt.profile.mode == "vmware":
-                    observed = rt.vm_state if rt.vm_state is not None else rt.vm
-                    power = observed.power_state()
-                    if power != PowerState.RUNNING:
-                        out["skipped"] = f"the VM is {power.value}"
-                        return
-                with rt.lock.read(timeout_s=budget):
-                    client = rt.connect(bid, wait=True, timeout_s=budget)  # GET / on first contact
+                vm = look_at_vm()
+                if "error" in vm or "skipped" in vm:
+                    out.update({k: vm[k] for k in ("error", "skipped") if k in vm})
+                    return
+                if rt.profile.mode == "vmware" and not rt.backend(bid).url and not vm["ip"]:
+                    out["skipped"] = "the guest IP address is not known yet"
+                    return
+                left = max(0.0, deadline - time.monotonic())
+                with rt.lock.read(timeout_s=left):
+                    client = rt.connect(bid, wait=True, timeout_s=left)  # GET / on first contact
                 reports = isinstance(client, VersionReportingClient)
                 if rt.catalog.reported_version(bid) is None and not reports:
                     out["skipped"] = "this client does not report the plugin version"
@@ -1297,7 +1423,6 @@ class Gateway(GatewayApp):
 
         threads = {bid: threading.Thread(target=learn, args=(bid,), name=f"gw-warm-up-{bid}", daemon=True)
                    for bid in rt.backends}
-        deadline = time.monotonic() + budget
         for t in threads.values():
             t.start()
         for t in threads.values():
@@ -1315,7 +1440,13 @@ class Gateway(GatewayApp):
             if threads[bid].is_alive():
                 out["pending"] = True
             summary[bid] = out
-        log.info("warm-up: %s", {bid: (o["version"], o["source"]) for bid, o in summary.items()})
+        versions = {bid: (o["version"], o["source"]) for bid, o in summary.items()}
+        pending = [bid for bid, o in summary.items() if o.get("pending")]
+        if pending:
+            log.warning("warm-up: backend(s) %s did not answer within %.1f s; their first tool list is the "
+                        "cached / builtin one (%s) and changes once they answer", pending, budget, versions)
+        else:
+            log.info("warm-up: %s", versions)
         return {"profile": rt.profile.name, "backends": summary}
 
     def _active_or_none(self, rt: Runtime) -> Job | None:

@@ -70,7 +70,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from .. import __version__
-from ..app_api import GatewayApp
+from ..app_api import WARM_UP_TIMEOUT_S, GatewayApp
 from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
@@ -113,8 +113,6 @@ _WORK_THREADS = 40    # everything else: VM operations, transfers, backend calls
 # Mirrored tool lookups for tools/call (read at call time).
 _MIRROR_TTL_S = 30.0
 _MIRROR_MISS_REFRESH_S = 1.0
-#: Bound of the start-up warm-up (``warm_up``) before serving.
-WARM_UP_TIMEOUT_S = 5.0
 
 
 def allowed_tiers(scope: str | None) -> frozenset[RiskTier]:
@@ -376,15 +374,12 @@ def warm_up(app: GatewayApp, timeout_s: float = WARM_UP_TIMEOUT_S) -> None:
 
     Clients such as Claude Code do not reliably re-read the list after
     ``notifications/tools/list_changed``, so the list answered at start-up must already
-    match the plugin build in the guest. Feature-tested (``app.warm_up`` is not part of
-    the ``GatewayApp`` protocol), bounded by the app, and never fatal: serving starts
-    whatever happens.
+    match the plugin build in the guest. ``GatewayApp.warm_up`` is bounded by the app
+    and never fatal here: serving starts whatever happens (an app without it, or one
+    that fails, is logged as a warning).
     """
-    fn = getattr(app, "warm_up", None)
-    if not callable(fn):
-        return
     try:
-        fn(timeout_s=timeout_s)
+        app.warm_up(timeout_s=timeout_s)
     except Exception:
         log.warning("warm-up failed; serving the cached / builtin tool list", exc_info=True)
 

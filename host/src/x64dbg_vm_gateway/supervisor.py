@@ -32,9 +32,13 @@ Without a VM provider / guest channel (endpoint mode) only the HTTP rows apply
 and relaunching is impossible.
 
 Resolved clients only (E4 on the spike VM): ``check`` and ``ensure_alive`` first
-obtain the client through ``resolve(backend_id)`` (the runtime passes
+obtain the client through ``resolve(backend_id, timeout_s)`` (the runtime passes
 ``Runtime.connect``, which reads the guest token if needed); without a resolver
-the ``clients`` entry is used. A client that cannot be resolved, or a placeholder
+the ``clients`` entry is used. ``timeout_s`` is what is left of the caller's
+budget (``check(max_wait_s=...)``, ``ensure_alive(max_wait_s=...)``, the
+readiness deadline after a relaunch), or None when the caller has none and the
+resolver applies its own bound: re-reading a token while VMware Tools start never
+outlasts the caller's budget. A client that cannot be resolved, or a placeholder
 (``is_unresolved_client``: ``wiring.UnresolvedClient`` until the URL and token are
 known), is UNRESOLVED: nothing is probed, nothing is classified from guest
 processes, no L2 failure is counted, nothing is killed or relaunched, and
@@ -70,8 +74,9 @@ without a job id are counted per backend within ``crash_loop_window_s`` and the
 count is reset by ``bump_epoch`` (VM revert).
 
 Bounded waits: ``ensure_alive(max_wait_s=...)`` bounds the wait for another
-relaunch, the LOADING wait and the readiness wait (the launch itself is always
-issued); the guest commands (list/kill/run) are bounded by their own timeouts.
+relaunch, the client resolutions, the LOADING wait and the readiness wait (the
+launch itself is always issued); ``check(max_wait_s=...)`` bounds its resolution;
+the guest commands (list/kill/run) are bounded by their own timeouts.
 
 Thread-safety: all public methods may be called from any thread. Bookkeeping is
 guarded by one re-entrant lock that is never held across guest/HTTP I/O; a
@@ -177,15 +182,16 @@ class Supervisor:
         hang_hook: Callable[[str, HealthReport], None] | None = None,
         crash_loop_window_s: float = 600.0,
         kill_exit_timeout_s: float = 10.0,
-        resolve: Callable[[str], BackendClient] | None = None,
+        resolve: Callable[[str, float | None], BackendClient] | None = None,
     ) -> None:
         """``clients`` is read on every use (not copied), so a token refresher may
         replace an entry; ``backends`` supplies exe/launch_task (falling back to the
         client's endpoint fields). ``hang_hook(backend_id, report)`` runs before a
         HUNG debugger is killed (e.g. to save a screenshot into the job directory);
-        its exceptions are logged and ignored. ``resolve(backend_id)`` returns a
-        usable client (resolving URL and token when needed, bounded by its own
-        timeout); without it the ``clients`` entry is used (see "Resolved clients
+        its exceptions are logged and ignored. ``resolve(backend_id, timeout_s)``
+        returns a usable client (resolving URL and token when needed) within
+        ``timeout_s``, the caller's remaining budget (None: the resolver's own
+        bound); without it the ``clients`` entry is used (see "Resolved clients
         only" in the module docstring)."""
         if relaunch_mode not in RELAUNCH_MODES:
             raise ConfigError(f"relaunch_mode must be one of {RELAUNCH_MODES}, got {relaunch_mode!r}")
@@ -233,17 +239,27 @@ class Supervisor:
         except KeyError:
             raise ConfigError(f"unknown backend: {backend_id!r}") from None
 
-    def _resolved_client(self, backend_id: str, client: BackendClient | None = None) -> BackendClient:
-        """A client that may be probed: ``client`` if given, else the resolver's, else the
-        ``clients`` entry. Raises _Unresolved (no usable client: VM not ready, Tools
-        starting, guest-channel error, placeholder), BackendAuthError (the token cannot
-        be used), BackendThrottled and ConfigError."""
+    def _left(self, until: float | None) -> float | None:
+        """Seconds left until the monotonic deadline ``until`` (None: no deadline)."""
+        return None if until is None else max(0.0, until - self._clock.monotonic())
+
+    def _until(self, max_wait_s: float | None) -> float | None:
+        """Monotonic deadline of a ``max_wait_s`` budget (None: unbounded)."""
+        return None if max_wait_s is None else self._clock.monotonic() + max(0.0, max_wait_s)
+
+    def _resolved_client(self, backend_id: str, client: BackendClient | None = None, *,
+                         until: float | None = None) -> BackendClient:
+        """A client that may be probed: ``client`` if given, else the resolver's (given what
+        is left until the monotonic deadline ``until``), else the ``clients`` entry.
+        Raises _Unresolved (no usable client: VM not ready, Tools starting, guest-channel
+        error, placeholder), BackendAuthError (the token cannot be used),
+        BackendThrottled and ConfigError."""
         if client is None:
             if self._resolve is None:
                 client = self._client(backend_id)
             else:
                 try:
-                    client = self._resolve(backend_id)
+                    client = self._resolve(backend_id, self._left(until))
                 except (BackendAuthError, BackendThrottled, ConfigError):
                     raise
                 except GatewayError as e:
@@ -441,7 +457,7 @@ class Supervisor:
     # ── classification ──────────────────────────────────────────────
     def check(self, backend_id: str, *, client: BackendClient | None = None,
               vm_state: tuple[PowerState, ToolsState] | None = None,
-              record_pids: bool = True) -> HealthReport:
+              record_pids: bool = True, max_wait_s: float | None = None) -> HealthReport:
         """Classify the backend's health (see module docstring). Never relaunches.
 
         ``client``: probe this client instead of resolving one (a placeholder is
@@ -449,8 +465,11 @@ class Supervisor:
         so the VM is not asked again. ``record_pids=False`` (status polling) lists guest
         processes only when L1 fails; the default also records the debugger's process
         ids once per epoch, the evidence of the external-restart detection.
+        ``max_wait_s``: the caller's remaining budget, handed to the resolver (None:
+        the resolver's own bound); the probes keep their own timeouts.
         """
         self._client(backend_id)
+        until = self._until(max_wait_s)
         if self.is_paused():
             return self._report(HealthState.PAUSED, backend_id)
         if self._vm is not None:
@@ -466,14 +485,15 @@ class Supervisor:
                 return self._report(HealthState.VM_DOWN, backend_id, power=str(power.value))
             if tools != ToolsState.RUNNING:
                 return self._report(HealthState.TOOLS_DOWN, backend_id, tools=str(tools.value))
-        return self._probe(backend_id, client, refreshed=False, record_pids=record_pids)
+        return self._probe(backend_id, client, refreshed=False, record_pids=record_pids, until=until)
 
     def _probe(self, backend_id: str, client: BackendClient | None, *, refreshed: bool,
-               record_pids: bool = True) -> HealthReport:
-        """Resolve a client (unless given) and classify it over HTTP. ``refreshed``: the
-        token was re-read already, so a 401 is not answered with another refresh."""
+               record_pids: bool = True, until: float | None = None) -> HealthReport:
+        """Resolve a client (unless given; by the monotonic deadline ``until``) and classify
+        it over HTTP. ``refreshed``: the token was re-read already, so a 401 is not
+        answered with another refresh."""
         try:
-            target = self._resolved_client(backend_id, client)
+            target = self._resolved_client(backend_id, client, until=until)
         except _Unresolved as u:
             return self._report(HealthState.UNRESOLVED, backend_id, reason=u.reason, error=u.code)
         except BackendAuthError as e:
@@ -481,12 +501,12 @@ class Supervisor:
                                 resolve_error=e.code, message=e.message)
         except BackendThrottled as e:
             return self._throttled_report(backend_id, e, "connect")
-        again = None if refreshed else self._recheck(backend_id, client, record_pids)
+        again = None if refreshed else self._recheck(backend_id, client, record_pids, until)
         return self._check_http(backend_id, target, again=again, record_pids=record_pids)
 
     def _recheck(self, backend_id: str, client: BackendClient | None,
-                 record_pids: bool = True) -> Callable[[], HealthReport]:
-        return lambda: self._probe(backend_id, client, refreshed=True, record_pids=record_pids)
+                 record_pids: bool = True, until: float | None = None) -> Callable[[], HealthReport]:
+        return lambda: self._probe(backend_id, client, refreshed=True, record_pids=record_pids, until=until)
 
     def _check_http(self, backend_id: str, client: BackendClient, *,
                     again: Callable[[], HealthReport] | None, record_pids: bool = True) -> HealthReport:
@@ -607,8 +627,9 @@ class Supervisor:
         """Make sure the backend is HEALTHY, relaunching it if needed; return the epoch.
 
         ``max_wait_s`` (default: unbounded apart from the configured timeouts) bounds
-        the waits: for another caller's relaunch, for a LOADING debugger, and for
-        readiness after a launch. A launch is always issued once decided; when the
+        the waits: for another caller's relaunch, for a client resolution (the
+        resolver gets what is left), for a LOADING debugger, and for readiness after
+        a launch. A launch is always issued once decided; when the
         budget runs out before the new debugger is ready, BackendUnavailable is
         raised with ``details['relaunch_pending'] = True`` and the epoch has
         already been bumped.
@@ -642,7 +663,7 @@ class Supervisor:
             self._raise_if_paused(backend_id)
             with self._lock:
                 was_up = self._seen_up_epoch.get(backend_id) == current
-            report = self.check(backend_id)
+            report = self.check(backend_id, max_wait_s=self._left(budget_end))
             waited_for_boot = False
             loading_pids: set[int] = set()
             polls = 0
@@ -663,7 +684,7 @@ class Supervisor:
                 polls += 1
                 self._clock.sleep(self._poll_s)
                 self._raise_if_paused(backend_id)
-                report = self.check(backend_id)
+                report = self.check(backend_id, max_wait_s=self._left(budget_end))
             state = report.state
             if state is HealthState.HEALTHY:
                 if waited_for_boot and was_up and not self._same_instance(backend_id, current, loading_pids):
@@ -859,7 +880,7 @@ class Supervisor:
             polls += 1
             self._raise_if_paused(backend_id)
             try:
-                client: BackendClient | None = self._resolved_client(backend_id)
+                client: BackendClient | None = self._resolved_client(backend_id, until=deadline)
             except _Unresolved:
                 client = None  # e.g. the token cannot be read yet: not ready, keep polling
             except BackendAuthError as e:
@@ -875,7 +896,7 @@ class Supervisor:
                         self._probe_l2(client, self._l2_timeout_s):
                     return
             except BackendAuthError:
-                report = self._on_auth(backend_id, self._recheck(backend_id, None))
+                report = self._on_auth(backend_id, self._recheck(backend_id, None, until=deadline))
                 if report.state is HealthState.HEALTHY:
                     return
                 if report.state is HealthState.AUTH:

@@ -24,6 +24,7 @@ from x64dbg_vm_gateway.config import BackendConfig
 from x64dbg_vm_gateway.contracts import BackendEndpoint, PowerState, Secret, ToolsState
 from x64dbg_vm_gateway.errors import (
     BackendAuthError,
+    BackendUnavailable,
     GuestOperationError,
     ToolsNotRunning,
     VmNotReady,
@@ -56,22 +57,38 @@ class ProbedPlaceholder(UnresolvedClient):
 
 
 class Resolver:
-    """Programmable ``resolve`` hook: each answer is a client or an exception to raise."""
+    """Programmable ``resolve(backend_id, timeout_s)`` hook: each answer is a client or an
+    exception to raise; ``timeouts`` records the budget each call was given."""
 
     def __init__(self, *answers: Any) -> None:
         self.answers = list(answers)
         self.calls: list[str] = []
+        self.timeouts: list[float | None] = []
 
-    def __call__(self, backend_id: str) -> Any:
+    def __call__(self, backend_id: str, timeout_s: float | None = None) -> Any:
         self.calls.append(backend_id)
+        self.timeouts.append(timeout_s)
         answer = self.answers[0] if len(self.answers) == 1 else self.answers.pop(0)
         if isinstance(answer, BaseException):
             raise answer
         return answer
 
 
-def sup_with(vm, guest, clock, clients: dict[str, Any], *, resolve: Callable[[str], Any] | None = None,
-             **kw: Any) -> Supervisor:
+class SlowResolver(Resolver):
+    """Like ``wiring``'s resolver while VMware Tools are not running: it keeps re-reading the
+    token for its whole budget (``own_bound_s`` when the caller gives none), in fake time."""
+
+    def __init__(self, clock: Any, *answers: Any, own_bound_s: float = 20.0) -> None:
+        super().__init__(*answers)
+        self.clock, self.own_bound_s = clock, own_bound_s
+
+    def __call__(self, backend_id: str, timeout_s: float | None = None) -> Any:
+        self.clock.advance(self.own_bound_s if timeout_s is None else min(self.own_bound_s, timeout_s))
+        return super().__call__(backend_id, timeout_s)
+
+
+def sup_with(vm, guest, clock, clients: dict[str, Any], *,
+             resolve: Callable[[str, float | None], Any] | None = None, **kw: Any) -> Supervisor:
     return Supervisor(vm=vm, guest=guest, clients=clients, backends={"x64": cfg()}, relaunch_mode="task",
                       clock=clock, resolve=resolve, **kw)
 
@@ -250,3 +267,51 @@ def test_unresolved_is_reported_as_retryable_vm_not_ready_by_ensure_alive(fake_v
 
 def test_scripted_client_is_not_a_placeholder():
     assert is_unresolved_client(ScriptedClient()) is False
+
+
+# ── the resolution is bounded by the caller's budget ────────────────
+TOOLS_STARTING = ToolsNotRunning("Error: The VMware Tools are not running in the virtual machine")
+
+
+def test_check_without_a_budget_leaves_the_bound_to_the_resolver(fake_vm, fake_guest, fake_clock, client):
+    resolver = Resolver(client)
+    sup = sup_with(fake_vm, fake_guest, fake_clock, {"x64": client}, resolve=resolver)
+    assert sup.check("x64").state is HealthState.HEALTHY
+    assert resolver.timeouts == [None]
+
+
+def test_check_hands_its_budget_to_the_resolver(fake_vm, fake_guest, fake_clock, client):
+    resolver = SlowResolver(fake_clock, TOOLS_STARTING)
+    sup = sup_with(fake_vm, fake_guest, fake_clock, {"x64": client}, resolve=resolver)
+    t0 = fake_clock.monotonic()
+    assert sup.check("x64", max_wait_s=3).state is HealthState.UNRESOLVED
+    assert resolver.timeouts == [3]
+    assert fake_clock.monotonic() - t0 <= 3
+
+
+def test_ensure_alive_bounds_the_resolution_by_max_wait_s(fake_vm, fake_guest, fake_clock, client):
+    fake_guest.add_process(f'"{EXE}"')
+    resolver = SlowResolver(fake_clock, TOOLS_STARTING)
+    sup = sup_with(fake_vm, fake_guest, fake_clock, {"x64": client}, resolve=resolver)
+    t0 = fake_clock.monotonic()
+    with pytest.raises(VmNotReady):
+        sup.ensure_alive("x64", reason="proxy recovery", max_wait_s=3)
+    assert fake_clock.monotonic() - t0 <= 3  # not the resolver's own 20 s
+    assert all(t is not None and t <= 3 for t in resolver.timeouts), resolver.timeouts
+    no_side_effects(fake_guest)
+
+
+def test_the_readiness_wait_resolves_within_its_deadline(fake_vm, fake_guest, fake_clock, client):
+    # DEAD -> relaunched -> the token cannot be read any more: every poll is bounded by what is
+    # left of max_wait_s, so the wait ends at the budget, not 20 s per poll later
+    client.down()
+    relaunch_brings_up(fake_guest, client)
+    resolver = SlowResolver(fake_clock, client, TOOLS_STARTING)
+    sup = sup_with(fake_vm, fake_guest, fake_clock, {"x64": ProbedPlaceholder()}, resolve=resolver,
+                   relaunch_ready_timeout_s=120)
+    t0 = fake_clock.monotonic()
+    with pytest.raises(BackendUnavailable) as ei:
+        sup.ensure_alive("x64", reason="dead", max_wait_s=30)
+    assert ei.value.details.get("relaunch_pending") is True
+    assert fake_clock.monotonic() - t0 <= 30 + 5  # at most one poll interval beyond the budget
+    assert all(t is not None and t <= 30 for t in resolver.timeouts), resolver.timeouts

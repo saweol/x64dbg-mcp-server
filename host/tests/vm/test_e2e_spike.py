@@ -197,6 +197,15 @@ def run_to_sleep(gw: Any) -> str:
     pytest.fail(f"never paused in kernel32.Sleep: {state}")
 
 
+def manifest_entries(entries: list[dict[str, Any]], match: Any) -> list[dict[str, Any]]:
+    """manifest.json entries whose file name (``original_path``: out-dir relative with ``/``,
+    or a guest path with ``\\``) satisfies ``match`` (compared in lower case)."""
+    def name(e: dict[str, Any]) -> str:
+        return PureWindowsPath(str(e["original_path"]).replace("/", "\\")).name.lower()
+
+    return [e for e in entries if match(name(e))]
+
+
 def full_loop(gw: Any, vmx: str, arch: str) -> None:
     res = start_analysis(gw, vmx, arch)
     job_id = res["job_id"]
@@ -214,11 +223,19 @@ def full_loop(gw: Any, vmx: str, arch: str) -> None:
 
     collected = finished(gw, gw.analysis_collect(job_id))
     assert collected["state"] == "COLLECTED" and collected["partial"] is False, collected
-    originals = [str(f["original_path"]) for f in collected["files"]]
-    assert any(PureWindowsPath(p).name == dump_name for p in originals), originals
-    assert any(p.lower().endswith(DB_EXT[arch]) for p in originals), originals
+    # the manifest written to disk (not only the call's answer) lists the dump and the database
     manifest = json.loads(Path(collected["manifest_path"]).read_text(encoding="utf-8"))
-    assert manifest["entries"], manifest
+    entries = manifest["entries"]
+    dumps = manifest_entries(entries, lambda name: name == dump_name)
+    databases = manifest_entries(entries, lambda name: name.endswith(DB_EXT[arch]))
+    assert dumps, [e["original_path"] for e in entries]
+    assert databases, [e["original_path"] for e in entries]
+    stored = {f["original_path"]: f["host_path"] for f in collected["files"]}
+    for e in dumps + databases:
+        assert e["status"] in ("ok", "archived") and e["size"] > 0, e  # archived: kept in raw/out.zip
+        if e["status"] == "ok":
+            assert e["sha256"], e
+            assert stored.get(e["original_path"]) and Path(stored[e["original_path"]]).is_file(), e
 
     exported = finished(gw, gw.ida_export_annotations(job_id))
     assert Path(exported["host_path"]).is_file(), exported

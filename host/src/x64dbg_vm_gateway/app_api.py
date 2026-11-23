@@ -24,6 +24,10 @@ from .contracts import ToolInfo
 
 JSON = dict[str, Any]
 
+#: How long a front-end lets ``GatewayApp.warm_up`` learn the live plugin versions before it
+#: serves (E5); the only definition (app.py and the MCP front-end import it).
+WARM_UP_TIMEOUT_S = 5.0
+
 
 @runtime_checkable
 class GatewayApp(Protocol):
@@ -46,6 +50,13 @@ class GatewayApp(Protocol):
     def list_mirrored_tools(self) -> list[ToolInfo]:
         """Backend tools to expose under their original names (never empty: falls
         back to the builtin catalog)."""
+        ...
+
+    def warm_up(self, timeout_s: float = WARM_UP_TIMEOUT_S) -> JSON:
+        """Learn the live plugin versions of the default profile's backends (bounded by
+        ``timeout_s``) so the first ``list_mirrored_tools`` matches the plugin build in
+        the guest; front-ends call it before they serve. Never raises; returns
+        ``{"profile", "backends": {id: {"version", "source", ...}}}``."""
         ...
 
     # ── VM ────────────────────────────────────────────────────────────

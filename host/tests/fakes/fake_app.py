@@ -25,6 +25,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
+from x64dbg_vm_gateway.app_api import WARM_UP_TIMEOUT_S
 from x64dbg_vm_gateway.contracts import ToolInfo
 
 JSON = dict[str, Any]
@@ -251,6 +252,10 @@ class FakeApp:
     def discard_job(self, job_id: str, actor: str) -> JSON:
         return self._record("discard_job", {"job_id": job_id, "state": "DISCARDED"}, job_id=job_id,
                             actor=actor)
+
+    def warm_up(self, timeout_s: float = WARM_UP_TIMEOUT_S) -> JSON:
+        """No-op (not recorded): nothing to learn in memory."""
+        return {"profile": None, "backends": {}}
 
     def close(self) -> None:
         with self._lock:

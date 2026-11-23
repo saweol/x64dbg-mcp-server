@@ -67,10 +67,34 @@ def test_a_failing_warm_up_never_stops_serving(monkeypatch):
     assert app.order[:2] == ["warm_up", "instructions"]
 
 
+class NoWarmUpApp(FakeApp):
+    """An app built against the contract before ``warm_up`` existed (``None`` hides the
+    inherited method from both ``isinstance`` flavours: hasattr on 3.11, getattr_static
+    on 3.12+)."""
+
+    warm_up = None  # type: ignore[assignment]
+
+
 def test_an_app_without_warm_up_is_served_as_before(monkeypatch):
-    app = FakeApp()
+    app = NoWarmUpApp()
     monkeypatch.setattr(mcp_server, "stdio_server", closed_stdio)
     mcp_server.run_stdio(app)  # no AttributeError
+
+
+def test_warm_up_is_part_of_the_app_contract():
+    """Review: ``warm_up`` is a ``GatewayApp`` member (a renamed method is a type error, not a
+    silently skipped warm-up) and its default budget is defined once, in the contract."""
+    import inspect
+
+    from x64dbg_vm_gateway import app as app_mod
+    from x64dbg_vm_gateway import app_api
+
+    assert isinstance(FakeApp(), app_api.GatewayApp)
+    assert not isinstance(NoWarmUpApp(), app_api.GatewayApp)
+    assert mcp_server.WARM_UP_TIMEOUT_S is app_api.WARM_UP_TIMEOUT_S
+    assert app_mod.WARM_UP_TIMEOUT_S is app_api.WARM_UP_TIMEOUT_S
+    default = inspect.signature(app_mod.Gateway.warm_up).parameters["timeout_s"].default
+    assert default is app_api.WARM_UP_TIMEOUT_S
 
 
 def test_serve_http_warms_the_app_up_before_serving(tmp_path, monkeypatch):

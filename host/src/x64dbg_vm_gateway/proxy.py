@@ -47,8 +47,9 @@ Rules applied to every ``Proxy.call``:
     result holds gateway metadata only (``{"gateway": {backend, epoch, retried}}``),
     never the unsanitised backend payload.
 
-Supervisor surface used (``SupervisorLike``): ``check``, ``ensure_alive`` (with
-the ``max_wait_s`` extension), ``epoch``, ``is_paused`` (calls are refused while
+Supervisor surface used (``SupervisorLike``): ``check`` and ``ensure_alive`` (both
+with the ``max_wait_s`` extension: recovery gives them what is left of the call
+budget), ``epoch``, ``is_paused`` (calls are refused while
 a VM operation holds supervision) and ``note_up`` (a successful call proves the
 backend was up in that epoch; used for external-restart detection).
 
@@ -207,7 +208,7 @@ def plan_call(tool: str, arguments: Mapping[str, Any] | None, *, max_call_s: flo
 
 # ── proxy ───────────────────────────────────────────────────────────
 class SupervisorLike(Protocol):
-    def check(self, backend_id: str) -> HealthReport: ...
+    def check(self, backend_id: str, *, max_wait_s: float | None = None) -> HealthReport: ...
     def ensure_alive(self, backend_id: str, *, job_id: str | None = None, reason: str,
                      max_wait_s: float | None = None) -> int: ...
     def epoch(self, backend_id: str) -> int: ...
@@ -379,7 +380,8 @@ class Proxy:
         state: HealthState = HealthState.UNKNOWN
         recovery_error: GatewayError | None = None
         try:
-            report = self._sup.check(backend_id)
+            # the health check may resolve the client (token re-read): within the call budget
+            report = self._sup.check(backend_id, max_wait_s=max(0.0, deadline - self._clock.monotonic()))
             state = report.state
             if state in (HealthState.DEAD, HealthState.HUNG):
                 remaining = max(0.0, deadline - self._clock.monotonic())

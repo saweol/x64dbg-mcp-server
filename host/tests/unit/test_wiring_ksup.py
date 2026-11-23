@@ -20,7 +20,7 @@ from x64dbg_vm_gateway.contracts import PowerState, ToolsState
 from x64dbg_vm_gateway.errors import ToolsNotRunning, VmNotReady
 from x64dbg_vm_gateway.locks import VmOpLock
 from x64dbg_vm_gateway.supervisor import HealthState
-from x64dbg_vm_gateway.wiring import VM_STATE_TTL_S, UnresolvedClient
+from x64dbg_vm_gateway.wiring import SUPERVISOR_RESOLVE_TIMEOUT_S, VM_STATE_TTL_S, UnresolvedClient
 
 TOOLS_DOWN = "Error: The VMware Tools are not running in the virtual machine"
 
@@ -95,6 +95,24 @@ def test_e4_a_revert_with_tools_still_starting_never_kills_x64dbg(lab):
     assert lab.guest.calls_of("kill_process") == [] and lab.launches == []
     assert rt.supervisor.epoch("x64") == 0
     assert lab.servers["x64"].running  # the plugin was healthy all along
+
+
+def test_the_supervisor_resolution_is_bounded_by_the_callers_budget(lab):
+    """Review: the resolve hook must not block a check for its own 20 s when the caller (the
+    proxy's call budget, ensure_alive's max_wait_s) has less left."""
+    rt = lab.runtime()
+    rt.connect("x64")
+    rt.invalidate_clients(drop_tokens=True, reason="VM reverted")
+    lab.guest.fail_next("copy_from_guest", ToolsNotRunning(TOOLS_DOWN), times=100_000)
+    t0 = lab.clock.monotonic()
+    assert rt.supervisor.check("x64", max_wait_s=3).state is HealthState.UNRESOLVED
+    assert lab.clock.monotonic() - t0 <= 3
+    t0 = lab.clock.monotonic()
+    assert rt.supervisor.check("x64", max_wait_s=0).state is HealthState.UNRESOLVED
+    assert lab.clock.monotonic() - t0 == 0  # one read, no waiting
+    t0 = lab.clock.monotonic()
+    assert rt.supervisor.check("x64").state is HealthState.UNRESOLVED  # no budget: the runtime's bound
+    assert lab.clock.monotonic() - t0 <= SUPERVISOR_RESOLVE_TIMEOUT_S
 
 
 # ── VM state cache (session_status fast path) ───────────────────────

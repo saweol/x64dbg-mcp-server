@@ -69,3 +69,20 @@ def test_a_fresh_live_list_serves_again(cache):
     cat.set_server_version("x64", "1.10")
     cat.update_from_live("x64", "1.10", builtin_tools(V110))
     assert cat.server_version("x64") == "1.10" and NEW_TOOLS <= names(cat)
+
+
+def test_an_id_less_lookup_ignores_a_stale_cached_list(tmp_path):
+    """Review: ``tool(name)`` without a backend id must apply the same build filter as
+    ``tools(backend_id)``: the stale v1.3 list must not answer lookups (or read-only
+    flags) for the v1.10 plugin, whose own list does."""
+    path = tmp_path / "cache"
+    legacy = ToolInfo("LegacyOnlyTool", "only in the old plugin", {"type": "object", "properties": {}}, True)
+    ToolCatalog(V19, cache_dir=path).update_from_live("x64", "1.3", [*builtin_tools(V19), legacy])
+    cat = ToolCatalog(V19, cache_dir=path)
+    assert cat.tool("LegacyOnlyTool", "x64") is not None  # control: served while nothing was reported
+    assert cat.tool("LegacyOnlyTool") is not None
+    cat.set_server_version("x64", "1.10")
+    assert cat.tool("LegacyOnlyTool", "x64") is None
+    assert cat.tool("LegacyOnlyTool") is None
+    assert cat.tool("GetServerInfo") is not None  # the list the backend serves now
+    assert cat.is_read_only("GetServerInfo") is True

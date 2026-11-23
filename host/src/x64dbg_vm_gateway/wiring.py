@@ -18,7 +18,8 @@ a backend (guest IP + token), its entry in ``Runtime.clients`` is an
 share that dict) always find every configured backend id. The placeholder
 refuses calls with ``VmNotReady`` and is marked ``unresolved``: the supervisor
 resolves clients itself through ``Runtime.connect`` (its ``resolve`` hook, bounded
-by ``SUPERVISOR_RESOLVE_TIMEOUT_S``) and never probes a placeholder.
+by the supervisor caller's remaining budget, at most ``SUPERVISOR_RESOLVE_TIMEOUT_S``)
+and never probes a placeholder.
 
 Token reads after a revert: ``connect(timeout_s=...)`` re-reads the guest token
 while VMware Tools are not running (guest operations fail with ToolsNotRunning
@@ -135,7 +136,8 @@ TOKEN_READ_WAIT_S = 180.0
 VERSION_PROBE_TIMEOUT_S = 2.0
 #: Interval of the token re-reads while VMware Tools are not running (``connect(timeout_s=...)``).
 TOKEN_RETRY_POLL_S = 2.0
-#: Bound of the supervisor's own resolution (``Runtime.connect`` as its ``resolve`` hook).
+#: Bound of the supervisor's own resolution (``Runtime.connect`` as its ``resolve`` hook) when
+#: its caller gives no budget; a smaller remaining budget of the caller wins.
 SUPERVISOR_RESOLVE_TIMEOUT_S = 20.0
 #: How long status polling may answer from an earlier VM power / Tools observation (E6).
 VM_STATE_TTL_S = 3.0
@@ -876,9 +878,13 @@ def build_runtime(
     def hang_hook(backend_id: str, report: HealthReport) -> None:
         holder["rt"]._on_hang(backend_id, report)
 
-    def resolve(backend_id: str) -> BackendClient:
-        # the supervisor probes resolved clients only (never the UnresolvedClient placeholder)
-        return holder["rt"].connect(backend_id, wait=True, timeout_s=SUPERVISOR_RESOLVE_TIMEOUT_S)
+    def resolve(backend_id: str, timeout_s: float | None = None) -> BackendClient:
+        # The supervisor probes resolved clients only (never the UnresolvedClient placeholder).
+        # Its caller's remaining budget bounds the token re-reads; 0 means one read, no waiting.
+        bound = SUPERVISOR_RESOLVE_TIMEOUT_S
+        if timeout_s is not None:
+            bound = min(bound, max(0.0, timeout_s))
+        return holder["rt"].connect(backend_id, wait=True, timeout_s=bound)
 
     sup_opts = dict(supervisor_options or {})
     sup_opts.setdefault("resolve", resolve)

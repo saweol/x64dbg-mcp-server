@@ -535,10 +535,10 @@ def test_serialisation_lock_is_released_before_recovery(catalog, client, sup):
         def __init__(self, inner: Supervisor) -> None:
             self._inner = inner
 
-        def check(self, backend_id: str):  # type: ignore[no-untyped-def]
+        def check(self, backend_id: str, **kw: Any):  # type: ignore[no-untyped-def]
             in_check.set()
             release.wait(5)
-            return self._inner.check(backend_id)
+            return self._inner.check(backend_id, **kw)
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._inner, name)
