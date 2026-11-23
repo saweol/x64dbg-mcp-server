@@ -66,7 +66,7 @@ def wire_tools(version: str) -> list[dict[str, Any]]:
              "_debug_only": bool(t.get("debug_only", False))} for t in data["tools"]]
 
 
-def make_pe(*, machine: int = 0x8664, dll: bool = False, pad: bytes = b"") -> bytes:
+def make_pe(*, machine: int = 0x8664, dll: bool = False, pad: bytes = b"", image_base: int = 0) -> bytes:
     """Minimal structurally valid PE image (headers + one raw section)."""
     magic = 0x20B if machine == 0x8664 else 0x10B
     dd_rel = 112 if magic == 0x20B else 96
@@ -80,6 +80,10 @@ def make_pe(*, machine: int = 0x8664, dll: bool = False, pad: bytes = b"") -> by
     opt = bytearray(size_opt)
     struct.pack_into("<H", opt, 0, magic)
     struct.pack_into("<I", opt, dd_rel - 4, 16)
+    if magic == 0x20B:
+        struct.pack_into("<Q", opt, 24, image_base)  # IMAGE_OPTIONAL_HEADER64.ImageBase
+    else:
+        struct.pack_into("<I", opt, 28, image_base)  # IMAGE_OPTIONAL_HEADER32.ImageBase
     headers_len = len(dos) + len(fh) + size_opt + 40
     raw_ptr = (headers_len + 0x1FF) & ~0x1FF
     sect = struct.pack("<8sIIIIIIHHI", b".text", 0x1000, 0x1000, 0x200, raw_ptr, 0, 0, 0, 0, 0x60000020)
@@ -103,6 +107,8 @@ class FakeLab:
     gateways: list[Gateway] = field(default_factory=list)
     runtimes: list[Runtime] = field(default_factory=list)
     vmrun_path: str = "/usr/bin/vmrun"
+    #: what the fake SaveDatabase writes (tests put an x64dbg JSON database here)
+    db_content: bytes = b"x64dbg database"
 
     @property
     def profile(self) -> ProfileConfig:
@@ -167,9 +173,10 @@ class FakeLab:
         self.guest.write(CFG[backend_id], data)
 
     def sample(self, name: str = "sample.exe", *, machine: int = 0x8664, dll: bool = False,
-               data: bytes | None = None) -> Path:
+               data: bytes | None = None, image_base: int = 0) -> Path:
         p = self.samples / name
-        p.write_bytes(data if data is not None else make_pe(machine=machine, dll=dll, pad=name.encode()))
+        p.write_bytes(data if data is not None
+                      else make_pe(machine=machine, dll=dll, pad=name.encode(), image_base=image_base))
         return p
 
     def close(self) -> None:
@@ -234,9 +241,16 @@ def make_lab(
     return lab
 
 
+#: Runtime bases the fake debugger reports in ListModules (the sample, then ntdll.dll).
+SAMPLE_BASE, SAMPLE_SIZE = 0x00400000, 0x2000
+NTDLL_BASE, NTDLL_SIZE = 0x7FF800000000, 0x1F0000
+
+
 def _install_debugger_behaviour(lab: FakeLab, backend_id: str) -> None:
-    """LoadBinary remembers the file; SaveDatabase writes a database file into the guest
-    (``filePath`` when given, else x64dbg's default ``<exe dir>\\db\\<file name>.dd64``)."""
+    """LoadBinary remembers the file; SaveDatabase writes ``lab.db_content`` into the guest
+    (``filePath`` when given, else x64dbg's default ``<exe dir>\\db\\<file name>.dd64``);
+    ListModules reports the loaded file at ``SAMPLE_BASE`` and ntdll.dll, in the plugin's
+    ``0x{base:X} | 0x{size:X} | {name}`` format."""
     srv = lab.servers[backend_id]
     loaded: dict[str, str] = {}
     ext = "dd64" if backend_id == "x64" else "dd32"
@@ -250,10 +264,15 @@ def _install_debugger_behaviour(lab: FakeLab, backend_id: str) -> None:
         if not path:
             name = loaded.get("path", "unknown").rsplit("\\", 1)[-1]
             path = f"{EXE[backend_id].rsplit(chr(92), 1)[0]}\\db\\{name}.{ext}"
-        lab.guest.write(path, b"x64dbg database")
+        lab.guest.write(path, lab.db_content)
         return f"Database saved to {path}"
+
+    def modules(args: dict[str, Any]) -> str:
+        name = loaded.get("path", "").rsplit("\\", 1)[-1] or "sample.exe"
+        return (f"0x{SAMPLE_BASE:08X} | 0x{SAMPLE_SIZE:08X} | {name}\n"
+                f"0x{NTDLL_BASE:X} | 0x{NTDLL_SIZE:X} | ntdll.dll")
 
     srv.on_tool("LoadBinary", load)
     srv.on_tool("SaveDatabase", save)
-    srv.on_tool("ListModules", "0x00400000 0x00001000 sample.exe\n0x7ff800000000 0x001f0000 ntdll.dll")
+    srv.on_tool("ListModules", modules)
     srv.on_tool("WaitForPause", "Debugger paused at 0x7ff800001234 (system breakpoint)")

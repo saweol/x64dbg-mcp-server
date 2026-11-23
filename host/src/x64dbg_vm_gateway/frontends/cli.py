@@ -26,6 +26,15 @@ imported lazily inside the commands, so importing this module stays cheap and
 tests can substitute them through ``sys.modules``. ``jobs`` reads the
 ``state.json`` files directly (read-only, no store lock) so it also works while
 a gateway is serving.
+
+A serving gateway holds the jobs root (``JobStore`` process lock). Commands
+that need it (``discard``, ``status``, ``doctor``, ``provision``,
+``install-plugin``) then fail with LOCK_TIMEOUT naming the gateway's pid and
+what to do instead (stop it, or use its MCP tools). ``provision`` and
+``install-plugin`` claim the jobs root first (so they never run next to a
+serving gateway), pause supervision and hold the VM write lock while they
+change the guest; after a plugin install (or a provisioning reboot) every
+backend starts a new epoch and cached clients/tokens are dropped.
 """
 
 from __future__ import annotations
@@ -46,7 +55,7 @@ from typing import Any, TextIO
 
 from .. import config as gw_config
 from .. import platform as gw_platform
-from ..errors import ConfigError, GatewayError, JobNotFound, StateViolation, VmrunNotFound
+from ..errors import ConfigError, GatewayError, JobNotFound, LockTimeout, StateViolation, VmrunNotFound
 from ..jobs import DISCARD_ACTOR, JOB_ID_RE, Job, validate_job_id
 from ..proxy import sanitize_untrusted_text
 from .tool_defs import InternalError
@@ -67,6 +76,16 @@ _BACKEND_LAYOUT = (  # (id, port, subdirectory, executable, scheduled task)
     ("x32", 9095, "x32", "x32dbg.exe", "MCP-x32dbg"),
 )
 _MAX_STATE_BYTES = 16 * 1024 * 1024
+VM_LOCK_TIMEOUT_S = 120.0  # wait for the VM write lock (in-process VM operations finish first)
+_SERVING_ADVICE = {
+    "discard": "stop that gateway first (discard is human-only and has no MCP tool), run discard again, "
+               "then start the gateway again",
+    "status": "use the running gateway's MCP tool session_status instead, or stop the gateway first",
+    "doctor": "use the running gateway's MCP tool gateway_doctor instead, or stop the gateway first",
+    "provision": "stop that gateway first: provisioning reboots the guest and must not run next to it",
+    "install-plugin": "stop that gateway first: installing the plugin kills and relaunches the debuggers",
+    "serve": "a gateway is already serving this jobs root: connect to it, or stop it first",
+}
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:\\")
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -178,6 +197,64 @@ def _runtime(app: Any, profile: str | None) -> Any:
     if runtime is None:
         raise InternalError("this gateway build cannot provision guests (no runtime access)", stage="cli")
     return runtime(profile)
+
+
+def _claim_jobs_root(app: Any) -> None:
+    """Open the gateway's job store now: fails (LOCK_TIMEOUT naming the pid) while another
+    gateway process serves the same jobs root, before anything in the guest changes."""
+    opener = getattr(app, "open", None)
+    if callable(opener):
+        opener()
+
+
+@contextlib.contextmanager
+def _holding_vm(runtime: Any) -> Iterator[None]:
+    """Supervision paused and the VM write lock held (like the gateway's own VM operations),
+    so no relaunch or backend call of this process races with the guest changes."""
+    with runtime.supervisor.paused(), runtime.lock.write(timeout_s=VM_LOCK_TIMEOUT_S):
+        yield
+
+
+def _new_epochs(app: Any, runtime: Any, profile: str | None, reason: str) -> list[str]:
+    """The debuggers were killed/relaunched: every backend starts a new epoch, cached clients
+    and tokens are dropped (the next connect re-reads them). The epochs live in this process
+    only, so the job store records it too: the profile's jobs whose debugger held the sample
+    get ``flags.debuggee_lost`` (``Gateway.note_debuggers_restarted``); returns their ids."""
+    for bid in list(runtime.backends):
+        runtime.supervisor.bump_epoch(bid, reason)
+    invalidate = getattr(runtime, "invalidate_clients", None)
+    if callable(invalidate):
+        invalidate(drop_tokens=True, reason=reason)
+    note = getattr(app, "note_debuggers_restarted", None)
+    return list(note(profile, reason)) if callable(note) else []
+
+
+def _report_lost(result: Any, lost: list[str], out: _Output) -> Any:
+    """Name the jobs whose debuggee is gone (stderr, and in the result as debuggee_lost_jobs)."""
+    if not lost:
+        return result
+    for job_id in lost:
+        out.note(f"job {job_id}: the debuggers were restarted, its sample is no longer loaded")
+    return {**result, "debuggee_lost_jobs": lost} if isinstance(result, Mapping) else result
+
+
+def _explain(err: GatewayError, command: str) -> GatewayError:
+    """A jobs root held by a serving gateway: say which process and what to do instead."""
+    if not isinstance(err, LockTimeout) or "owner_pid" not in err.details:
+        return err
+    pid, host = err.details.get("owner_pid"), err.details.get("owner_host")
+    who = f"pid {pid}" if pid is not None else "pid unknown"
+    if host:
+        who += f" on {host}"
+    advice = _SERVING_ADVICE.get(command, "stop the running gateway first, or use its MCP tools")
+    lock = err.details.get("lock")
+    if lock:
+        advice += f". Lock file: {lock} (delete it by hand only if no gateway runs)"
+    return LockTimeout(
+        f"another x64dbg-vm-gateway process ({who}) is serving this jobs root; `{command}` "
+        "cannot run next to it",
+        stage="cli", hint=advice, details=dict(err.details),
+    )
 
 
 def _is_windows_abs(path: str) -> bool:
@@ -372,17 +449,23 @@ def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
         )
     provision = _import("provision")
     with _app(args, config) as app:
-        result = provision.provision_guest(
-            _runtime(app, args.profile),
-            x64dbg_root=x64dbg_root,
-            user=user,
-            password=password,
-            autologon=autologon,
-            bind=args.bind,
-            reboot=not args.no_reboot,
-            wait_ready_s=float(args.wait_ready),
-            clean_snapshot=args.snapshot,
-        )
+        _claim_jobs_root(app)
+        runtime = _runtime(app, args.profile)
+        with _holding_vm(runtime):
+            result = provision.provision_guest(
+                runtime,
+                x64dbg_root=x64dbg_root,
+                user=user,
+                password=password,
+                autologon=autologon,
+                bind=args.bind,
+                reboot=not args.no_reboot,
+                wait_ready_s=float(args.wait_ready),
+                clean_snapshot=args.snapshot,
+            )
+            if isinstance(result, Mapping) and result.get("rebooted") is True:
+                lost = _new_epochs(app, runtime, args.profile, "guest rebooted by provision")
+                result = _report_lost(result, lost, out)
     out.data(result)
     return EXIT_OK if _result_ok(result) else EXIT_FAILURE
 
@@ -395,8 +478,15 @@ def cmd_install_plugin(args: argparse.Namespace, out: _Output) -> int:
     config = _load_config(args)
     provision = _import("provision")
     with _app(args, config) as app:
-        result = provision.install_plugin(_runtime(app, args.profile), dist_dir=dist, x64dbg_root=x64dbg_root,
-                                          relaunch=not args.no_relaunch)
+        _claim_jobs_root(app)
+        runtime = _runtime(app, args.profile)
+        with _holding_vm(runtime):
+            result = provision.install_plugin(runtime, dist_dir=dist, x64dbg_root=x64dbg_root,
+                                              relaunch=not args.no_relaunch)
+            if _result_ok(result):
+                lost = _new_epochs(app, runtime, args.profile,
+                                   "plugin reinstalled (debuggers killed and relaunched)")
+                result = _report_lost(result, lost, out)
     out.data(result)
     return EXIT_OK if _result_ok(result) else EXIT_FAILURE
 
@@ -797,7 +887,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(sys.stderr, f"{PROG} {args.command}: error: {e}")
         return EXIT_USAGE
     except GatewayError as e:
-        out.error(e)
+        out.error(_explain(e, args.command))
         return EXIT_FAILURE
     except KeyboardInterrupt:
         out.note("interrupted")

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import enum
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -242,11 +242,10 @@ class BackendClient(Protocol):
     BackendTimeout, BackendProtocolError. Must never retry by itself.
     ``health_l1``/``health_l2`` return False for unreachable, slow or malformed
     backends but RAISE BackendAuthError on HTTP 401 so AUTH can be told apart from DEAD.
-    Implementations may additionally offer ``update_token(token: Secret)`` and
-    ``server_info(timeout_s) -> dict`` (HttpBackendClient does); callers must
-    feature-test them with ``getattr`` because they are not part of this Protocol.
-    ``cancel_all()`` must unblock every in-flight call within ~1s (used when a
-    VM operation preempts backend traffic).
+    Implementations may additionally offer ``update_token(token: Secret)`` (callers
+    feature-test it with ``getattr``) and the ``VersionReportingClient`` extension
+    (HttpBackendClient offers both). ``cancel_all()`` must unblock every in-flight call
+    within ~1s (used when a VM operation preempts backend traffic).
     """
 
     endpoint: BackendEndpoint
@@ -258,6 +257,21 @@ class BackendClient(Protocol):
     def call_tool(self, name: str, arguments: Mapping[str, Any] | None,
                   timeout_s: float) -> ToolCallResult: ...
     def cancel_all(self) -> None: ...
+
+
+@runtime_checkable
+class VersionReportingClient(Protocol):
+    """Optional ``BackendClient`` extension: the plugin version (``GET /`` / ``initialize``).
+
+    The runtime checks it with ``isinstance`` and uses it to pick the builtin tool list
+    of the backend's plugin version (``catalog``): ``server_info`` is the first-contact
+    probe, ``on_server_version(callback)`` registers ``callback(version)`` for every
+    version the client sees (also at once when one is already known). A client without
+    it keeps the catalog's default list until a live tool list reports a version.
+    """
+
+    def server_info(self, timeout_s: float = 2.0) -> dict[str, Any]: ...
+    def on_server_version(self, callback: Callable[[str], None]) -> None: ...
 
 
 # ── jobs ────────────────────────────────────────────────────────────

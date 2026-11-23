@@ -17,8 +17,10 @@ EXPECTED = {
     "session_status", "gateway_doctor", "vm_snapshots_list", "vm_snapshot_take", "vm_snapshot_revert",
     "vm_snapshot_delete", "vm_power", "vm_screenshot", "file_upload", "file_download", "debugger_select",
     "debugger_restart", "debugger_call", "analysis_start", "analysis_collect", "analysis_finish",
-    "ida_rebase", "ida_export_annotations", "ida_import_annotations",
+    "ida_rebase", "ida_export_annotations", "ida_import_annotations", "jobs_list", "jobs_show",
 }
+#: tools whose GatewayApp method has another name
+METHODS = {"gateway_doctor": "doctor", "jobs_list": "list_jobs", "jobs_show": "get_job"}
 
 
 def test_exactly_the_gateway_tools_are_defined():
@@ -57,9 +59,17 @@ def test_schema_matches_the_gateway_app_method_signature(tool):
 
 
 def test_method_mapping():
-    assert TOOLS_BY_NAME["gateway_doctor"].method == "doctor"
-    for name in EXPECTED - {"gateway_doctor"}:
-        assert TOOLS_BY_NAME[name].method == name
+    for name in EXPECTED:
+        assert TOOLS_BY_NAME[name].method == METHODS.get(name, name)
+
+
+def test_job_views_are_read_only_tools():
+    # a second process cannot open the job store a serving gateway holds: its clients read
+    # the jobs through these tools (J-integ review)
+    for name in ("jobs_list", "jobs_show"):
+        tool = TOOLS_BY_NAME[name]
+        assert tool.tier is RiskTier.OBSERVE and tool.annotations["readOnlyHint"] is True
+    assert TOOLS_BY_NAME["jobs_show"].input_schema["required"] == ["job_id"]
 
 
 @pytest.mark.parametrize("tool", GATEWAY_TOOLS, ids=lambda t: t.name)
@@ -179,6 +189,49 @@ def test_ida_rebase_accepts_int_and_string_addresses():
         assert kw["address"] == addr
 
 
+# ── IDA tools follow ida_sync's item shape (J-integ) ────────────────
+IMPORT = "ida_import_annotations"
+
+
+def _import_args(*items: object) -> dict:
+    return {"items": list(items), "module": "sample.exe", "ida_imagebase": "0x140000000"}
+
+
+@pytest.mark.parametrize("item", [
+    {"rva": "0x1000", "name": "decrypt"},
+    {"rva": 4096, "comment": "x"},
+    {"ida_address": "0x140001000", "name": "decrypt", "comment": "c"},
+    # items of an x64dbg-ida-sync/1 export document are accepted as they are
+    {"rva": "0x1010", "comment": "c", "bookmark": True, "breakpoint": {"type": "normal", "enabled": True}},
+])
+def test_import_items_accept_ida_sync_items(item):
+    kw = tool_defs.check_arguments(TOOLS_BY_NAME[IMPORT], _import_args(item))
+    assert kw["items"] == [item]
+
+
+@pytest.mark.parametrize(("item", "fragment"), [
+    ({"address": "0x401000", "name": "f"}, "items/0"),  # the old, never-implemented shape
+    ({"name": "f"}, "items/0"),
+    ({"rva": 1.5, "name": "f"}, "items/0/rva"),
+    ({"rva": "0x10", "name": 5}, "items/0/name"),
+])
+def test_import_items_reject_other_shapes(item, fragment):
+    with pytest.raises(tool_defs.InvalidArguments) as ei:
+        tool_defs.check_arguments(TOOLS_BY_NAME[IMPORT], _import_args(item))
+    assert any(e["path"].startswith(fragment) for e in ei.value.details["errors"])
+
+
+def test_ida_tool_descriptions_name_the_real_mechanics():
+    imp = TOOLS_BY_NAME[IMPORT]
+    item = imp.input_schema["properties"]["items"]["items"]
+    assert {"rva", "ida_address", "name", "comment"} <= set(item["properties"])
+    assert "CommentOrLabelAtAddress" in imp.description and "ida_address" in imp.description
+    exp = TOOLS_BY_NAME["ida_export_annotations"].description
+    assert "ida_sync.json" in exp and "SaveDatabase" in exp and "x64dbg-ida-sync/1" in exp
+    reb = TOOLS_BY_NAME["ida_rebase"].description
+    assert "ListModules" in reb and "ida_imagebase" in reb
+
+
 def test_frontend_error_codes():
     assert tool_defs.InvalidArguments("x").code == "INVALID_ARGUMENTS"
     assert tool_defs.UnknownTool("x").code == "UNKNOWN_TOOL"
@@ -210,7 +263,7 @@ def test_wait_s_upper_bound_is_accepted():
 
 @pytest.mark.parametrize("name,args,path", [
     ("debugger_call", {"tool": "run", "arguments": {"timeoutMs": float("nan")}}, "arguments/timeoutMs"),
-    ("ida_import_annotations", {"items": [{"address": float("inf")}], "module": "a.exe"}, "items/0/address"),
+    ("ida_import_annotations", {"items": [{"rva": float("inf")}], "module": "a.exe"}, "items/0/rva"),
 ])
 def test_non_finite_numbers_are_rejected_anywhere(name, args, path):
     with pytest.raises(tool_defs.InvalidArguments) as ei:

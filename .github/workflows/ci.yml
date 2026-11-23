@@ -41,3 +41,34 @@ jobs:
 
       - name: Build x32 and x64 plugins
         run: zig build -Doptimize=ReleaseSafe
+
+  host:
+    name: Host gateway (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The gateway runs on Linux, Windows and macOS hosts (plan 6.3); the unit
+        # suite uses fakes only, so every OS runs it without VMware.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: host/uv.lock
+
+      - name: Install dependencies (uv sync, lock must be current)
+        run: uv sync --locked
+
+      - name: Run tests (includes ida/tests through a subprocess test)
+        run: uv run pytest -q
+
+      - name: Lint
+        run: uv run ruff check src tests

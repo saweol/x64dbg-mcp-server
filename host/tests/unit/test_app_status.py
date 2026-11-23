@@ -214,10 +214,11 @@ def test_debugger_call_validates_the_tool_name(lab):
     lambda gw: gw.ida_export_annotations(),
     lambda gw: gw.ida_import_annotations([], module="a.exe"),
 ])
-def test_ida_tools_are_not_wired_yet(lab, call):
+def test_ida_tools_need_a_job(lab, call):
+    # The IDA tools are wired now (J-integ, see test_app_ida); this pinned the old stub.
     with pytest.raises(GatewayError) as ei:
         call(lab.gateway())
-    assert "later step" in ei.value.message and ei.value.hint
+    assert ei.value.code == "STATE_VIOLATION" and ei.value.next_tool == "analysis_start"
 
 
 def test_close_is_idempotent(lab):

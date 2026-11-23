@@ -1746,3 +1746,33 @@ def test_collect_through_vix_channel(vix, fake_guest, ps, tmp_path, fake_clock):
     assert m.partial
     leftovers = [k for k in fake_guest.files if k.endswith(".txt") and "x64gw" in k]
     assert leftovers == []
+
+
+# ── fetch_file: the bounded fetch as a public function (J-integ review) ─
+_PS_EXE = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+
+def test_fetch_file_copies_one_guest_file_privately(fake_guest, ps, tmp_path):
+    data = os.urandom(300)
+    fake_guest.mkdir(JOB_DIR)
+    fake_guest.write(f"{JOB_DIR}\\out\\db.dd64", data)
+    dest = tmp_path / "artifacts" / "db.dd64"
+    dest.parent.mkdir()
+    digest, size = transfer.fetch_file(fake_guest, _PS_EXE, JOB_DIR, FetchLimits(max_file_bytes=400),
+                                       f"{JOB_DIR}\\out\\db.dd64", dest)
+    assert (digest, size) == (_sha(data), 300) and dest.read_bytes() == data
+    if os.name == "posix":
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+    assert sorted(p.name for p in dest.parent.iterdir()) == ["db.dd64"]  # no scratch or .part left
+
+
+def test_fetch_file_refuses_a_file_over_the_limit_before_copying(fake_guest, ps, tmp_path):
+    fake_guest.mkdir(JOB_DIR)
+    big = f"{JOB_DIR}\\out\\big.dd64"
+    fake_guest.write(big, os.urandom(500))
+    dest = tmp_path / "big.dd64"
+    with pytest.raises(TransferError) as ei:
+        transfer.fetch_file(fake_guest, _PS_EXE, JOB_DIR, FetchLimits(max_file_bytes=400), big, dest)
+    assert ei.value.details["reason"] == "too-large"
+    assert big not in [a[0] for a, _ in fake_guest.calls_of("copy_from_guest")]
+    assert not dest.exists() and list(tmp_path.iterdir()) == []

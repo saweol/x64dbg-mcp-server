@@ -34,6 +34,7 @@ from typing import Any
 
 import jsonschema
 
+from .. import ida_sync
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_of
 
@@ -84,6 +85,8 @@ LOCAL_TIERS: Mapping[str, RiskTier] = MappingProxyType({
     "ida_rebase": RiskTier.OBSERVE,
     "ida_export_annotations": RiskTier.GUEST_MUTATE,
     "ida_import_annotations": RiskTier.GUEST_MUTATE,
+    "jobs_list": RiskTier.OBSERVE,
+    "jobs_show": RiskTier.OBSERVE,
 })
 """Tiers of gateway tools that ``policy.GATEWAY_TOOL_TIERS`` does not list."""
 
@@ -213,6 +216,23 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "modal dialog or a crash window in the guest. Read-only for the VM (only writes the image file).",
         _obj({"profile": _PROFILE}),
     ),
+    _def(
+        "jobs_list", "List analysis jobs",
+        "List every analysis job the gateway knows, oldest first, finished ones included, optionally of one "
+        "profile: job_id, state, sample (name, sha256, arch), backend, epoch, host and guest job "
+        "directories, manifest path and flags; corrupt lists job directories whose state is unreadable. "
+        "Use it to find an earlier job's results or id (e.g. for ida_export_annotations). Read-only.",
+        _obj({"profile": _str("Only jobs of this gateway profile. Omit for every profile.")}),
+        method="list_jobs",
+    ),
+    _def(
+        "jobs_show", "Show analysis job",
+        "Show one analysis job: everything jobs_list reports plus its state history and, when an "
+        "interrupted job needs attention after a gateway restart, needs_recovery with a recovery_hint and "
+        "the next_tool to call. Read-only.",
+        _obj({"job_id": _str("Job id (YYYYMMDD-HHMMSS-xxxxxx).")}, ("job_id",)),
+        method="get_job",
+    ),
     # VM control
     _def(
         "vm_snapshot_take", "Take VM snapshot",
@@ -247,8 +267,10 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "vm_power", "VM power",
         "Change the VM's power state: start (boot or resume headless), stop, suspend or reset. Side effects: "
         "stop and reset are IRREVERSIBLE for unsaved guest state (like pulling the plug: the debuggee, the "
-        "debugger state and uncollected artifacts in memory are lost); suspend keeps memory on disk. Refused "
-        "while a job holds uncollected results. Returns state='in_progress' if not done within wait_s.",
+        "debugger state and uncollected artifacts in memory are lost); suspend keeps memory on disk. stop, "
+        "suspend and reset are refused while a job holds uncollected results; start (e.g. to resume a VM "
+        "suspended by host sleep) is allowed during an analysis. Every action is refused while a job is "
+        "uploading, collecting or reverting. Returns state='in_progress' if not done within wait_s.",
         _obj({"action": {"type": "string", "enum": ["start", "stop", "suspend", "reset"],
                          "description": "Power action."},
               "profile": _PROFILE, "wait_s": _wait_s("the power change")}, ("action",)),
@@ -359,36 +381,63 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
     # IDA integration
     _def(
         "ida_rebase", "Rebase address for IDA",
-        "Convert an address between the debugger's runtime address space and an IDA database using the "
-        "job's module base map (recorded by analysis_collect): runtime_to_ida, ida_to_runtime, "
-        "runtime_to_rva, rva_to_runtime. Give module when the address is not inside the main module, and "
-        "ida_imagebase when the IDA database does not use the PE's preferred base. Read-only calculation.",
+        "Convert an address between x64dbg runtime addresses (ASLR), module RVAs and IDA addresses "
+        "(ida = ida_imagebase + rva): runtime_to_ida, ida_to_runtime, runtime_to_rva, rva_to_runtime. The "
+        "module map is a live ListModules of the job's debugger while the sample is loaded, else the map "
+        "analysis_collect recorded (result: module_map_source; warnings says when the recorded map stood in "
+        "for an unavailable live one, which may be stale). For runtime_* directions the module is "
+        "found by address; rva_to_runtime / ida_to_runtime need module (default: the sample). "
+        "ida_imagebase is the IDB image base (idaapi.get_imagebase()): required for ida_to_runtime; for "
+        "runtime_to_ida it defaults to the module's PE image base when the gateway knows it (the sample's). "
+        "Read-only (at most one ListModules call; a dead debugger is not restarted).",
         _obj({"address": _address("Address to convert: integer or hex string such as '0x140001000'."),
               "direction": {"type": "string",
                             "enum": ["runtime_to_ida", "ida_to_runtime", "runtime_to_rva", "rva_to_runtime"],
                             "description": "Conversion to perform."},
-              "module": _str("Module name (e.g. 'sample.exe' or 'kernel32.dll'). Omit for the sample."),
-              "ida_imagebase": _address("Image base of the IDA database. Omit for the PE's preferred base."),
+              "module": _str("Module name (e.g. 'sample.exe', 'kernel32.dll', or 'name@0x<base>' when a "
+                             "name is loaded twice). Omit for the sample (runtime_*: found by address)."),
+              "ida_imagebase": _address("Image base of the IDA database (idaapi.get_imagebase()). "
+                                        "Required for ida_to_runtime; omit for the PE image base otherwise."),
               "job_id": _JOB_ID}, ("address", "direction")),
     ),
     _def(
         "ida_export_annotations", "Export annotations for IDA",
-        "Export the debugger's labels, comments and breakpoints of the job's modules as RVA-based JSON under "
-        "the host job directory, ready to import into IDA, and return its path and counts. Side effects: "
-        "queries the debugger in the guest and writes the export file on the host.",
+        "Save the x64dbg database of the job's debugger (SaveDatabase: into the job out dir on plugin v1.10, "
+        "x64dbg's db folder before), copy it to the host and convert its labels, comments, bookmarks and "
+        "breakpoints into an x64dbg-ida-sync/1 document keyed by module + RVA at "
+        "<job host dir>/artifacts/ida_sync.json, for ida/x64dbg_sync.py (Import) or for ida-multi-mcp "
+        "(rename / set_comments at ida_imagebase + rva). Without a debug session the database collected by "
+        "analysis_collect is used. Returns host_path, item counts and the database used. An LZ4-compressed "
+        "database is refused with DATABASE_FORMAT (the hint says how to turn compression off). Side effects: "
+        "saves the debugger database in the guest and writes files under the host job directory. Returns "
+        "state='in_progress' if it takes longer than the call budget.",
         _obj({"job_id": _JOB_ID}),
     ),
     _def(
         "ida_import_annotations", "Import annotations from IDA",
-        "Apply names and comments from IDA to the running debugger: each item is an object such as "
-        "{address, name, comment} with an IDA address; addresses are rebased from ida_imagebase onto the "
-        "module's runtime base before they are set. Side effects: sets labels/comments in the guest "
-        "debugger (not persisted until analysis_collect saves the database).",
-        _obj({"items": {"type": "array", "items": {"type": "object"},
-                        "description": "Annotations to apply, e.g. [{address: '0x401000', name: 'decrypt', "
-                                       "comment: '...'}]."},
-              "module": _str("Module the IDA addresses belong to (e.g. 'sample.exe')."),
-              "ida_imagebase": _address("Image base of the IDA database. Omit for the PE's preferred base."),
+        "Apply names and comments from IDA to the job's running debugger through the plugin tool "
+        "CommentOrLabelAtAddress (mode Label / Comment). Each item has rva (inside module) or ida_address "
+        "(needs ida_imagebase) plus name and/or comment; items of an x64dbg-ida-sync/1 document are accepted "
+        "as they are, and bookmark/breakpoint-only items are skipped. Addresses are rebased onto the "
+        "module's current runtime base (live ListModules; the sample must be loaded), names are made "
+        "x64dbg-safe. One invalid item rejects the whole batch before anything is set. Returns applied / "
+        "failed / not_attempted counts per operation. Side effects: sets labels and comments in the guest "
+        "debugger (persisted only when the database is saved, e.g. by analysis_collect).",
+        _obj({"items": {"type": "array", "maxItems": ida_sync.MAX_ITEMS,
+                        "items": {"type": "object",
+                                  "properties": {
+                                      "rva": _address("Offset inside the module, e.g. '0x1234'."),
+                                      "ida_address": _address("Address in the IDB; needs ida_imagebase."),
+                                      "name": {"type": "string", "description": "Label to set."},
+                                      "comment": {"type": "string", "description": "Comment to set."},
+                                  },
+                                  "anyOf": [{"required": ["rva"]}, {"required": ["ida_address"]}]},
+                        "description": "Annotations, e.g. [{rva: '0x1000', name: 'decrypt_config'}, "
+                                       "{ida_address: '0x140001500', comment: 'C2 loop'}]."},
+              "module": _str("Module the items belong to (e.g. 'sample.exe' or the sample's '<sha12>.exe' "
+                             "as analysis_start reports it)."),
+              "ida_imagebase": _address("Image base of the IDA database (idaapi.get_imagebase()); required "
+                                        "when an item uses ida_address."),
               "job_id": _JOB_ID}, ("items", "module")),
         idempotent=True,
     ),

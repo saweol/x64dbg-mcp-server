@@ -143,8 +143,10 @@ def test_keyword_only_and_list_arguments_are_converted(app):
     async def go(c: Client) -> Any:
         await c.call_tool("analysis_start", {"sample_path": "/samples/a.exe", "arch": "x32", "revert": False})
         await c.call_tool("analysis_collect", {"extra_guest_paths": ["C:\\a", "C:\\b"]})
-        return await c.call_tool("ida_import_annotations", {"items": [{"address": "0x1000", "name": "f"}],
-                                                            "module": "a.exe", "ida_imagebase": 0x400000})
+        # items use ida_sync's shape: rva or ida_address (+ name / comment)
+        items = [{"ida_address": "0x401000", "name": "f"}]
+        return await c.call_tool("ida_import_annotations",
+                                 {"items": items, "module": "a.exe", "ida_imagebase": 0x400000})
 
     res = drive(mcp_server.build_server(app), go)
     assert payload(res) == {"applied": 1}
@@ -309,6 +311,8 @@ def test_scope_denies_calls_with_forbidden(app, scope, tool, args):
     ("read", "session_status", {}),
     ("read", "GetDebugState", {}),
     ("read", "ida_rebase", {"address": "0x1", "direction": "runtime_to_rva"}),
+    ("read", "jobs_list", {"profile": "lab"}),
+    ("read", "jobs_show", {"job_id": "20261123-101010-abcdef"}),
     ("analyze", "SetBreakpoint", {"address": "0x1"}),
     ("analyze", "analysis_start", {"sample_path": "/s/a.exe"}),
     ("admin", "vm_snapshot_delete", {"name": "gw-job-x"}),

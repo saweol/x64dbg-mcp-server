@@ -236,10 +236,12 @@ EXPECTED_TRANSITIONS = {
     S.LOADING: {S.ANALYZING, S.FAILED},
     S.ANALYZING: {S.ANALYZING, S.COLLECTING, S.FAILED},
     S.COLLECTING: {S.COLLECTED, S.COLLECTED_PARTIAL, S.FAILED},
-    S.COLLECTED: {S.REVERTING, S.ANALYZING, S.FAILED},
+    # -> DONE without REVERTING: analysis_finish(revert=False) (J-integ)
+    S.COLLECTED: {S.REVERTING, S.ANALYZING, S.FAILED, S.DONE},
     S.COLLECTED_PARTIAL: {S.COLLECTING, S.FAILED},
-    S.DISCARDED: {S.REVERTING, S.FAILED},
-    S.REVERTING: {S.DONE, S.FAILED},
+    S.DISCARDED: {S.REVERTING, S.FAILED, S.DONE},
+    # REVERTING -> REVERTING: an interrupted revert is redone (J-integ)
+    S.REVERTING: {S.DONE, S.FAILED, S.REVERTING},
     S.DONE: set(),
     S.FAILED: set(),
 }
@@ -258,8 +260,14 @@ def test_every_nonterminal_state_can_fail_and_terminal_states_are_final():
 
 
 def test_invariant_reverting_only_from_collected_or_discarded():
+    # The retry self-loop aside, REVERTING is entered only from a collected or discarded job.
     sources = {st for st, targets in TRANSITIONS.items() if S.REVERTING in targets}
-    assert sources == {S.COLLECTED, S.DISCARDED}
+    assert sources == {S.COLLECTED, S.DISCARDED, S.REVERTING}
+
+
+def test_done_only_after_a_collection_a_discard_or_a_revert():
+    sources = {st for st, targets in TRANSITIONS.items() if S.DONE in targets}
+    assert sources == {S.COLLECTED, S.DISCARDED, S.REVERTING}
 
 
 def test_invariant_discarded_is_never_a_transition_target():
@@ -425,6 +433,9 @@ def test_full_happy_path_records_history(store):
         (S.COLLECTED_PARTIAL, S.COLLECTING),
         (S.COLLECTING, S.COLLECTED_PARTIAL),
         (S.DISCARDED, S.REVERTING),
+        (S.COLLECTED, S.DONE),
+        (S.DISCARDED, S.DONE),
+        (S.REVERTING, S.REVERTING),
     ],
 )
 def test_special_edges_are_allowed(store, start, to):

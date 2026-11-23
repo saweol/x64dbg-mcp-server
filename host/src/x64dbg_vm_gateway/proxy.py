@@ -30,7 +30,10 @@ Rules applied to every ``Proxy.call``:
     issues the launch, so the client gets BACKEND_RESTARTED and the next mutating
     call is gated). The health check and the kill/launch guest commands are
     bounded by their own timeouts, so a failing call may overrun ``max_call_s``
-    by those (seconds, not the boot wait).
+    by those (seconds, not the boot wait). BACKEND_THROTTLED (HTTP 429, the
+    plugin's auth-failure lockout) is surfaced as it is: never retried, no health
+    check, no relaunch; a health check that finds the backend THROTTLED after
+    another failure does not relaunch it either.
 (e) Epoch gating: after a relaunch / VM revert, the first mutating call fails with
     BACKEND_RESTARTED without reaching the backend until ``ack()`` is called. The
     epoch read by the gate is the reference for the failure path, so a relaunch

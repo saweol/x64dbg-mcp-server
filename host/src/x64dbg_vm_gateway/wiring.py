@@ -41,13 +41,12 @@ import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import platform as gw_platform
 from .backend import HttpBackendClient
-from .catalog import ToolCatalog, default_cache_dir
+from .catalog import ToolCatalog, builtin_for_version, default_cache_dir, version_tuple
 from .config import BackendConfig, GatewayConfig, ProfileConfig, resolve_secret
 from .contracts import (
     BackendClient,
@@ -59,10 +58,19 @@ from .contracts import (
     SystemClock,
     ToolCallResult,
     ToolInfo,
+    VersionReportingClient,
     VmProvider,
     VmrunRunner,
 )
-from .errors import BackendAuthError, ConfigError, GuestOperationError, VmNotReady
+from .errors import (
+    BackendAuthError,
+    BackendError,
+    BackendThrottled,
+    CancelledByVmOp,
+    ConfigError,
+    GuestOperationError,
+    VmNotReady,
+)
 from .guest import VixChannel
 from .locks import VmOpLock
 from .proxy import Proxy
@@ -103,6 +111,8 @@ MAX_GUEST_CONFIG_BYTES = 64 * 1024
 GUEST_IP_TIMEOUT_S = 120.0
 #: How long ``connect`` waits for another thread's token read of the same backend.
 TOKEN_READ_WAIT_S = 180.0
+#: ``GET /`` timeout when a new client first learns the plugin version (``Runtime.connect``).
+VERSION_PROBE_TIMEOUT_S = 2.0
 _CONNECT_ATTEMPTS = 3
 BUILTIN_V1_9 = "data/tools-v1.9.json"
 BUILTIN_V1_10 = "data/tools-v1.10.json"
@@ -111,7 +121,6 @@ BUILTIN_V1_10 = "data/tools-v1.10.json"
 _SUPERVISOR_MAX_RESTARTS = int(inspect.signature(Supervisor).parameters["max_restarts_per_job"].default)
 
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_VERSION_RE = re.compile(r"\s*v?(\d+)\.(\d+)(?:\.\d+)*\s*")
 _VERSION_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 _BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
 
@@ -244,37 +253,26 @@ def parse_guest_token(data: bytes, backend_id: str) -> Secret:
 
 
 # ── tool catalog ────────────────────────────────────────────────────
-def _version_tuple(version: str | None) -> tuple[int, int] | None:
-    m = _VERSION_RE.fullmatch(version or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def _resource_exists(rel: str) -> bool:
-    try:
-        return resources.files("x64dbg_vm_gateway").joinpath(rel).is_file()
-    except (OSError, ModuleNotFoundError):
-        return False
-
-
 def builtin_catalog_for(version: str | None) -> str:
-    """Builtin tool list for a plugin version: v1.10+ -> tools-v1.10.json (when shipped),
-    anything else or unknown -> tools-v1.9.json."""
-    vt = _version_tuple(version)
-    if vt is not None and vt >= (1, 10) and _resource_exists(BUILTIN_V1_10):
-        return BUILTIN_V1_10
-    return BUILTIN_V1_9
+    """Builtin tool list for a plugin version (``catalog.builtin_for_version``): the newest
+    shipped list not newer than ``version``, else the oldest (tools-v1.9.json)."""
+    return builtin_for_version(version)
 
 
 def make_catalog(profile: ProfileConfig, cache_dir: Path | str | None = None) -> ToolCatalog:
-    """The profile's catalog (cache under ``<cache_dir>/<profile>``), whose builtin list
-    matches the newest plugin version seen in that cache."""
+    """The profile's catalog (cache under ``<cache_dir>/<profile>``).
+
+    Each backend uses the builtin list of its own plugin version (cached, then live,
+    see ``catalog``); backends never seen yet default to the list of the newest
+    version in that cache (the debuggers of one guest usually share a build).
+    """
     cdir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()
     cdir = cdir / profile.name
     probe = ToolCatalog(BUILTIN_V1_9, cache_dir=cdir)
-    versions = [v for v in (probe.server_version(b.id) for b in profile.backends) if _version_tuple(v)]
+    versions = [v for v in (probe.server_version(b.id) for b in profile.backends) if version_tuple(v)]
     if not versions:
         return probe
-    newest = max(versions, key=lambda v: _version_tuple(v) or (0, 0))
+    newest = max(versions, key=lambda v: version_tuple(v) or (0, 0))
     choice = builtin_catalog_for(newest)
     return probe if choice == BUILTIN_V1_9 else ToolCatalog(choice, cache_dir=cdir)
 
@@ -362,6 +360,7 @@ class Runtime:
     _token_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False, repr=False)
     _resolved: dict[str, str] = field(default_factory=dict, init=False, repr=False)  # backend -> url
     _catalog_epoch: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _probe_refused: set[str] = field(default_factory=set, init=False, repr=False)  # see _learn_version
 
     # ── backends ────────────────────────────────────────────────────
     def backend(self, backend_id: str) -> BackendConfig:
@@ -552,7 +551,38 @@ class Runtime:
             config_path=cfg.config,
             launch_task=cfg.launch_task,
         )
-        return self.client_factory(endpoint, clock=self.clock)
+        client = self.client_factory(endpoint, clock=self.clock)
+        if isinstance(client, VersionReportingClient):
+            # GET / (health checks) and initialize report the plugin version: the catalog then
+            # uses the builtin list of that version for this backend (catalog module docstring)
+            client.on_server_version(
+                lambda version, _bid=cfg.id: self.catalog.set_server_version(_bid, version)
+            )
+        return client
+
+    def _learn_version(self, backend_id: str, client: BackendClient) -> None:
+        """First contact: ask ``GET /`` for the plugin version (until the plugin has reported
+        one), so the tool flags are those of that version before the first call. Later
+        changes arrive through the client's version listener (health checks). Best effort: a
+        backend that does not answer is reported by the call or check that follows, and is
+        asked again by the next client. A probe the plugin refused (401: wrong token, 429:
+        locked out) is never repeated by this process: on v1.10 each one is a failed login
+        that prolongs the lockout, and clients are rebuilt after every revert."""
+        if not isinstance(client, VersionReportingClient):
+            return
+        if self.catalog.reported_version(backend_id) is not None:
+            return
+        with self._mutex:
+            if backend_id in self._probe_refused:
+                return
+        try:
+            client.server_info(timeout_s=VERSION_PROBE_TIMEOUT_S)  # its version listener does the rest
+        except (BackendAuthError, BackendThrottled) as e:
+            with self._mutex:
+                self._probe_refused.add(backend_id)
+            log.debug("backend %s: version probe refused (%s); not asking again", backend_id, e.code)
+        except (BackendError, CancelledByVmOp) as e:
+            log.debug("backend %s: version probe failed (%s)", backend_id, e.code)
 
     def connect(self, backend_id: str, *, wait: bool = True) -> BackendClient:
         """Return a usable client for ``backend_id``, resolving URL and token if needed.
@@ -582,7 +612,8 @@ class Runtime:
                 client = self._make_client(cfg, url, token)
                 self.clients[backend_id] = client
                 self._resolved[backend_id] = url
-                return client
+            self._learn_version(backend_id, client)  # backend I/O: outside the mutex
+            return client
         raise VmNotReady(
             f"backend {backend_id}: the endpoint changed while it was being resolved",
             stage="connect",

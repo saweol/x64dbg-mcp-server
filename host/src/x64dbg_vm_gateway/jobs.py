@@ -28,7 +28,9 @@ Invariants enforced here (plan 4.1):
 - Only the edges in ``TRANSITIONS`` are legal; terminal states are final.
 - ``DISCARDED`` is never a ``transition()`` target. Only ``discard()`` with
   ``actor == "human-cli"`` can enter it, so no MCP tool can skip collection.
-- ``REVERTING`` is entered only from ``COLLECTED`` or ``DISCARDED``.
+- ``REVERTING`` is entered only from ``COLLECTED`` or ``DISCARDED`` (plus its
+  own retry self-loop), and ``DONE`` only from those three: a job is never
+  finished before its artifacts were collected or a human discarded it.
 - A profile has at most one non-terminal job at a time. A job directory
   whose state cannot be read counts as live (fail closed): it blocks its
   profile (or every profile, if the profile is unknown) in ``create()`` and
@@ -109,10 +111,12 @@ TRANSITIONS: Mapping[JobState, frozenset[JobState]] = MappingProxyType({
     _S.ANALYZING: frozenset({_S.ANALYZING, _S.COLLECTING, _S.FAILED}),
     _S.COLLECTING: frozenset({_S.COLLECTED, _S.COLLECTED_PARTIAL, _S.FAILED}),
     # COLLECTED -> ANALYZING: keep analysing after an intermediate collect.
-    _S.COLLECTED: frozenset({_S.REVERTING, _S.ANALYZING, _S.FAILED}),
+    # COLLECTED / DISCARDED -> DONE: analysis_finish(revert=False), no revert happens.
+    _S.COLLECTED: frozenset({_S.REVERTING, _S.ANALYZING, _S.DONE, _S.FAILED}),
     _S.COLLECTED_PARTIAL: frozenset({_S.COLLECTING, _S.FAILED}),
-    _S.DISCARDED: frozenset({_S.REVERTING, _S.FAILED}),
-    _S.REVERTING: frozenset({_S.DONE, _S.FAILED}),
+    _S.DISCARDED: frozenset({_S.REVERTING, _S.DONE, _S.FAILED}),
+    # REVERTING -> REVERTING: an interrupted revert (gateway restart) is redone.
+    _S.REVERTING: frozenset({_S.REVERTING, _S.DONE, _S.FAILED}),
     _S.DONE: frozenset(),
     _S.FAILED: frozenset(),
 })

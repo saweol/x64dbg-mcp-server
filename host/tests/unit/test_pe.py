@@ -241,3 +241,23 @@ def test_sha256_file(tmp_path):
 def test_sha256_file_rejects_bad_chunk(tmp_path):
     with pytest.raises(ValueError):
         sha256_file(_write(tmp_path, b"x"), chunk=0)
+
+
+# ── preferred image base (IDA default image base, J-integ) ──────────
+_OPT = 0x80 + 24  # optional header offset for make_pe's default e_lfanew
+
+
+def test_image_base_of_a_pe32_plus_image(tmp_path):
+    data = bytearray(make_pe(machine=0x8664))
+    struct.pack_into("<Q", data, _OPT + 24, 0x140000000)
+    assert detect_pe(_write(tmp_path, bytes(data))).image_base == 0x140000000
+
+
+def test_image_base_of_a_pe32_image(tmp_path):
+    data = bytearray(make_pe(machine=0x14C))
+    struct.pack_into("<I", data, _OPT + 28, 0x400000)
+    assert detect_pe(_write(tmp_path, bytes(data))).image_base == 0x400000
+
+
+def test_image_base_is_none_without_one(tmp_path):
+    assert detect_pe(_write(tmp_path, b"not a pe")).image_base is None

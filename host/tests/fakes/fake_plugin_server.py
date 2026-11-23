@@ -23,6 +23,7 @@ Programming the fake::
     srv.set_delay("run", 5.0)                                # sleep before answering
     srv.close_without_response("run", times=1)               # drop the connection
     srv.set_raw_response("tools/list", 200, b"not json")     # arbitrary bytes
+    srv.lock_out(300)                                        # 429 + Retry-After (v1.10 lockout)
     srv.stop(); srv.restart()                                # refused while stopped
 
 Keys accepted by ``set_delay`` / ``close_without_response`` / ``set_raw_response``:
@@ -136,6 +137,7 @@ class FakePluginServer:
         self._raw: dict[str, _RawResponse] = {}
         self._log: list[RecordedRequest] = []
         self._release = threading.Event()  # set on stop(): delayed handlers return early
+        self._lockout: tuple[int, bool, bool] | None = None  # (retry_after_s, header, body)
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._port = 0
@@ -218,6 +220,22 @@ class FakePluginServer:
     def clear_raw_responses(self) -> None:
         with self._lock:
             self._raw.clear()
+
+    def lock_out(self, retry_after_s: int = 300, *, header: bool = True, body: bool = True) -> None:
+        """Answer every request with ``429 Too Many Requests`` before authentication, like the
+        v1.10 plugin's auth-failure lockout (http.zig ``lockedOutResponse``): ``Retry-After``
+        header (unless ``header=False``) and ``{"error", "retry_after_s"}`` body (unless
+        ``body=False``)."""
+        with self._lock:
+            self._lockout = (retry_after_s, header, body)
+
+    def unlock(self) -> None:
+        with self._lock:
+            self._lockout = None
+
+    def _locked_out(self) -> tuple[int, bool, bool] | None:
+        with self._lock:
+            return self._lockout
 
     def set_tools(self, tools: list[dict[str, Any]]) -> None:
         with self._lock:
@@ -375,6 +393,17 @@ def _make_handler(fake: FakePluginServer) -> type[BaseHTTPRequestHandler]:
                 pass
             self.close_connection = True
 
+        def _send_locked_out(self) -> bool:
+            lock = fake._locked_out()
+            if lock is None:
+                return False
+            retry_after_s, header, body = lock
+            payload = (json.dumps({"error": "Too many failed authentication attempts",
+                                   "retry_after_s": retry_after_s}).encode() if body
+                       else b'{"error":"Too many failed authentication attempts"}')
+            self._send(429, payload, {"Retry-After": str(retry_after_s)} if header else None)
+            return True
+
         def _send_json(self, obj: Any) -> None:
             self._send(200, json.dumps(obj).encode("utf-8"))
 
@@ -394,6 +423,8 @@ def _make_handler(fake: FakePluginServer) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             ok, auth = self._authorized()
             fake._record(RecordedRequest("GET", self.path, ok, auth, self.headers.get("Connection")))
+            if self._send_locked_out():
+                return
             if not ok:
                 self._send(401, b'{"error":"Unauthorized"}')
                 return
@@ -420,6 +451,8 @@ def _make_handler(fake: FakePluginServer) -> type[BaseHTTPRequestHandler]:
                     rec.tool = params.get("name")
                     rec.arguments = params.get("arguments")
             fake._record(rec)
+            if self._send_locked_out():
+                return
             if not ok:
                 self._send(401, b'{"error":"Unauthorized"}')
                 return

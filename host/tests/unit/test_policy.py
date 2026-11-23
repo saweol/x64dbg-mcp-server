@@ -105,7 +105,8 @@ def test_mirror_tools_tier_from_read_only_hint():
 
 # ── VM op invariants (plan 4.1 invariant 1, 2) ──────────────────────
 def test_vm_ops_and_busy_states_constants():
-    assert set(VM_OPS) == {"revert", "power", "snapshot_take", "snapshot_delete"}
+    # "power" was split (J-integ): starting/resuming is not destructive, stopping is.
+    assert set(VM_OPS) == {"revert", "power_start", "power_stop", "snapshot_take", "snapshot_delete"}
     assert set(VM_BUSY_STATES) == {S.UPLOADING, S.COLLECTING, S.REVERTING}
 
 
@@ -124,9 +125,9 @@ def test_every_op_refused_while_job_is_busy(op, state):
     assert ei.value.details["op"] == op
 
 
-@pytest.mark.parametrize("op", ["revert", "power"])
+@pytest.mark.parametrize("op", ["revert", "power_stop"])
 @pytest.mark.parametrize("state", list(S))
-def test_revert_and_power_only_when_collected_or_discarded(op, state):
+def test_revert_and_power_stop_only_when_collected_or_discarded(op, state):
     job = job_in(state)
     if state in (S.COLLECTED, S.DISCARDED) or state in TERMINAL_JOB_STATES:
         assert_vm_op_allowed(op, job)
@@ -134,6 +135,25 @@ def test_revert_and_power_only_when_collected_or_discarded(op, state):
         with pytest.raises(StateViolation) as ei:
             assert_vm_op_allowed(op, job)
         assert ei.value.details == {"job_id": JID, "state": state.value, "op": op}
+
+
+@pytest.mark.parametrize("state", list(S))
+def test_power_start_is_refused_only_while_busy(state):
+    """Starting/resuming loses nothing (a VM suspended by host sleep must be resumable while
+    ANALYZING); only the UPLOADING/COLLECTING/REVERTING steps keep it out."""
+    if state in VM_BUSY_STATES:
+        with pytest.raises(StateViolation) as ei:
+            assert_vm_op_allowed("power_start", job_in(state))
+        assert ei.value.details["op"] == "power_start"
+    else:
+        assert_vm_op_allowed("power_start", job_in(state))
+
+
+def test_power_start_is_allowed_while_analyzing_but_power_stop_is_not():
+    assert_vm_op_allowed("power_start", job_in(S.ANALYZING))
+    with pytest.raises(StateViolation) as ei:
+        assert_vm_op_allowed("power_stop", job_in(S.ANALYZING))
+    assert ei.value.next_tool == "analysis_collect"
 
 
 @pytest.mark.parametrize("op", ["snapshot_take", "snapshot_delete"])
@@ -146,7 +166,7 @@ def test_snapshot_ops_refused_only_while_busy(op, state):
         assert_vm_op_allowed(op, job_in(state))
 
 
-@pytest.mark.parametrize("op", ["delete", "", "REVERT", "start"])
+@pytest.mark.parametrize("op", ["delete", "", "REVERT", "start", "power"])  # "power" was split
 def test_unknown_vm_op_is_a_programming_error(op):
     with pytest.raises(ValueError):
         assert_vm_op_allowed(op, None)  # type: ignore[arg-type]

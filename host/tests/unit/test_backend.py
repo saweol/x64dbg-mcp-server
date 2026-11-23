@@ -11,12 +11,15 @@ import time
 import pytest
 
 from tests.fakes.fake_plugin_server import FakePluginServer, RpcError, ToolError
+from x64dbg_vm_gateway import backend as backend_mod
 from x64dbg_vm_gateway import contracts
 from x64dbg_vm_gateway.backend import HttpBackendClient
 from x64dbg_vm_gateway.contracts import BackendEndpoint, Secret, ToolCallResult
 from x64dbg_vm_gateway.errors import (
     BackendAuthError,
+    BackendError,
     BackendProtocolError,
+    BackendThrottled,
     BackendTimeout,
     BackendUnavailable,
     CancelledByVmOp,
@@ -329,6 +332,81 @@ def test_token_never_logged(client, server, caplog):
     assert TOKEN not in caplog.text
 
 
+# ── HTTP 429: auth-failure lockout of plugin v1.10 ──────────────────
+def test_lockout_429_maps_to_backend_throttled_with_retry_after(client, server):
+    server.lock_out(7)
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    err = ei.value
+    assert isinstance(err, BackendError)
+    assert err.code == "BACKEND_THROTTLED" and err.retryable is True
+    assert err.details["retry_after_s"] == 7 and err.details["status"] == 429
+    assert err.details["backend"] == "x64"
+    assert err.hint and "7" in err.hint
+    assert_no_token(err)
+
+
+def test_retry_after_falls_back_to_the_json_body(client, server):
+    server.lock_out(9, header=False)
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert ei.value.details["retry_after_s"] == 9
+
+
+def test_unknown_retry_after_is_none(client, server):
+    server.lock_out(9, header=False, body=False)
+    with pytest.raises(BackendThrottled) as ei:
+        client.initialize()
+    assert ei.value.details["retry_after_s"] is None
+
+
+@pytest.mark.parametrize("header", ["²", "١", "７", "1¹", "-3", "+3", "3.5"])
+def test_retry_after_header_takes_ascii_digits_only(header):
+    # http.client decodes headers as latin-1, so a guest can send b"\xb2" ('²'): str.isdigit()
+    # accepts it but int() raises ValueError (it escaped as an internal error); int() also
+    # parses other scripts' digits ('١', '７'). Such a header is ignored: the JSON body decides.
+    body = json.dumps({"retry_after_s": 5}).encode()
+    assert backend_mod._retry_after_s(header, body) == 5
+    assert backend_mod._retry_after_s(header, b"") is None
+
+
+def test_non_ascii_retry_after_on_the_wire_still_maps_to_throttled(client, server):
+    server.lock_out("²", body=False)  # type: ignore[arg-type]  # the header goes out as b"\xb2"
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert ei.value.details["retry_after_s"] is None
+
+
+def test_huge_retry_after_is_clamped(client, server):
+    server.lock_out(18446744073709551615)  # the plugin prints a u64
+    with pytest.raises(BackendThrottled) as ei:
+        client.list_tools()
+    assert ei.value.details["retry_after_s"] == backend_mod.MAX_RETRY_AFTER_S
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.health_l1(),
+    lambda c: c.health_l2(),
+    lambda c: c.server_info(),
+    lambda c: c.initialize(),
+    lambda c: c.list_tools(),
+    lambda c: c.call_tool("StepInto", {}, 5),
+], ids=["health_l1", "health_l2", "server_info", "initialize", "list_tools", "call_tool"])
+def test_every_request_kind_raises_throttled_instead_of_reporting_down(client, server, call):
+    # health_l1/health_l2 must not return False: "down" would make the supervisor relaunch.
+    server.lock_out(5)
+    with pytest.raises(BackendThrottled):
+        call(client)
+
+
+def test_throttled_client_recovers_after_the_lockout(client, server):
+    server.lock_out(1)
+    with pytest.raises(BackendThrottled):
+        client.health_l1()
+    server.unlock()
+    assert client.health_l1() is True
+
+
 # ── one connection per request ─────────────────────────────────────
 def test_each_request_uses_its_own_connection(client, server):
     for _ in range(3):
@@ -581,3 +659,19 @@ def test_cancel_before_an_immediately_completing_connect_is_not_lost(client, ser
     with pytest.raises(CancelledByVmOp):
         client.call_tool("GetDebugState", {}, timeout_s=5)
     assert server.tool_calls("GetDebugState") == []
+
+
+def test_http_client_offers_the_optional_version_contract(client):
+    # wiring picks the builtin tool list per backend through this optional protocol
+    assert isinstance(client, contracts.VersionReportingClient)
+    assert isinstance(client, contracts.BackendClient)
+
+
+def test_a_minimal_backend_client_is_not_version_reporting():
+    class Minimal:
+        endpoint = BackendEndpoint(id="x64", arch="x64", url="http://127.0.0.1:1/", token=Secret("t" * 32))
+
+        def server_info(self, timeout_s: float = 2.0) -> dict:  # no on_server_version
+            return {}
+
+    assert not isinstance(Minimal(), contracts.VersionReportingClient)

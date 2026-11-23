@@ -101,7 +101,8 @@ def tier_for_mirror(*, read_only: bool) -> RiskTier:
 
 
 # ── VM operation invariants (plan 4.1) ──────────────────────────────
-VmOp = Literal["revert", "power", "snapshot_take", "snapshot_delete"]
+VmOp = Literal["revert", "power_start", "power_stop", "snapshot_take", "snapshot_delete"]
+"""``power_start``: start or resume the VM. ``power_stop``: stop, suspend or reset it."""
 VM_OPS: frozenset[str] = frozenset(get_args(VmOp))
 
 VM_BUSY_STATES: frozenset[JobState] = frozenset({JobState.UPLOADING, JobState.COLLECTING, JobState.REVERTING})
@@ -110,7 +111,7 @@ VM_BUSY_STATES: frozenset[JobState] = frozenset({JobState.UPLOADING, JobState.CO
 REVERT_READY_STATES: frozenset[JobState] = frozenset({JobState.COLLECTED, JobState.DISCARDED})
 """Invariant 1: the only states from which the VM may be reverted (fail-closed collection)."""
 
-_STATE_GATED_OPS = frozenset({"revert", "power"})
+_STATE_GATED_OPS = frozenset({"revert", "power_stop"})
 
 
 def assert_vm_op_allowed(op: VmOp, active_job: Job | None) -> None:
@@ -118,8 +119,12 @@ def assert_vm_op_allowed(op: VmOp, active_job: Job | None) -> None:
 
     - With no live job, everything is allowed.
     - While the job is UPLOADING, COLLECTING or REVERTING, everything is refused.
-    - ``revert`` and ``power`` are refused unless the job is COLLECTED or
-      DISCARDED, so artifacts cannot be lost by reverting before collection.
+    - ``revert`` and ``power_stop`` are refused unless the job is COLLECTED or
+      DISCARDED, so artifacts cannot be lost by reverting (or by stopping the
+      debuggee) before collection.
+    - ``power_start`` loses nothing (a suspended VM resumes with its memory, an
+      off VM has nothing left to lose), so it is allowed in every other state,
+      ANALYZING included: a VM suspended by host sleep must be resumable.
 
     The orchestrator's own revert inside ``analysis_finish`` (the job is then
     REVERTING) is checked with ``assert_revert_for_job`` before it enters

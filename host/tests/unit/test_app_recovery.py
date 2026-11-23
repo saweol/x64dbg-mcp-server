@@ -77,16 +77,19 @@ def test_job_left_in_reverting_is_finished_after_a_restart(lab):
     assert gw2.session_status()["needs_recovery"] == [] and gw2.session_status()["job"] is None
 
 
-def test_job_left_in_reverting_can_be_finished_without_a_revert(lab):
+def test_job_left_in_reverting_is_not_finished_without_a_revert(lab):
+    # J-integ review: revert=False no longer passes REVERTING, so a job left there was being
+    # reverted; its VM state is unknown and only redoing the revert may close it
     gw1 = lab.gateway()
     job_id = gw1.analysis_start(str(lab.sample()))["job_id"]
     gw1.analysis_collect()
     crash_in(gw1, job_id, JobState.REVERTING)
     gw2 = lab.gateway()
     before = reverts(lab)
-    fin = gw2.analysis_finish(job_id, revert=False)
-    assert fin["state"] == JobState.DONE and fin["reverted"] is False
+    with pytest.raises(StateViolation):
+        gw2.analysis_finish(job_id, revert=False)
     assert reverts(lab) == before
+    assert gw2._jobs().get(job_id).state == JobState.REVERTING
 
 
 def test_job_left_in_collecting_is_collected_again_after_a_restart(lab):

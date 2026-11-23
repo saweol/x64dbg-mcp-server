@@ -31,6 +31,15 @@
   AllowExternal / AllowedClients when allowed_clients is given) are written
   first, every other key of an existing valid config is kept as it was.
 
+  x64dbg settings: [Engine] DisableDatabaseCompression=1 is written into the
+  debugger's ini file next to its exe (x64dbg.ini / x32dbg.ini), creating the
+  file, section or key as needed and keeping every other line, so databases
+  saved to x64dbg's default location are plain JSON (the gateway's
+  ida_export_annotations cannot read LZ4-compressed ones). The other lines are
+  kept byte for byte (any encoding) and the file is replaced in one step. The
+  summary's db_compression is read back from the file: 'disabled', or
+  'unverified' when the value did not stick.
+
   Results:
     C:\mcp\provision.log            progress log (no secrets), including the plugin
                                     build found in each plugins folder
@@ -100,6 +109,107 @@ function Read-ConfigObject([string]$ConfigPath) {
         }
     } catch { }
     return $out
+}
+
+function Read-IniText([string]$Path) {
+    # The ini file as @{ Lines (List[string]); Prefix (BOM bytes); Encoding }, empty when
+    # missing. Byte-preserving: a UTF-16 file (BOM) is decoded as UTF-16; any other file as
+    # Latin-1, which maps every byte to one char, so UTF-8 and ANSI text (e.g. CP949 paths)
+    # are written back byte for byte whatever the code page. CR and LF never occur inside a
+    # multi-byte ANSI or UTF-8 character, so the line split is safe.
+    $enc = [System.Text.Encoding]::GetEncoding(28591)
+    $prefix = New-Object byte[] 0
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $raw = [System.IO.File]::ReadAllBytes($Path)
+        $skip = 0
+        if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) {
+            $skip = 3
+        } elseif ($raw.Length -ge 2 -and $raw[0] -eq 0xFF -and $raw[1] -eq 0xFE) {
+            $skip = 2; $enc = New-Object System.Text.UnicodeEncoding($false, $false)
+        } elseif ($raw.Length -ge 2 -and $raw[0] -eq 0xFE -and $raw[1] -eq 0xFF) {
+            $skip = 2; $enc = New-Object System.Text.UnicodeEncoding($true, $false)
+        }
+        $prefix = New-Object byte[] $skip
+        [System.Array]::Copy($raw, $prefix, $skip)
+        $text = $enc.GetString($raw, $skip, $raw.Length - $skip)
+        if ($text.Length -gt 0) {
+            foreach ($l in ($text -split "`r`n|`n|`r")) { $lines.Add($l) }
+            if ($text.EndsWith("`n") -or $text.EndsWith("`r")) { $lines.RemoveAt($lines.Count - 1) }
+        }
+    }
+    return @{ Lines = $lines; Prefix = $prefix; Encoding = $enc }
+}
+
+function Find-IniKey($Lines, [string]$Section, [string]$Key) {
+    # @{ Start; End; Found }: line of the [Section] header (-1: none), the line after the
+    # section, line of Key (-1: none). Section and key compare case-insensitively.
+    $header = '[' + $Section + ']'
+    $start = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i].Trim() -ieq $header) { $start = $i; break }
+    }
+    $end = $Lines.Count
+    $found = -1
+    if ($start -ge 0) {
+        for ($i = $start + 1; $i -lt $Lines.Count; $i++) {
+            if ($Lines[$i].Trim().StartsWith('[')) { $end = $i; break }
+        }
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            $t = $Lines[$i].Trim()
+            $eq = $t.IndexOf('=')
+            if ($eq -gt 0 -and $t.Substring(0, $eq).Trim() -ieq $Key) { $found = $i; break }
+        }
+    }
+    return @{ Start = $start; End = $end; Found = $found }
+}
+
+function Get-IniValue([string]$Path, [string]$Section, [string]$Key) {
+    # Value of Key in [Section], trimmed; $null when the file, section or key is missing.
+    $ini = Read-IniText $Path
+    $at = Find-IniKey $ini.Lines $Section $Key
+    if ($at.Found -lt 0) { return $null }
+    $t = $ini.Lines[$at.Found]
+    return $t.Substring($t.IndexOf('=') + 1).Trim()
+}
+
+function Set-IniValue([string]$Path, [string]$Section, [string]$Key, [string]$Value) {
+    # Sets Key=Value in [Section] of an INI file: creates the file, the section or the key
+    # when missing, replaces the key's line in place when present and keeps every other
+    # line byte for byte (Read-IniText), a BOM included; lines end in CRLF afterwards.
+    # The new content is written next to the file and then swapped in (File.Replace keeps
+    # the file's ACL), so a crash cannot leave a truncated ini. Returns $false when the
+    # file already had exactly that line (it is not rewritten).
+    $ini = Read-IniText $Path
+    $lines = $ini.Lines
+    $wanted = $Key + '=' + $Value
+    $at = Find-IniKey $lines $Section $Key
+    if ($at.Start -lt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim() -ne '') { $lines.Add('') }
+        $lines.Add('[' + $Section + ']')
+        $lines.Add($wanted)
+    } elseif ($at.Found -ge 0) {
+        if ($lines[$at.Found] -ceq $wanted) { return $false }
+        $lines[$at.Found] = $wanted
+    } else {
+        # after the section's last non-empty line
+        $insert = $at.End
+        while ($insert -gt $at.Start + 1 -and $lines[$insert - 1].Trim() -eq '') { $insert-- }
+        $lines.Insert($insert, $wanted)
+    }
+    $body = $ini.Encoding.GetBytes(($lines -join "`r`n") + "`r`n")
+    $bytes = New-Object byte[] ($ini.Prefix.Length + $body.Length)
+    [System.Array]::Copy($ini.Prefix, 0, $bytes, 0, $ini.Prefix.Length)
+    [System.Array]::Copy($body, 0, $bytes, $ini.Prefix.Length, $body.Length)
+    $tmp = $Path + '.gw-new'
+    [System.IO.File]::WriteAllBytes($tmp, $bytes)
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        # [NullString]: a plain $null would reach .NET as '' (no backup file wanted)
+        [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+    } else {
+        [System.IO.File]::Move($tmp, $Path)
+    }
+    return $true
 }
 
 function Get-PluginInfo([string]$Path) {
@@ -226,6 +336,28 @@ try {
             Write-Utf8NoBom $cfgPath ($cfg | ConvertTo-Json -Compress -Depth 10)
         }
 
+        # x64dbg reads its settings from <exe dir>\<exe name>.ini (x64dbg.ini, x32dbg.ini).
+        # Engine/DisableDatabaseCompression=1 keeps databases saved to x64dbg's default
+        # location plain JSON instead of LZ4 (ida_export_annotations parses them).
+        # ASSUMPTION, to be verified on the real VM: the ini file name (taken from the exe
+        # name, as x64dbg's bridge does) and the section/key names (x64dbg database.cpp).
+        # A debugger running now may write its own settings back when it exits; the reboot
+        # that normally follows provisioning starts it with the new file.
+        $ini = [System.IO.Path]::ChangeExtension($exe, '.ini')
+        $dbgName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+        if (@(Get-Process -Name $dbgName -ErrorAction SilentlyContinue).Count -gt 0) {
+            Write-Log "note: $($a.exe) is running; it may rewrite $ini when it exits"
+        }
+        Invoke-Planned "set [Engine] DisableDatabaseCompression=1 in $ini" {
+            Set-IniValue $ini 'Engine' 'DisableDatabaseCompression' '1' | Out-Null
+        }
+        # what the file says now (read back, not assumed): 'disabled' only when it took
+        $compression = 'unchanged'
+        if (-not $dry) {
+            $compression = 'unverified'
+            if ((Get-IniValue $ini 'Engine' 'DisableDatabaseCompression') -eq '1') { $compression = 'disabled' }
+        }
+
         Invoke-Planned "register scheduled task $($a.task) -> $exe (user $user, Interactive, Highest, AtLogOn)" {
             $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -239,6 +371,7 @@ try {
         $result.backends[$a.id] = [ordered]@{
             exe = $exe; config = $cfgPath; port = $port; task = $a.task
             token_length = $tokenLength; token_generated = $generated; plugin = $plugin
+            settings_ini = $ini; db_compression = $compression
         }
     }
 

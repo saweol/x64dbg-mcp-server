@@ -18,6 +18,7 @@ from x64dbg_vm_gateway.errors import (
     BackendAuthError,
     BackendProtocolError,
     BackendRestarted,
+    BackendThrottled,
     BackendTimeout,
     BackendUnavailable,
     CancelledByVmOp,
@@ -414,6 +415,41 @@ def test_crash_loop_surfaces(catalog, client, fake_vm, fake_guest, fake_clock):
     with pytest.raises(CrashLoop) as ei:
         p.call("x64", "run", {}, job_id="j1")
     assert ei.value.details["tool"] == "run"
+
+
+# ── throttling (HTTP 429 auth lockout) ──────────────────────────────
+def test_throttled_read_only_call_is_never_retried_and_surfaces(proxy, client):
+    checks: list[int] = []
+    client.l1 = lambda: checks.append(1) or True  # any recovery would run a health check
+    client.queue("GetAllRegisters", BackendThrottled("429", retry_after_s=12))
+    with pytest.raises(BackendThrottled) as ei:
+        proxy.call("x64", "GetAllRegisters", {})
+    assert len(client.calls_of("GetAllRegisters")) == 1
+    d = ei.value.details
+    assert d["retry_after_s"] == 12 and d["tool"] == "GetAllRegisters" and d["backend"] == "x64"
+    assert checks == []
+
+
+def test_throttled_mutating_call_is_throttled_not_result_unknown(proxy, client):
+    client.queue("StepInto", BackendThrottled("429", retry_after_s=4))
+    with pytest.raises(BackendThrottled):
+        proxy.call("x64", "StepInto", {})
+    assert len(client.calls_of("StepInto")) == 1
+    proxy.call("x64", "StepInto", {})  # the serialisation lock was released
+
+
+def test_recovery_never_relaunches_a_throttled_backend(catalog, client, fake_vm, fake_guest, fake_clock):
+    sup = Supervisor(vm=fake_vm, guest=fake_guest, clients={"x64": client},
+                     backends={"x64": BackendConfig(id="x64", arch="x64", exe=EXE, launch_task="t")},
+                     relaunch_mode="task", clock=fake_clock)
+    p = make_proxy(catalog, client, sup)
+    client.queue("run", BackendUnavailable("reset"))
+    client.l1 = BackendThrottled("429", retry_after_s=60)  # locked out when the health check runs
+    with pytest.raises(ResultUnknown) as ei:
+        p.call("x64", "run", {}, job_id="j1")
+    assert ei.value.details["state"] == "THROTTLED"
+    assert fake_guest.calls_of("run_program") == [] and fake_guest.calls_of("kill_process") == []
+    assert sup.epoch("x64") == 0
 
 
 def test_auth_and_protocol_errors_propagate(proxy, client):

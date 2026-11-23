@@ -238,7 +238,9 @@ class ProvisionScript:
                             "port": p["ports"][a], "task": f"MCP-{a}dbg", "token_length": 32,
                             "token_generated": False,
                             "plugin": {"present": True, "file_version": None, "size": 123456,
-                                       "mtime": "2026-11-20T10:00:00Z", "sha256": "ab" * 32}}
+                                       "mtime": "2026-11-20T10:00:00Z", "sha256": "ab" * 32},
+                            "settings_ini": f"{p['x64dbg_root']}\\{a}\\{exes[a][:-4]}.ini",
+                            "db_compression": "unchanged" if p.get("dry_run") else "disabled"}
                         for a in self.archs
                     },
                 }
@@ -323,6 +325,125 @@ def test_guest_script_keeps_secret_handling_and_has_new_features() -> None:
 
 def test_runtime_protocol_is_satisfied_by_the_fake(rt: FakeRuntime) -> None:
     assert isinstance(rt, RuntimeLike)
+
+
+# ── database compression off (J-integ) ─────────────────────────────
+def _function_body(text: str, name: str) -> str:
+    start = text.index(f"function {name}(")
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
+def test_guest_script_turns_x64dbg_database_compression_off() -> None:
+    """x64dbg LZ4-compresses databases saved to its default location unless
+    [Engine] DisableDatabaseCompression=1 (x64dbg database.cpp); ida_export_annotations
+    can only read plain JSON. The ini is <exe dir>\\<exe name>.ini (bridgemain.cpp derives it
+    from the module file name): x64dbg.ini for x64dbg.exe, x32dbg.ini for x32dbg.exe."""
+    text = GUEST_SCRIPT.read_text()
+    assert "[System.IO.Path]::ChangeExtension($exe, '.ini')" in text
+    call = "Set-IniValue $ini 'Engine' 'DisableDatabaseCompression' '1'"
+    assert call in text
+    # applied through Invoke-Planned, so a dry run only reports it
+    planned = text.index('Invoke-Planned "set [Engine] DisableDatabaseCompression=1 in $ini"')
+    assert text.index(call) > planned
+    assert "ASSUMPTION" in text[text.index("DisableDatabaseCompression") - 600:planned]
+    assert "settings_ini = $ini" in text and "db_compression =" in text
+
+
+def test_ini_helper_creates_or_updates_and_keeps_other_content() -> None:
+    # static shape only; test_ini_helper_behaviour runs it where pwsh is installed
+    text = GUEST_SCRIPT.read_text()
+    read = _function_body(text, "Read-IniText")
+    assert "ReadAllBytes" in read and "GetEncoding(28591)" in read  # byte-preserving (Latin-1)
+    assert "0xEF" in read and "UnicodeEncoding" in read  # UTF-8 BOM kept, UTF-16 stays UTF-16
+    find = _function_body(text, "Find-IniKey")
+    assert "-ieq $header" in find and "-ieq $Key" in find  # case-insensitive section and key
+    body = _function_body(text, "Set-IniValue")
+    assert ".Insert(" in body  # a missing key goes into the existing section
+    assert "return $false" in body  # an ini that already has the value is not rewritten
+    assert "WriteAllBytes($tmp" in body and "File]::Replace($tmp, $Path" in body  # temp + swap
+    assert "[NullString]::Value" in body  # no backup file ('' would be an invalid path)
+
+
+def test_summary_reports_the_value_read_back() -> None:
+    text = GUEST_SCRIPT.read_text()
+    assert "(Get-IniValue $ini 'Engine' 'DisableDatabaseCompression') -eq '1'" in text
+    assert "db_compression = $compression" in text and "'unverified'" in text
+
+
+_INI_RUNNER = """\
+param([string]$Dir)
+$ErrorActionPreference = 'Stop'
+__FUNCTIONS__
+$out = [ordered]@{}
+foreach ($name in @(Get-ChildItem -LiteralPath $Dir -Name | Sort-Object)) {
+    $path = Join-Path $Dir $name
+    $changed = Set-IniValue $path 'Engine' 'DisableDatabaseCompression' '1'
+    $value = Get-IniValue $path 'Engine' 'DisableDatabaseCompression'
+    $out[$name] = [ordered]@{ changed = $changed; value = $value; other = (Get-IniValue $path 'Gui' 'Path') }
+}
+$missing = Join-Path $Dir 'sub-missing.ini'
+$out['missing-before'] = (Get-IniValue $missing 'Engine' 'DisableDatabaseCompression')
+$out['missing'] = Set-IniValue $missing 'Engine' 'DisableDatabaseCompression' '1'
+$out | ConvertTo-Json -Depth 4 -Compress
+"""
+
+_KEY = "DisableDatabaseCompression"
+_CP949 = "C:\\\uc554\ud638".encode("cp949")  # C:\<two Korean syllables> in the ANSI code page
+_INI_CASES: dict[str, tuple[bytes, bytes | None]] = {
+    # name: (before, expected after; None: unchanged)
+    "a-no-section.ini": (b"[Gui]\nPath=x\n",
+                         b"[Gui]\r\nPath=x\r\n\r\n[Engine]\r\n" + _KEY.encode() + b"=1\r\n"),
+    "b-other-keys.ini": (b"[Engine]\r\nA=1\r\n\r\n[Gui]\r\nPath=x\r\n",
+                         b"[Engine]\r\nA=1\r\n" + _KEY.encode() + b"=1\r\n\r\n[Gui]\r\nPath=x\r\n"),
+    "c-other-case.ini": (b"[engine]\r\n disabledatabasecompression = 0\r\nB=2\r\n",
+                         b"[engine]\r\n" + _KEY.encode() + b"=1\r\nB=2\r\n"),
+    "d-already-set.ini": (b"[Engine]\n" + _KEY.encode() + b"=1\n", None),
+    "e-utf8-bom.ini": (b"\xef\xbb\xbf[Gui]\r\nPath=C:\\\xec\x95\x94\xed\x98\xb8\r\n",
+                       b"\xef\xbb\xbf[Gui]\r\nPath=C:\\\xec\x95\x94\xed\x98\xb8\r\n\r\n[Engine]\r\n"
+                       + _KEY.encode() + b"=1\r\n"),
+    "f-ansi.ini": (b"[Gui]\r\nPath=" + _CP949 + b"\r\n",
+                   b"[Gui]\r\nPath=" + _CP949 + b"\r\n\r\n[Engine]\r\n" + _KEY.encode() + b"=1\r\n"),
+    "g-utf16.ini": ("\ufeff[Gui]\r\nPath=x\r\n".encode("utf-16-le"),
+                    "\ufeff[Gui]\r\nPath=x\r\n\r\n[Engine]\r\nDisableDatabaseCompression=1\r\n".encode("utf-16-le")),
+}
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) is not installed")
+def test_ini_helper_behaviour(tmp_path: Path) -> None:
+    """Set-IniValue / Get-IniValue executed (PowerShell 7; the guest runs 5.1, same .NET APIs):
+    create, add section, insert key, replace a differently cased key in place, leave an ini
+    that already has it untouched, keep UTF-8 (BOM), ANSI and UTF-16 content byte for byte."""
+    text = GUEST_SCRIPT.read_text()
+    functions = "\n".join(_function_body(text, name) + "\n}\n"
+                          for name in ("Read-IniText", "Find-IniKey", "Get-IniValue", "Set-IniValue"))
+    runner = tmp_path / "run.ps1"
+    runner.write_text(_INI_RUNNER.replace("__FUNCTIONS__", functions), encoding="utf-8")
+    inis = tmp_path / "inis"
+    inis.mkdir()
+    for name, (before, _after) in _INI_CASES.items():
+        (inis / name).write_bytes(before)
+    res = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner), "-Dir", str(inis)],
+                         capture_output=True, text=True, timeout=50, check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+    out = json.loads(res.stdout.strip().splitlines()[-1])
+    for name, (before, after) in _INI_CASES.items():
+        assert (inis / name).read_bytes() == (before if after is None else after), name
+        assert out[name]["changed"] is (after is not None), name
+        assert out[name]["value"] == "1", name
+    assert out["a-no-section.ini"]["other"] == "x"
+    assert out["missing-before"] is None and out["missing"] is True
+    assert (inis / "sub-missing.ini").read_bytes() == b"[Engine]\r\n" + _KEY.encode() + b"=1\r\n"
+    assert not list(inis.glob("*.gw-new"))  # the temp file was swapped in, not left behind
+
+
+def test_provision_summary_reports_the_settings_ini(rt: FakeRuntime, timeline: Timeline,
+                                                   host_tmp: Path) -> None:
+    _setup(rt, timeline)
+    summary = _provision(rt, Probe(timeline))
+    x64, x32 = summary["backends"]["x64"], summary["backends"]["x32"]
+    assert x64["settings_ini"] == f"{ROOT}\\x64\\x64dbg.ini" and x64["db_compression"] == "disabled"
+    assert x32["settings_ini"] == f"{ROOT}\\x32\\x32dbg.ini" and x32["db_compression"] == "disabled"
 
 
 # ── provision_guest: happy path / params / secrets ─────────────────
@@ -744,6 +865,20 @@ def test_default_probes_against_a_plugin_server() -> None:
     finally:
         srv.stop()
     assert default_http_probe("127.0.0.1", srv.port, 1.0) is None  # refused
+
+
+def test_readiness_probe_keeps_treating_a_locked_out_plugin_as_up() -> None:
+    # The gateway's backend client maps 429 to BACKEND_THROTTLED; provisioning's raw probe
+    # must still count it as "the HTTP server is up" (only a running plugin answers 429).
+    from x64dbg_vm_gateway.provision import READY_STATUSES
+
+    srv = FakePluginServer(token="T" * 32, version="1.10").start()
+    try:
+        srv.lock_out(300)
+        status = default_http_probe("127.0.0.1", srv.port, 3.0)
+    finally:
+        srv.stop()
+    assert status == 429 and status in READY_STATUSES
 
 
 def test_default_local_ip_for_loopback() -> None:
