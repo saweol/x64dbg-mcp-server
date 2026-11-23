@@ -74,7 +74,7 @@ _ERROR_RULES: tuple[tuple[type[VmrunError], tuple[str, ...]], ...] = (
                        "unknown user name or bad password", "authentication failure", "authentication failed",
                        "login failure", "login failed", "logon failure", "cannot authenticate",
                        "incorrect password", "invalid password", "invalid credentials")),
-    (VmLocked, ("failed to lock", "is locked", "lock file", "appears to be in use", "already in use",
+    (VmLocked, ("failed to lock", "is locked", "appears to be in use", "already in use",
                 "in use by another", "another operation", "operation is in progress",
                 "operation in progress", "operation is already in progress", "is busy")),
     (VmNotRunning, ("not powered on", "needs to be powered on", "must be powered on",
@@ -83,7 +83,7 @@ _ERROR_RULES: tuple[tuple[type[VmrunError], tuple[str, ...]], ...] = (
 _SNAPSHOT_MISSING = ("not found", "does not exist", "doesn't exist", "no such", "cannot find",
                      "could not find", "unable to find")
 # Errors about the VM/vmrun itself: never re-labelled as guest-operation failures.
-_GENERIC = ("cannot open vm", "cannot be found", "unrecognized command", "already running",
+_GENERIC = ("cannot open vm", "virtual machine cannot be found", "unrecognized command",
             "should not be powered on", "insufficient permissions in the host")
 _GUEST_COMMAND_RE = re.compile(r"(inguest|guesttohost|hosttoguest)$", re.IGNORECASE)
 

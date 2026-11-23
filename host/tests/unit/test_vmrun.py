@@ -129,10 +129,16 @@ CREDS = GuestCredentials("mcp", Secret(PASSWORD))
 
 
 def assert_no_password(exc: BaseException) -> None:
-    blob = " ".join([str(exc), repr(exc), repr(exc.args)])
-    if isinstance(exc, errors.GatewayError):
-        blob += json.dumps(exc.to_dict(), default=str) + repr(exc.details) + str(exc.hint)
-    assert PASSWORD not in blob
+    # Walk the whole chain: e.g. a subprocess.TimeoutExpired carries the full argv.
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        blob = " ".join([str(current), repr(current), repr(current.args)])
+        if isinstance(current, errors.GatewayError):
+            blob += json.dumps(current.to_dict(), default=str) + repr(current.details) + str(current.hint)
+        assert PASSWORD not in blob, type(current)
+        current = current.__cause__ or current.__context__
 
 
 # ── VmrunCli: argv construction ─────────────────────────────────────
