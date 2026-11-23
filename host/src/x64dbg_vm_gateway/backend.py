@@ -389,6 +389,11 @@ class HttpBackendClient:
             chunks: list[bytes] = []
             total = 0
             while True:
+                if resp.isclosed():
+                    # The whole Content-Length body has arrived. With "Connection: close"
+                    # (plugin v1.10 sends it on every response) http.client has closed the
+                    # socket by now, so settimeout() below would fail with EBADF.
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("response deadline exceeded")

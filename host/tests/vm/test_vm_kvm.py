@@ -1,8 +1,7 @@
 """Real-VM checks for the K-vm fixes (opt-in: ``-m vm`` and X64DBG_VM_E2E_CONFIG).
 
-Run with ``uv run pytest -m vm tests/unit/test_vm_e2e_kvm.py`` (the default
-``addopts`` deselect the ``vm`` marker; like ``test_vmrun.py``'s real-vmrun test,
-this file sits under tests/unit, the directory K-vm owns). Set
+Run with ``uv run pytest -m vm tests/vm/test_vm_kvm.py`` (the default
+``addopts`` deselect the ``vm`` marker). Set
 ``X64DBG_VM_E2E_CONFIG`` to a gateway config file whose default profile is
 the spike VM (vmware mode, guest credentials resolvable). These tests are
 written to be run by the main session on the spike VM; they do not change the

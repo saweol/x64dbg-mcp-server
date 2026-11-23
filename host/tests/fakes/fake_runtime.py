@@ -200,8 +200,10 @@ def make_lab(
     vm.snapshots = [Snapshot("MCP_CLEAN"), Snapshot("BASE")]
     guest = FakeGuest()
     ps = GuestPowerShell(guest)
+    # connection_close: every response framed like the real plugin v1.10 (Connection: close)
     servers = {b: FakePluginServer(token=token_for(b), version=plugin_version,
-                                   tools=wire_tools(plugin_version)).start() for b in backends}
+                                   tools=wire_tools(plugin_version), connection_close=True).start()
+               for b in backends}
     environ = {PW_ENV: "guest-pw"}
     if token_source == "env":
         environ.update({TOKEN_ENV[b]: token_for(b) for b in backends})

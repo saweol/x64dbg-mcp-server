@@ -123,8 +123,13 @@ class FakePluginServer:
         instructions: str = PLUGIN_INSTRUCTIONS,
         debugging: bool = True,
         state_line: str = "[state] PAUSED at 0x401000 (sample.exe) | push rbp",
+        connection_close: bool = False,
     ) -> None:
+        """``connection_close=True`` frames every response like plugin v1.10
+        (src/core/mcp_server.zig): ``Content-Length`` plus ``Connection: close``, then
+        the server closes the socket."""
         self.token = token
+        self.connection_close = connection_close
         self.version = version
         self.instructions = instructions
         self.debugging = debugging
@@ -382,6 +387,9 @@ def _make_handler(fake: FakePluginServer) -> type[BaseHTTPRequestHandler]:
                 self.send_response(status)
                 hdrs = {"Content-Type": "application/json"}
                 hdrs.update(headers or {})
+                if fake.connection_close:
+                    hdrs.setdefault("Connection", "close")
+                    self.close_connection = True
                 for k, v in hdrs.items():
                     self.send_header(k, v)
                 if content_length and "Content-Length" not in hdrs:
