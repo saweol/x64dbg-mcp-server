@@ -331,11 +331,63 @@ def test_list_processes_parses_fixture(runner, chan):
     assert runner.calls[0]["params"] == ()
 
 
-def test_list_processes_tolerates_crlf_and_count_mismatch(runner, chan):
+def test_list_processes_tolerates_crlf_and_trailing_blank_lines(runner, chan):
     runner.queue("listProcessesInGuest",
-                 "Process list: 9\r\npid=8, owner=u, cmd=C:\\a.exe\r\n\r\n")
+                 "Process list: 1\r\npid=8, owner=u, cmd=C:\\a.exe\r\n\r\n")
     procs = chan.list_processes()
     assert len(procs) == 1 and procs[0].cmd == "C:\\a.exe"
+
+
+def test_list_processes_empty(runner, chan):
+    runner.queue("listProcessesInGuest", "Process list: 0\n")
+    assert chan.list_processes() == []
+
+
+def test_list_processes_count_mismatch_is_an_error(runner, chan):
+    """A short list (format drift, truncated output) must not look like 'process gone'."""
+    runner.queue("listProcessesInGuest",
+                 "Process list: 9\r\npid=8, owner=u, cmd=C:\\a.exe\r\n\r\n")
+    with pytest.raises(GuestOperationError) as ei:
+        chan.list_processes()
+    assert ei.value.details["declared"] == 9 and ei.value.details["parsed"] == 1
+
+
+def test_list_processes_forged_entry_in_command_line_is_detected(runner, chan):
+    """A guest process whose command line contains a newline cannot inject a fake entry."""
+    forged = ("Process list: 2\n"
+              "pid=1200, owner=DESKTOP\\mcp, cmd=evil.exe x\n"
+              "pid=4, owner=NT AUTHORITY\\SYSTEM, cmd=C:\\x64dbg\\x64dbg.exe\n"
+              "pid=1300, owner=DESKTOP\\mcp, cmd=C:\\Windows\\notepad.exe\n")
+    runner.queue("listProcessesInGuest", forged)
+    with pytest.raises(GuestOperationError):
+        chan.list_processes()
+
+
+def test_list_processes_multiline_command_line_is_kept_whole(runner, chan):
+    text = ("Process list: 2\n"
+            "pid=1200, owner=DESKTOP\\mcp, cmd=a.exe first\n"
+            "  second line, still the same cmd\n"
+            "\n"
+            "pid=1300, owner=DESKTOP\\mcp, cmd=b.exe\n")
+    runner.queue("listProcessesInGuest", text)
+    procs = chan.list_processes()
+    assert [p.pid for p in procs] == [1200, 1300]
+    assert procs[0].cmd == "a.exe first\n  second line, still the same cmd\n"
+    assert procs[1].cmd == "b.exe"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Process list: 1\ngarbage before any entry\npid=1, owner=a, cmd=b\n",
+        "Process list: abc\npid=1, owner=a, cmd=b\n",
+        "Process list:\n",
+    ],
+)
+def test_list_processes_malformed_output_is_an_error(runner, chan, text):
+    runner.queue("listProcessesInGuest", text)
+    with pytest.raises(GuestOperationError):
+        chan.list_processes()
 
 
 def test_list_processes_without_header_is_an_error(runner, chan):
@@ -494,6 +546,19 @@ def test_list_dir_without_header_is_an_error(runner, chan):
     runner.queue("listDirectoryInGuest", "garbage")
     with pytest.raises(GuestOperationError):
         chan.list_dir("C:\\a")
+
+
+@pytest.mark.parametrize("text", ["Directory list: 5\na\n", "Directory list: 0\na\n",
+                                  "Directory list: x\na\n"])
+def test_list_dir_count_mismatch_is_an_error(runner, chan, text):
+    runner.queue("listDirectoryInGuest", text)
+    with pytest.raises(GuestOperationError):
+        chan.list_dir("C:\\a")
+
+
+def test_list_dir_tolerates_crlf(runner, chan):
+    runner.queue("listDirectoryInGuest", "Directory list: 2\r\na\r\nb c\r\n\r\n")
+    assert chan.list_dir("C:\\a") == ["a", "b c"]
 
 
 def test_delete_and_rename(runner, chan):

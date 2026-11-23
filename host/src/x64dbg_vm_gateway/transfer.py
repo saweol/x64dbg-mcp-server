@@ -6,8 +6,10 @@ copied back (runProgramInGuest returns no output) -> rename to
 
 Collect: zip the guest ``out`` directory with ``Compress-Archive`` (vmrun cannot
 copy directories), copy the zip and any extra guest files to the host job
-directory, extract the zip with :func:`safe_extract` and write
-``artifacts/manifest.json`` atomically. Host layout::
+directory with size limits (:class:`FetchLimits`: guest-side size probe, host
+free-space reserve, post-copy size check), extract the zip with
+:func:`safe_extract` and write ``artifacts/manifest.json`` atomically. A new
+collection first removes the output of an earlier one. Host layout::
 
     <host_job_dir>/artifacts/
         manifest.json
@@ -58,9 +60,11 @@ from .pe import sha256_file
 
 __all__ = [
     "DEFAULT_EXTRACT_LIMITS",
+    "DEFAULT_FETCH_LIMITS",
     "MANIFEST_SCHEMA_VERSION",
     "ExtractLimits",
     "ExtractedEntry",
+    "FetchLimits",
     "Manifest",
     "ManifestEntry",
     "collect_artifacts",
@@ -77,6 +81,8 @@ _MiB = 1024 * _KiB
 _GiB = 1024 * _MiB
 _COPY_CHUNK = _MiB
 _HASH_FILE_MAX = 4 * _KiB  # a SHA-256 hex line is 66 bytes; anything larger is garbage
+_SIZE_FILE_MAX = 256  # a decimal file length plus line ending (any encoding)
+_PROBE_TIMEOUT_S = 120.0  # PowerShell start-up in a loaded guest can take several seconds
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 _PS_PREFIX = ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command")
 # Characters PowerShell interprets as wildcards / escapes in -Path / -FilePath arguments.
@@ -157,8 +163,14 @@ def _write_json_atomic(path: Path, doc: Any) -> None:
 
 
 def _jsonable(value: Any) -> Any:
-    """Round-trip through JSON so the manifest object equals what is written to disk."""
-    return json.loads(json.dumps(value, default=str))
+    """Round-trip through JSON so the manifest object equals what is written to disk.
+
+    Never raises: a value JSON cannot hold is replaced by a clipped ``repr``.
+    """
+    try:
+        return json.loads(json.dumps(value, default=str, allow_nan=False))
+    except (TypeError, ValueError, RecursionError):
+        return {"unserializable": _clip(repr(value))}
 
 
 def _check_sha256(value: str) -> str:
@@ -195,10 +207,14 @@ def _ps(channel: GuestChannel, powershell: str, command: str, timeout_s: float) 
 
 
 # ── upload ──────────────────────────────────────────────────────────
-def _parse_hash_file(path: Path) -> str | None:
+def _read_small_text(path: Path, limit: int) -> str | None:
+    """Text of a small result file written by PowerShell (ASCII, UTF-8 BOM or UTF-16), stripped.
+
+    None when the file is larger than ``limit`` bytes (only ``limit + 1`` bytes are read).
+    """
     with path.open("rb") as f:
-        data = f.read(_HASH_FILE_MAX + 1)
-    if len(data) > _HASH_FILE_MAX:
+        data = f.read(limit + 1)
+    if len(data) > limit:
         return None
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         text = data.decode("utf-16", errors="replace")
@@ -206,29 +222,46 @@ def _parse_hash_file(path: Path) -> str | None:
         if data.startswith(b"\xef\xbb\xbf"):
             data = data[3:]
         text = data.decode("ascii", errors="replace")
-    text = text.strip().strip("﻿").strip()
-    return text.lower() if _SHA256_RE.fullmatch(text) else None
+    return text.strip().strip("\ufeff").strip()
+
+
+def _parse_hash_file(path: Path) -> str | None:
+    text = _read_small_text(path, _HASH_FILE_MAX)
+    return text.lower() if text is not None and _SHA256_RE.fullmatch(text) else None
 
 
 def _guest_sha256(channel: GuestChannel, powershell: str, part: str, hash_path: str, local: Path,
-                  timeout_s: float) -> str | None:
-    """Hash ``part`` in the guest; None when the hash could not be produced or read back."""
+                  timeout_s: float) -> tuple[str | None, str]:
+    """Hash ``part`` in the guest.
+
+    Returns ``(hash, "")`` or ``(None, problem)`` when the hash could not be produced
+    or read back (``exit-code-N``, ``no-hash-file``, ``unreadable-hash-file``). A
+    missing hash says nothing about the copied bytes, only about the guest tooling.
+    """
     command = (f"(Get-FileHash -Algorithm SHA256 -LiteralPath '{part}').Hash"
                f" | Out-File -Encoding ascii -FilePath '{hash_path}'")
-    if _ps(channel, powershell, command, timeout_s) != 0:
-        return None
-    with contextlib.suppress(FileNotFoundError):
-        local.unlink()
+    rc = _ps(channel, powershell, command, timeout_s)
+    if rc != 0:
+        return None, f"exit-code-{rc}"
+    _unlink_quiet(local)
     try:
         channel.copy_from_guest(hash_path, local)
     except VmrunError as exc:
         if isinstance(exc, GUEST_ENV_ERRORS):
             raise
-        return None  # hash file missing: hashing failed in the guest
+        return None, "no-hash-file"  # hashing failed in the guest
     try:
-        return _parse_hash_file(local)
+        value = _parse_hash_file(local)
     except FileNotFoundError:
-        return None
+        return None, "no-hash-file"
+    return (value, "") if value is not None else (None, "unreadable-hash-file")
+
+
+def _cleanup_guest(channel: GuestChannel, *paths: str) -> None:
+    """Best-effort removal of guest files after a failed upload; never raises a GatewayError."""
+    for path in paths:
+        with contextlib.suppress(GatewayError):
+            _delete_guest_if_exists(channel, path)
 
 
 def upload_sample(
@@ -245,11 +278,21 @@ def upload_sample(
 ) -> str:
     """Upload a sample and return its verified guest path ``<in>\\<sha12>.<ext>``.
 
-    The host file is re-hashed first (it must still match ``sha256``). Each
-    attempt copies to ``<sha12>.part``, hashes it in the guest and compares; a
-    mismatch deletes the part and retries after a short back-off. After
-    ``max_attempts`` failures raises IntegrityError. Guest/vmrun errors other
-    than a missing hash file propagate unchanged (no retry).
+    The host file is re-hashed first (it must still match ``sha256``). The sample
+    is copied to ``<sha12>.part`` and hashed in the guest, up to ``max_attempts``
+    rounds with a short back-off between them:
+
+    - hash read back and different: the part is deleted and re-copied next round;
+    - hash unavailable (PowerShell failed, no/garbled hash file): only the hash
+      step is repeated, the part is not re-copied.
+
+    After the last round raises IntegrityError if any round read a different
+    hash, otherwise TransferError (the guest could not hash the file at all). On
+    success an existing final file is replaced. Guest/vmrun errors other than a
+    missing hash file propagate unchanged (no retry); before they do, the part
+    and hash files are removed best-effort unless the error means the guest is
+    unreachable (``GUEST_ENV_ERRORS``). The replace step deletes the old final
+    file before the rename, so a failed rename leaves neither file.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
@@ -271,35 +314,49 @@ def upload_sample(
 
     channel.mkdir(in_dir)
     observed: list[str] = []
-    verified = False
-    with tempfile.TemporaryDirectory(prefix="x64gw-hash-") as td:
-        local = Path(td) / "guest.sha256"
-        for attempt in range(1, max_attempts + 1):
-            if attempt > 1:
-                clock.sleep(min(2.0 ** (attempt - 2), 8.0))
-            _delete_guest_if_exists(channel, hash_path)  # never trust a stale result
-            channel.copy_to_guest(src, part)
-            got = _guest_sha256(channel, powershell, part, hash_path, local, hash_timeout_s)
-            if got == expected:
-                verified = True
-                break
-            observed.append(got or "unavailable")
-            _delete_guest_if_exists(channel, part)
-    if not verified:
-        with contextlib.suppress(VmrunError):
-            _delete_guest_if_exists(channel, hash_path)
-        raise IntegrityError(
-            f"guest copy of {sha12} failed SHA-256 verification {max_attempts} time(s)",
-            stage="upload",
-            details={"attempts": max_attempts, "expected": expected, "observed": observed},
-        )
+    mismatch_seen = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="x64gw-hash-") as td:
+            local = Path(td) / "guest.sha256"
+            need_copy = True
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    clock.sleep(min(2.0 ** (attempt - 2), 8.0))
+                if need_copy:
+                    channel.copy_to_guest(src, part)
+                    need_copy = False
+                _delete_guest_if_exists(channel, hash_path)  # never trust a stale result
+                got, problem = _guest_sha256(channel, powershell, part, hash_path, local, hash_timeout_s)
+                if got == expected:
+                    if channel.file_exists(final):
+                        channel.delete_file(final)
+                    channel.rename(part, final)
+                    _cleanup_guest(channel, hash_path)
+                    return final
+                if got is None:
+                    observed.append(f"unavailable:{problem}")
+                    continue  # tooling problem: re-run the hash step on the same part
+                observed.append(got)
+                mismatch_seen = True
+                need_copy = True
+                _delete_guest_if_exists(channel, part)
+    except GatewayError as exc:
+        if not isinstance(exc, GUEST_ENV_ERRORS):
+            _cleanup_guest(channel, part, hash_path)
+        raise
 
-    if channel.file_exists(final):
-        channel.delete_file(final)
-    channel.rename(part, final)
-    with contextlib.suppress(VmrunError):
-        _delete_guest_if_exists(channel, hash_path)
-    return final
+    _cleanup_guest(channel, part, hash_path)
+    details = {"attempts": max_attempts, "expected": expected, "observed": observed}
+    if mismatch_seen:
+        raise IntegrityError(f"guest copy of {sha12} failed SHA-256 verification {max_attempts} time(s)",
+                             stage="upload", details=details)
+    raise TransferError(
+        f"the guest could not compute the SHA-256 of {sha12} ({max_attempts} attempt(s))",
+        stage="upload",
+        hint=f"check that Windows PowerShell runs in the guest at {powershell} for the guest user "
+             "(Get-FileHash needs PowerShell 4+); 'observed' holds the exit codes",
+        details={**details, "powershell": powershell},
+    )
 
 
 # ── safe extraction ─────────────────────────────────────────────────
@@ -307,10 +364,20 @@ def upload_sample(
 class ExtractLimits:
     """Upper bounds for :func:`safe_extract`. Byte limits apply to bytes actually decompressed.
 
-    ``max_ratio`` is checked per entry once the entry has produced more than
-    ``ratio_min_bytes`` (small, highly compressible files are harmless). Memory
-    dumps with large zero-filled regions can compress better than 200:1; raise
-    ``max_ratio`` if that becomes a problem, the byte limits still apply.
+    - ``max_files``: archive members of every kind (files, directories, rejected
+      entries); more aborts before anything is written.
+    - ``max_total_bytes``: bytes decompressed over the whole archive, including
+      members rejected part-way; exceeding it aborts.
+    - ``max_file_bytes``: one member; a larger member is rejected (``too-large``).
+    - ``max_ratio``: decompressed / compressed size of one member, checked once the
+      member has produced more than ``ratio_min_bytes`` (small, highly compressible
+      files are harmless). A violating member is rejected (``ratio``), the rest of
+      the archive is still extracted. Memory dumps with large zero-filled regions
+      can compress better than 200:1; raise ``max_ratio`` to keep them (they stay
+      in the raw archive either way).
+
+    The compressed size a member declares is only trusted after checking that it
+    does not overlap the next member or the central directory (``overlap``).
     """
 
     max_files: int = 10_000
@@ -379,6 +446,33 @@ def _dup_key(name: str) -> str:
     return "/".join(c for c in name.replace("\\", "/").split("/") if c).casefold()
 
 
+def _is_dir_entry(info: zipfile.ZipInfo) -> bool:
+    """Directory member, also with the ``\\`` separator Windows PowerShell 5.1 writes.
+
+    ``ZipInfo.is_dir`` only recognises ``\\`` on hosts whose ``os.altsep`` is ``/``.
+    """
+    return info.is_dir() or info.filename.replace("\\", "/").endswith("/")
+
+
+def _overlapping_members(infos: Sequence[zipfile.ZipInfo], start_dir: int) -> frozenset[int]:
+    """Indexes of members whose declared compressed data runs into the next local header.
+
+    A member's data starts after its local header, so in a well-formed archive
+    ``header_offset + compress_size`` never exceeds the next member's header
+    offset (or the start of the central directory). Overlapping members are the
+    building block of zip bombs (CVE-2024-0450) and would also let a member
+    inflate its ``compress_size`` to dodge the ratio check. zipfile detects this
+    itself only from Python 3.11.8 / 3.12.2 on, so it is checked here as well.
+    """
+    order = sorted(range(len(infos)), key=lambda i: infos[i].header_offset)
+    bad: set[int] = set()
+    for pos, i in enumerate(order):
+        end = infos[order[pos + 1]].header_offset if pos + 1 < len(order) else start_dir
+        if infos[i].header_offset + infos[i].compress_size > end:
+            bad.add(i)
+    return frozenset(bad)
+
+
 def _is_link(info: zipfile.ZipInfo) -> bool:
     mode = info.external_attr >> 16
     if stat.S_ISLNK(mode):
@@ -397,7 +491,8 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
     """Extract one member; returns the entry and the number of bytes decompressed.
 
     Bytes decompressed for a member that is later rejected still count against
-    ``max_total_bytes`` so a stream of corrupt members cannot reset the budget.
+    ``max_total_bytes`` so a stream of corrupt or over-ratio members cannot reset
+    the budget. ``info.compress_size`` has already been checked for overlap.
     """
     tmp = dest / f".{index:04d}.{secrets.token_hex(6)}.partial"
     denom = max(1, min(info.compress_size, archive_size))
@@ -440,13 +535,19 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
                             details={"reason": "total-bytes", "entry_index": index,
                                      "limit": limits.max_total_bytes})
                     if written > limits.ratio_min_bytes and written / denom > limits.max_ratio:
-                        raise UnsafeArchiveError(
-                            "archive member exceeds the compression ratio limit", stage="extract",
-                            details={"reason": "ratio", "entry_index": index, "limit": limits.max_ratio})
+                        raise _EntryRejected("ratio")
                     digest.update(chunk)
                     out.write(chunk)
             out.flush()
             os.fsync(out.fileno())
+        sha = digest.hexdigest()
+        stored = f"{index:04d}_{sha[:12]}"
+        final = dest / stored
+        os.replace(tmp, final)  # replaces a pre-existing link itself, never its target
+        if not _within(str(final), dest_real):
+            _unlink_quiet(final)
+            return ExtractedEntry(info.filename, None, written, None, "rejected:escape"), written
+        return ExtractedEntry(info.filename, stored, written, sha, "ok"), written
     except _EntryRejected as rej:
         _unlink_quiet(tmp)
         return ExtractedEntry(info.filename, None, info.file_size, None, f"rejected:{rej.reason}"), written
@@ -457,15 +558,6 @@ def _extract_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, index: int, dest
     except BaseException:
         _unlink_quiet(tmp)
         raise
-
-    sha = digest.hexdigest()
-    stored = f"{index:04d}_{sha[:12]}"
-    final = dest / stored
-    os.replace(tmp, final)  # replaces a pre-existing link itself, never its target
-    if not _within(str(final), dest_real):
-        _unlink_quiet(final)
-        return ExtractedEntry(info.filename, None, written, None, "rejected:escape"), written
-    return ExtractedEntry(info.filename, stored, written, sha, "ok"), written
 
 
 def _unlink_quiet(path: Path) -> None:
@@ -482,66 +574,106 @@ def _open_zip(zip_path: Path) -> zipfile.ZipFile:
                             details={"error": type(exc).__name__}) from exc
 
 
-def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[ExtractedEntry]) -> None:
-    """Extract into ``dest``, appending one entry per member to ``out`` as it goes.
+def _require_empty_dir(dest: Path) -> None:
+    with os.scandir(dest) as it:
+        if next(it, None) is not None:
+            raise TransferError("extraction directory is not empty", stage="extract",
+                                details={"reason": "dest-not-empty", "path": str(dest)})
 
-    ``out`` keeps the entries finished before an UnsafeArchiveError abort.
+
+def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[ExtractedEntry]) -> None:
+    """Extract into ``dest`` (absent or empty), appending one entry per member to ``out``.
+
+    ``out`` keeps the entries finished before an UnsafeArchiveError abort; the
+    abort also records their number in ``details["entries_done"]``.
     """
     with _open_zip(zip_path) as zf:
         infos = zf.infolist()
-        n_files = sum(1 for i in infos if not i.is_dir())
-        if n_files > limits.max_files:
+        if len(infos) > limits.max_files:
             raise UnsafeArchiveError("archive has too many members", stage="extract",
-                                     details={"reason": "file-count", "files": n_files,
+                                     details={"reason": "file-count", "files": len(infos),
                                               "limit": limits.max_files})
         _make_private_dir(dest)
+        _require_empty_dir(dest)
         dest_real = os.path.realpath(dest)
         archive_size = zip_path.stat().st_size
+        overlapping = _overlapping_members(infos, getattr(zf, "start_dir", archive_size))
         seen: set[str] = set()
         total = 0
-        for index, info in enumerate(infos):
-            name = info.filename
-            reason = _name_problem(name)
-            key = _dup_key(name)
-            if reason is None and key in seen:
-                reason = "duplicate"
-            seen.add(key)
-            if reason is None and _is_link(info):
-                reason = "symlink"
-            if reason is None and info.is_dir():
-                out.append(ExtractedEntry(name, None, 0, None, "skipped:directory"))
-                continue
-            if reason is None and info.flag_bits & _ZIP_FLAG_ENCRYPTED:
-                reason = "encrypted"
-            if reason is None and info.file_size > limits.max_file_bytes:
-                reason = "too-large"
-            if reason is not None:
-                out.append(ExtractedEntry(name, None, info.file_size, None, f"rejected:{reason}"))
-                continue
-            entry, consumed = _extract_member(zf, info, index, dest, dest_real, limits, total, archive_size)
-            total += consumed
-            out.append(entry)
+        try:
+            for index, info in enumerate(infos):
+                name = info.filename
+                reason = _name_problem(name)
+                key = _dup_key(name)
+                if reason is None and key in seen:
+                    reason = "duplicate"
+                seen.add(key)
+                if reason is None and _is_link(info):
+                    reason = "symlink"
+                if reason is None and _is_dir_entry(info):
+                    out.append(ExtractedEntry(name, None, 0, None, "skipped:directory"))
+                    continue
+                if reason is None and index in overlapping:
+                    reason = "overlap"
+                if reason is None and info.flag_bits & _ZIP_FLAG_ENCRYPTED:
+                    reason = "encrypted"
+                if reason is None and info.file_size > limits.max_file_bytes:
+                    reason = "too-large"
+                if reason is not None:
+                    out.append(ExtractedEntry(name, None, info.file_size, None, f"rejected:{reason}"))
+                    continue
+                entry, consumed = _extract_member(zf, info, index, dest, dest_real, limits, total,
+                                                  archive_size)
+                total += consumed
+                out.append(entry)
+        except UnsafeArchiveError as exc:
+            exc.details.setdefault("entries_done", len(out))
+            raise
 
 
 def safe_extract(zip_path: str | os.PathLike[str], dest_dir: str | os.PathLike[str],
-                 limits: ExtractLimits = DEFAULT_EXTRACT_LIMITS) -> list[ExtractedEntry]:
+                 limits: ExtractLimits = DEFAULT_EXTRACT_LIMITS, *,
+                 entries_out: list[ExtractedEntry] | None = None) -> list[ExtractedEntry]:
     """Extract ``zip_path`` into the flat directory ``dest_dir`` without trusting the archive.
 
-    Members are stored as ``NNNN_<sha12>`` (NNNN = member index); original names
-    only appear in the returned entries. Unsafe members are skipped with status
+    ``dest_dir`` must not exist or be empty (TransferError ``dest-not-empty``
+    otherwise), so every file in it belongs to this extraction. Members are
+    stored as ``NNNN_<sha12>`` (NNNN = member index); original names only appear
+    in the returned entries. Unsafe members are skipped with status
     ``rejected:<reason>`` (absolute, drive, unc, traversal, ads, reserved-name,
-    trailing-dot-space, invalid-char, duplicate, symlink, encrypted, too-large,
-    corrupt, unsupported-compression). Exceeding the member count, the total
-    size or the compression ratio aborts with UnsafeArchiveError after removing
-    the partial output of the current member; earlier members stay on disk.
-    A file that is not a readable zip raises TransferError.
+    trailing-dot-space, invalid-char, duplicate, symlink, overlap, encrypted,
+    too-large, ratio, corrupt, unsupported-compression). Exceeding the member
+    count or the total size aborts with UnsafeArchiveError after removing the
+    partial output of the current member; earlier members stay on disk. Pass
+    ``entries_out`` to keep their entries: it is filled as members finish and
+    is the list returned on success. A file that is not a readable zip raises
+    TransferError.
     """
-    entries: list[ExtractedEntry] = []
+    entries: list[ExtractedEntry] = [] if entries_out is None else entries_out
     _extract_into(Path(zip_path), Path(dest_dir), limits, entries)
     return entries
 
 
 # ── collection ──────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class FetchLimits:
+    """Bounds for guest -> host copies in :func:`collect_artifacts` (out.zip and extra files).
+
+    ``max_file_bytes``: largest file kept on the host. ``min_host_free_bytes``: free
+    space that must remain on the host file system once the copy has landed.
+    """
+
+    max_file_bytes: int = 4 * _GiB
+    min_host_free_bytes: int = 1 * _GiB
+
+    def __post_init__(self) -> None:
+        if self.max_file_bytes < 0 or self.min_host_free_bytes < 0:
+            raise ValueError("fetch limits must be non-negative")
+
+
+DEFAULT_FETCH_LIMITS = FetchLimits()
+
+
 @dataclass(frozen=True)
 class ManifestEntry:
     """``source``: ``out`` (member of the guest out.zip, ``original_path`` is the member
@@ -618,36 +750,152 @@ def _error(stage: str, code: str, message: str, details: dict[str, Any] | None =
     return err
 
 
-def _fetch(channel: GuestChannel, guest_path: str, dst: Path) -> tuple[str, int]:
-    """Copy a guest file to ``dst`` via ``dst.part`` + rename; returns (sha256, size)."""
-    part = dst.with_name(dst.name + ".part")
-    _unlink_quiet(part)
+def _module_map_json(value: Any) -> Any:
+    """``value`` as it will appear in manifest.json; raises TransferError if JSON cannot hold it.
+
+    Values json cannot encode (paths, sets, ...) are stringified and tuples become
+    lists; non-string keys of other types, reference cycles and NaN/Infinity raise.
+    """
     try:
-        channel.copy_from_guest(guest_path, part)
-        _chmod(part, 0o600)
-        os.replace(part, dst)
-    except BaseException:
+        return json.loads(json.dumps(value, default=str, allow_nan=False))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise TransferError("module_map is not JSON-serializable", stage="validate",
+                            details={"reason": "module-map-not-json", "error": type(exc).__name__}) from exc
+
+
+def _remove_path(path: Path) -> None:
+    """Remove a file, symlink or directory tree (never following a link); missing is fine."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        _unlink_quiet(path)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _clear_previous_collection(art: Path, raw: Path) -> None:
+    """Drop output of an earlier run so the disk always matches the manifest this run writes."""
+    for path in (art / MANIFEST_NAME, art / "files", raw / "out.zip", raw / "out.zip.part", raw / "extra"):
+        _remove_path(path)
+
+
+def _host_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _read_size_file(path: Path) -> int | None:
+    text = _read_small_text(path, _SIZE_FILE_MAX)
+    return int(text) if text is not None and text.isascii() and text.isdigit() else None
+
+
+class _BoundedFetch:
+    """Guest -> host copies with size limits, for one :func:`collect_artifacts` call.
+
+    vmrun cannot stop a copy part-way, so the size is bounded three ways:
+
+    1. a guest-side size probe (``Get-Item ... .Length`` written to a file in the
+       guest job dir and copied back) refuses files over ``max_file_bytes``
+       before copying them. The guest controls this answer, so it only stops
+       honest large files early; when it is unavailable the copy goes ahead;
+    2. the host must keep ``min_host_free_bytes`` free after the probed size;
+    3. what actually arrived is measured and deleted when over the limit.
+
+    A guest that grows a file after the probe can still use host disk space up to
+    the free space during the copy; step 3 removes the result. Not thread-safe:
+    use one instance per call (it owns a scratch directory).
+    """
+
+    def __init__(self, channel: GuestChannel, powershell: str, guest_job_dir: str, limits: FetchLimits,
+                 scratch: Path) -> None:
+        self._channel = channel
+        self._powershell = powershell
+        self._job_dir = guest_job_dir
+        self._limits = limits
+        self._scratch = scratch
+
+    def _too_large(self, size: int, **extra: Any) -> TransferError:
+        return TransferError("guest file exceeds the fetch size limit", stage="fetch",
+                             details={"reason": "too-large", "size": size,
+                                      "limit": self._limits.max_file_bytes, **extra})
+
+    def _check_free(self, directory: Path, incoming: int) -> None:
+        free = _host_free_bytes(directory)
+        needed = self._limits.min_host_free_bytes + incoming
+        if free < needed:
+            raise TransferError("not enough free host disk space for the guest file", stage="fetch",
+                                details={"reason": "host-disk-space", "free": free, "needed": needed})
+
+    def probe_size(self, guest_path: str) -> int | None:
+        """Size the guest reports for ``guest_path``; None if the probe did not work."""
+        result = _gjoin(self._job_dir, f".x64gw-size-{secrets.token_hex(6)}.txt")
+        command = (f"(Get-Item -LiteralPath '{guest_path}' -Force).Length"
+                   f" | Out-File -Encoding ascii -FilePath '{result}'")
+        local = self._scratch / "size.txt"
+        size: int | None = None
+        try:
+            if _ps(self._channel, self._powershell, command, _PROBE_TIMEOUT_S) == 0:
+                _unlink_quiet(local)
+                self._channel.copy_from_guest(result, local)
+                size = _read_size_file(local)
+        except GatewayError as exc:
+            if isinstance(exc, GUEST_ENV_ERRORS):
+                raise
+        finally:
+            _unlink_quiet(local)
+        with contextlib.suppress(GatewayError):
+            self._channel.delete_file(result)
+        return size
+
+    def fetch(self, guest_path: str, dst: Path) -> tuple[str, int]:
+        """Copy a guest file to ``dst`` via ``dst.part`` + rename; returns (sha256, size).
+
+        Raises TransferError (``details["reason"]``: ``too-large`` / ``host-disk-space``),
+        guest errors from the channel, or OSError for host file-system failures.
+        """
+        self._check_free(dst.parent, 0)
+        probed = self.probe_size(guest_path)
+        if probed is not None and probed > self._limits.max_file_bytes:
+            raise self._too_large(probed)
+        self._check_free(dst.parent, probed or 0)
+        part = dst.with_name(dst.name + ".part")
         _unlink_quiet(part)
-        raise
-    return sha256_file(dst), dst.stat().st_size
+        try:
+            self._channel.copy_from_guest(guest_path, part)
+            got = part.stat().st_size
+            if got > self._limits.max_file_bytes:
+                raise self._too_large(got, probed=probed)
+            _chmod(part, 0o600)
+            os.replace(part, dst)
+        except BaseException:
+            _unlink_quiet(part)
+            raise
+        return sha256_file(dst), dst.stat().st_size
 
 
 def _screenshot_record(screenshot: str | os.PathLike[str] | None, job: Path) -> dict[str, Any] | None:
+    """Manifest record for the screenshot: sha256/size, or ``status`` missing / error."""
     if screenshot is None:
         return None
     sp = Path(screenshot)
     shown = str(sp)
-    with contextlib.suppress(ValueError):
+    with contextlib.suppress(ValueError, OSError):
         shown = sp.resolve().relative_to(job.resolve()).as_posix()
-    if not sp.is_file():
-        return {"path": shown, "status": "missing"}
-    return {"path": shown, "sha256": sha256_file(sp), "size": sp.stat().st_size}
+    try:
+        if not sp.is_file():
+            return {"path": shown, "status": "missing"}
+        return {"path": shown, "sha256": sha256_file(sp), "size": sp.stat().st_size}
+    except OSError as exc:
+        return {"path": shown, "status": "error", "error": _clip(str(exc.strerror or exc))}
 
 
 def _list_archive(zip_path: Path) -> list[ManifestEntry]:
     with _open_zip(zip_path) as zf:
         return [ManifestEntry("out", i.filename, None, i.file_size, None,
-                              "skipped:directory" if i.is_dir() else "archived") for i in zf.infolist()]
+                              "skipped:directory" if _is_dir_entry(i) else "archived")
+                for i in zf.infolist()]
+
+
+def _gateway_details(exc: GatewayError) -> dict[str, Any] | None:
+    # Only this module's own errors: vmrun error details carry argv/stdout noise.
+    return exc.details if isinstance(exc, TransferError) else None
 
 
 def collect_artifacts(
@@ -665,14 +913,25 @@ def collect_artifacts(
     clock: Clock = _SYSTEM_CLOCK,
     powershell: str = POWERSHELL_EXE,
     zip_timeout_s: float = 1800.0,
+    fetch_limits: FetchLimits = DEFAULT_FETCH_LIMITS,
 ) -> Manifest:
     """Collect the guest out directory (+ extra guest files) into ``host_job_dir/artifacts``.
 
-    Invalid guest directories raise PathNotAllowed before anything runs. Every
-    later failure (zip, copy, one extra path, extraction abort) is recorded in
-    ``errors`` / entry statuses and makes ``partial`` True; a manifest is always
-    written. ``module_map`` must be JSON-serializable (other values are
-    stringified). The guest out.zip is left in place for a retry.
+    Before any guest work: invalid guest directories raise PathNotAllowed, a
+    ``module_map`` that JSON cannot hold raises TransferError (values json cannot
+    encode are stringified), and host directory problems raise TransferError.
+    Output of an earlier collection of the same job (manifest, files/, raw/out.zip,
+    raw/extra/) is removed at that point, so what is on disk always matches the
+    manifest written by this call. Every later failure (zip, copy, size limits,
+    one extra path, extraction abort, host I/O, screenshot) is recorded in
+    ``errors`` / entry statuses and makes ``partial`` True; the manifest is then
+    always written (a failure to write it raises TransferError). Guest -> host
+    copies are bounded by ``fetch_limits`` (see :class:`_BoundedFetch`). The guest
+    out.zip is left in place for a retry.
+
+    ``allowed_guest_roots`` is a lexical check (see validate_guest_path): a
+    junction or symlink the guest created under an allowed root can still point
+    elsewhere in the guest.
     """
     roots = [allowed_guest_roots] if isinstance(allowed_guest_roots, str) else list(allowed_guest_roots)
     out_dir = _ps_safe_dir(guest_out_dir, must_be_under=roots)
@@ -681,12 +940,18 @@ def collect_artifacts(
     if _is_within(zip_guest, out_dir):
         raise PathNotAllowed("out.zip would be created inside the directory being zipped",
                              stage="validate", details={"reason": "zip-inside-out-dir"})
+    module_map_doc = _module_map_json(module_map)
 
     job = Path(os.path.abspath(host_job_dir))
     art = job / "artifacts"
     raw = art / "raw"
-    _make_private_dir(art)
-    _make_private_dir(raw)
+    try:
+        _make_private_dir(art)
+        _make_private_dir(raw)
+        _clear_previous_collection(art, raw)
+    except OSError as exc:
+        raise TransferError(f"cannot prepare the host artifacts directory: {exc.strerror or exc}",
+                            stage="host_fs", details={"path": str(art)}) from exc
     errors: list[dict[str, Any]] = []
     out_entries: list[ManifestEntry] = []
     extra_entries: list[ManifestEntry] = []
@@ -694,47 +959,57 @@ def collect_artifacts(
     raw_sha: str | None = None
     raw_size: int | None = None
 
-    # 1. zip the out dir in the guest and fetch the archive
-    has_content = False
-    try:
-        if not channel.dir_exists(out_dir):
-            errors.append(_error("out_dir", "GUEST_OP_FAILED", "guest out dir does not exist"))
-        else:
-            has_content = bool(channel.list_dir(out_dir))
-    except GatewayError as exc:
-        errors.append(_error("out_dir", exc.code, exc.message))
-    if has_content:
-        command = (f"Compress-Archive -Path '{out_dir.rstrip(chr(92))}\\*' "
-                   f"-DestinationPath '{zip_guest}' -Force")
-        try:
-            rc = _ps(channel, powershell, command, zip_timeout_s)
-        except GatewayError as exc:
-            errors.append(_error("zip", exc.code, exc.message))
-        else:
-            if rc != 0:
-                errors.append(_error("zip", TransferError.code, f"Compress-Archive exited with code {rc}"))
-            else:
-                try:
-                    raw_sha, raw_size = _fetch(channel, zip_guest, raw / "out.zip")
-                    raw_zip = raw / "out.zip"
-                except GatewayError as exc:
-                    errors.append(_error("fetch", exc.code, exc.message))
-                except OSError as exc:
-                    errors.append(_error("fetch", TransferError.code, f"host write failed: {exc.strerror}"))
+    with tempfile.TemporaryDirectory(prefix="x64gw-probe-") as scratch:
+        fetcher = _BoundedFetch(channel, powershell, job_dir, fetch_limits, Path(scratch))
 
-    # 2. extra guest files, each validated against the allowed roots
-    for index, guest_path in enumerate(extra_guest_paths):
-        shown = _clip(str(guest_path))
+        # 1. zip the out dir in the guest and fetch the archive
+        has_content = False
         try:
-            validated = validate_guest_path(guest_path, must_be_under=roots)
-            stored = f"raw/extra/{index:04d}_{_sanitize_basename(PureWindowsPath(validated).name)}"
-            _make_private_dir(raw / "extra")
-            sha, size = _fetch(channel, validated, art / stored)
-            extra_entries.append(ManifestEntry("extra", validated, stored, size, sha, "ok"))
+            if not channel.dir_exists(out_dir):
+                errors.append(_error("out_dir", "GUEST_OP_FAILED", "guest out dir does not exist"))
+            else:
+                has_content = bool(channel.list_dir(out_dir))
         except GatewayError as exc:
-            extra_entries.append(ManifestEntry("extra", shown, None, 0, None, f"failed:{exc.code}"))
-        except OSError:
-            extra_entries.append(ManifestEntry("extra", shown, None, 0, None, f"failed:{TransferError.code}"))
+            errors.append(_error("out_dir", exc.code, exc.message))
+        if has_content:
+            command = (f"Compress-Archive -Path '{out_dir.rstrip(chr(92))}\\*' "
+                       f"-DestinationPath '{zip_guest}' -Force")
+            try:
+                rc = _ps(channel, powershell, command, zip_timeout_s)
+            except GatewayError as exc:
+                errors.append(_error("zip", exc.code, exc.message))
+            else:
+                if rc != 0:
+                    errors.append(_error("zip", TransferError.code,
+                                         f"Compress-Archive exited with code {rc}"))
+                else:
+                    try:
+                        raw_sha, raw_size = fetcher.fetch(zip_guest, raw / "out.zip")
+                        raw_zip = raw / "out.zip"
+                    except GatewayError as exc:
+                        errors.append(_error("fetch", exc.code, exc.message, _gateway_details(exc)))
+                    except OSError as exc:
+                        errors.append(_error("fetch", TransferError.code,
+                                             f"host write failed: {exc.strerror or exc}"))
+
+        # 2. extra guest files, each validated against the allowed roots
+        for index, guest_path in enumerate(extra_guest_paths):
+            shown = _clip(str(guest_path))
+            try:
+                validated = validate_guest_path(guest_path, must_be_under=roots)
+                stored = f"raw/extra/{index:04d}_{_sanitize_basename(PureWindowsPath(validated).name)}"
+                _make_private_dir(raw / "extra")
+                sha, size = fetcher.fetch(validated, art / stored)
+                extra_entries.append(ManifestEntry("extra", validated, stored, size, sha, "ok"))
+            except GatewayError as exc:
+                extra_entries.append(ManifestEntry("extra", shown, None, 0, None, f"failed:{exc.code}"))
+                errors.append(_error("extra", exc.code, exc.message,
+                                     {**(_gateway_details(exc) or {}), "index": index}))
+            except OSError as exc:
+                extra_entries.append(ManifestEntry("extra", shown, None, 0, None,
+                                                   f"failed:{TransferError.code}"))
+                errors.append(_error("extra", TransferError.code, f"host write failed: {exc.strerror or exc}",
+                                     {"index": index}))
 
     # 3. extract (or just list) the archive
     extracted = False
@@ -756,6 +1031,14 @@ def collect_artifacts(
                 out_entries.extend(_list_archive(raw_zip))
         except GatewayError as exc:
             errors.append(_error("extract", exc.code, exc.message, exc.details))
+        except OSError as exc:
+            errors.append(_error("extract", TransferError.code,
+                                 f"host file system error while extracting: {exc.strerror or exc}"))
+
+    shot = _screenshot_record(screenshot, job)
+    if shot is not None and shot.get("status") == "error":
+        errors.append(_error("screenshot", TransferError.code,
+                             f"cannot read the screenshot: {shot['error']}"))
 
     entries = out_entries + extra_entries
     partial = bool(errors) or any(e.status.startswith("failed:") for e in entries)
@@ -772,11 +1055,15 @@ def collect_artifacts(
         partial=partial,
         entries=entries,
         errors=errors,
-        module_map=_jsonable(module_map),
-        screenshot=_screenshot_record(screenshot, job),
+        module_map=module_map_doc,
+        screenshot=shot,
         manifest_path=str(art / MANIFEST_NAME),
     )
-    _write_json_atomic(art / MANIFEST_NAME, manifest.to_dict())
+    try:
+        _write_json_atomic(art / MANIFEST_NAME, manifest.to_dict())
+    except OSError as exc:
+        raise TransferError(f"cannot write the manifest: {exc.strerror or exc}", stage="manifest",
+                            details={"path": manifest.manifest_path}) from exc
     return manifest
 
 
@@ -808,7 +1095,7 @@ def encrypt_archive(src_zip: str | os.PathLike[str], dst_zip: str | os.PathLike[
                 tmp, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zout:
             zout.setpassword(secret.encode("utf-8"))
             for info in zin.infolist():
-                if info.is_dir():
+                if _is_dir_entry(info):
                     continue
                 if info.file_size > limits.max_file_bytes:
                     raise UnsafeArchiveError("archive member too large to re-pack", stage="encrypt",

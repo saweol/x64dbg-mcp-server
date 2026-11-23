@@ -162,6 +162,14 @@ def validate_guest_path(p: str, *, must_be_under: str | Iterable[str] | None = N
     dot or space. With ``must_be_under`` (one root or several) the path must be
     equal to or inside one of the roots, compared case-insensitively.
 
+    The root check is lexical only: it cannot see junctions, symbolic links or
+    mount points that the guest created under an allowed root, so a path that
+    passes may still resolve to a file elsewhere in the guest. 8.3 short names
+    only alias names within the same directory and cannot escape a root, but a
+    root spelled in long form does not match the same directory spelled short
+    (that fails closed). Treat ``must_be_under`` as a policy filter for
+    guest-to-host reads, not as a guarantee against a hostile guest.
+
     Raises errors.PathNotAllowed for every violation (``details["reason"]``).
     """
     normalized = _validate(p)
@@ -202,32 +210,69 @@ def _exit_code_in(texts: Iterable[str]) -> int | None:
     return None
 
 
+def _split_listing(text: str, header: str, command: str) -> tuple[int, list[str]]:
+    """Split vmrun list output into the declared count ``N`` and the lines after the header.
+
+    Trailing blank lines are dropped. Raises GuestOperationError when the header is
+    missing or ``N`` is not a non-negative integer.
+    """
+    lines = _lines(text)
+    for i, line in enumerate(lines):
+        if line.startswith(header):
+            count = line[len(header):].strip()
+            if not count.isascii() or not count.isdigit():
+                break
+            body = lines[i + 1:]
+            while body and not body[-1].strip():
+                body.pop()
+            return int(count), body
+    raise GuestOperationError(f"unexpected {command} output", details={"stdout": _clip(text)})
+
+
+def _count_mismatch(command: str, declared: int, parsed: int, text: str) -> GuestOperationError:
+    return GuestOperationError(
+        f"{command} output lists {parsed} entries but declares {declared}",
+        details={"declared": declared, "parsed": parsed, "stdout": _clip(text)},
+    )
+
+
 def parse_process_list(text: str) -> list[GuestProcess]:
-    """Parse ``listProcessesInGuest`` output (``Process list: N`` + ``pid=.., owner=.., cmd=..``)."""
-    header = False
-    procs: list[GuestProcess] = []
-    for line in _lines(text):
-        if not line.strip():
-            continue
-        if line.startswith("Process list:"):
-            header = True
-            continue
+    """Parse ``listProcessesInGuest`` output (``Process list: N`` + ``pid=.., owner=.., cmd=..``).
+
+    ``owner`` and ``cmd`` are guest-controlled and untrusted: a guest process can put
+    any text, newlines included, into its command line. Lines that do not start a
+    ``pid=`` entry are therefore continuation lines of the previous ``cmd``. Because
+    a command line could also contain a complete fake ``pid=`` line, the number of
+    entries must equal the declared ``N``; any difference raises GuestOperationError
+    instead of returning a list that could hide or invent a process. Callers must
+    not decide what to kill from ``cmd``/``owner`` text alone.
+    """
+    declared, body = _split_listing(text, "Process list:", "listProcessesInGuest")
+    procs: list[tuple[int, str, list[str]]] = []
+    for line in body:
         m = _PROC_RE.match(line)
         if m:
-            procs.append(GuestProcess(pid=int(m.group(1)), owner=m.group(2), cmd=m.group(3)))
-    if not header:
-        raise GuestOperationError("unexpected listProcessesInGuest output",
-                                  details={"stdout": _clip(text)})
-    return procs
+            procs.append((int(m.group(1)), m.group(2), [m.group(3)]))
+        elif procs:
+            procs[-1][2].append(line)
+        elif line.strip():
+            raise GuestOperationError("unexpected listProcessesInGuest output",
+                                      details={"stdout": _clip(text)})
+    if len(procs) != declared:
+        raise _count_mismatch("listProcessesInGuest", declared, len(procs), text)
+    return [GuestProcess(pid=pid, owner=owner, cmd="\n".join(cmd)) for pid, owner, cmd in procs]
 
 
 def parse_dir_list(text: str) -> list[str]:
-    """Parse ``listDirectoryInGuest`` output (``Directory list: N`` + one name per line)."""
-    lines = _lines(text)
-    for i, line in enumerate(lines):
-        if line.startswith("Directory list:"):
-            return [name for name in lines[i + 1:] if name]
-    raise GuestOperationError("unexpected listDirectoryInGuest output", details={"stdout": _clip(text)})
+    """Parse ``listDirectoryInGuest`` output (``Directory list: N`` + one name per line).
+
+    The number of names must equal the declared ``N``; otherwise GuestOperationError.
+    """
+    declared, body = _split_listing(text, "Directory list:", "listDirectoryInGuest")
+    names = [name for name in body if name]
+    if len(names) != declared:
+        raise _count_mismatch("listDirectoryInGuest", declared, len(names), text)
+    return names
 
 
 # ── VixChannel ──────────────────────────────────────────────────────
@@ -239,6 +284,14 @@ class VixChannel:
     elements into one guest command line with plain spaces. That joining
     behaviour is inferred, not yet verified against a real guest (Phase 0);
     pass ``quote_args=False`` to hand arguments through verbatim.
+
+    Errors: besides the ``VmrunError`` subclasses listed in the ``GuestChannel``
+    contract, every method raises ``PathNotAllowed`` for a guest path that fails
+    :func:`validate_guest_path` (before vmrun runs), ``copy_to_guest`` /
+    ``copy_from_guest`` raise ``TransferError`` for an unusable host path, and
+    ``run_program`` / ``kill_process`` raise ``TypeError`` / ``ValueError`` for
+    wrongly typed arguments (caller bugs). All but the last two are
+    ``GatewayError`` subclasses.
     """
 
     def __init__(
