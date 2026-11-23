@@ -1,0 +1,278 @@
+//! SSE client table with per-client bounded outbound queues
+//! (pure, host-testable).
+//!
+//! Producers (the x64dbg callback thread via notifyEvent, HTTP threads
+//! answering POST /messages) only *enqueue* frames; they never touch a
+//! socket, so a stalled SSE client can never block the debugger. Each SSE
+//! connection's own thread pops frames and writes them with a send timeout.
+//! A client whose queue overflows (by count or bytes) is marked dead and its
+//! owner thread closes the connection.
+//!
+//! Slots carry a generation number so a stale handle held by an exiting
+//! thread can never remove or kill a newer client that reused the slot.
+//!
+//! Thread-safety: all methods are internally locked. Frames returned by
+//! `pop` are owned by the caller and must be released with `free`.
+
+const std = @import("std");
+const sync = @import("sync.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const MAX_CLIENTS = 8;
+pub const SESSION_ID_MAX = 10;
+
+pub const Limits = struct {
+    max_queued_frames: usize = 64,
+    max_queued_bytes: usize = 1 << 20,
+};
+
+pub const Handle = struct { idx: u8, gen: u32 };
+
+const State = enum { free, active, dead };
+
+const Slot = struct {
+    state: State = .free,
+    gen: u32 = 0,
+    session_buf: [SESSION_ID_MAX]u8 = undefined,
+    session_len: usize = 0,
+    queue: std.ArrayListUnmanaged([]u8) = .{},
+    queued_bytes: usize = 0,
+};
+
+pub const Hub = struct {
+    allocator: Allocator,
+    limits: Limits,
+    lock: sync.RwLock = .{},
+    slots: [MAX_CLIENTS]Slot = [_]Slot{.{}} ** MAX_CLIENTS,
+    next_session: u32 = 1,
+
+    pub fn init(allocator: Allocator, limits: Limits) Hub {
+        return .{ .allocator = allocator, .limits = limits };
+    }
+
+    /// Frees every queued frame. No other thread may use the hub afterwards.
+    pub fn deinit(self: *Hub) void {
+        _ = self;
+    }
+
+    /// Registers a new client; null when the table is full.
+    pub fn add(self: *Hub) ?Handle {
+        _ = self;
+        return null;
+    }
+
+    /// Copies the client's session id into `out`.
+    pub fn sessionId(self: *Hub, h: Handle, out: *[SESSION_ID_MAX]u8) ?[]const u8 {
+        _ = self;
+        _ = h;
+        _ = out;
+        return null;
+    }
+
+    /// Releases the slot (no-op for a stale handle) and frees its queue.
+    pub fn remove(self: *Hub, h: Handle) void {
+        _ = self;
+        _ = h;
+    }
+
+    pub fn isAlive(self: *Hub, h: Handle) bool {
+        _ = self;
+        _ = h;
+        return false;
+    }
+
+    pub fn markDead(self: *Hub, h: Handle) void {
+        _ = self;
+        _ = h;
+    }
+
+    /// Marks every client dead (server shutdown).
+    pub fn killAll(self: *Hub) void {
+        _ = self;
+    }
+
+    /// Queues "event: <event>\ndata: <data>\n\n" for every live client.
+    /// Returns how many clients accepted the frame.
+    pub fn broadcast(self: *Hub, event: []const u8, data: []const u8) usize {
+        _ = self;
+        _ = event;
+        _ = data;
+        return 0;
+    }
+
+    /// Queues a frame for the live client with `session_id`.
+    pub fn sendTo(self: *Hub, session_id: []const u8, event: []const u8, data: []const u8) bool {
+        _ = self;
+        _ = session_id;
+        _ = event;
+        _ = data;
+        return false;
+    }
+
+    /// Takes the oldest queued frame of a live client.
+    pub fn pop(self: *Hub, h: Handle) ?[]u8 {
+        _ = self;
+        _ = h;
+        return null;
+    }
+
+    pub fn free(self: *Hub, frame: []u8) void {
+        self.allocator.free(frame);
+    }
+
+    pub fn activeCount(self: *Hub) usize {
+        _ = self;
+        return 0;
+    }
+};
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn expectPop(hub: *Hub, h: Handle, want: []const u8) !void {
+    const f = hub.pop(h) orelse return error.TestExpectedFrame;
+    defer hub.free(f);
+    try testing.expectEqualStrings(want, f);
+}
+
+test "add assigns unique session ids up to MAX_CLIENTS" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    var handles: [MAX_CLIENTS]Handle = undefined;
+    var ids: [MAX_CLIENTS][SESSION_ID_MAX]u8 = undefined;
+    var lens: [MAX_CLIENTS]usize = undefined;
+    for (&handles, 0..) |*h, i| {
+        h.* = hub.add() orelse return error.TestUnexpectedResult;
+        lens[i] = hub.sessionId(h.*, &ids[i]).?.len;
+    }
+    try testing.expectEqual(@as(?Handle, null), hub.add());
+    try testing.expectEqual(@as(usize, MAX_CLIENTS), hub.activeCount());
+    for (0..MAX_CLIENTS) |i| for (i + 1..MAX_CLIENTS) |j| {
+        try testing.expect(!std.mem.eql(u8, ids[i][0..lens[i]], ids[j][0..lens[j]]));
+    };
+}
+
+test "broadcast queues SSE frames for every live client in FIFO order" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    const a = hub.add().?;
+    const b = hub.add().?;
+    try testing.expectEqual(@as(usize, 2), hub.broadcast("message", "{\"n\":1}"));
+    try testing.expectEqual(@as(usize, 2), hub.broadcast("message", "{\"n\":2}"));
+    try expectPop(&hub, a, "event: message\ndata: {\"n\":1}\n\n");
+    try expectPop(&hub, a, "event: message\ndata: {\"n\":2}\n\n");
+    try testing.expectEqual(@as(?[]u8, null), hub.pop(a));
+    try expectPop(&hub, b, "event: message\ndata: {\"n\":1}\n\n");
+    // b still has one frame queued; deinit must free it (leak-checked).
+}
+
+test "sendTo targets one session" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    const a = hub.add().?;
+    const b = hub.add().?;
+    var idb: [SESSION_ID_MAX]u8 = undefined;
+    const sid_b = hub.sessionId(b, &idb).?;
+    try testing.expect(hub.sendTo(sid_b, "message", "x"));
+    try testing.expectEqual(@as(?[]u8, null), hub.pop(a));
+    try expectPop(&hub, b, "event: message\ndata: x\n\n");
+    try testing.expect(!hub.sendTo("999999", "message", "x"));
+}
+
+test "queue overflow by count kills only that client" {
+    var hub = Hub.init(testing.allocator, .{ .max_queued_frames = 2 });
+    defer hub.deinit();
+    const slow = hub.add().?;
+    const fast = hub.add().?;
+    _ = hub.broadcast("m", "1");
+    _ = hub.broadcast("m", "2");
+    hub.free(hub.pop(fast).?);
+    hub.free(hub.pop(fast).?);
+    // slow never drains: the third frame overflows its queue.
+    try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "3"));
+    try testing.expect(!hub.isAlive(slow));
+    try testing.expect(hub.isAlive(fast));
+    try testing.expectEqual(@as(?[]u8, null), hub.pop(slow));
+    try expectPop(&hub, fast, "event: m\ndata: 3\n\n");
+}
+
+test "queue overflow by bytes kills the client" {
+    var hub = Hub.init(testing.allocator, .{ .max_queued_bytes = 64 });
+    defer hub.deinit();
+    const h = hub.add().?;
+    try testing.expectEqual(@as(usize, 0), hub.broadcast("m", "x" ** 100));
+    try testing.expect(!hub.isAlive(h));
+    try testing.expectEqual(@as(usize, 0), hub.broadcast("m", "y"));
+}
+
+test "dead and removed clients receive nothing" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    const h = hub.add().?;
+    var idbuf: [SESSION_ID_MAX]u8 = undefined;
+    const sid = try testing.allocator.dupe(u8, hub.sessionId(h, &idbuf).?);
+    defer testing.allocator.free(sid);
+    hub.markDead(h);
+    try testing.expect(!hub.isAlive(h));
+    try testing.expectEqual(@as(usize, 0), hub.broadcast("m", "x"));
+    try testing.expect(!hub.sendTo(sid, "m", "x"));
+    hub.remove(h);
+    try testing.expectEqual(@as(usize, 0), hub.activeCount());
+}
+
+test "stale handles cannot touch a client that reused the slot" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    const old = hub.add().?;
+    hub.remove(old);
+    const new = hub.add().?;
+    try testing.expectEqual(old.idx, new.idx);
+    try testing.expect(old.gen != new.gen);
+    hub.markDead(old);
+    hub.remove(old);
+    try testing.expect(hub.isAlive(new));
+    try testing.expect(!hub.isAlive(old));
+    try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "x"));
+    try testing.expectEqual(@as(?[]u8, null), hub.pop(old));
+    try expectPop(&hub, new, "event: m\ndata: x\n\n");
+}
+
+test "killAll marks every client dead" {
+    var hub = Hub.init(testing.allocator, .{});
+    defer hub.deinit();
+    const a = hub.add().?;
+    const b = hub.add().?;
+    hub.killAll();
+    try testing.expect(!hub.isAlive(a));
+    try testing.expect(!hub.isAlive(b));
+}
+
+test "concurrent producers and a consumer keep frames intact" {
+    var hub = Hub.init(std.heap.page_allocator, .{ .max_queued_frames = 1 << 20, .max_queued_bytes = 1 << 30 });
+    defer hub.deinit();
+    const h = hub.add().?;
+    const Producer = struct {
+        fn run(hb: *Hub) void {
+            for (0..500) |_| _ = hb.broadcast("message", "{\"k\":\"v\"}");
+        }
+    };
+    var ts: [3]std.Thread = undefined;
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Producer.run, .{&hub});
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got < 1500 and spins < 50_000_000) : (spins += 1) {
+        if (hub.pop(h)) |f| {
+            defer hub.free(f);
+            try testing.expectEqualStrings("event: message\ndata: {\"k\":\"v\"}\n\n", f);
+            got += 1;
+        }
+    }
+    for (ts) |t| t.join();
+    while (hub.pop(h)) |f| {
+        hub.free(f);
+        got += 1;
+    }
+    try testing.expectEqual(@as(usize, 1500), got);
+}
