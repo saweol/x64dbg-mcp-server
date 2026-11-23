@@ -650,6 +650,7 @@ class _RebootWatch:
     signal: str | None = None  # "boot_time" | "down": what showed the reboot
     after: str | None = None  # the new boot time, when that showed the reboot
     last: str | None = None  # last boot time read while waiting
+    before_dt: datetime | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.before_dt = _boot_datetime(self.before)
@@ -1199,14 +1200,15 @@ def _fetch_and_hash(channel: GuestChannel, guest_path: str, local: Path) -> str:
 
 
 def _adopt_legacy_backup(channel: GuestChannel, legacy: str, backups: _Backups, tmp: Path) -> str | None:
-    """Move a ``<plugin>.bak`` left in plugins\\ by earlier versions into ``plugins_backup``.
+    """Move a file left in plugins\\ (``<plugin>.bak`` of earlier versions, a stale
+    ``<plugin>.old``) into ``plugins_backup``.
 
     Best effort (the install does not depend on it): an identical backup that
     exists already makes it a plain delete. Returns the backup path, or None
     (logged) when it could not be moved. Guest environment errors propagate.
     """
     try:
-        local = tmp / "legacy.bak"
+        local = tmp / ("leftover" + PureWindowsPath(legacy).suffix)
         path, _created = backups.store(channel, local, _fetch_and_hash(channel, legacy, local))
         channel.delete_file(legacy)
     except GatewayError as exc:
@@ -1223,7 +1225,8 @@ def _replace_plugin(channel: GuestChannel, local: Path, target: str, backups: _B
     """Swap in ``local`` as ``target``; back the replaced build up in ``plugins_backup`` first.
 
     Steps: upload ``target.new``; move a ``target.bak`` left by earlier versions
-    into the backup folder; copy the current plugin to the host, hash it and copy
+    and a stale ``target.old`` into the backup folder (a ``.old`` that cannot be
+    moved is deleted, as before); copy the current plugin to the host, hash it and copy
     it to ``<backup dir>\\<plugin>.<UTC stamp>.bak`` unless a backup with the same
     SHA-256 exists; only then rename ``target`` to ``target.old`` and ``.new``
     into place, and delete ``.old``. When the second rename fails, ``.old`` is
@@ -1239,11 +1242,13 @@ def _replace_plugin(channel: GuestChannel, local: Path, target: str, backups: _B
     result: dict[str, Any] = {"backup": "none", "backup_path": None, "legacy_backup": None}
     _delete_if_exists(channel, new)
     channel.copy_to_guest(local, new)  # upload first: the old plugin stays until the copy worked
-    # A .old is only ever a second copy (its build was backed up before the swap).
-    _delete_if_exists(channel, old)
     with tempfile.TemporaryDirectory(prefix="x64dbg-gw-plugin-") as tmp:
         if channel.file_exists(legacy):
             result["legacy_backup"] = _adopt_legacy_backup(channel, legacy, backups, Path(tmp))
+        # A .old left by an interrupted install: this version backs its build up before
+        # the swap, earlier versions did not always; keep it unless that fails.
+        if channel.file_exists(old) and _adopt_legacy_backup(channel, old, backups, Path(tmp)) is None:
+            _delete_if_exists(channel, old)
         if not channel.file_exists(target):
             channel.rename(new, target)
             return result

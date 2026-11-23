@@ -454,6 +454,27 @@ def test_legacy_bak_identical_to_an_existing_backup_is_not_duplicated(rt, timeli
     assert summary["installed"]["x64"]["backup"] == "kept"
 
 
+def test_stale_old_file_is_backed_up_before_it_leaves_plugins(rt, timeline, tmp_path) -> None:
+    # A <plugin>.old from an interrupted install of an earlier version may be the only
+    # copy of that build: it is kept in plugins_backup, not just deleted.
+    _seed_install(rt.channel)
+    rt.channel.write(X64_PLUGIN + ".old", b"interrupted64")
+    _emu(rt.channel)
+    _install(rt, Probe(timeline), _dist(tmp_path))
+    assert not rt.channel.file_exists(X64_PLUGIN + ".old")
+    assert sorted(_files_in(rt.channel, X64_BACKUPS).values()) == [b"interrupted64", b"old64"]
+    assert _files_in(rt.channel, X64_PLUGINS) == {"x64dbg-mcp-server.dp64": b"new64"}
+
+
+def test_stale_old_file_identical_to_a_backup_is_just_removed(rt, timeline, tmp_path) -> None:
+    _seed_install(rt.channel)
+    rt.channel.write(X64_PLUGIN + ".old", b"old64")
+    _emu(rt.channel)
+    _install(rt, Probe(timeline), _dist(tmp_path))
+    assert not rt.channel.file_exists(X64_PLUGIN + ".old")
+    assert list(_files_in(rt.channel, X64_BACKUPS).values()) == [b"old64"]
+
+
 def test_unknown_backup_hashes_fail_open_to_a_new_backup(rt, timeline, fake_clock, tmp_path,
                                                          caplog: pytest.LogCaptureFixture) -> None:
     _seed_install(rt.channel)
