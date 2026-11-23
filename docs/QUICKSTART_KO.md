@@ -59,8 +59,8 @@ upload_roots = ["~/samples"]          # analysis_start가 읽을 수 있는 host
 [profiles.lab]
 mode = "vmware"
 vmx = "/vms/analysis_clone/analysis_clone.vmx"
-clean_snapshot = "MCP_CLEAN_V110"
-protected_snapshots = ["MCP_CLEAN_V110"]
+clean_snapshot = "MCP_CLEAN"
+protected_snapshots = ["MCP_CLEAN"]
 guest_user_env = "X64DBG_GW_GUEST_USER"
 guest_password_env = "X64DBG_GW_GUEST_PW"
 guest_host = "auto"                   # 또는 고정 IP
@@ -87,11 +87,11 @@ launch_task = "MCP-x32dbg"
 ## 5. 게스트 준비 (한 번만)
 
 ```bash
-# 1) 플러그인 배포: 디버거 종료 → 기존 플러그인 백업 → 복사 → 재기동 (실측 17초)
+# 1) 플러그인 배포: 디버거 종료 → 기존 플러그인을 plugins_backup\에 백업 → 복사 → 재기동 (실측 17~25초)
 x64dbg-vm-gateway install-plugin --dist dist --x64dbg-root 'C:\x64dbg\release'
 
 # 2) 프로비저닝 → 재부팅 → 클린 스냅샷
-x64dbg-vm-gateway provision --x64dbg-root 'C:\x64dbg\release' --snapshot MCP_CLEAN_V110
+x64dbg-vm-gateway provision --x64dbg-root 'C:\x64dbg\release' --snapshot MCP_CLEAN
 ```
 
 프로비저닝이 하는 일은 다음과 같습니다.
@@ -103,7 +103,7 @@ x64dbg-vm-gateway provision --x64dbg-root 'C:\x64dbg\release' --snapshot MCP_CLE
   - 손상된 토큰을 복구합니다.
 - `C:\mcp\jobs`를 만들고, x64dbg DB 압축을 끕니다(IDA 연동용).
 
-스냅샷은 메모리 포함 켜짐 상태로 만듭니다(4GB 게스트 기준 약 3분). 복원하면 x64dbg가 띄워진 상태 그대로 약 10초 만에 돌아옵니다.
+프로비저닝은 재부팅을 게스트 부팅 시각으로 확인한 뒤 플러그인 응답을 기다리고 스냅샷을 찍습니다(실측: 준비 39초, 전체 3분 14초). 스냅샷은 메모리 포함 켜짐 상태입니다. 복원하면 x64dbg가 떠 있는 상태 그대로 11~14초 만에 돌아옵니다.
 
 ## 6. 점검
 
@@ -174,23 +174,26 @@ IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 �
 
 | 증상 | 원인 / 조치 |
 |---|---|
-| 업로드한 파일이 LoadBinary로 안 열리고 System32 파일만 열림 | 같은 .vmx의 **VM 프로세스가 2개**(revert 후 고아 인스턴스). `pgrep -af vmware-vmx`로 확인하고 고아를 종료한다. 게이트웨이는 시작 전 이 상황을 검사해 거부한다. |
-| 재기동 후 계속 `refused`, 디버거가 반복 재시작됨 | 게이트웨이 클라이언트가 미확정 상태(토큰 미확보)에서 판정한 버그였다(K 수정). |
-| 429 / `BACKEND_THROTTLED` | 플러그인 인증 실패 잠금(토큰 없는 요청 5회/60초). 잠시 기다리거나 토큰을 확인한다. |
+| 업로드한 파일이 LoadBinary로 안 열리고 System32 파일만 열림 | 같은 .vmx의 **VM 프로세스가 2개**(revert 후 고아 인스턴스). `pgrep -af '^/usr/lib/vmware/bin/vmware-vmx'`로 확인하고 고아를 종료한다. 게이트웨이는 시작 전 이 상황을 검사해 거부한다(`VM_LOCKED`, doctor `single_vm_instance`). |
+| 429 / `BACKEND_THROTTLED`, doctor에 "locked this host out" | 플러그인 인증 실패 잠금. **토큰 없는 요청은 모두 실패로 센다**(5회 → 300초). 토큰 없이 `curl`로 포트를 두드리는 것도 포함된다. 5분 기다린다. 반복되면 토큰이 틀린 것이다(`doctor`의 token 항목). |
 | `BackendAuthError` + provision 안내 | 게스트 `mcp_config.json`이 손상됨(0으로 채워진 사례 있음). `provision`을 다시 실행한다. |
-| 게스트 명령 인자 깨짐 | vmrun은 인자마다 따옴표를 씌우고 이스케이프하지 않는다. PowerShell은 `-EncodedCommand`나 `-File`로, cmd.exe는 쓰지 않는다. |
-| 재부팅 대기 시간 초과 | 재부팅이 약 14초라 다운 구간을 놓쳤다. 부팅 시각 비교로 수정했다(K). |
+| `provision`이 `--user is required` | 구버전 CLI가 `guest_user_env`/`env_file`을 읽지 않던 결함(수정됨). 지금은 env 파일 값으로 동작한다. |
+| `GetDebugState`가 `status: LOCKED` | 이전 플러그인 빌드. 정지 상태(PAUSED)와 같다. 플러그인을 다시 설치하면 PAUSED로 나온다. |
+| 게스트 명령 인자 깨짐 | vmrun은 인자마다 따옴표를 씌우고 이스케이프하지 않는다. 게이트웨이가 미리 이스케이프한다. 직접 vmrun을 쓸 때는 PowerShell `-EncodedCommand`나 `-File`을 쓰고, cmd.exe는 쓰지 않는다. |
+| 게스트 PowerShell 스크립트가 "인수 형식이 일치하지 않습니다" | Windows PowerShell 5.1의 `ConvertTo-Json @($List[object])` 문제. 게이트웨이 스크립트는 `.ToArray()`를 쓴다. |
 
 ## 12. 검증 현황
 
-- **실 VM 검증:**
-  - doctor, install-plugin, provision(재부팅 감지 제외)
-  - 클린 스냅샷 복원(약 10초), 플러그인 v1.10 외부 바인드
-  - 샘플 업로드와 로드, 수집 전 복원 금지, CLI `jobs`/`discard`
-  - MCP stdio(툴 목록, `session_status`)
-- **K 수정 후 재검증 예정:**
-  - 전체 루프(x64/x32)
-  - x64dbg 강제 종료 후 복구
-  - IDA export
-  - 시작 시 툴 목록 버전
-- **미검증:** Windows/macOS host, 실제 Claude Code 클라이언트에서의 장시간 호출 timeout, 실제 IDA에서의 스크립트 실행
+2026-11-24 기준, 스파이크 VM(Windows 10 + PowerShell 5.1)에서 확인한 범위입니다. 자세한 기록은 `docs/PHASE0_RESULTS.md`에 있습니다.
+
+- **실 VM 검증 완료** — `pytest -m vm tests/vm` 10건 통과
+  - doctor(단일 VM 인스턴스 포함), install-plugin(25초, `plugins_backup`), provision(부팅 시각 기반 재부팅 감지, 스냅샷까지 3분 14초)
+  - x64·x32 전체 루프: 복원 → 업로드 → 로드 → BP/run/스택/덤프 → 수집(덤프·DB가 manifest에 기록) → IDA export → 복원. 분석 명령을 뺀 한 바퀴 약 48초
+  - x64dbg 강제 종료 → `BACKEND_RESTARTED` → 재기동 → ack → 분석 재개
+  - MCP stdio: 첫 툴 목록에 v1.10 툴이 들어 있음, `session_status` 호출
+- **미검증**
+  - Windows/macOS host
+  - 실제 Claude Code 클라이언트에서의 장시간 호출 timeout
+  - 실제 IDA에서의 스크립트 실행
+  - 원격 HTTP/TLS 모드의 실제 다른 PC 접속(단위 테스트만)
+  - `run`/step 직후 과도 상태의 `GetDebugState`

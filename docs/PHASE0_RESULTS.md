@@ -57,3 +57,66 @@
 - **로드 확인:** 새로 업로드한 샘플이 `LoadBinary`(v1.10)에서 250 ms 만에 시스템 BP에서 정지했다.
 - **게스트 Defender:** 실시간 보호는 꺼져 있었다(`RealTimeProtectionEnabled=False`).
 - **검사 도구 제한:** Sysinternals Process Monitor로 게스트를 추적하려던 시도는 auto mode 분류기가 차단했다(Undermining Oversight). 그 대신 플러그인에 진단 툴 `ProbeFile`과 `ExecuteDebuggerCommand(direct=true)`를 추가했다.
+
+## K 수정 후 실 VM 재검증 (2026-11-24)
+
+- **대상:** 스파이크 VM, 클린 스냅샷 `MCP_CLEAN_V110B`(아래 수정 플러그인 + provision으로 새로 만든 것)
+- **실행:** `pytest -m vm tests/vm`(E2E 5건 + K-vm 5건) **10건 모두 통과**(3분 43초)
+
+### 확인한 것
+
+- **doctor:** 전 항목 정상(`single_vm_instance` 포함).
+- **x64·x32 전체 루프**
+  - `analysis_start`: 복원 → 시작 → 업로드 → `LoadBinary` 시스템 BP 정지
+  - `GetServerInfo`(1.10), `ListModules`, `SetBreakpoint kernel32.Sleep`, `run` 반복 후 kernel32 안에서 정지(`GetDebugState` PAUSED)
+  - `GetCallStack`, `DumpMemory`(상대경로 → job `out`)
+  - `analysis_collect`: manifest.json에 덤프와 `.dd64`/`.dd32`가 sha256과 함께 기록됐고 host 파일이 존재
+  - `ida_export_annotations`, `analysis_finish`(복원)
+  - VM 작업마다 같은 .vmx의 `vmware-vmx` 프로세스가 정확히 1개
+- **루프 소요 시간(job 상태 기록 기준)**
+
+  | 구간 | 시간 |
+  |---|---|
+  | 복원+시작 → VM_READY | 11~14 s |
+  | 업로드 | 약 7 s |
+  | 로드 | 1 s 미만 |
+  | 수집 | 2~5 s |
+  | 종료 복원 | 10~13 s |
+  | 분석 명령을 뺀 한 바퀴 | 약 48 s |
+
+- **x64dbg 강제 종료(ANALYZING 중)**
+  - 다음 변경 호출이 `BACKEND_RESTARTED`(epoch 증가)를 받았다.
+  - 예약 작업으로 재기동됐다.
+  - `session_status`가 ack 후 HEALTHY를 보고했다.
+  - 이어서 `LoadBinary` → `WaitForPause` → PAUSED.
+- **MCP stdio:** 첫 `tools/list`에 v1.10 툴(`GetServerInfo`, `SetArtifactDir`, `ProbeFile`)이 있고, `session_status` 호출도 성공했다.
+- **K-vm(E1~E3)**
+  - vmrun 인자 왕복: 따옴표, 끝 `\`, 빈 문자열, 유니코드 포함
+  - PowerShell `-Command` 한 줄 명령
+  - `instance_report`
+  - LastBootUpTime 안정성
+- **provision(실 VM)**
+  - 자격 증명을 `env_file`에서 읽었다(셸에 export 없음).
+  - 재부팅을 부팅 시각(13:37 → 16:42 UTC)으로 감지했다. `reboot_signal=boot_time`.
+  - 39 s 후 준비 완료, 스냅샷까지 총 3분 14초.
+- **install-plugin(실 VM)**
+  - 25 s 걸렸다.
+  - 백업은 `<arch>\plugins_backup\<plugin>.<UTC>.bak`에 만들어졌고, `plugins\`에는 플러그인만 남았다.
+
+### 이 재검증에서 새로 찾아 고친 결함
+
+| 결함 | 원인 | 조치 |
+|---|---|---|
+| 게이트웨이의 모든 백엔드 호출이 `BackendUnavailable (errno 9)` | 플러그인 v1.10은 모든 응답에 `Connection: close`를 붙인다. `http.client`는 본문을 다 읽으면 소켓을 닫는데, 읽기 루프가 그 뒤 `settimeout()`을 호출했다. 가짜 서버는 이 헤더를 보내지 않아 단위 테스트에서 드러나지 않았다. | 응답이 닫히면 루프를 끝낸다. 가짜 서버에 v1.10 프레이밍을 추가하고 백엔드 테스트를 두 프레이밍 모두로 돌린다. |
+| doctor 몇 번과 수동 curl로 host가 5분간 잠김(HTTP 429) | 플러그인은 토큰 없는 요청을 모두 로그인 실패로 센다(5회 → 300 s 잠금). doctor의 도달성 검사는 토큰 없이 요청했다. | 토큰이 있으면 토큰으로 확인하고, 없으면 TCP 연결만 확인한다. 토큰이 거부되면 실패 1회로 끝낸다. |
+| `GetDebugState`가 정지 상태를 `LOCKED`로 보고(문서·`[state]` 줄은 PAUSED) | x64dbg는 디버기가 멈춰 있는 동안 run lock을 잡는다. 시스템 BP, 엔트리 BP, `WaitForPause` 직후 모두 LOCKED였다. | 플러그인이 PAUSED를 보고한다(`src/mcp/debugstate.zig`). loop rules에 "이전 빌드의 LOCKED는 정지"를 추가했다. |
+| `provision`이 빠른 시작 설정으로 실패(`--user is required`) | CLI가 `guest_user_env`와 `env_file`을 보지 않았다. | 게이트웨이와 같은 방식(실환경 > env_file)으로 해석한다. HTTP serve의 `token_envs`도 같다. |
+| install-plugin 백업 목록 조회 실패(exit 1) | Windows PowerShell 5.1에서 `ConvertTo-Json -InputObject @($List[object])`와 `@($List[object]) \| ConvertTo-Json`이 "인수 형식이 일치하지 않습니다"로 실패했다. `$list.ToArray()`는 동작했다. `List[string]`을 해시테이블 속성에 넣는 형태는 동작했다. | 백업 목록 조회와 `discover_x64dbg`가 `.ToArray()`를 쓴다. 두 스크립트를 게스트에서 실행해 확인했다. 정적 검사를 추가했다. |
+
+### 아직 실 VM에서 확인하지 않은 것
+
+- 수정된 `GetDebugState`가 `run`/step 직후의 과도 상태에서 무엇을 보고하는지. E2E는 `run` 반환 뒤의 정지 상태만 봤다.
+- x64dbg 강제 종료 시 디버기 프로세스가 어떻게 되는지(V14).
+- `LogRedirect` 명령의 실제 동작(V5 일부).
+- vmrun 동시 호출(V7), Claude Code 실제 클라이언트의 장시간 호출 timeout(V8), vmtoolsd 강제 종료(V9).
+- Windows/macOS host(V11, 범위 밖).

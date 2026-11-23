@@ -359,3 +359,11 @@ smoke test starts its own `serve`). The suite covers:
 After every VM operation the suite asserts that exactly one `vmware-vmx` process runs the .vmx
 (`platform.find_vmx_processes` when available, else `pgrep -af vmware-vmx`): a second instance
 of the same VM shares its MAC and IP, so HTTP and vmrun could reach different instances.
+
+`tests/vm/test_vm_kvm.py` (same marker and config variable) checks the guest-level fixes without
+changing the VM's power state or snapshots: program arguments round-trip through vmrun
+(quotes, trailing backslashes, empty strings, Unicode), a PowerShell `-Command` one-liner,
+`instance_report()`, and the guest boot time used for reboot detection.
+
+Last full run on the spike VM (2026-11-24): 10 passed in 3 min 43 s; see
+`docs/PHASE0_RESULTS.md` for the timings and the defects this suite found.
