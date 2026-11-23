@@ -295,7 +295,8 @@ pub const AuthLimiter = struct {
 
     /// Records a failed authentication. Returns true when this failure
     /// started a lockout.
-    pub fn recordFailure(self: *AuthLimiter, ip: Ipv4, now_ms: u64) bool {
+    pub fn recordFailure(self: *AuthLimiter, ip: Ipv4, now_ms: u64, failure: Failure) bool {
+        _ = failure;
         if (isLoopback(ip)) return false;
         const e = self.findOrClaim(ip, now_ms);
         e.last_seen = now_ms;
@@ -311,6 +312,18 @@ pub const AuthLimiter = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn lockRemainingMs(self: *const AuthLimiter, ip: Ipv4, now_ms: u64) u64 {
+        _ = self;
+        _ = ip;
+        _ = now_ms;
+        return 0;
+    }
+
+    pub fn lockoutMsFor(self: *const AuthLimiter, ip: Ipv4) u64 {
+        _ = ip;
+        return self.lockout_ms;
     }
 
     pub fn recordSuccess(self: *AuthLimiter, ip: Ipv4) void {
@@ -351,6 +364,15 @@ pub const AuthLimiter = struct {
         return victim;
     }
 };
+
+/// RED-phase stubs (replaced by the implementation).
+pub const LOOPBACK_LOCKOUT_MS: u64 = 5_000;
+pub const Failure = enum { no_credentials, bad_credentials };
+pub const BIND_ADDRESS_HINT = "(0.0.0.0, 127.0.0.1, etc.)";
+pub fn retryAfterSeconds(remaining_ms: u64) u64 {
+    _ = remaining_ms;
+    return 0;
+}
 
 /// Bounded counter of concurrently served client connections.
 pub const ClientSlots = struct {
@@ -621,76 +643,180 @@ test "AuthLimiter locks after max failures and unlocks after the lockout" {
     const ip = Ipv4{ 192, 168, 10, 9 };
     var t: u64 = 1000;
     for (0..4) |_| {
-        try testing.expect(!lim.recordFailure(ip, t));
+        try testing.expect(!lim.recordFailure(ip, t, .bad_credentials));
         t += 10;
     }
     try testing.expect(!lim.isLocked(ip, t));
-    try testing.expect(lim.recordFailure(ip, t));
+    try testing.expect(lim.recordFailure(ip, t, .bad_credentials));
     try testing.expect(lim.isLocked(ip, t));
     try testing.expect(lim.isLocked(ip, t + 299_999));
     try testing.expect(!lim.isLocked(ip, t + 300_000));
     // The counter restarts after the lockout expires.
-    try testing.expect(!lim.recordFailure(ip, t + 300_001));
+    try testing.expect(!lim.recordFailure(ip, t + 300_001, .bad_credentials));
     try testing.expect(!lim.isLocked(ip, t + 300_002));
 }
 
 test "AuthLimiter forgets failures outside the window" {
     var lim = AuthLimiter.init(3, 1000, 5000);
     const ip = Ipv4{ 10, 0, 0, 1 };
-    _ = lim.recordFailure(ip, 0);
-    _ = lim.recordFailure(ip, 10);
+    _ = lim.recordFailure(ip, 0, .bad_credentials);
+    _ = lim.recordFailure(ip, 10, .bad_credentials);
     // Third failure arrives after the window: counts as the first again.
-    try testing.expect(!lim.recordFailure(ip, 2000));
-    try testing.expect(!lim.recordFailure(ip, 2010));
-    try testing.expect(lim.recordFailure(ip, 2020));
+    try testing.expect(!lim.recordFailure(ip, 2000, .bad_credentials));
+    try testing.expect(!lim.recordFailure(ip, 2010, .bad_credentials));
+    try testing.expect(lim.recordFailure(ip, 2020, .bad_credentials));
 }
 
 test "AuthLimiter success clears the failure count; IPs are independent" {
     var lim = AuthLimiter.init(2, 60_000, 60_000);
     const a = Ipv4{ 10, 0, 0, 1 };
     const b = Ipv4{ 10, 0, 0, 2 };
-    _ = lim.recordFailure(a, 0);
+    _ = lim.recordFailure(a, 0, .bad_credentials);
     lim.recordSuccess(a);
-    try testing.expect(!lim.recordFailure(a, 1));
-    try testing.expect(lim.recordFailure(a, 2));
+    try testing.expect(!lim.recordFailure(a, 1, .bad_credentials));
+    try testing.expect(lim.recordFailure(a, 2, .bad_credentials));
     try testing.expect(lim.isLocked(a, 3));
     try testing.expect(!lim.isLocked(b, 3));
-    try testing.expect(!lim.recordFailure(b, 4));
+    try testing.expect(!lim.recordFailure(b, 4, .bad_credentials));
 }
 
 test "AuthLimiter keeps locked entries when the table overflows" {
     var lim = AuthLimiter.init(2, 60_000, 60_000);
     const victim = Ipv4{ 172, 16, 0, 1 };
-    _ = lim.recordFailure(victim, 0);
-    try testing.expect(lim.recordFailure(victim, 0));
+    _ = lim.recordFailure(victim, 0, .bad_credentials);
+    try testing.expect(lim.recordFailure(victim, 0, .bad_credentials));
     // Flood the table with other addresses, one (non-locking) failure each,
     // trying to evict the locked entry.
     var i: u32 = 0;
     while (i < AuthLimiter.CAPACITY * 2) : (i += 1) {
         const ip = Ipv4{ 10, @intCast((i >> 16) & 0xff), @intCast((i >> 8) & 0xff), @intCast(i & 0xff) };
-        _ = lim.recordFailure(ip, 1 + i);
+        _ = lim.recordFailure(ip, 1 + i, .bad_credentials);
     }
     try testing.expect(lim.isLocked(victim, 1000));
 }
 
-test "AuthLimiter never locks out loopback peers" {
-    // Every local process (and any web page, via the browser) shares
-    // 127.0.0.1; counting their failures would let them lock the real
-    // client out of the default loopback setup.
+test "AuthLimiter gives loopback peers a much shorter lockout" {
+    var lim = AuthLimiter.init(3, 60_000, 300_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    try testing.expect(!lim.recordFailure(lo, 1000, .bad_credentials));
+    try testing.expect(!lim.recordFailure(lo, 1001, .bad_credentials));
+    try testing.expect(lim.recordFailure(lo, 1002, .bad_credentials));
+    try testing.expect(lim.isLocked(lo, 1002));
+    try testing.expectEqual(LOOPBACK_LOCKOUT_MS, lim.lockRemainingMs(lo, 1002));
+    try testing.expectEqual(LOOPBACK_LOCKOUT_MS, lim.lockoutMsFor(lo));
+    try testing.expect(LOOPBACK_LOCKOUT_MS * 10 <= lim.lockout_ms);
+    try testing.expect(lim.isLocked(lo, 1002 + LOOPBACK_LOCKOUT_MS - 1));
+    try testing.expect(!lim.isLocked(lo, 1002 + LOOPBACK_LOCKOUT_MS));
+    // Remote peers keep the configured lockout.
+    const remote = Ipv4{ 192, 168, 10, 9 };
+    try testing.expectEqual(@as(u64, 300_000), lim.lockoutMsFor(remote));
+    _ = lim.recordFailure(remote, 2000, .bad_credentials);
+    _ = lim.recordFailure(remote, 2001, .bad_credentials);
+    try testing.expect(lim.recordFailure(remote, 2002, .bad_credentials));
+    try testing.expectEqual(@as(u64, 300_000), lim.lockRemainingMs(remote, 2002));
+}
+
+test "AuthLimiter loopback lockout never exceeds the configured lockout" {
+    var lim = AuthLimiter.init(1, 60_000, 2_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    try testing.expectEqual(@as(u64, 2_000), lim.lockoutMsFor(lo));
+    try testing.expect(lim.recordFailure(lo, 0, .bad_credentials));
+    try testing.expect(!lim.isLocked(lo, 2_000));
+}
+
+test "AuthLimiter ignores loopback requests that carry no credentials" {
+    // A web page can make the browser send simple requests (and CORS
+    // preflights) to 127.0.0.1 but cannot attach an Authorization header,
+    // so such requests must not lock the local MCP client out.
     var lim = AuthLimiter.init(2, 60_000, 300_000);
     const lo = Ipv4{ 127, 0, 0, 1 };
-    for (0..50) |i| try testing.expect(!lim.recordFailure(lo, i));
+    for (0..50) |i| try testing.expect(!lim.recordFailure(lo, i, .no_credentials));
     try testing.expect(!lim.isLocked(lo, 100));
-    try testing.expect(!lim.isLocked(.{ 127, 1, 2, 3 }, 100));
-    try testing.expect(!lim.recordFailure(.{ 127, 9, 9, 9 }, 101));
-    try testing.expect(!lim.recordFailure(.{ 127, 9, 9, 9 }, 102));
-    // Loopback failures take no table slot.
-    for (lim.entries) |e| try testing.expect(!e.used);
-    // Remote peers are still locked out.
-    const remote = Ipv4{ 192, 168, 10, 9 };
-    _ = lim.recordFailure(remote, 200);
-    try testing.expect(lim.recordFailure(remote, 201));
+    // A remote peer without credentials still counts.
+    const remote = Ipv4{ 10, 0, 0, 7 };
+    _ = lim.recordFailure(remote, 200, .no_credentials);
+    try testing.expect(lim.recordFailure(remote, 201, .no_credentials));
     try testing.expect(lim.isLocked(remote, 202));
+}
+
+test "AuthLimiter treats every loopback address as one peer" {
+    // Windows lets a local process pick any 127.x.y.z source address;
+    // per-address counting would make the loopback limit worthless.
+    var lim = AuthLimiter.init(3, 60_000, 300_000);
+    _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 10, .bad_credentials);
+    _ = lim.recordFailure(.{ 127, 0, 0, 2 }, 11, .bad_credentials);
+    try testing.expect(lim.recordFailure(.{ 127, 200, 3, 4 }, 12, .bad_credentials));
+    try testing.expect(lim.isLocked(.{ 127, 9, 9, 9 }, 13));
+    try testing.expect(lim.isLocked(.{ 127, 0, 0, 1 }, 13));
+    try testing.expect(!lim.isLocked(.{ 10, 0, 0, 1 }, 13));
+    // A success from any loopback address forgets the failure history.
+    lim = AuthLimiter.init(3, 60_000, 300_000);
+    _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 10, .bad_credentials);
+    _ = lim.recordFailure(.{ 127, 0, 0, 1 }, 11, .bad_credentials);
+    lim.recordSuccess(.{ 127, 0, 0, 5 });
+    try testing.expect(!lim.recordFailure(.{ 127, 0, 0, 1 }, 12, .bad_credentials));
+}
+
+test "AuthLimiter keeps the loopback bucket out of the remote table" {
+    var lim = AuthLimiter.init(2, 60_000, 300_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    _ = lim.recordFailure(lo, 0, .bad_credentials);
+    try testing.expect(lim.recordFailure(lo, 1, .bad_credentials));
+    for (lim.entries) |e| try testing.expect(!e.used);
+    // A remote flood cannot evict or reset the loopback lockout.
+    var i: u32 = 0;
+    while (i < AuthLimiter.CAPACITY * 2) : (i += 1) {
+        const ip = Ipv4{ 10, @intCast((i >> 16) & 0xff), @intCast((i >> 8) & 0xff), @intCast(i & 0xff) };
+        _ = lim.recordFailure(ip, 2 + i, .bad_credentials);
+    }
+    try testing.expect(lim.isLocked(lo, 1000));
+}
+
+test "lockRemainingMs and retryAfterSeconds" {
+    var lim = AuthLimiter.init(1, 60_000, 10_000);
+    const ip = Ipv4{ 192, 168, 10, 9 };
+    try testing.expectEqual(@as(u64, 0), lim.lockRemainingMs(ip, 0));
+    try testing.expect(lim.recordFailure(ip, 1000, .bad_credentials));
+    try testing.expectEqual(@as(u64, 10_000), lim.lockRemainingMs(ip, 1000));
+    try testing.expectEqual(@as(u64, 1), lim.lockRemainingMs(ip, 10_999));
+    try testing.expectEqual(@as(u64, 0), lim.lockRemainingMs(ip, 11_000));
+    try testing.expectEqual(@as(u64, 10), retryAfterSeconds(10_000));
+    try testing.expectEqual(@as(u64, 1), retryAfterSeconds(1));
+    try testing.expectEqual(@as(u64, 2), retryAfterSeconds(1001));
+    try testing.expectEqual(@as(u64, 1), retryAfterSeconds(0));
+}
+
+test "admit does not consult the auth lockout (429 is sent after the request)" {
+    var lim = AuthLimiter.init(1, 60_000, 300_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    const remote = Ipv4{ 192, 168, 10, 5 };
+    _ = lim.recordFailure(lo, 0, .bad_credentials);
+    _ = lim.recordFailure(remote, 0, .bad_credentials);
+    try testing.expect(lim.isLocked(lo, 1) and lim.isLocked(remote, 1));
+    var bad: usize = 0;
+    const list = try Allowlist.fromStrings(&.{"192.168.10.0/24"}, &bad);
+    var slots: ClientSlots = .{};
+    try testing.expectEqual(Admission.accept, admit(&list, lo, &slots, 4));
+    try testing.expectEqual(Admission.accept, admit(&list, remote, &slots, 4));
+}
+
+test "the dialog's bind address hint only suggests addresses that start by default" {
+    // Every dotted quad in the hint must pass planStartup without
+    // AllowExternal/AllowedClients (the dialog cannot set those).
+    var found: usize = 0;
+    var it = std.mem.tokenizeAny(u8, BIND_ADDRESS_HINT, " (),=;");
+    while (it.next()) |word| {
+        const ip = parseIpv4(word) catch continue;
+        _ = ip;
+        found += 1;
+        var diag: StartupDiag = .{};
+        _ = planStartup(.{ .ip_address = word, .allow_external = false, .allowed_clients = &.{}, .token = token32 }, &diag) catch |err| {
+            std.debug.print("hint suggests '{s}', which fails with {s}\n", .{ word, @errorName(err) });
+            return error.TestUnexpectedResult;
+        };
+    }
+    try testing.expect(found > 0);
+    try testing.expect(std.mem.indexOf(u8, BIND_ADDRESS_HINT, "etc") == null);
 }
 
 test "admit checks the allowlist before taking a client slot" {

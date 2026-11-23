@@ -560,7 +560,7 @@ fn recordAuthFailure(ip: netpolicy.Ipv4) void {
     {
         auth_lock.lock();
         defer auth_lock.unlock();
-        locked = auth_limiter.recordFailure(ip, GetTickCount64());
+        locked = auth_limiter.recordFailure(ip, GetTickCount64(), .bad_credentials);
         lockout_s = auth_limiter.lockout_ms / 1000;
     }
     if (locked) {

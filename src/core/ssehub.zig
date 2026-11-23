@@ -160,6 +160,13 @@ pub const Hub = struct {
         return f;
     }
 
+    /// RED-phase stub (replaced by the implementation).
+    pub fn read(self: *Hub, h: Handle, out: []u8) []u8 {
+        _ = self;
+        _ = h;
+        return out[0..0];
+    }
+
     pub fn free(self: *Hub, frame: []u8) void {
         self.allocator.free(frame);
     }
@@ -245,10 +252,22 @@ pub const Hub = struct {
 
 const testing = std.testing;
 
-fn expectPop(hub: *Hub, h: Handle, want: []const u8) !void {
-    const f = hub.pop(h) orelse return error.TestExpectedFrame;
-    defer hub.free(f);
-    try testing.expectEqualStrings(want, f);
+/// Reads everything queued for `h` in small chunks (so frames are split
+/// across reads and the ring wraps) and compares it with `want`.
+fn expectStream(hub: *Hub, h: Handle, want: []const u8) !void {
+    var got = std.ArrayList(u8).init(testing.allocator);
+    defer got.deinit();
+    var chunk: [7]u8 = undefined;
+    while (true) {
+        const n = hub.read(h, &chunk);
+        if (n.len == 0) break;
+        try got.appendSlice(n);
+    }
+    try testing.expectEqualStrings(want, got.items);
+}
+
+fn sseFrame(comptime event: []const u8, comptime data: []const u8) []const u8 {
+    return "event: " ++ event ++ "\ndata: " ++ data ++ "\n\n";
 }
 
 test "add assigns unique session ids up to MAX_CLIENTS" {
@@ -323,11 +342,63 @@ test "broadcast queues SSE frames for every live client in FIFO order" {
     const b = hub.add().?;
     try testing.expectEqual(@as(usize, 2), hub.broadcast("message", "{\"n\":1}"));
     try testing.expectEqual(@as(usize, 2), hub.broadcast("message", "{\"n\":2}"));
-    try expectPop(&hub, a, "event: message\ndata: {\"n\":1}\n\n");
-    try expectPop(&hub, a, "event: message\ndata: {\"n\":2}\n\n");
-    try testing.expectEqual(@as(?[]u8, null), hub.pop(a));
-    try expectPop(&hub, b, "event: message\ndata: {\"n\":1}\n\n");
-    // b still has one frame queued; deinit must free it (leak-checked).
+    try expectStream(&hub, a, comptime (sseFrame("message", "{\"n\":1}") ++ sseFrame("message", "{\"n\":2}")));
+    var none: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), hub.read(a, &none).len);
+    try expectStream(&hub, b, comptime (sseFrame("message", "{\"n\":1}") ++ sseFrame("message", "{\"n\":2}")));
+}
+
+test "queueing a frame never allocates (the debugger callback thread)" {
+    // Only the per-client buffer (allocated by add) may come from the
+    // allocator; every later allocation fails.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var hub = Hub.init(failing.allocator(), .{ .max_queued_bytes = 4096 });
+    defer hub.deinit();
+    const h = hub.add().?;
+    for (0..500) |i| {
+        try testing.expectEqual(@as(usize, 1), hub.broadcast("message", "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}"));
+        if (i % 10 == 9) {
+            var sink: [1024]u8 = undefined;
+            while (hub.read(h, &sink).len > 0) {}
+        }
+    }
+    try testing.expect(hub.isAlive(h));
+    try testing.expectEqual(@as(usize, 1), failing.allocations);
+}
+
+test "add fails cleanly when the client buffer cannot be allocated" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var hub = Hub.init(failing.allocator(), .{});
+    defer hub.deinit();
+    try testing.expectEqual(@as(?Handle, null), hub.add());
+    try testing.expectEqual(@as(usize, 0), hub.activeCount());
+}
+
+test "the client buffer wraps around without corrupting frames" {
+    const f = comptime sseFrame("m", "0123456789");
+    var hub = Hub.init(testing.allocator, .{ .max_queued_bytes = f.len * 2 + 5 });
+    defer hub.deinit();
+    const h = hub.add().?;
+    var chunk: [5]u8 = undefined;
+    var got = std.ArrayList(u8).init(testing.allocator);
+    defer got.deinit();
+    for (0..200) |_| {
+        try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "0123456789"));
+        // Drain only part of the queue so the write position keeps moving.
+        try got.appendSlice(hub.read(h, &chunk));
+        try got.appendSlice(hub.read(h, &chunk));
+        try got.appendSlice(hub.read(h, &chunk));
+        try got.appendSlice(hub.read(h, &chunk));
+    }
+    while (true) {
+        const n = hub.read(h, &chunk);
+        if (n.len == 0) break;
+        try got.appendSlice(n);
+    }
+    try testing.expect(hub.isAlive(h));
+    try testing.expectEqual(@as(usize, 200 * f.len), got.items.len);
+    var i: usize = 0;
+    while (i < got.items.len) : (i += f.len) try testing.expectEqualStrings(f, got.items[i..][0..f.len]);
 }
 
 test "sendTo targets one session" {
@@ -338,29 +409,28 @@ test "sendTo targets one session" {
     var idb: [SESSION_ID_MAX]u8 = undefined;
     const sid_b = hub.sessionId(b, &idb).?;
     try testing.expect(hub.sendTo(sid_b, "message", "x"));
-    try testing.expectEqual(@as(?[]u8, null), hub.pop(a));
-    try expectPop(&hub, b, "event: message\ndata: x\n\n");
+    try expectStream(&hub, a, "");
+    try expectStream(&hub, b, comptime sseFrame("message", "x"));
     try testing.expect(!hub.sendTo("999999", "message", "x"));
 }
 
-test "queue overflow by count kills only that client" {
-    var hub = Hub.init(testing.allocator, .{ .max_queued_frames = 2 });
+test "queue overflow kills only the client that stopped reading" {
+    const f = comptime sseFrame("m", "1");
+    var hub = Hub.init(testing.allocator, .{ .max_queued_bytes = 3 * f.len });
     defer hub.deinit();
     const slow = hub.add().?;
     const fast = hub.add().?;
-    _ = hub.broadcast("m", "1");
-    _ = hub.broadcast("m", "2");
-    hub.free(hub.pop(fast).?);
-    hub.free(hub.pop(fast).?);
-    // slow never drains: the third frame overflows its queue.
-    try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "3"));
+    for (0..3) |_| try testing.expectEqual(@as(usize, 2), hub.broadcast("m", "1"));
+    try expectStream(&hub, fast, f ++ f ++ f);
+    // slow never drains: the fourth frame overflows its buffer.
+    try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "1"));
     try testing.expect(!hub.isAlive(slow));
     try testing.expect(hub.isAlive(fast));
-    try testing.expectEqual(@as(?[]u8, null), hub.pop(slow));
-    try expectPop(&hub, fast, "event: m\ndata: 3\n\n");
+    try expectStream(&hub, slow, "");
+    try expectStream(&hub, fast, f);
 }
 
-test "queue overflow by bytes kills the client" {
+test "a frame larger than the client buffer kills the client" {
     var hub = Hub.init(testing.allocator, .{ .max_queued_bytes = 64 });
     defer hub.deinit();
     const h = hub.add().?;
@@ -376,8 +446,10 @@ test "dead and removed clients receive nothing" {
     var idbuf: [SESSION_ID_MAX]u8 = undefined;
     const sid = try testing.allocator.dupe(u8, hub.sessionId(h, &idbuf).?);
     defer testing.allocator.free(sid);
+    _ = hub.broadcast("m", "queued before death");
     hub.markDead(h);
     try testing.expect(!hub.isAlive(h));
+    try expectStream(&hub, h, "");
     try testing.expectEqual(@as(usize, 0), hub.broadcast("m", "x"));
     try testing.expect(!hub.sendTo(sid, "m", "x"));
     hub.remove(h);
@@ -397,8 +469,8 @@ test "stale handles cannot touch a client that reused the slot" {
     try testing.expect(hub.isAlive(new));
     try testing.expect(!hub.isAlive(old));
     try testing.expectEqual(@as(usize, 1), hub.broadcast("m", "x"));
-    try testing.expectEqual(@as(?[]u8, null), hub.pop(old));
-    try expectPop(&hub, new, "event: m\ndata: x\n\n");
+    try expectStream(&hub, old, "");
+    try expectStream(&hub, new, comptime sseFrame("m", "x"));
 }
 
 test "killAll marks every client dead" {
@@ -412,7 +484,8 @@ test "killAll marks every client dead" {
 }
 
 test "concurrent producers and a consumer keep frames intact" {
-    var hub = Hub.init(std.heap.page_allocator, .{ .max_queued_frames = 1 << 20, .max_queued_bytes = 1 << 30 });
+    const f = comptime sseFrame("message", "{\"k\":\"v\"}");
+    var hub = Hub.init(testing.allocator, .{ .max_queued_bytes = 1 << 20 });
     defer hub.deinit();
     const h = hub.add().?;
     const Producer = struct {
@@ -422,19 +495,21 @@ test "concurrent producers and a consumer keep frames intact" {
     };
     var ts: [3]std.Thread = undefined;
     for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Producer.run, .{&hub});
-    var got: usize = 0;
+    var got = std.ArrayList(u8).init(testing.allocator);
+    defer got.deinit();
+    var chunk: [64]u8 = undefined;
     var spins: usize = 0;
-    while (got < 1500 and spins < 50_000_000) : (spins += 1) {
-        if (hub.pop(h)) |f| {
-            defer hub.free(f);
-            try testing.expectEqualStrings("event: message\ndata: {\"k\":\"v\"}\n\n", f);
-            got += 1;
-        }
+    while (got.items.len < 1500 * f.len and spins < 50_000_000) : (spins += 1) {
+        try got.appendSlice(hub.read(h, &chunk));
     }
     for (ts) |t| t.join();
-    while (hub.pop(h)) |f| {
-        hub.free(f);
-        got += 1;
+    while (true) {
+        const n = hub.read(h, &chunk);
+        if (n.len == 0) break;
+        try got.appendSlice(n);
     }
-    try testing.expectEqual(@as(usize, 1500), got);
+    try testing.expect(hub.isAlive(h));
+    try testing.expectEqual(@as(usize, 1500 * f.len), got.items.len);
+    var i: usize = 0;
+    while (i < got.items.len) : (i += f.len) try testing.expectEqualStrings(f, got.items[i..][0..f.len]);
 }
