@@ -41,6 +41,7 @@ class VmOpLock:
         self._writer: int | None = None  # thread id holding the write lock
         self._writer_depth = 0
         self._waiting_writers = 0
+        self._waiting_readers = 0  # diagnostics/tests only; not part of state()
         self._hooks: list[PreemptHook] = []
 
     # ── public API ──────────────────────────────────────────────────
@@ -113,11 +114,15 @@ class VmOpLock:
                 # hold the lock, or the writer and this thread deadlock.
                 self._readers[me] = self._readers.get(me, 0) + 1
                 return
-            while self._writer is not None or self._waiting_writers > 0:
-                remaining = self._remaining(deadline)
-                if remaining is not None and remaining <= 0:
-                    raise self._timeout("read", timeout_s)
-                self._cond.wait(remaining)
+            self._waiting_readers += 1
+            try:
+                while self._writer is not None or self._waiting_writers > 0:
+                    remaining = self._remaining(deadline)
+                    if remaining is not None and remaining <= 0:
+                        raise self._timeout("read", timeout_s)
+                    self._cond.wait(remaining)
+            finally:
+                self._waiting_readers -= 1
             self._readers[me] = 1
 
     def _release_read(self) -> None:

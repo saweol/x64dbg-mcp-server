@@ -48,9 +48,9 @@ class Worker(threading.Thread):
 
 
 def hold_read(lock: VmOpLock, acquired: threading.Event, release: threading.Event,
-              log: list[str] | None = None, tag: str = "r") -> Worker:
+              log: list[str] | None = None, tag: str = "r", lock_timeout: float = WAIT) -> Worker:
     def body() -> None:
-        with lock.read(WAIT):
+        with lock.read(lock_timeout):
             if log is not None:
                 log.append(f"{tag}+")
             acquired.set()
@@ -180,11 +180,13 @@ def test_write_timeout_cleans_up_and_unblocks_queued_readers():
     assert acquired.wait(WAIT)
 
     outcome: list[BaseException] = []
+    # The preempt hook runs in the writer's thread before it blocks: holding it until the
+    # second reader is provably queued makes the ordering deterministic.
+    lock.add_preempt_hook(lambda: until(lambda: lock._waiting_readers == 1))
 
     def writer() -> None:
         try:
-            # timeout long enough for the reader below to queue up behind us
-            with lock.write(0.15):
+            with lock.write(0.05):
                 pass
         except LockTimeout as e:
             outcome.append(e)
@@ -195,12 +197,12 @@ def test_write_timeout_cleans_up_and_unblocks_queued_readers():
 
     r2_acquired = threading.Event()
     r2_release = threading.Event()
-    r2 = hold_read(lock, r2_acquired, r2_release)
-    assert not r2_acquired.wait(0.01)  # queued behind the waiting writer
+    # r2's own lock timeout is long: only a prompt wake-up from the writer giving up admits it
+    r2 = hold_read(lock, r2_acquired, r2_release, lock_timeout=30.0)
     w.finish()
     assert len(outcome) == 1 and outcome[0].details["mode"] == "write"
     # once the writer gave up, the queued reader must be admitted (no lost wake-up)
-    assert r2_acquired.wait(WAIT)
+    assert r2_acquired.wait(2.0)
     assert lock.state()["waiting_writers"] == 0
     release.set()
     r2_release.set()
