@@ -263,8 +263,9 @@ pub const BIND_ADDRESS_HINT = "(127.0.0.1 = local only)";
 
 /// Lockout applied to loopback peers (capped by the configured lockout).
 /// Much shorter than the remote default: it only has to slow down a local
-/// token guesser, while every local process shares the loopback bucket and
-/// could otherwise keep the real client locked out for minutes.
+/// token guesser, while every local process shares the loopback bucket.
+/// A local process that keeps failing can still re-lock the bucket each
+/// time a lockout ends; this bounds each lockout, not their number.
 pub const LOOPBACK_LOCKOUT_MS: u64 = 5_000;
 
 /// Kind of a failed authentication.
@@ -293,12 +294,16 @@ pub fn retryAfterSeconds(remaining_ms: u64) u64 {
 /// table (a remote flood cannot evict it), because a local process can pick
 /// any 127.x.y.z source address. Their lockout is LOOPBACK_LOCKOUT_MS (at
 /// most `lockout_ms`): enough to throttle a local token guesser, short
-/// enough that whoever shares 127.0.0.1 cannot lock the real client out for
-/// long. Loopback requests without any Authorization header are not
-/// counted: a web page can make the browser send those (simple requests,
-/// CORS preflights), but cannot add an Authorization header to a
-/// cross-origin request without a preflight this server never approves,
-/// so ordinary web pages cannot trigger the loopback lockout.
+/// enough that each lockout of the real client by another local process
+/// ends quickly. That process can re-lock the bucket as soon as a lockout
+/// ends (a valid token does not bypass a lockout, or the lockout would no
+/// longer slow a guesser down), so on loopback the token, not the lockout,
+/// is the security boundary. Loopback requests without any Authorization
+/// header are not counted (http.authFailureKind): a web page can make the
+/// browser send those (simple requests, CORS preflights), but cannot add an
+/// Authorization header to a cross-origin request without a preflight this
+/// server never approves, so ordinary web pages cannot trigger the loopback
+/// lockout.
 /// Not thread-safe.
 pub const AuthLimiter = struct {
     pub const CAPACITY = 128;
@@ -746,6 +751,25 @@ test "AuthLimiter gives loopback peers a much shorter lockout" {
     _ = lim.recordFailure(remote, 2001, .bad_credentials);
     try testing.expect(lim.recordFailure(remote, 2002, .bad_credentials));
     try testing.expectEqual(@as(u64, 300_000), lim.lockRemainingMs(remote, 2002));
+}
+
+test "AuthLimiter bounds each loopback lockout, not how often it re-locks" {
+    // What the README states: failures during a lockout are not counted,
+    // but a local process that keeps failing re-locks the shared loopback
+    // bucket right after each lockout ends.
+    var lim = AuthLimiter.init(3, 60_000, 300_000);
+    const lo = Ipv4{ 127, 0, 0, 1 };
+    var t: u64 = 0;
+    for (0..3) |_| {
+        _ = lim.recordFailure(lo, t, .bad_credentials);
+        _ = lim.recordFailure(lo, t + 1, .bad_credentials);
+        try testing.expect(lim.recordFailure(lo, t + 2, .bad_credentials));
+        // Further failures while locked neither count nor extend the lockout.
+        for (0..10) |i| try testing.expect(!lim.recordFailure(lo, t + 3 + i, .bad_credentials));
+        try testing.expectEqual(LOOPBACK_LOCKOUT_MS, lim.lockRemainingMs(lo, t + 2));
+        t += 2 + LOOPBACK_LOCKOUT_MS;
+        try testing.expect(!lim.isLocked(lo, t));
+    }
 }
 
 test "AuthLimiter loopback lockout never exceeds the configured lockout" {

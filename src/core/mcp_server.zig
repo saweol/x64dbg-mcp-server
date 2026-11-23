@@ -687,9 +687,8 @@ fn handleClient(sock: SOCKET) void {
         },
         .unauthorized => {
             // Only a request that sent credentials counts against a loopback
-            // peer (see netpolicy.AuthLimiter).
-            const failure: netpolicy.Failure = if (http.headerValue(head, "Authorization") == null) .no_credentials else .bad_credentials;
-            recordAuthFailure(peer_ip, failure);
+            // peer (see http.authFailureKind and netpolicy.AuthLimiter).
+            recordAuthFailure(peer_ip, http.authFailureKind(head));
             return sendJsonStatus(sock, "401 Unauthorized", "WWW-Authenticate: Bearer\r\n", "{\"error\":\"Unauthorized\"}");
         },
         else => recordAuthSuccess(peer_ip),

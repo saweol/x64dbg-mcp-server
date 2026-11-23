@@ -30,10 +30,16 @@
 
 const std = @import("std");
 
+/// The output buffer cannot hold the command and its NUL terminator.
+pub const BufferError = error{BufferTooSmall};
 /// Errors of the builders that only quote strings.
-pub const QuoteError = error{ Unrepresentable, BufferTooSmall };
-/// Errors of the builders that also take numeric or enumerated arguments.
-pub const Error = QuoteError || error{ InvalidNumber, InvalidArgument };
+pub const QuoteError = error{Unrepresentable} || BufferError;
+/// Errors of the builders that take one numeric argument (out of range).
+pub const NumberError = error{InvalidNumber} || BufferError;
+/// Errors of buildSaveData (quoted path and a size).
+pub const SaveDataError = error{InvalidNumber} || QuoteError;
+/// Errors of buildHardwareBp (size and type letter).
+pub const HardwareBpError = error{ InvalidNumber, InvalidArgument } || BufferError;
 
 /// True when `s` can be embedded in a quoted x64dbg argument.
 pub fn isRepresentable(s: []const u8) bool {
@@ -57,13 +63,13 @@ const Builder = struct {
     buf: []u8,
     len: usize = 0,
 
-    fn raw(self: *Builder, s: []const u8) QuoteError!void {
+    fn raw(self: *Builder, s: []const u8) BufferError!void {
         if (self.buf.len == 0 or self.len + s.len > self.buf.len - 1) return error.BufferTooSmall;
         @memcpy(self.buf[self.len..][0..s.len], s);
         self.len += s.len;
     }
 
-    fn print(self: *Builder, comptime fmt: []const u8, args: anytype) QuoteError!void {
+    fn print(self: *Builder, comptime fmt: []const u8, args: anytype) BufferError!void {
         if (self.buf.len == 0) return error.BufferTooSmall;
         const room = self.buf[self.len .. self.buf.len - 1];
         const s = std.fmt.bufPrint(room, fmt, args) catch return error.BufferTooSmall;
@@ -132,7 +138,7 @@ pub fn buildModExport(buf: []u8, module: []const u8, path: []const u8) QuoteErro
 }
 
 /// `savedata "<path>",<addr_expr>,0x<size>`. `size` must be positive.
-pub fn buildSaveData(buf: []u8, path: []const u8, addr_expr: []const u8, size: i64) Error![:0]const u8 {
+pub fn buildSaveData(buf: []u8, path: []const u8, addr_expr: []const u8, size: i64) SaveDataError![:0]const u8 {
     const n = try positive(size);
     var b: Builder = .{ .buf = buf };
     try b.raw("savedata ");
@@ -142,7 +148,7 @@ pub fn buildSaveData(buf: []u8, path: []const u8, addr_expr: []const u8, size: i
 }
 
 /// `alloc 0x<size>`. `size` must be positive.
-pub fn buildAlloc(buf: []u8, size: i64) Error![:0]const u8 {
+pub fn buildAlloc(buf: []u8, size: i64) NumberError![:0]const u8 {
     const n = try positive(size);
     var b: Builder = .{ .buf = buf };
     try b.print("alloc 0x{X}", .{n});
@@ -153,7 +159,7 @@ pub fn buildAlloc(buf: []u8, size: i64) Error![:0]const u8 {
 /// (switchthread, suspendthread, resumethread, attach). Ids are written in
 /// decimal with x64dbg's '.' prefix, the form ListThreads reports them in.
 /// `id` must be a non-zero 32-bit value.
-pub fn buildIdCommand(buf: []u8, verb: []const u8, id: i64) Error![:0]const u8 {
+pub fn buildIdCommand(buf: []u8, verb: []const u8, id: i64) NumberError![:0]const u8 {
     if (id <= 0 or id > std.math.maxInt(u32)) return error.InvalidNumber;
     var b: Builder = .{ .buf = buf };
     try b.print("{s} .{d}", .{ verb, id });
@@ -166,7 +172,7 @@ pub fn buildIdCommand(buf: []u8, verb: []const u8, id: i64) Error![:0]const u8 {
 /// 1, 2, 4 (and 8 on x64) with 1, so both are validated here: the type's
 /// first letter must be r, w, x or e (execute), and the size one of those
 /// values. A single-digit size reads the same in hex and decimal.
-pub fn buildHardwareBp(buf: []u8, addr_expr: []const u8, bp_type: []const u8, size: i64, is_x64: bool) Error![:0]const u8 {
+pub fn buildHardwareBp(buf: []u8, addr_expr: []const u8, bp_type: []const u8, size: i64, is_x64: bool) HardwareBpError![:0]const u8 {
     if (bp_type.len == 0) return error.InvalidArgument;
     const letter: u8 = switch (std.ascii.toLower(bp_type[0])) {
         'r' => 'r',
@@ -186,7 +192,7 @@ pub fn buildHardwareBp(buf: []u8, addr_expr: []const u8, bp_type: []const u8, si
 
 /// `SetExceptionBPX <code>,<chance>` with chance 1 (first), 2 (second) or
 /// 3 (all), the values x64dbg accepts (single digits, same in hex).
-pub fn buildSetExceptionBpx(buf: []u8, code: []const u8, chance: i64) Error![:0]const u8 {
+pub fn buildSetExceptionBpx(buf: []u8, code: []const u8, chance: i64) NumberError![:0]const u8 {
     if (chance < 1 or chance > 3) return error.InvalidNumber;
     var b: Builder = .{ .buf = buf };
     try b.print("SetExceptionBPX {s},{d}", .{ code, chance });
@@ -536,6 +542,34 @@ test "buildHardwareBp rejects sizes x64dbg would silently turn into 1" {
     try testing.expectError(error.InvalidNumber, buildHardwareBp(&buf, "0x10", "w", 8, false));
     try testing.expectError(error.InvalidArgument, buildHardwareBp(&buf, "0x10", "q", 1, true));
     try testing.expectError(error.InvalidArgument, buildHardwareBp(&buf, "0x10", "", 1, true));
+}
+
+/// True when the error set returned by `f` is exactly `want` (any order).
+fn returnsExactly(comptime f: anytype, comptime want: []const []const u8) bool {
+    const R = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+    const errs = @typeInfo(@typeInfo(R).error_union.error_set).error_set orelse return false;
+    if (errs.len != want.len) return false;
+    for (want) |w| {
+        var found = false;
+        for (errs) |e| {
+            if (std.mem.eql(u8, e.name, w)) found = true;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+test "each builder declares only the errors it can return" {
+    // Callers switch on these sets exhaustively; an error a builder never
+    // returns would force a dead (and misleading) branch in tools.zig.
+    try testing.expect(comptime returnsExactly(buildInit, &.{ "Unrepresentable", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildDbSave, &.{ "Unrepresentable", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildModExport, &.{ "Unrepresentable", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildSaveData, &.{ "InvalidNumber", "Unrepresentable", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildAlloc, &.{ "InvalidNumber", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildIdCommand, &.{ "InvalidNumber", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildHardwareBp, &.{ "InvalidNumber", "InvalidArgument", "BufferTooSmall" }));
+    try testing.expect(comptime returnsExactly(buildSetExceptionBpx, &.{ "InvalidNumber", "BufferTooSmall" }));
 }
 
 test "buildSetExceptionBpx validates the chance" {

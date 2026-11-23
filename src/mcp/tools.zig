@@ -809,7 +809,7 @@ fn schemaModuleName(w: *JsonWriter) void {
 }
 
 fn schemaSetHardwareBreakpoint(w: *JsonWriter) void {
-    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Address for the hardware breakpoint.\"},\"type\":{\"type\":\"string\",\"description\":\"Type: r (read/write), w (write), x (execute, default).\",\"default\":\"x\"},\"size\":{\"type\":\"integer\",\"enum\":[1,2,4,8],\"description\":\"Size in bytes: 1, 2, 4, or 8 (8 on x64 only; default 1). The address must be aligned to it.\",\"default\":1}},\"required\":[\"address\"]}");
+    w.raw("{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Address for the hardware breakpoint.\"},\"type\":{\"type\":\"string\",\"description\":\"Type: r (read/write), w (write), x (execute, default). Only the first letter counts, so 'read', 'write' and 'execute' also work.\",\"default\":\"x\"},\"size\":{\"type\":\"integer\",\"enum\":[1,2,4,8],\"description\":\"Size in bytes: 1, 2, 4, or 8 (8 on x64 only; default 1). The address must be aligned to it.\",\"default\":1}},\"required\":[\"address\"]}");
 }
 
 fn schemaSetMemoryBreakpoint(w: *JsonWriter) void {
@@ -2389,8 +2389,8 @@ fn setHardwareBreakpoint(params: ?std.json.Value, out: []u8) ToolResult {
             errResult(out, "Error: size must be 1, 2, 4 or 8.")
         else
             errResult(out, "Error: size must be 1, 2 or 4 (8-byte hardware breakpoints need x64)."),
-        error.InvalidArgument => errResult(out, "Error: type must be r (read/write), w (write) or x (execute)."),
-        error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long."),
+        error.InvalidArgument => errResult(out, "Error: type must start with r (read/write), w (write) or x / e (execute)."),
+        error.BufferTooSmall => errResult(out, "Error: input too long."),
     };
     if (!bridge.cmdExec(cmd.ptr))
         return errResult(out, "Error: Failed to set hardware breakpoint.");
@@ -3265,7 +3265,7 @@ fn dumpMemory(params: ?std.json.Value, out: []u8) ToolResult {
 
     var cmd_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
     const cmd = cmdline.buildSaveData(&cmd_buf, resolved, addr_str, size) catch |err| return switch (err) {
-        error.InvalidNumber, error.InvalidArgument => errResult(out, "Error: size must be a positive number of bytes."),
+        error.InvalidNumber => errResult(out, "Error: size must be a positive number of bytes."),
         error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long or filePath cannot be quoted."),
     };
     const ok = bridge.cmdExec(cmd.ptr);
@@ -3689,8 +3689,10 @@ fn dumpModule(params: ?std.json.Value, out: []u8) ToolResult {
         var save_buf: [pathutil.MAX_PATH_LEN + 128]u8 = undefined;
         const size = std.math.cast(i64, mod_size) orelse
             return fmtErr(out, "Error: Could not determine size of \"{s}\".", .{mod_name});
-        const save_cmd = cmdline.buildSaveData(&save_buf, resolved, addr_expr, size) catch
-            return errResult(out, "Error: path too long.");
+        const save_cmd = cmdline.buildSaveData(&save_buf, resolved, addr_expr, size) catch |err| return switch (err) {
+            error.InvalidNumber => fmtErr(out, "Error: Could not determine size of \"{s}\".", .{mod_name}),
+            error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long or filePath cannot be quoted."),
+        };
         const save_ok = bridge.cmdExec(save_cmd.ptr);
         if (!save_ok) return errResult(out, "Error: Failed to dump module.");
         return fmtResult(out, "Module dumped to \"{s}\".", .{resolved});
@@ -3943,8 +3945,8 @@ fn setExceptionBreakpoint(params: ?std.json.Value, out: []u8) ToolResult {
         return fmtResult(out, "Exception {s} set to pass to application (ignore).", .{code});
     } else {
         const cmd = cmdline.buildSetExceptionBpx(&cmd_buf, code, chance) catch |err| return switch (err) {
-            error.InvalidNumber, error.InvalidArgument => errResult(out, "Error: chance must be 1 (first-chance), 2 (second-chance) or 3 (both)."),
-            error.BufferTooSmall, error.Unrepresentable => errResult(out, "Error: input too long."),
+            error.InvalidNumber => errResult(out, "Error: chance must be 1 (first-chance), 2 (second-chance) or 3 (both)."),
+            error.BufferTooSmall => errResult(out, "Error: input too long."),
         };
         const ok = bridge.cmdExec(cmd.ptr);
         return fmtResult(out, "{s}", .{if (ok) "Exception breakpoint set." else "Failed to set exception breakpoint."});

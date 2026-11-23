@@ -6,6 +6,7 @@
 //! All functions are pure and thread-safe.
 
 const std = @import("std");
+const netpolicy = @import("netpolicy.zig");
 
 pub fn findHeaderEnd(data: []const u8) ?usize {
     return std.mem.indexOf(u8, data, "\r\n\r\n");
@@ -182,6 +183,16 @@ pub fn route(in: RouteInput) Route {
     return .json_rpc;
 }
 
+/// How a request answered with `.unauthorized` counts against its peer
+/// (see netpolicy.AuthLimiter). Only a request without any Authorization
+/// header is `.no_credentials`: that is all a web page can make a browser
+/// send cross-origin without a CORS preflight, which this server never
+/// approves. Any Authorization header (empty, another scheme, a wrong
+/// token) is `.bad_credentials`. The header name is case-insensitive.
+pub fn authFailureKind(head: []const u8) netpolicy.Failure {
+    return if (headerValue(head, "Authorization") == null) .no_credentials else .bad_credentials;
+}
+
 /// Buffer size that always fits lockedOutResponse.
 pub const LOCKED_OUT_RESPONSE_MAX = 320;
 
@@ -355,4 +366,20 @@ test "lockedOutResponse is a complete 429 with Retry-After and a JSON error" {
     // The largest value still fits the buffer.
     const big = lockedOutResponse(&buf, std.math.maxInt(u64));
     try testing.expect(std.mem.indexOf(u8, big, "Retry-After: 18446744073709551615\r\n") != null);
+}
+
+test "authFailureKind: only a request without an Authorization header is no_credentials" {
+    // What a browser can be made to send from any web page: no header.
+    try testing.expectEqual(netpolicy.Failure.no_credentials, authFailureKind("POST / HTTP/1.1\r\nHost: 127.0.0.1"));
+    try testing.expectEqual(netpolicy.Failure.no_credentials, authFailureKind("GET / HTTP/1.1"));
+    try testing.expectEqual(netpolicy.Failure.no_credentials, authFailureKind("GET / HTTP/1.1\r\nX-Authorization: Bearer abc\r\nAuthorization-Hint: x"));
+    // A header line without ':' is not a header.
+    try testing.expectEqual(netpolicy.Failure.no_credentials, authFailureKind("GET / HTTP/1.1\r\nAuthorization Bearer abc"));
+    // Anything that carries the header counts, whatever its value.
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nAuthorization: Bearer wrong"));
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nAuthorization:"));
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nAuthorization:   "));
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz"));
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nHost: x\r\nauthorization: bearer wrong"));
+    try testing.expectEqual(netpolicy.Failure.bad_credentials, authFailureKind("POST / HTTP/1.1\r\nAUTHORIZATION: Bearer"));
 }

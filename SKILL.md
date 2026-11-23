@@ -278,7 +278,7 @@ State-changing tools run one at a time (new in v1.10). If one is still running (
 | Go idle while user interacts with GUI | Call `WaitForEvent` with longer timeout (60-120s) to watch for events |
 | Retry a tool that returned `BUSY` in a tight loop | `BUSY` means it did not run: `PauseDebug` or `WaitForPause` first, then retry once |
 | Dump to a guessed relative path | `GetServerInfo` to see `artifact_dir`, or `SetArtifactDir` first |
-| Type a decimal number into `ExecuteDebuggerCommand` (`savedata f,rsp,4096`) | x64dbg reads bare numbers as **hex**: write `0x1000` or `.4096`. Tool parameters (`size`, `threadId`, `pid`, `count`) are plain JSON integers and are converted for you |
+| Type a decimal number into `ExecuteDebuggerCommand` (`savedata f,rsp,4096`) | x64dbg reads bare numbers as **hex**: write `0x1000` or `.4096`. Tool parameters that end up in an x64dbg command (`size`, `threadId`, `pid`) are plain JSON integers; the tools write them in the form x64dbg expects |
 
 ---
 

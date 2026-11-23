@@ -677,7 +677,7 @@
      },
      "type": {
       "type": "string",
-      "description": "Type: r (read/write), w (write), x (execute, default).",
+      "description": "Type: r (read/write), w (write), x (execute, default). Only the first letter counts, so 'read', 'write' and 'execute' also work.",
       "default": "x"
      },
      "size": {
