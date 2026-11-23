@@ -1,0 +1,20 @@
+{
+  "_about": "Real vmrun output captured on the development host (Linux, vmrun 1.17.0 build-24583834, 2026-11-23). Only read-only commands were run against the real VM; every other command targeted the non-existent path /nonexistent/x.vmx. raw/<name>.stdout and raw/<name>.stderr hold the bytes exactly as printed, except that in listSnapshots_*.stdout every snapshot name other than the two already published in docs/VM_ORCHESTRATION_PLAN.md (MCP_BASE, remote_base) was replaced by snapNN (NN = its line number in the tree); header, count, TAB depth, order and line endings are unchanged. The guest password used for the listProcessesInGuest capture was a throw-away value and is masked here.",
+  "vmrun_version": "1.17.0 build-24583834",
+  "host_system": "Linux",
+  "captures": {
+    "list": {"argv": ["vmrun", "-T", "ws", "list"], "returncode": 0},
+    "listSnapshots_showTree": {"argv": ["vmrun", "-T", "ws", "listSnapshots", "/vms/analysis_vm/analysis_vm.vmx", "showTree"], "returncode": 0},
+    "listSnapshots_flat": {"argv": ["vmrun", "-T", "ws", "listSnapshots", "/vms/analysis_vm/analysis_vm.vmx"], "returncode": 0},
+    "checkToolsState": {"argv": ["vmrun", "-T", "ws", "checkToolsState", "/vms/analysis_vm/analysis_vm.vmx"], "returncode": 0},
+    "getGuestIPAddress": {"argv": ["vmrun", "-T", "ws", "getGuestIPAddress", "/vms/analysis_vm/analysis_vm.vmx"], "returncode": 0},
+    "err_checkToolsState_nonexistent": {"argv": ["vmrun", "-T", "ws", "checkToolsState", "/nonexistent/x.vmx"], "returncode": 255},
+    "err_listSnapshots_nonexistent": {"argv": ["vmrun", "-T", "ws", "listSnapshots", "/nonexistent/x.vmx", "showTree"], "returncode": 255},
+    "err_getGuestIPAddress_nonexistent": {"argv": ["vmrun", "-T", "ws", "getGuestIPAddress", "/nonexistent/x.vmx"], "returncode": 255},
+    "err_revertToSnapshot_nonexistent": {"argv": ["vmrun", "-T", "ws", "revertToSnapshot", "/nonexistent/x.vmx", "NoSuchSnap"], "returncode": 255},
+    "err_start_nonexistent": {"argv": ["vmrun", "-T", "ws", "start", "/nonexistent/x.vmx", "nogui"], "returncode": 255},
+    "err_listProcessesInGuest_nonexistent": {"argv": ["vmrun", "-T", "ws", "-gu", "fakeuser", "-gp", "***", "listProcessesInGuest", "/nonexistent/x.vmx"], "returncode": 255},
+    "err_unknown_command": {"argv": ["vmrun", "-T", "ws", "noSuchCommand", "/nonexistent/x.vmx"], "returncode": 255},
+    "err_fusion_on_linux": {"argv": ["vmrun", "-T", "fusion", "checkToolsState", "/nonexistent/x.vmx"], "returncode": 255}
+  }
+}

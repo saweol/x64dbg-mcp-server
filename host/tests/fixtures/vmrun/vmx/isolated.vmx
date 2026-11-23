@@ -1,0 +1,11 @@
+.encoding = "UTF-8"
+# Synthetic: the MCP_CLEAN contract (plan 5.7) - HGFS disabled globally even
+# though a writable share is still declared, single host-only NIC.
+isolation.tools.hgfs.disable = "TRUE"
+sharedFolder0.present = "TRUE"
+sharedFolder0.enabled = "TRUE"
+sharedFolder0.writeAccess = "TRUE"
+sharedFolder.maxNum = "1"
+ethernet0.present = "TRUE"
+ethernet0.connectionType = "hostonly"
+ethernet0.startConnected = "TRUE"

@@ -1,0 +1,49 @@
+# Mirrors the example in docs/VM_ORCHESTRATION_PLAN.md section 5.1, plus [http]
+# and a retention table so every section of the schema is exercised.
+
+[gateway]
+jobs_root = "~/mcp-lab/jobs"
+default_profile = "win10"
+max_call_s = 55
+
+[http]
+enabled = true
+bind = "127.0.0.1"
+port = 9100
+allow_clients = ["10.0.0.0/24", "192.168.56.1"]
+token_envs = { read = "GW_TOKEN_READ", admin = "GW_TOKEN_ADMIN" }
+
+[profiles.win10]
+mode = "vmware"
+vmx = "/vms/analysis_vm/analysis_vm.vmx"
+vmrun = "auto"
+vmrun_type = "auto"
+clean_snapshot = "MCP_CLEAN"
+protected_snapshots = ["MCP_CLEAN", "MCP_BASE", "remote_base"]
+guest_user = "mcp"
+guest_password_env = "X64DBG_GW_GUEST_PW"
+guest_host = "auto"
+job_root_guest = 'C:\mcp\jobs'
+require_isolation = true
+token_source = "guest-config"
+relaunch_mode = "task"
+
+[profiles.win10.retention]
+max_gateway_snapshots = 5
+max_age_days = 7
+
+[profiles.win10.backends.x64]
+port = 9094
+exe = 'C:\tools\x64dbg\release\x64\x64dbg.exe'
+config = 'C:\tools\x64dbg\release\x64\mcp_config.json'
+launch_task = "MCP-x64dbg"
+
+[profiles.win10.backends.x32]
+port = 9095
+exe = 'C:\tools\x64dbg\release\x32\x32dbg.exe'
+config = 'C:\tools\x64dbg\release\x32\mcp_config.json'
+launch_task = "MCP-x32dbg"
+
+[profiles.remote-pc]
+mode = "endpoint"
+backends.x64 = { url = "http://10.0.0.20:9094", token_env = "REMOTE_X64DBG_TOKEN" }

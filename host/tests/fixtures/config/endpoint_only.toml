@@ -1,0 +1,10 @@
+# Smallest useful config: one endpoint-mode profile, no [gateway] table.
+
+[profiles.lab.backends.dbg64]
+arch = "x64"
+url = "https://lab.example:9443/"
+token_env = "LAB_DBG_TOKEN"
+
+[profiles.lab]
+mode = "endpoint"
+token_source = "env"
