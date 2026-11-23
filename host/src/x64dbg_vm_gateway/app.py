@@ -1173,12 +1173,15 @@ class Gateway(GatewayApp):
             raise InvalidArgument(f"action must be one of {', '.join(POWER_ACTIONS)}")
         rt = self.runtime(profile)
         self._require_vm(rt)
-        self._guard_vm_op(rt, "power")
+        # start/resume loses nothing and is allowed while ANALYZING; stop/suspend/reset lose the
+        # debuggee (or freeze it mid-analysis) and follow the revert rules
+        op: policy.VmOp = "power_start" if action == "start" else "power_stop"
+        self._guard_vm_op(rt, op)
         wait = self._wait(wait_s)
 
         def work(progress: Progress) -> dict[str, Any]:
             with rt.supervisor.paused(), rt.lock.write(timeout_s=WRITE_LOCK_TIMEOUT_S):
-                self._guard_vm_op(rt, "power")
+                self._guard_vm_op(rt, op)
                 progress(action)
                 if action == "stop":
                     rt.vm.stop(hard=False)

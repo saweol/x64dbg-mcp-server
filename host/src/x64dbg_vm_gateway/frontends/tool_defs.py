@@ -247,8 +247,10 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "vm_power", "VM power",
         "Change the VM's power state: start (boot or resume headless), stop, suspend or reset. Side effects: "
         "stop and reset are IRREVERSIBLE for unsaved guest state (like pulling the plug: the debuggee, the "
-        "debugger state and uncollected artifacts in memory are lost); suspend keeps memory on disk. Refused "
-        "while a job holds uncollected results. Returns state='in_progress' if not done within wait_s.",
+        "debugger state and uncollected artifacts in memory are lost); suspend keeps memory on disk. stop, "
+        "suspend and reset are refused while a job holds uncollected results; start (e.g. to resume a VM "
+        "suspended by host sleep) is allowed during an analysis. Every action is refused while a job is "
+        "uploading, collecting or reverting. Returns state='in_progress' if not done within wait_s.",
         _obj({"action": {"type": "string", "enum": ["start", "stop", "suspend", "reset"],
                          "description": "Power action."},
               "profile": _PROFILE, "wait_s": _wait_s("the power change")}, ("action",)),
