@@ -1264,14 +1264,23 @@ class Gateway(GatewayApp):
 
         def reachable() -> tuple[bool, str, str | None]:
             url = rt.backend_url(bid)
-            # No token on purpose: 401 proves the plugin answers without needing a valid token.
-            probe = rt.client_factory(
-                BackendEndpoint(id=bid, arch=cfg.arch, url=url, token=Secret("")), clock=self._clock
-            )
+            # Plugin v1.10 counts every request without a valid token as a failed login
+            # (5 per window -> HTTP 429 for 300 s), so probe with the gateway's token when it
+            # can be obtained; only without one does a tokenless probe (401 = it answers) run.
+            try:
+                probe = rt.connect(bid, wait=False)
+                tokenless = False
+            except GatewayError:
+                probe = rt.client_factory(
+                    BackendEndpoint(id=bid, arch=cfg.arch, url=url, token=Secret("")), clock=self._clock
+                )
+                tokenless = True
             try:
                 alive = probe.health_l1()
             except BackendAuthError:
-                return True, f"{url} answers (bearer token required)", None
+                detail = ("bearer token required" if tokenless
+                          else "it rejects the gateway's token: see the token check")
+                return True, f"{url} answers ({detail})", None
             except BackendThrottled as e:
                 retry = e.details.get("retry_after_s")
                 return (
