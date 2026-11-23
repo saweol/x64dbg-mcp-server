@@ -22,6 +22,7 @@ from x64dbg_vm_gateway.contracts import (
 )
 from x64dbg_vm_gateway.errors import (
     BackendAuthError,
+    BackendThrottled,
     BackendUnavailable,
     CancelledByVmOp,
     ConfigError,
@@ -250,6 +251,58 @@ def test_unknown_backend(fake_vm, fake_guest, fake_clock, client):
         sup.check("x99")
     with pytest.raises(ConfigError):
         sup.epoch("x99")
+
+
+# ── throttling (HTTP 429 auth lockout, plugin v1.10) ────────────────
+def test_throttled_on_l1_is_its_own_state(fake_vm, fake_guest, fake_clock, client):
+    client.l1 = BackendThrottled("429", retry_after_s=30)
+    fake_guest.add_process(f'"{EXE}"')
+    r = make_sup(fake_vm, fake_guest, fake_clock, client).check("x64")
+    assert r.state is HealthState.THROTTLED
+    assert r.details["retry_after_s"] == 30
+    assert client.l2_calls == 0
+    assert fake_guest.calls_of("list_processes") == []  # alive by definition: no process probing
+
+
+def test_throttled_on_l2(fake_vm, fake_guest, fake_clock, client):
+    client.l2 = BackendThrottled("429", retry_after_s=3)
+    r = make_sup(fake_vm, fake_guest, fake_clock, client).check("x64")
+    assert r.state is HealthState.THROTTLED and r.details["retry_after_s"] == 3
+
+
+def test_throttling_never_counts_as_l2_failure(fake_vm, fake_guest, fake_clock, client):
+    client.l2 = BackendThrottled("429", retry_after_s=300)
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, l2_fail_threshold=1, l2_min_window_s=0)
+    for _ in range(5):
+        assert sup.check("x64").state is HealthState.THROTTLED
+        fake_clock.advance(60)
+
+
+def test_ensure_alive_never_kills_or_relaunches_a_throttled_backend(fake_vm, fake_guest, fake_clock, client):
+    client.l1 = BackendThrottled("429", retry_after_s=120)
+    fake_guest.add_process(f'"{EXE}"')
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client)
+    with pytest.raises(BackendThrottled) as ei:
+        sup.ensure_alive("x64", job_id="j1", reason="test")
+    assert ei.value.details["retry_after_s"] == 120 and ei.value.details["backend"] == "x64"
+    assert fake_guest.calls_of("kill_process") == [] and fake_guest.calls_of("run_program") == []
+    assert sup.epoch("x64") == 0 and sup.restarts("j1") == 0
+
+
+def test_relaunched_backend_that_throttles_stops_the_ready_wait(fake_vm, fake_guest, fake_clock, client):
+    client.down()
+
+    def on_run(exe, args, **kw):
+        fake_guest.add_process(f'"{EXE}"')
+        client.l1 = BackendThrottled("429", retry_after_s=60)
+        return 0 if kw.get("wait") else None
+
+    fake_guest.on_run_program = on_run
+    sup = make_sup(fake_vm, fake_guest, fake_clock, client, relaunch_ready_timeout_s=600)
+    with pytest.raises(BackendThrottled):
+        sup.ensure_alive("x64", reason="test")
+    assert len(fake_guest.calls_of("run_program")) == 1
+    assert client.l1_calls <= 3  # no polling loop against a locked-out plugin
 
 
 # ── endpoint mode ───────────────────────────────────────────────────

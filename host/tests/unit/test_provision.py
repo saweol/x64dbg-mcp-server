@@ -746,6 +746,20 @@ def test_default_probes_against_a_plugin_server() -> None:
     assert default_http_probe("127.0.0.1", srv.port, 1.0) is None  # refused
 
 
+def test_readiness_probe_keeps_treating_a_locked_out_plugin_as_up() -> None:
+    # The gateway's backend client maps 429 to BACKEND_THROTTLED; provisioning's raw probe
+    # must still count it as "the HTTP server is up" (only a running plugin answers 429).
+    from x64dbg_vm_gateway.provision import READY_STATUSES
+
+    srv = FakePluginServer(token="T" * 32, version="1.10").start()
+    try:
+        srv.lock_out(300)
+        status = default_http_probe("127.0.0.1", srv.port, 3.0)
+    finally:
+        srv.stop()
+    assert status == 429 and status in READY_STATUSES
+
+
 def test_default_local_ip_for_loopback() -> None:
     assert default_local_ip_for("127.0.0.1") == "127.0.0.1"
     assert default_local_ip_for("not-an-ip") is None

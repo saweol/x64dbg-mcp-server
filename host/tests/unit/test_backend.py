@@ -11,12 +11,15 @@ import time
 import pytest
 
 from tests.fakes.fake_plugin_server import FakePluginServer, RpcError, ToolError
+from x64dbg_vm_gateway import backend as backend_mod
 from x64dbg_vm_gateway import contracts
 from x64dbg_vm_gateway.backend import HttpBackendClient
 from x64dbg_vm_gateway.contracts import BackendEndpoint, Secret, ToolCallResult
 from x64dbg_vm_gateway.errors import (
     BackendAuthError,
+    BackendError,
     BackendProtocolError,
+    BackendThrottled,
     BackendTimeout,
     BackendUnavailable,
     CancelledByVmOp,
@@ -327,6 +330,64 @@ def test_token_never_logged(client, server, caplog):
     with pytest.raises(BackendUnavailable):
         client.call_tool("run", {}, timeout_s=5)
     assert TOKEN not in caplog.text
+
+
+# ── HTTP 429: auth-failure lockout of plugin v1.10 ──────────────────
+def test_lockout_429_maps_to_backend_throttled_with_retry_after(client, server):
+    server.lock_out(7)
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    err = ei.value
+    assert isinstance(err, BackendError)
+    assert err.code == "BACKEND_THROTTLED" and err.retryable is True
+    assert err.details["retry_after_s"] == 7 and err.details["status"] == 429
+    assert err.details["backend"] == "x64"
+    assert err.hint and "7" in err.hint
+    assert_no_token(err)
+
+
+def test_retry_after_falls_back_to_the_json_body(client, server):
+    server.lock_out(9, header=False)
+    with pytest.raises(BackendThrottled) as ei:
+        client.call_tool("GetDebugState", {}, timeout_s=5)
+    assert ei.value.details["retry_after_s"] == 9
+
+
+def test_unknown_retry_after_is_none(client, server):
+    server.lock_out(9, header=False, body=False)
+    with pytest.raises(BackendThrottled) as ei:
+        client.initialize()
+    assert ei.value.details["retry_after_s"] is None
+
+
+def test_huge_retry_after_is_clamped(client, server):
+    server.lock_out(18446744073709551615)  # the plugin prints a u64
+    with pytest.raises(BackendThrottled) as ei:
+        client.list_tools()
+    assert ei.value.details["retry_after_s"] == backend_mod.MAX_RETRY_AFTER_S
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: c.health_l1(),
+    lambda c: c.health_l2(),
+    lambda c: c.server_info(),
+    lambda c: c.initialize(),
+    lambda c: c.list_tools(),
+    lambda c: c.call_tool("StepInto", {}, 5),
+], ids=["health_l1", "health_l2", "server_info", "initialize", "list_tools", "call_tool"])
+def test_every_request_kind_raises_throttled_instead_of_reporting_down(client, server, call):
+    # health_l1/health_l2 must not return False: "down" would make the supervisor relaunch.
+    server.lock_out(5)
+    with pytest.raises(BackendThrottled):
+        call(client)
+
+
+def test_throttled_client_recovers_after_the_lockout(client, server):
+    server.lock_out(1)
+    with pytest.raises(BackendThrottled):
+        client.health_l1()
+    server.unlock()
+    assert client.health_l1() is True
 
 
 # ── one connection per request ─────────────────────────────────────
