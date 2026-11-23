@@ -286,20 +286,24 @@ def test_create_builds_job_and_private_host_dirs(store, root):
     assert job.created_at == job.updated_at == FakeClock().now_iso()
 
 
-@pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+@pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="POSIX permission bits (root ignores them)")
 def test_create_uses_owner_only_permissions_even_with_odd_umask(root):
-    old = os.umask(0o077)
+    old = os.umask(0o277)  # strips owner write: mkdir/open modes alone would be too narrow
     try:
         s = make_store(root).open()
         job = s.create("win10", GUEST_ROOT)
+        s.transition(job.id, S.PREPARING_VM, reason="r")
+        s.close()
+        s.open()  # reopen: lock/guard files must still be usable
+        s.close()
     finally:
         os.umask(old)
     jd = Path(job.host_root)
-    for d in (jd, jd / "input", jd / "artifacts", jd / "logs"):
+    for d in (root, jd, jd / "input", jd / "artifacts", jd / "logs"):
         assert mode(d) == 0o700, d
     assert mode(jd / "state.json") == 0o600
     assert mode(jd / "intent.log") == 0o600
-    s.close()
+    assert mode(root / ".lock.guard") == 0o600
 
 
 def test_create_strips_trailing_backslash_from_guest_root(store):
@@ -466,8 +470,9 @@ def test_illegal_transitions_are_refused_and_nothing_is_written(store, src, dst)
 def test_transition_to_discarded_is_refused(store, start):
     job = store.create("win10", GUEST_ROOT)
     drive(store, job.id, start)
-    with pytest.raises(StateViolation):
+    with pytest.raises(StateViolation) as ei:
         store.transition(job.id, S.DISCARDED, reason="ai wants to skip collect")
+    assert "discard" in ei.value.message  # points the AI at the human-only CLI path
     assert store.get(job.id).state == start
 
 
@@ -1036,6 +1041,57 @@ def test_lock_excludes_a_real_second_process_and_stale_lock_is_reclaimed(root, t
     s2 = JobStore(root).open()  # dead child's lock is reclaimed
     assert json.loads((root / ".lock").read_text())["pid"] == os.getpid()
     s2.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses /proc process start times")
+def test_lock_with_reused_pid_is_reclaimed(root):
+    import socket
+
+    root.mkdir(parents=True)
+    # our own (live) pid, but recorded by an earlier process that had another start time
+    (root / ".lock").write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
+                                            "nonce": "old", "start": "other-boot:1"}))
+    s = JobStore(root).open()
+    assert json.loads((root / ".lock").read_text())["nonce"] != "old"
+    s.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="uses /proc process start times")
+def test_second_store_in_same_live_process_is_refused(root):
+    a = JobStore(root).open()
+    with pytest.raises(LockTimeout):
+        JobStore(root).open()
+    a.close()
+
+
+def test_failed_lock_write_leaves_no_lock_behind(root, monkeypatch):
+    s = make_store(root)
+
+    def boom(fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        s.open()
+    monkeypatch.undo()
+    assert not (root / ".lock").exists()
+    s.open()
+    s.close()
+
+
+def test_update_without_fields_writes_nothing(store):
+    job = store.create("win10", GUEST_ROOT)
+    n = len(intent_lines(job))
+    assert store.update(job.id) == job
+    assert len(intent_lines(job)) == n
+
+
+def test_unknown_job_is_refused_by_mutators(store):
+    for call in (lambda: store.transition("20261123-000000-ffffff", S.FAILED, reason="x"),
+                 lambda: store.update("20261123-000000-ffffff", epoch=1),
+                 lambda: store.discard("20261123-000000-ffffff", DISCARD_ACTOR)):
+        with pytest.raises(JobNotFound):
+            call()
 
 
 def test_pid_alive_default_implementation():
