@@ -28,7 +28,7 @@ from x64dbg_vm_gateway.errors import (
     VmrunError,
     VmrunTimeout,
 )
-from x64dbg_vm_gateway.guest import VixChannel, validate_guest_path
+from x64dbg_vm_gateway.guest import VixChannel, fold_case, validate_guest_path
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "transfer"
 
@@ -207,6 +207,14 @@ def test_run_program_quotes_args_for_the_guest_command_line(runner, chan):
     (c,) = runner.calls
     assert c["params"] == ("C:\\ps.exe", "-Command", "\"(Get-Item 'C:\\a b').Length\"", '""',
                            '"say \\"hi\\""')
+
+
+def test_vix_channel_documents_the_observed_vmrun_argument_joining():
+    doc = " ".join((VixChannel.__doc__ or "").split())
+    assert "observed on vmrun 1.17.0" in doc
+    assert "not re-quoted" in doc
+    assert "quote_args=True is required" in doc
+    assert "pending" in doc  # end-to-end confirmation still belongs to the VM test suite
 
 
 def test_run_program_quoting_can_be_disabled(runner):
@@ -601,6 +609,14 @@ def test_must_be_under_does_not_apply_multichar_case_mappings():
     with pytest.raises(PathNotAllowed):
         validate_guest_path("C:\\mass\\x", must_be_under="C:\\ma\u00df")
     assert validate_guest_path("C:\\MA\u1e9e\\x", must_be_under="C:\\ma\u00df") == "C:\\MA\u1e9e\\x"
+
+
+def test_fold_case_is_per_character_lowercase():
+    """One shared Windows-style fold: simple per-character lower-casing, no multi-char mappings."""
+    assert fold_case("C:\\MCP\\Jobs") == "c:\\mcp\\jobs"
+    assert fold_case("Stra\u00dfe") == "stra\u00dfe"  # casefold() would give 'strasse'
+    assert fold_case("\u1e9e") == "\u00df"
+    assert fold_case("\u0130") == "\u0130"  # 'İ'.lower() is two code points: left unchanged
 
 
 def test_copy_from_guest_refuses_symlink_or_directory_destination(tmp_path, runner, chan):

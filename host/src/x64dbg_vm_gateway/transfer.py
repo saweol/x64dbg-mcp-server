@@ -4,18 +4,21 @@ Upload: ``<in>\\<sha12>.part`` -> guest-side SHA-256 written to a file and
 copied back (runProgramInGuest returns no output) -> rename to
 ``<in>\\<sha12>.<exe|dll|bin>``.
 
-Collect: zip the guest ``out`` directory with ``Compress-Archive`` (vmrun cannot
-copy directories), copy the zip and any extra guest files to the host job
+Collect: zip the guest ``out`` directory (vmrun cannot copy directories) with
+``Compress-Archive``, falling back to the built-in ``tar.exe`` and finally to
+per-file copies; copy the zip and any extra guest files to the host job
 directory with size limits (:class:`FetchLimits`: guest-side size probe, host
 free-space reserve, post-copy size check), extract the zip with
-:func:`safe_extract` and write ``artifacts/manifest.json`` atomically. A new
-collection first removes the output of an earlier one. Host layout::
+:func:`safe_extract` and write ``artifacts/manifest.json`` atomically. The
+output of an earlier collection waits in ``artifacts.prev/`` until the new
+manifest is written. Host layout::
 
     <host_job_dir>/artifacts/
         manifest.json
         raw/out.zip                       original archive, kept as received
         raw/extra/NNNN_<sanitized-name>   extra guest files
-        files/NNNN_<sha12>                extracted members (names only in the manifest)
+        files/NNNN_<sha12>                extracted members or per-file copies
+                                          (names only in the manifest)
 
 On POSIX hosts directories are 0700 and files 0600 (never executable). On a
 Windows host the caller should pass ``extract=False`` and keep the archive,
@@ -40,7 +43,7 @@ import stat
 import tempfile
 import zipfile
 import zlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
@@ -55,13 +58,14 @@ from .errors import (
     UnsafeArchiveError,
     VmrunError,
 )
-from .guest import GUEST_ENV_ERRORS, POWERSHELL_EXE, is_reserved_name, validate_guest_path
+from .guest import GUEST_ENV_ERRORS, POWERSHELL_EXE, fold_case, is_reserved_name, validate_guest_path
 from .pe import sha256_file
 
 __all__ = [
     "DEFAULT_EXTRACT_LIMITS",
     "DEFAULT_FETCH_LIMITS",
     "MANIFEST_SCHEMA_VERSION",
+    "TAR_EXE",
     "ExtractLimits",
     "ExtractedEntry",
     "FetchLimits",
@@ -75,6 +79,9 @@ __all__ = [
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_NAME = "manifest.json"
+
+#: Built-in bsdtar of Windows 10 1803+ (no 2 GB limit, unlike Compress-Archive in PowerShell 5.1).
+TAR_EXE = "C:\\Windows\\System32\\tar.exe"
 
 _KiB = 1024
 _MiB = 1024 * _KiB
@@ -193,7 +200,7 @@ def _gjoin(directory: str, name: str) -> str:
 
 
 def _is_within(path: str, root: str) -> bool:
-    p, r = path.lower(), root.lower().rstrip("\\")
+    p, r = fold_case(path), fold_case(root).rstrip("\\")
     return p == r or p.startswith(r + "\\")
 
 
@@ -204,6 +211,15 @@ def _delete_guest_if_exists(channel: GuestChannel, path: str) -> None:
 
 def _ps(channel: GuestChannel, powershell: str, command: str, timeout_s: float) -> int | None:
     return channel.run_program(powershell, [*_PS_PREFIX, command], wait=True, timeout_s=timeout_s)
+
+
+def _exit_problem(rc: int | None) -> str:
+    """Short diagnostic for a failed run_program result (it returns None without an exit code)."""
+    return "no-exit-code" if rc is None else f"exit-code-{rc}"
+
+
+def _exit_text(tool: str, rc: int | None) -> str:
+    return f"{tool} returned no exit code" if rc is None else f"{tool} exited with code {rc}"
 
 
 # ── upload ──────────────────────────────────────────────────────────
@@ -235,14 +251,15 @@ def _guest_sha256(channel: GuestChannel, powershell: str, part: str, hash_path: 
     """Hash ``part`` in the guest.
 
     Returns ``(hash, "")`` or ``(None, problem)`` when the hash could not be produced
-    or read back (``exit-code-N``, ``no-hash-file``, ``unreadable-hash-file``). A
-    missing hash says nothing about the copied bytes, only about the guest tooling.
+    or read back (``exit-code-N``, ``no-exit-code``, ``no-hash-file``,
+    ``unreadable-hash-file``). A missing hash says nothing about the copied bytes,
+    only about the guest tooling.
     """
     command = (f"(Get-FileHash -Algorithm SHA256 -LiteralPath '{part}').Hash"
                f" | Out-File -Encoding ascii -FilePath '{hash_path}'")
     rc = _ps(channel, powershell, command, timeout_s)
     if rc != 0:
-        return None, f"exit-code-{rc}"
+        return None, _exit_problem(rc)
     _unlink_quiet(local)
     try:
         channel.copy_from_guest(hash_path, local)
@@ -286,6 +303,9 @@ def upload_sample(
     - hash unavailable (PowerShell failed, no/garbled hash file): only the hash
       step is repeated, the part is not re-copied.
 
+    A ``<sha12>.part`` left by an earlier, aborted upload is deleted before the
+    first copy, and the hash file before every hash step.
+
     After the last round raises IntegrityError if any round read a different
     hash, otherwise TransferError (the guest could not hash the file at all). On
     success an existing final file is replaced. Guest/vmrun errors other than a
@@ -316,6 +336,7 @@ def upload_sample(
     observed: list[str] = []
     mismatch_seen = False
     try:
+        _delete_guest_if_exists(channel, part)  # never append to / trust a stale part
         with tempfile.TemporaryDirectory(prefix="x64gw-hash-") as td:
             local = Path(td) / "guest.sha256"
             need_copy = True
@@ -371,10 +392,13 @@ class ExtractLimits:
     - ``max_file_bytes``: one member; a larger member is rejected (``too-large``).
     - ``max_ratio``: decompressed / compressed size of one member, checked once the
       member has produced more than ``ratio_min_bytes`` (small, highly compressible
-      files are harmless). A violating member is rejected (``ratio``), the rest of
-      the archive is still extracted. Memory dumps with large zero-filled regions
-      can compress better than 200:1; raise ``max_ratio`` to keep them (they stay
-      in the raw archive either way).
+      files are harmless). A violating member is rejected (``rejected:ratio``) and
+      the rest of the archive is still extracted. This is a deliberate deviation
+      from plan 5.3, which lists the ratio with the archive-wide caps: sparse memory
+      dumps (large zero-filled regions) routinely compress better than 200:1, and
+      aborting would also drop every log after such a dump. The byte budget of
+      ``max_total_bytes`` still applies to what a rejected member decompressed.
+      Raise ``max_ratio`` to keep such dumps (they stay in the raw archive either way).
 
     The compressed size a member declares is only trusted after checking that it
     does not overlap the next member or the central directory (``overlap``).
@@ -397,7 +421,8 @@ DEFAULT_EXTRACT_LIMITS = ExtractLimits()
 
 @dataclass(frozen=True)
 class ExtractedEntry:
-    """One archive member. ``size`` is the extracted byte count for ``ok`` entries and the
+    """One archive member; ``original_name`` is the raw name stored in the archive (separators
+    untouched). ``size`` is the extracted byte count for ``ok`` entries and the
     header-declared size otherwise. ``status``: ``ok`` | ``skipped:directory`` |
     ``rejected:<reason>``."""
 
@@ -434,6 +459,8 @@ def _name_problem(name: str) -> str | None:
         return "empty-name"
     if ".." in components:
         return "traversal"
+    if "." in components:
+        return "dot-component"
     for comp in components:
         if comp[-1] in ". ":
             return "trailing-dot-space"
@@ -443,7 +470,7 @@ def _name_problem(name: str) -> str | None:
 
 
 def _dup_key(name: str) -> str:
-    return "/".join(c for c in name.replace("\\", "/").split("/") if c).casefold()
+    return fold_case("/".join(c for c in name.replace("\\", "/").split("/") if c))
 
 
 def _is_dir_entry(info: zipfile.ZipInfo) -> bool:
@@ -575,17 +602,39 @@ def _open_zip(zip_path: Path) -> zipfile.ZipFile:
 
 
 def _require_empty_dir(dest: Path) -> None:
-    with os.scandir(dest) as it:
+    """Raise TransferError ``dest-not-empty`` unless ``dest`` is missing or empty."""
+    try:
+        it = os.scandir(dest)
+    except FileNotFoundError:
+        return
+    with it:
         if next(it, None) is not None:
             raise TransferError("extraction directory is not empty", stage="extract",
                                 details={"reason": "dest-not-empty", "path": str(dest)})
 
 
-def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[ExtractedEntry]) -> None:
+def _strip_dot(name: str) -> str:
+    """Drop the single leading ``./`` that ``tar -C <dir> .`` puts in front of every member name."""
+    if len(name) > 2 and name[0] == "." and name[1] in "/\\":
+        return name[2:]
+    return name
+
+
+def _member_path(name: str, strip_dot_prefix: bool = False) -> str:
+    """Member name as recorded in the manifest: ``/`` separators, tar's ``./`` prefix removed."""
+    path = name.replace("\\", "/")
+    return _strip_dot(path) if strip_dot_prefix else path
+
+
+def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[ExtractedEntry], *,
+                  strip_dot_prefix: bool = False) -> None:
     """Extract into ``dest`` (absent or empty), appending one entry per member to ``out``.
 
     ``out`` keeps the entries finished before an UnsafeArchiveError abort; the
-    abort also records their number in ``details["entries_done"]``.
+    abort also records their number in ``details["entries_done"]``. With
+    ``strip_dot_prefix`` (archives written by ``tar -C <dir> .``) one leading
+    ``./`` is removed before the name checks and the bare ``./`` root member is a
+    skipped directory; any further ``.`` component is still rejected.
     """
     with _open_zip(zip_path) as zf:
         infos = zf.infolist()
@@ -593,8 +642,8 @@ def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[E
             raise UnsafeArchiveError("archive has too many members", stage="extract",
                                      details={"reason": "file-count", "files": len(infos),
                                               "limit": limits.max_files})
+        _require_empty_dir(dest)  # before touching it: a foreign directory keeps its mode
         _make_private_dir(dest)
-        _require_empty_dir(dest)
         dest_real = os.path.realpath(dest)
         archive_size = zip_path.stat().st_size
         overlapping = _overlapping_members(infos, getattr(zf, "start_dir", archive_size))
@@ -603,8 +652,12 @@ def _extract_into(zip_path: Path, dest: Path, limits: ExtractLimits, out: list[E
         try:
             for index, info in enumerate(infos):
                 name = info.filename
-                reason = _name_problem(name)
-                key = _dup_key(name)
+                if strip_dot_prefix and name.replace("\\", "/") == "./":
+                    out.append(ExtractedEntry(name, None, 0, None, "skipped:directory"))
+                    continue
+                checked = _strip_dot(name) if strip_dot_prefix else name
+                reason = _name_problem(checked)
+                key = _dup_key(checked)
                 if reason is None and key in seen:
                     reason = "duplicate"
                 seen.add(key)
@@ -639,12 +692,17 @@ def safe_extract(zip_path: str | os.PathLike[str], dest_dir: str | os.PathLike[s
     ``dest_dir`` must not exist or be empty (TransferError ``dest-not-empty``
     otherwise), so every file in it belongs to this extraction. Members are
     stored as ``NNNN_<sha12>`` (NNNN = member index); original names only appear
-    in the returned entries. Unsafe members are skipped with status
-    ``rejected:<reason>`` (absolute, drive, unc, traversal, ads, reserved-name,
-    trailing-dot-space, invalid-char, duplicate, symlink, overlap, encrypted,
-    too-large, ratio, corrupt, unsupported-compression). Exceeding the member
-    count or the total size aborts with UnsafeArchiveError after removing the
-    partial output of the current member; earlier members stay on disk. Pass
+    in the returned entries (``original_name`` is the raw member name). Unsafe
+    members are skipped with status ``rejected:<reason>`` (absolute, drive, unc,
+    traversal, dot-component, ads, reserved-name, trailing-dot-space,
+    invalid-char, duplicate, symlink, overlap, encrypted, too-large, ratio,
+    corrupt, unsupported-compression). Duplicates are names that differ only by
+    per-character case (:func:`guest.fold_case`). A member over ``max_ratio`` is
+    only rejected, not an abort: a deliberate deviation from plan 5.3 so that
+    sparse memory dumps do not cost the rest of the archive (see
+    :class:`ExtractLimits`). Exceeding the member count or the total size aborts
+    with UnsafeArchiveError after removing the partial output of the current
+    member; earlier members stay on disk. Pass
     ``entries_out`` to keep their entries: it is filled as members finish and
     is the list returned on success. A file that is not a readable zip raises
     TransferError.
@@ -676,12 +734,14 @@ DEFAULT_FETCH_LIMITS = FetchLimits()
 
 @dataclass(frozen=True)
 class ManifestEntry:
-    """``source``: ``out`` (member of the guest out.zip, ``original_path`` is the member
-    name relative to the out dir) or ``extra`` (guest file copied on its own,
-    ``original_path`` is the guest path). ``stored_name`` is relative to
-    ``<host_job_dir>/artifacts`` with ``/`` separators. ``status``: ``ok`` |
-    ``archived`` (kept in raw/out.zip, not extracted) | ``skipped:<why>`` |
-    ``rejected:<reason>`` | ``failed:<error code>``."""
+    """``source``: ``out`` (a file or directory of the guest out dir; ``original_path`` is
+    its path relative to the out dir with ``/`` separators, directories end in ``/``)
+    or ``extra`` (guest file copied on its own, ``original_path`` is the validated
+    guest path). Archive member names are normalised here (``\\`` -> ``/``, the
+    ``./`` prefix of tar.exe removed); :class:`ExtractedEntry` keeps the raw name.
+    ``stored_name`` is relative to ``<host_job_dir>/artifacts`` with ``/``
+    separators. ``status``: ``ok`` | ``archived`` (kept in raw/out.zip, not
+    extracted) | ``skipped:<why>`` | ``rejected:<reason>`` | ``failed:<error code>``."""
 
     source: str
     original_path: str
@@ -693,6 +753,17 @@ class ManifestEntry:
 
 @dataclass
 class Manifest:
+    """What :func:`collect_artifacts` collected; :meth:`to_dict` is the ``manifest.json`` document.
+
+    ``archive_method`` says how the out dir reached the host: ``compress-archive``
+    or ``tar`` (guest-side zip kept as ``raw_zip``), ``copy`` (per-file copies
+    straight into ``files/``), or None (empty or missing out dir, or no method
+    worked). ``archive_attempts`` lists every method tried, in order, as
+    ``{"method", "status": "ok" | "failed", "error"?}``; a failed method followed
+    by one that worked does not make the manifest ``partial``. ``extracted`` is
+    True when ``files/`` holds the out-dir files (extracted archive or copies).
+    """
+
     schema_version: int
     job_dir: str
     collected_at: str
@@ -701,6 +772,8 @@ class Manifest:
     raw_zip: str | None
     raw_zip_sha256: str | None
     raw_zip_size: int | None
+    archive_method: str | None
+    archive_attempts: list[dict[str, Any]]
     extracted: bool
     partial: bool
     entries: list[ManifestEntry]
@@ -720,6 +793,8 @@ class Manifest:
             "raw_zip": self.raw_zip,
             "raw_zip_sha256": self.raw_zip_sha256,
             "raw_zip_size": self.raw_zip_size,
+            "archive_method": self.archive_method,
+            "archive_attempts": [dict(a) for a in self.archive_attempts],
             "extracted": self.extracted,
             "partial": self.partial,
             "errors": [dict(e) for e in self.errors],
@@ -771,10 +846,77 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _clear_previous_collection(art: Path, raw: Path) -> None:
-    """Drop output of an earlier run so the disk always matches the manifest this run writes."""
-    for path in (art / MANIFEST_NAME, art / "files", raw / "out.zip", raw / "out.zip.part", raw / "extra"):
-        _remove_path(path)
+#: What one collection writes under ``artifacts/`` (the manifest last). Anything else
+#: there (e.g. a screenshot the caller saved) is not touched.
+_OWNED = ("files", "raw/out.zip", "raw/extra", MANIFEST_NAME)
+
+
+def _stash_dirs(art: Path) -> tuple[Path, Path]:
+    """``artifacts.prev`` (complete stash of the previous output) and ``artifacts.prev.tmp``."""
+    return art.with_name(art.name + ".prev"), art.with_name(art.name + ".prev.tmp")
+
+
+def _move_owned(src_root: Path, dst_root: Path) -> None:
+    for rel in _OWNED:
+        src = src_root / rel
+        if os.path.lexists(src):
+            dst = dst_root / rel
+            _make_private_dir(dst.parent)
+            _remove_path(dst)
+            os.replace(src, dst)
+
+
+def _remove_owned(root: Path) -> None:
+    for rel in (*_OWNED, "raw/out.zip.part"):
+        _remove_path(root / rel)
+
+
+def _recover_previous(art: Path) -> None:
+    """Bring ``art`` back to one consistent collection after an interrupted run.
+
+    ``artifacts.prev.tmp`` is a stash that was being filled or emptied: its items
+    go back into ``art``. ``artifacts.prev`` is a complete stash: if ``art`` holds
+    a manifest the newer collection was committed and the stash is dropped;
+    otherwise the uncommitted output is removed and the stash goes back. Every
+    step is a rename or a removal, so a run killed during recovery is recovered
+    by the next call.
+    """
+    prev, staging = _stash_dirs(art)
+    if os.path.lexists(staging):
+        _move_owned(staging, art)
+        _remove_path(staging)
+    if not os.path.lexists(prev):
+        return
+    if (art / MANIFEST_NAME).is_file():
+        _remove_path(prev)
+        return
+    _remove_owned(art)
+    os.replace(prev, staging)
+    _move_owned(staging, art)
+    _remove_path(staging)
+
+
+def _stash_previous(art: Path) -> None:
+    """Move the output of an earlier collection to ``artifacts.prev`` (kept until the new manifest)."""
+    _recover_previous(art)
+    _remove_path(art / "raw" / "out.zip.part")
+    if not any(os.path.lexists(art / rel) for rel in _OWNED):
+        return
+    prev, staging = _stash_dirs(art)
+    _make_private_dir(staging)
+    _move_owned(art, staging)
+    os.replace(staging, prev)
+
+
+def _restore_previous(art: Path) -> None:
+    """Undo a collection that failed before its manifest was written."""
+    _remove_owned(art)
+    _recover_previous(art)
+
+
+def _drop_previous(art: Path) -> None:
+    with contextlib.suppress(OSError):
+        _remove_path(_stash_dirs(art)[0])
 
 
 def _host_free_bytes(path: Path) -> int:
@@ -886,9 +1028,9 @@ def _screenshot_record(screenshot: str | os.PathLike[str] | None, job: Path) -> 
         return {"path": shown, "status": "error", "error": _clip(str(exc.strerror or exc))}
 
 
-def _list_archive(zip_path: Path) -> list[ManifestEntry]:
+def _list_archive(zip_path: Path, strip_dot_prefix: bool = False) -> list[ManifestEntry]:
     with _open_zip(zip_path) as zf:
-        return [ManifestEntry("out", i.filename, None, i.file_size, None,
+        return [ManifestEntry("out", _member_path(i.filename, strip_dot_prefix), None, i.file_size, None,
                               "skipped:directory" if _is_dir_entry(i) else "archived")
                 for i in zf.infolist()]
 
@@ -896,6 +1038,93 @@ def _list_archive(zip_path: Path) -> list[ManifestEntry]:
 def _gateway_details(exc: GatewayError) -> dict[str, Any] | None:
     # Only this module's own errors: vmrun error details carry argv/stdout noise.
     return exc.details if isinstance(exc, TransferError) else None
+
+
+def _make_guest_archive(channel: GuestChannel, method: str, out_dir: str, zip_guest: str, powershell: str,
+                        tar: str, timeout_s: float) -> tuple[dict[str, Any] | None, bool]:
+    """Zip ``out_dir`` into ``zip_guest`` with ``method``; returns (error or None, guest unreachable)."""
+    stage = "zip" if method == "compress-archive" else "tar"
+    try:
+        if method == "compress-archive":
+            tool = "Compress-Archive"
+            command = (f"Compress-Archive -Path '{out_dir.rstrip(chr(92))}\\*' "
+                       f"-DestinationPath '{zip_guest}' -Force")
+            rc = _ps(channel, powershell, command, timeout_s)
+        else:
+            tool = "tar.exe"
+            # Whatever a failed earlier attempt left behind must never pass for tar's archive.
+            _delete_guest_if_exists(channel, zip_guest)
+            rc = channel.run_program(tar, ["-a", "-c", "-f", zip_guest, "-C", out_dir, "."], wait=True,
+                                     timeout_s=timeout_s)
+    except GatewayError as exc:
+        return _error(stage, exc.code, exc.message, _gateway_details(exc)), isinstance(exc, GUEST_ENV_ERRORS)
+    if rc != 0:
+        return _error(stage, TransferError.code, _exit_text(tool, rc)), False
+    return None, False
+
+
+def _copy_out_tree(channel: GuestChannel, fetcher: _BoundedFetch, out_dir: str, top_names: list[str],
+                   files: Path, limits: ExtractLimits, entries: list[ManifestEntry],
+                   errors: list[dict[str, Any]]) -> None:
+    """Last-resort fallback: copy each file under ``out_dir`` to ``files/NNNN_<sha12>``.
+
+    The tree is walked with list_dir / dir_exists (depth first, names sorted) and
+    every guest path must validate under ``out_dir`` (lexically). Each file goes
+    through ``fetcher`` (its FetchLimits). As for an extracted archive,
+    ``limits.max_files`` bounds the entries (files and directories) and
+    ``limits.max_total_bytes`` the bytes kept: the file that crosses the budget is
+    removed (``rejected:total-bytes``) and the walk stops. Other failures are
+    recorded per entry (``failed:<code>``) and in ``errors`` (stage ``copy``); a
+    guest environment error stops the walk. The guest resolves junctions and
+    symbolic links the lexical check cannot see (as Compress-Archive does); a
+    junction loop ends at ``max_files`` or at MAX_PATH (``too-long`` paths fail).
+    """
+    stack: list[tuple[str, str, Iterator[str]]] = [("", out_dir, iter(sorted(top_names)))]
+    index = total = 0
+    while stack:
+        rel_dir, guest_dir, names = stack[-1]
+        name = next(names, None)
+        if name is None:
+            stack.pop()
+            continue
+        if name in (".", ".."):
+            continue
+        if index >= limits.max_files:
+            errors.append(_error("copy", TransferError.code, "out dir has too many entries",
+                                 {"reason": "file-count", "limit": limits.max_files}))
+            return
+        rel = rel_dir + name
+        tmp = files / f".{index:04d}.fetch"
+        try:
+            guest = validate_guest_path(_gjoin(guest_dir, name), must_be_under=out_dir)
+            if channel.dir_exists(guest):
+                children = channel.list_dir(guest)
+                entries.append(ManifestEntry("out", rel + "/", None, 0, None, "skipped:directory"))
+                stack.append((rel + "/", guest, iter(sorted(children))))
+                continue
+            sha, size = fetcher.fetch(guest, tmp)
+            if total + size > limits.max_total_bytes:
+                entries.append(ManifestEntry("out", rel, None, size, None, "rejected:total-bytes"))
+                errors.append(_error("copy", TransferError.code, "out dir exceeds the total size limit",
+                                     {"reason": "total-bytes", "path": rel, "limit": limits.max_total_bytes}))
+                return
+            total += size
+            stored = f"{index:04d}_{sha[:12]}"
+            os.replace(tmp, files / stored)
+            entries.append(ManifestEntry("out", rel, f"files/{stored}", size, sha, "ok"))
+        except GatewayError as exc:
+            entries.append(ManifestEntry("out", rel, None, 0, None, f"failed:{exc.code}"))
+            errors.append(_error("copy", exc.code, exc.message,
+                                 {**(_gateway_details(exc) or {}), "path": rel}))
+            if isinstance(exc, GUEST_ENV_ERRORS):
+                return
+        except OSError as exc:
+            entries.append(ManifestEntry("out", rel, None, 0, None, f"failed:{TransferError.code}"))
+            errors.append(_error("copy", TransferError.code, f"host write failed: {exc.strerror or exc}",
+                                 {"path": rel}))
+        finally:
+            _unlink_quiet(tmp)
+            index += 1
 
 
 def collect_artifacts(
@@ -912,6 +1141,7 @@ def collect_artifacts(
     screenshot: str | os.PathLike[str] | None = None,
     clock: Clock = _SYSTEM_CLOCK,
     powershell: str = POWERSHELL_EXE,
+    tar: str = TAR_EXE,
     zip_timeout_s: float = 1800.0,
     fetch_limits: FetchLimits = DEFAULT_FETCH_LIMITS,
 ) -> Manifest:
@@ -920,14 +1150,35 @@ def collect_artifacts(
     Before any guest work: invalid guest directories raise PathNotAllowed, a
     ``module_map`` that JSON cannot hold raises TransferError (values json cannot
     encode are stringified), and host directory problems raise TransferError.
-    Output of an earlier collection of the same job (manifest, files/, raw/out.zip,
-    raw/extra/) is removed at that point, so what is on disk always matches the
-    manifest written by this call. Every later failure (zip, copy, size limits,
-    one extra path, extraction abort, host I/O, screenshot) is recorded in
-    ``errors`` / entry statuses and makes ``partial`` True; the manifest is then
-    always written (a failure to write it raises TransferError). Guest -> host
-    copies are bounded by ``fetch_limits`` (see :class:`_BoundedFetch`). The guest
-    out.zip is left in place for a retry.
+
+    The out dir reaches the host by the first method that works
+    (``Manifest.archive_method``; every try is in ``archive_attempts``):
+
+    1. ``Compress-Archive`` into ``<guest_job_dir>\\out.zip`` (PowerShell 5.1 fails
+       on files over 2 GB and on files another process holds open);
+    2. ``<tar> -a -c -f <zip> -C <out> .`` (built-in bsdtar, Windows 10 1803+, no
+       2 GB limit); the ``./`` prefix it gives every member is removed from the
+       recorded names;
+    3. per-file copies of the out tree straight into ``files/`` (see
+       ``_copy_out_tree``: ``fetch_limits`` per file, ``limits`` for the tree).
+       Skipped when ``extract`` is False, because it would leave loose guest
+       files on the host.
+
+    An archive that was created but cannot be fetched (too large, copy error)
+    goes straight to step 3. A guest environment error (VM, Tools, credentials)
+    ends the chain. Guest -> host copies are bounded by ``fetch_limits`` (see
+    :class:`_BoundedFetch`). The guest out.zip is left in place for a retry.
+
+    The output of an earlier collection of the same job (manifest, files/,
+    raw/out.zip, raw/extra/) is moved to ``<host_job_dir>/artifacts.prev`` before
+    any guest work and deleted once the new manifest is written, so what is on
+    disk always matches the manifest; if this call raises, the earlier output is
+    put back (a run that was killed part-way is repaired by the next call).
+    Other files in ``artifacts/`` are left alone. Every failure after that point
+    (archiving, copies, size limits, one extra path, extraction abort, host I/O,
+    screenshot) is recorded in ``errors`` / entry statuses and makes ``partial``
+    True; the manifest is then always written (a failure to write it raises
+    TransferError).
 
     ``allowed_guest_roots`` is a lexical check (see validate_guest_path): a
     junction or symlink the guest created under an allowed root can still point
@@ -944,17 +1195,44 @@ def collect_artifacts(
 
     job = Path(os.path.abspath(host_job_dir))
     art = job / "artifacts"
-    raw = art / "raw"
     try:
-        _make_private_dir(art)
-        _make_private_dir(raw)
-        _clear_previous_collection(art, raw)
+        _make_private_dir(art)  # refuses a symlinked directory before anything is moved
+        _stash_previous(art)
+        _make_private_dir(art / "raw")
     except OSError as exc:
+        if art.is_dir() and not art.is_symlink():
+            with contextlib.suppress(OSError, GatewayError):
+                _recover_previous(art)
         raise TransferError(f"cannot prepare the host artifacts directory: {exc.strerror or exc}",
                             stage="host_fs", details={"path": str(art)}) from exc
+    try:
+        manifest = _collect_into(
+            channel, out_dir=out_dir, job_dir=job_dir, zip_guest=zip_guest, roots=roots, job=job, art=art,
+            extra_guest_paths=extra_guest_paths, limits=limits, extract=extract,
+            module_map_doc=module_map_doc, screenshot=screenshot, clock=clock, powershell=powershell,
+            tar=tar, zip_timeout_s=zip_timeout_s, fetch_limits=fetch_limits)
+    except BaseException:
+        with contextlib.suppress(OSError, GatewayError):
+            _restore_previous(art)
+        raise
+    _drop_previous(art)
+    return manifest
+
+
+def _collect_into(channel: GuestChannel, *, out_dir: str, job_dir: str, zip_guest: str, roots: list[str],
+                  job: Path, art: Path, extra_guest_paths: Iterable[str], limits: ExtractLimits,
+                  extract: bool, module_map_doc: Any, screenshot: str | os.PathLike[str] | None,
+                  clock: Clock, powershell: str, tar: str, zip_timeout_s: float,
+                  fetch_limits: FetchLimits) -> Manifest:
+    """Body of :func:`collect_artifacts` once the host directories are ready."""
+    raw = art / "raw"
+    files = art / "files"
     errors: list[dict[str, Any]] = []
     out_entries: list[ManifestEntry] = []
     extra_entries: list[ManifestEntry] = []
+    attempts: list[dict[str, Any]] = []
+    method: str | None = None
+    extracted = False
     raw_zip: Path | None = None
     raw_sha: str | None = None
     raw_size: int | None = None
@@ -962,35 +1240,61 @@ def collect_artifacts(
     with tempfile.TemporaryDirectory(prefix="x64gw-probe-") as scratch:
         fetcher = _BoundedFetch(channel, powershell, job_dir, fetch_limits, Path(scratch))
 
-        # 1. zip the out dir in the guest and fetch the archive
-        has_content = False
+        # 1. the out dir: guest-side zip (Compress-Archive, then tar.exe) or per-file copies
+        top_names: list[str] = []
         try:
             if not channel.dir_exists(out_dir):
                 errors.append(_error("out_dir", "GUEST_OP_FAILED", "guest out dir does not exist"))
             else:
-                has_content = bool(channel.list_dir(out_dir))
+                top_names = channel.list_dir(out_dir)
         except GatewayError as exc:
             errors.append(_error("out_dir", exc.code, exc.message))
-        if has_content:
-            command = (f"Compress-Archive -Path '{out_dir.rstrip(chr(92))}\\*' "
-                       f"-DestinationPath '{zip_guest}' -Force")
-            try:
-                rc = _ps(channel, powershell, command, zip_timeout_s)
-            except GatewayError as exc:
-                errors.append(_error("zip", exc.code, exc.message))
-            else:
-                if rc != 0:
-                    errors.append(_error("zip", TransferError.code,
-                                         f"Compress-Archive exited with code {rc}"))
-                else:
+        guest_down = False
+        if top_names:
+            for archiver in ("compress-archive", "tar"):
+                failure, guest_down = _make_guest_archive(channel, archiver, out_dir, zip_guest, powershell,
+                                                          tar, zip_timeout_s)
+                if failure is None:
                     try:
                         raw_sha, raw_size = fetcher.fetch(zip_guest, raw / "out.zip")
-                        raw_zip = raw / "out.zip"
                     except GatewayError as exc:
-                        errors.append(_error("fetch", exc.code, exc.message, _gateway_details(exc)))
+                        failure = _error("fetch", exc.code, exc.message, _gateway_details(exc))
+                        guest_down = isinstance(exc, GUEST_ENV_ERRORS)
                     except OSError as exc:
-                        errors.append(_error("fetch", TransferError.code,
-                                             f"host write failed: {exc.strerror or exc}"))
+                        failure = _error("fetch", TransferError.code,
+                                         f"host write failed: {exc.strerror or exc}")
+                    else:
+                        raw_zip, method = raw / "out.zip", archiver
+                        attempts.append({"method": archiver, "status": "ok"})
+                        break
+                attempts.append({"method": archiver, "status": "failed", "error": failure})
+                if guest_down or failure["stage"] == "fetch":
+                    break  # an archive that exists but cannot be fetched would not fare better from tar
+            if method is None and not guest_down:
+                copy_error: dict[str, Any] | None = None
+                if not extract:
+                    copy_error = _error("copy", TransferError.code,
+                                        "per-file copies need extract=True "
+                                        "(they would leave loose guest files on the host)",
+                                        {"reason": "copy-needs-extract"})
+                else:
+                    try:
+                        _make_private_dir(files)
+                    except OSError as exc:
+                        copy_error = _error("copy", TransferError.code,
+                                            f"host file system error: {exc.strerror or exc}")
+                if copy_error is not None:
+                    attempts.append({"method": "copy", "status": "failed", "error": copy_error})
+                else:
+                    copy_limits = FetchLimits(
+                        max_file_bytes=min(fetch_limits.max_file_bytes, limits.max_file_bytes),
+                        min_host_free_bytes=fetch_limits.min_host_free_bytes)
+                    copier = _BoundedFetch(channel, powershell, job_dir, copy_limits, Path(scratch))
+                    _copy_out_tree(channel, copier, out_dir, top_names, files, limits, out_entries, errors)
+                    method, extracted = "copy", True
+                    attempts.append({"method": "copy", "status": "ok"})
+            if method is None:
+                errors.extend(a["error"] for a in attempts)
 
         # 2. extra guest files, each validated against the allowed roots
         for index, guest_path in enumerate(extra_guest_paths):
@@ -1012,23 +1316,22 @@ def collect_artifacts(
                                      {"index": index}))
 
     # 3. extract (or just list) the archive
-    extracted = False
     if raw_zip is not None:
+        strip = method == "tar"
         try:
             if extract:
                 extracted = True
-                files = art / "files"
                 _reset_dir(files)
                 members: list[ExtractedEntry] = []
                 try:
-                    _extract_into(raw_zip, files, limits, members)
+                    _extract_into(raw_zip, files, limits, members, strip_dot_prefix=strip)
                 finally:
                     out_entries.extend(
-                        ManifestEntry("out", m.original_name,
+                        ManifestEntry("out", _member_path(m.original_name, strip),
                                       None if m.stored_name is None else f"files/{m.stored_name}",
                                       m.size, m.sha256, m.status) for m in members)
             else:
-                out_entries.extend(_list_archive(raw_zip))
+                out_entries.extend(_list_archive(raw_zip, strip))
         except GatewayError as exc:
             errors.append(_error("extract", exc.code, exc.message, exc.details))
         except OSError as exc:
@@ -1051,6 +1354,8 @@ def collect_artifacts(
         raw_zip=None if raw_zip is None else "raw/out.zip",
         raw_zip_sha256=raw_sha,
         raw_zip_size=raw_size,
+        archive_method=method,
+        archive_attempts=attempts,
         extracted=extracted,
         partial=partial,
         entries=entries,

@@ -40,6 +40,7 @@ __all__ = [
     "MAX_GUEST_PATH",
     "POWERSHELL_EXE",
     "VixChannel",
+    "fold_case",
     "is_reserved_name",
     "parse_dir_list",
     "parse_process_list",
@@ -108,11 +109,14 @@ def _reject(reason: str, p: object) -> PathNotAllowed:
     )
 
 
-def _fold(s: str) -> str:
-    """Case-fold for Windows-style comparisons: per-character simple lower-casing.
+def fold_case(s: str) -> str:
+    """Case-fold for Windows-style name comparisons: per-character simple lower-casing.
 
-    ``str.casefold``/``str.upper`` apply multi-character mappings (``ß`` -> ``ss``)
-    that NTFS does not, which would let distinct directories compare equal.
+    ``str.casefold``/``str.upper``/``str.lower`` apply multi-character mappings
+    (``ß`` -> ``ss``, ``İ`` -> ``i̇``) that NTFS does not, which would let distinct
+    names compare equal. A character whose lower-case form is longer than one
+    code point is kept unchanged. This is the one fold used for guest path
+    roots and archive member names.
     """
     out = []
     for ch in s:
@@ -176,9 +180,9 @@ def validate_guest_path(p: str, *, must_be_under: str | Iterable[str] | None = N
     if must_be_under is None:
         return normalized
     roots = [must_be_under] if isinstance(must_be_under, str) else list(must_be_under)
-    folded = _fold(normalized)
+    folded = fold_case(normalized)
     for root in roots:
-        r = _fold(_validate(root)).rstrip("\\")
+        r = fold_case(_validate(root)).rstrip("\\")
         if folded == r or folded.startswith(r + "\\"):
             return normalized
     raise _reject("outside-allowed-roots", p)
@@ -281,9 +285,15 @@ class VixChannel:
 
     Program arguments are quoted with the MSVCRT rules (``subprocess.list2cmdline``)
     before they are handed to vmrun, because vmrun joins the trailing argv
-    elements into one guest command line with plain spaces. That joining
-    behaviour is inferred, not yet verified against a real guest (Phase 0);
-    pass ``quote_args=False`` to hand arguments through verbatim.
+    elements into one guest command line. This was observed on vmrun 1.17.0:
+    arguments are joined with spaces and not re-quoted (Phase 0,
+    docs/PHASE0_RESULTS.md V4: ``-NoProfile -NonInteractive -ExecutionPolicy
+    Bypass -EncodedCommand <base64>`` passed unquoted worked, an unquoted
+    ``-Command`` script containing double quotes failed because the quotes were
+    lost). quote_args=True is required for arguments containing spaces or
+    quotes; arguments without them pass through unchanged. End-to-end
+    confirmation of the quoted form is pending in the VM test suite. Pass
+    ``quote_args=False`` only to hand pre-quoted arguments through verbatim.
 
     Errors: besides the ``VmrunError`` subclasses listed in the ``GuestChannel``
     contract, every method raises ``PathNotAllowed`` for a guest path that fails

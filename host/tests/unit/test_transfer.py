@@ -47,6 +47,7 @@ from x64dbg_vm_gateway.transfer import (
 
 POSIX = os.name == "posix"
 PS_PREFIX = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+TAR_EXE = "C:\\Windows\\System32\\tar.exe"
 IN_DIR = "C:\\mcp\\jobs\\j1\\in"
 JOB_DIR = "C:\\mcp\\jobs\\j1"
 OUT_DIR = "C:\\mcp\\jobs\\j1\\out"
@@ -74,6 +75,8 @@ class GuestPowerShell:
         self.hash_encoding = "ascii"
         self.backslash_names = False  # Windows PowerShell 5.1 writes '\' separators
         self.commands: list[str] = []
+        self.tar_exit_codes: list[int] = []
+        self.tar_calls: list[tuple[str, tuple[str, ...]]] = []
 
     def _content(self, guest_path: str) -> bytes | None:
         try:
@@ -81,7 +84,30 @@ class GuestPowerShell:
         except KeyError:
             return None
 
+    def _tar(self, exe: str, args: tuple) -> int:
+        """``tar.exe -a -c -f <zip> -C <dir> .``: bsdtar names every member ``./<relative path>``."""
+        self.tar_calls.append((exe, tuple(args)))
+        code = self.tar_exit_codes.pop(0) if self.tar_exit_codes else 0
+        if code != 0:
+            return code
+        assert len(args) == 7 and args[:3] == ("-a", "-c", "-f") and args[4] == "-C" and args[6] == "."
+        dst, src_dir = args[3], args[5]
+        prefix = str(PureWindowsPath(src_dir)).lower() + "\\"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(zipfile.ZipInfo("./"), b"")
+            for d in sorted(self.guest.dirs):
+                if d.startswith(prefix):
+                    zf.writestr(zipfile.ZipInfo("./" + d[len(prefix):].replace("\\", "/") + "/"), b"")
+            for key, data in sorted(self.guest.files.items()):
+                if key.startswith(prefix):
+                    zf.writestr("./" + key[len(prefix):].replace("\\", "/"), data)
+        self.guest.write(dst, buf.getvalue())
+        return 0
+
     def __call__(self, exe: str, args: tuple, **_kw) -> int:
+        if exe.lower().endswith("\\tar.exe"):
+            return self._tar(exe, args)
         assert exe.lower().endswith("\\powershell.exe")
         assert list(args[:5]) == PS_PREFIX and len(args) == 6
         cmd = args[5]
@@ -308,6 +334,25 @@ def test_upload_sample_environment_error_skips_guest_cleanup(fake_guest, ps, sam
     assert methods[methods.index("run_program"):] == ["run_program"]
 
 
+def test_upload_sample_removes_a_stale_part_before_the_first_copy(fake_guest, ps, sample, fake_clock):
+    path, data, sha = sample
+    part = f"{IN_DIR}\\{sha[:12]}.part"
+    fake_guest.write(part, b"stale bytes from an aborted upload")
+    final = upload_sample(fake_guest, path, IN_DIR, sha256=sha, kind="exe", clock=fake_clock)
+    assert fake_guest.read(final) == data
+    calls = [(m, a[0] if a else None) for m, a, _ in fake_guest.calls]
+    first_copy = next(i for i, (m, _) in enumerate(calls) if m == "copy_to_guest")
+    assert ("delete_file", part) in calls[:first_copy]
+
+
+def test_upload_sample_missing_exit_code_is_reported_explicitly(fake_guest, sample, fake_clock):
+    path, _, sha = sample
+    fake_guest.on_run_program = lambda *_a, **_k: None  # run_program returned no exit code
+    with pytest.raises(TransferError) as ei:
+        upload_sample(fake_guest, path, IN_DIR, sha256=sha, kind="exe", clock=fake_clock)
+    assert ei.value.details["observed"] == ["unavailable:no-exit-code"] * 3
+
+
 def test_upload_sample_replaces_existing_final(fake_guest, ps, sample):
     path, data, sha = sample
     fake_guest.write(f"{IN_DIR}\\{sha[:12]}.exe", b"old junk")
@@ -443,7 +488,9 @@ def test_safe_extract_skips_directory_entries(tmp_path):
         ("x.", "trailing-dot-space"),
         ("x ", "trailing-dot-space"),
         ("dir./x", "trailing-dot-space"),
-        ("./x", "trailing-dot-space"),
+        ("./x", "dot-component"),
+        ("a/./b", "dot-component"),
+        ("a\\.\\b", "dot-component"),
         ("a\x01b", "invalid-char"),
         ("a\nb", "invalid-char"),
     ],
@@ -464,6 +511,26 @@ def test_safe_extract_rejects_case_insensitive_duplicates(tmp_path):
                                       ("DIR\\a", b"4")])
     entries = safe_extract(z, tmp_path / "d", ExtractLimits())
     assert [e.status for e in entries] == ["ok", "rejected:duplicate", "ok", "rejected:duplicate"]
+
+
+def test_safe_extract_duplicate_check_keeps_ntfs_distinct_names(tmp_path):
+    """'\u00df' and 'ss' are different NTFS names; only per-character case differences collide."""
+    z = make_zip(tmp_path / "o.zip", [("stra\u00dfe.txt", b"1"), ("strasse.txt", b"2"),
+                                      ("STRASSE.txt", b"3")])
+    entries = safe_extract(z, tmp_path / "d", ExtractLimits())
+    assert [e.status for e in entries] == ["ok", "ok", "rejected:duplicate"]
+
+
+def test_zip_inside_out_dir_check_uses_the_shared_fold():
+    assert transfer._is_within("C:\\MCP\\J1\\out.zip", "C:\\mcp\\j1")
+    # str.lower() turns U+0130 into 'i' + U+0307; NTFS keeps the two names apart.
+    assert not transfer._is_within("C:\\mcp\\\u0130\\out.zip", "C:\\mcp\\i\u0307")
+
+
+def test_ratio_rejection_is_documented_as_a_deliberate_deviation():
+    for doc in (ExtractLimits.__doc__, safe_extract.__doc__):
+        text = " ".join((doc or "").split())
+        assert "deliberate deviation" in text and "sparse memory dumps" in text
 
 
 def test_safe_extract_rejects_unix_symlink(tmp_path):
@@ -656,6 +723,18 @@ def test_safe_extract_refuses_a_non_empty_destination(tmp_path):
     assert _listing(dest) == {"0000_previous"}
 
 
+@pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+def test_safe_extract_refusing_a_non_empty_destination_leaves_its_mode_alone(tmp_path):
+    z = make_zip(tmp_path / "o.zip", [("a", b"1")])
+    dest = tmp_path / "d"
+    dest.mkdir()
+    os.chmod(dest, 0o740)
+    (dest / "keep").write_bytes(b"x")
+    with pytest.raises(TransferError):
+        safe_extract(z, dest, ExtractLimits())
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o740
+
+
 def test_safe_extract_reports_completed_entries_on_abort(tmp_path):
     a, b = os.urandom(600), os.urandom(600)
     z = make_zip(tmp_path / "o.zip", [("first.bin", a), ("second.bin", b)])
@@ -837,6 +916,8 @@ def test_collect_happy_path(fake_guest, ps, tmp_path, fake_clock):
     assert raw_zip.is_file()
     assert m.raw_zip_sha256 == _sha(raw_zip.read_bytes())
     assert not m.partial and m.errors == []
+    assert m.archive_method == "compress-archive"
+    assert m.archive_attempts == [{"method": "compress-archive", "status": "ok"}]
     assert m.collected_at == fake_clock.now_iso()
     ok = {e.original_path: e for e in m.entries if e.status == "ok"}
     assert set(ok) == {"dump.bin", "logs/x64dbg.log"}
@@ -855,7 +936,7 @@ def test_collect_happy_path(fake_guest, ps, tmp_path, fake_clock):
     doc = _load_manifest(tmp_path)
     assert doc == m.to_dict()
     for key in ("schema_version", "job_dir", "collected_at", "entries", "module_map", "screenshot",
-                "raw_zip_sha256", "partial"):
+                "raw_zip_sha256", "partial", "archive_method", "archive_attempts"):
         assert key in doc
     assert doc["module_map"] == mm
     assert doc["screenshot"]["sha256"] == _sha(b"\x89PNG fake")
@@ -874,6 +955,7 @@ def test_collect_empty_out_dir(fake_guest, ps, tmp_path, fake_clock):
     m = _collect(fake_guest, tmp_path, fake_clock)
     assert m.entries == [] and not m.partial
     assert m.raw_zip_sha256 is None
+    assert m.archive_method is None and m.archive_attempts == []
     assert fake_guest.calls_of("run_program") == []
     doc = _load_manifest(tmp_path)
     assert doc["entries"] == [] and doc["raw_zip_sha256"] is None
@@ -950,13 +1032,18 @@ def test_collect_total_size_abort_is_recorded_not_raised(fake_guest, ps, tmp_pat
     assert [e.status for e in m.entries] == ["ok"]  # the member finished before the abort is kept
 
 
-def test_collect_compress_failure_is_partial(fake_guest, ps, tmp_path, fake_clock):
+def test_collect_compress_failure_is_partial_when_every_fallback_fails(fake_guest, ps, tmp_path,
+                                                                       fake_clock):
     _seed_out(fake_guest, {"a.txt": b"a"})
     fake_guest.write(f"{JOB_DIR}\\x.log", b"x")
     ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    _fail_copies_of(fake_guest, "\\out\\a.txt")
     m = _collect(fake_guest, tmp_path, fake_clock, extra_guest_paths=[f"{JOB_DIR}\\x.log"])
     assert m.partial and m.raw_zip_sha256 is None
-    assert any(err["stage"] == "zip" for err in m.errors)
+    assert [(e.original_path, e.status) for e in m.entries if e.source == "out"] == \
+        [("a.txt", "failed:GUEST_OP_FAILED")]
+    assert any(err["stage"] == "copy" for err in m.errors)
     assert [e.status for e in m.entries if e.source == "extra"] == ["ok"]
 
 
@@ -976,12 +1063,18 @@ def _fail_copies_of(guest: FakeGuest, suffix: str, exc: Exception | None = None,
     guest.copy_from_guest = copy_from_guest  # type: ignore[method-assign]
 
 
-def test_collect_zip_copy_failure_is_partial(fake_guest, ps, tmp_path, fake_clock):
+def test_collect_zip_copy_failure_falls_back_to_per_file_copies(fake_guest, ps, tmp_path, fake_clock):
     _seed_out(fake_guest, {"a.txt": b"a"})
     _fail_copies_of(fake_guest, "\\out.zip", write=b"half a zip")
     m = _collect(fake_guest, tmp_path, fake_clock)
-    assert m.partial and m.raw_zip_sha256 is None
-    assert any(err["stage"] == "fetch" and err["code"] == "GUEST_OP_FAILED" for err in m.errors)
+    assert m.raw_zip_sha256 is None and m.archive_method == "copy"
+    assert not m.partial and m.errors == []
+    assert ps.tar_calls == []  # the archive was made; tar would only make another one
+    (failed, done) = m.archive_attempts
+    assert (failed["method"], failed["status"]) == ("compress-archive", "failed")
+    assert failed["error"]["stage"] == "fetch" and failed["error"]["code"] == "GUEST_OP_FAILED"
+    assert done == {"method": "copy", "status": "ok"}
+    assert [(e.original_path, e.status) for e in m.entries] == [("a.txt", "ok")]
     assert not list((tmp_path / "job" / "artifacts" / "raw").glob("*.part"))
     assert not (tmp_path / "job" / "artifacts" / "raw" / "out.zip").exists()
 
@@ -1025,8 +1118,11 @@ def test_collect_lying_size_probe_is_caught_after_the_copy(fake_guest, ps, tmp_p
 def test_collect_out_zip_over_the_size_limit_is_not_copied(fake_guest, ps, tmp_path, fake_clock):
     _seed_out(fake_guest, {"dump.bin": os.urandom(3000)})
     m = _collect(fake_guest, tmp_path, fake_clock, fetch_limits=FetchLimits(max_file_bytes=1000))
-    assert m.partial and m.raw_zip is None and m.entries == []
-    (err,) = [e for e in m.errors if e["stage"] == "fetch"]
+    assert m.partial and m.raw_zip is None
+    assert m.archive_attempts[0]["error"]["details"]["reason"] == "too-large"
+    # The per-file fallback applies the same limit to the one file.
+    assert [(e.original_path, e.status) for e in m.entries] == [("dump.bin", "failed:TRANSFER_FAILED")]
+    (err,) = [e for e in m.errors if e["stage"] == "copy"]
     assert err["code"] == "TRANSFER_FAILED" and err["details"]["reason"] == "too-large"
     assert not (tmp_path / "job" / "artifacts" / "raw" / "out.zip").exists()
     copied = [a[0] for a, _ in fake_guest.calls_of("copy_from_guest")]
@@ -1039,10 +1135,11 @@ def test_collect_refuses_copies_that_would_fill_the_host_disk(fake_guest, ps, tm
     m = _collect(fake_guest, tmp_path, fake_clock, extra_guest_paths=[f"{JOB_DIR}\\x.log"],
                  fetch_limits=FetchLimits(min_host_free_bytes=1 << 62))
     assert m.raw_zip is None and _extra_status(m) == ["failed:TRANSFER_FAILED"]
-    reasons = {e["details"]["reason"] for e in m.errors if e["stage"] in ("fetch", "extra")}
+    reasons = {e["details"]["reason"] for e in m.errors if e["stage"] in ("fetch", "extra", "copy")}
     assert reasons == {"host-disk-space"}
     copied = [a[0] for a, _ in fake_guest.calls_of("copy_from_guest")]
     assert f"{JOB_DIR}\\out.zip" not in copied and f"{JOB_DIR}\\x.log" not in copied
+    assert f"{OUT_DIR}\\a.txt" not in copied
 
 
 def test_collect_unavailable_size_probe_falls_back_to_host_checks(fake_guest, ps, tmp_path, fake_clock):
@@ -1070,6 +1167,260 @@ def _stale_check(tmp_path, m: Manifest) -> None:
     assert on_disk == in_manifest
 
 
+def _tree(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def _write_tree(root: Path, files: dict[str, bytes]) -> None:
+    for rel, data in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+
+def _prev_dirs(tmp_path) -> list[str]:
+    return sorted(p.name for p in (tmp_path / "job").iterdir() if p.name.startswith("artifacts."))
+
+
+# ── collect: previous collection kept until the new manifest is written (review item 5) ──
+_OLD = {"manifest.json": b"{}", "files/0000_aaaaaaaaaaaa": b"old", "raw/out.zip": b"oldzip",
+        "raw/extra/0000_x": b"oldx"}
+
+
+def test_collect_failed_manifest_write_restores_the_previous_collection(fake_guest, ps, tmp_path,
+                                                                       fake_clock, monkeypatch):
+    _seed_out(fake_guest, {"a.txt": b"first"})
+    fake_guest.write(f"{JOB_DIR}\\x.log", b"x")
+    _collect(fake_guest, tmp_path, fake_clock, extra_guest_paths=[f"{JOB_DIR}\\x.log"])
+    art = tmp_path / "job" / "artifacts"
+    before = _tree(art)
+    assert {"manifest.json", "raw/out.zip", "raw/extra/0000_x.log"} <= set(before)
+    fake_guest.files.clear()
+    _seed_out(fake_guest, {"b.txt": b"second"})
+
+    def disk_full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(transfer, "_write_json_atomic", disk_full)
+    with pytest.raises(TransferError) as ei:
+        _collect(fake_guest, tmp_path, fake_clock)
+    assert ei.value.stage == "manifest"
+    assert _tree(art) == before
+    assert _prev_dirs(tmp_path) == []
+
+
+def test_collect_unexpected_error_restores_the_previous_collection(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"first"})
+    _collect(fake_guest, tmp_path, fake_clock)
+    art = tmp_path / "job" / "artifacts"
+    before = _tree(art)
+    fake_guest.fail_next("list_dir", RuntimeError("bug"))
+    with pytest.raises(RuntimeError):
+        _collect(fake_guest, tmp_path, fake_clock)
+    assert _tree(art) == before
+    assert _prev_dirs(tmp_path) == []
+
+
+def test_collect_success_drops_the_previous_collection_but_keeps_other_files(fake_guest, ps, tmp_path,
+                                                                            fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"first"})
+    _collect(fake_guest, tmp_path, fake_clock)
+    art = tmp_path / "job" / "artifacts"
+    (art / "screenshot.png").write_bytes(b"png")
+    fake_guest.files.clear()
+    _seed_out(fake_guest, {"b.txt": b"second"})
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    assert {e.original_path for e in m.entries} == {"b.txt"}
+    assert (art / "screenshot.png").read_bytes() == b"png"
+    assert _prev_dirs(tmp_path) == []
+
+
+def test_recover_after_a_crash_during_collection_restores_the_stash(tmp_path):
+    art = tmp_path / "artifacts"
+    _write_tree(tmp_path / "artifacts.prev", _OLD)
+    _write_tree(art, {"files/0000_bbbbbbbbbbbb": b"new junk", "raw/out.zip": b"newzip", "note.txt": b"n"})
+    transfer._recover_previous(art)
+    assert _tree(art) == {**_OLD, "note.txt": b"n"}
+    assert not (tmp_path / "artifacts.prev").exists()
+
+
+def test_recover_after_a_crash_while_stashing_moves_the_stash_back(tmp_path):
+    art = tmp_path / "artifacts"
+    _write_tree(tmp_path / "artifacts.prev.tmp", {"manifest.json": b"{}", "files/0000_aaaaaaaaaaaa": b"old"})
+    _write_tree(art, {"raw/out.zip": b"oldzip", "raw/extra/0000_x": b"oldx"})
+    transfer._recover_previous(art)
+    assert _tree(art) == _OLD
+    assert not (tmp_path / "artifacts.prev.tmp").exists()
+
+
+def test_recover_after_the_new_manifest_was_written_drops_the_stash(tmp_path):
+    art = tmp_path / "artifacts"
+    new = {"manifest.json": b'{"new": 1}', "files/0000_bbbbbbbbbbbb": b"new"}
+    _write_tree(tmp_path / "artifacts.prev", _OLD)
+    _write_tree(art, new)
+    transfer._recover_previous(art)
+    assert _tree(art) == new
+    assert not (tmp_path / "artifacts.prev").exists()
+
+
+def test_collect_after_an_interrupted_collection(fake_guest, ps, tmp_path, fake_clock):
+    _write_tree(tmp_path / "job" / "artifacts.prev", _OLD)
+    _seed_out(fake_guest, {"a.txt": b"a"})
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    assert not m.partial and [(e.original_path, e.status) for e in m.entries] == [("a.txt", "ok")]
+    assert _prev_dirs(tmp_path) == []
+    _stale_check(tmp_path, m)
+
+
+# ── collect: archive fallback chain (review item 3) ──────────────────
+def test_collect_falls_back_to_tar_when_compress_archive_fails(fake_guest, ps, tmp_path, fake_clock):
+    dump, log = os.urandom(2048), b"log\n" * 10
+    _seed_out(fake_guest, {"dump.bin": dump, "logs\\x64dbg.log": log})
+    fake_guest.write(f"{JOB_DIR}\\out.zip", b"stale archive of an earlier run")
+    ps.exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    assert ps.tar_calls == [(TAR_EXE, ("-a", "-c", "-f", f"{JOB_DIR}\\out.zip", "-C", OUT_DIR, "."))]
+    deleted = [a[0] for a, _ in fake_guest.calls_of("delete_file")]
+    assert f"{JOB_DIR}\\out.zip" in deleted  # a half-written archive never stands in for tar's
+    assert m.archive_method == "tar" and not m.partial and m.errors == []
+    failed, done = m.archive_attempts
+    assert (failed["method"], failed["status"], failed["error"]["stage"]) == ("compress-archive", "failed",
+                                                                               "zip")
+    assert done == {"method": "tar", "status": "ok"}
+    status = {e.original_path: e.status for e in m.entries}
+    assert status == {"./": "skipped:directory", "logs/": "skipped:directory", "dump.bin": "ok",
+                      "logs/x64dbg.log": "ok"}
+    art = tmp_path / "job" / "artifacts"
+    ok = {e.original_path: e for e in m.entries if e.status == "ok"}
+    assert (art / ok["dump.bin"].stored_name).read_bytes() == dump
+    assert _load_manifest(tmp_path)["archive_method"] == "tar"
+    ps.exit_codes = [1]
+    listed = _collect(fake_guest, tmp_path, fake_clock, extract=False)
+    assert listed.archive_method == "tar"
+    assert {e.original_path: e.status for e in listed.entries} == {
+        "./": "skipped:directory", "logs/": "skipped:directory", "dump.bin": "archived",
+        "logs/x64dbg.log": "archived"}
+
+
+def test_collect_tar_dot_prefix_is_only_stripped_once(tmp_path):
+    z = make_zip(tmp_path / "t.zip", [("./", b""), ("./a.txt", b"a"), ("././b.txt", b"b"),
+                                      ("./c/../../x", b"x")])
+    members: list[ExtractedEntry] = []
+    transfer._extract_into(z, tmp_path / "d", ExtractLimits(), members, strip_dot_prefix=True)
+    assert [(e.original_name, e.status) for e in members] == [
+        ("./", "skipped:directory"), ("./a.txt", "ok"), ("././b.txt", "rejected:dot-component"),
+        ("./c/../../x", "rejected:traversal")]
+
+
+def test_collect_falls_back_to_per_file_copies_when_both_archivers_fail(fake_guest, ps, tmp_path,
+                                                                       fake_clock):
+    dump, log = os.urandom(2048), b"log\n" * 10
+    _seed_out(fake_guest, {"dump.bin": dump, "logs\\x64dbg.log": log})
+    fake_guest.mkdir(f"{OUT_DIR}\\empty")
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [2]
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    assert m.archive_method == "copy" and m.raw_zip is None and m.extracted
+    assert not m.partial and m.errors == []
+    assert [(a["method"], a["status"]) for a in m.archive_attempts] == [
+        ("compress-archive", "failed"), ("tar", "failed"), ("copy", "ok")]
+    assert "2" in m.archive_attempts[1]["error"]["message"]
+    status = {e.original_path: e.status for e in m.entries}
+    assert status == {"dump.bin": "ok", "empty/": "skipped:directory", "logs/": "skipped:directory",
+                      "logs/x64dbg.log": "ok"}
+    art = tmp_path / "job" / "artifacts"
+    for e in m.entries:
+        if e.status == "ok":
+            data = dump if e.original_path == "dump.bin" else log
+            assert re.fullmatch(r"files/\d{4}_[0-9a-f]{12}", e.stored_name)
+            assert e.stored_name.endswith(_sha(data)[:12])
+            assert (art / e.stored_name).read_bytes() == data
+            assert e.sha256 == _sha(data) and e.size == len(data)
+            _assert_mode(art / e.stored_name, 0o600)
+    _stale_check(tmp_path, m)
+    assert [p for p in art.rglob("*") if p.name.startswith(".")] == []
+    assert _load_manifest(tmp_path)["archive_method"] == "copy"
+
+
+def test_collect_per_file_copies_respect_fetch_limits(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"big.bin": os.urandom(3000), "small.log": b"s"})
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock, fetch_limits=FetchLimits(max_file_bytes=1000))
+    assert m.archive_method == "copy" and m.partial
+    status = {e.original_path: e.status for e in m.entries}
+    assert status == {"big.bin": "failed:TRANSFER_FAILED", "small.log": "ok"}
+    (err,) = [e for e in m.errors if e["stage"] == "copy"]
+    assert err["details"]["reason"] == "too-large" and err["details"]["path"] == "big.bin"
+    copied = [a[0] for a, _ in fake_guest.calls_of("copy_from_guest")]
+    assert f"{OUT_DIR}\\big.bin" not in copied
+    _stale_check(tmp_path, m)
+
+
+def test_collect_per_file_copies_stop_at_max_files(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {f"f{i}.txt": b"x" for i in range(5)})
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock, limits=ExtractLimits(max_files=3))
+    assert m.partial and len(m.entries) == 3
+    (err,) = [e for e in m.errors if e["stage"] == "copy"]
+    assert err["details"]["reason"] == "file-count"
+    _stale_check(tmp_path, m)
+
+
+def test_collect_per_file_copies_stop_at_the_total_byte_budget(fake_guest, ps, tmp_path, fake_clock):
+    a, b, c = os.urandom(600), os.urandom(600), os.urandom(600)
+    _seed_out(fake_guest, {"a.bin": a, "b.bin": b, "c.bin": c})
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock, limits=ExtractLimits(max_total_bytes=1000))
+    assert m.partial
+    assert [(e.original_path, e.status) for e in m.entries] == [("a.bin", "ok"),
+                                                                ("b.bin", "rejected:total-bytes")]
+    (err,) = [e for e in m.errors if e["stage"] == "copy"]
+    assert err["details"]["reason"] == "total-bytes"
+    _stale_check(tmp_path, m)
+
+
+def test_collect_per_file_copies_reject_unsafe_guest_names(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"it's.txt": b"q", "ok.txt": b"ok"})
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    status = {e.original_path: e.status for e in m.entries}
+    assert status == {"it's.txt": "failed:PATH_NOT_ALLOWED", "ok.txt": "ok"}
+    assert m.partial
+
+
+def test_collect_without_extract_does_not_fall_back_to_loose_copies(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"a"})
+    ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    m = _collect(fake_guest, tmp_path, fake_clock, extract=False)
+    assert m.partial and m.archive_method is None and m.entries == []
+    assert [e["stage"] for e in m.errors] == ["zip", "tar", "copy"]
+    assert m.errors[2]["details"]["reason"] == "copy-needs-extract"
+    assert fake_guest.calls_of("copy_from_guest") == []
+    assert not (tmp_path / "job" / "artifacts" / "files").exists()
+
+
+def test_collect_environment_error_stops_the_fallback_chain(fake_guest, ps, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"a"})
+    fake_guest.fail_next("run_program", ToolsNotRunning("Error: The VMware Tools are not running"))
+    m = _collect(fake_guest, tmp_path, fake_clock)
+    assert m.partial and m.archive_method is None and m.entries == []
+    assert [(e["stage"], e["code"]) for e in m.errors] == [("zip", "TOOLS_NOT_RUNNING")]
+    assert ps.tar_calls == [] and fake_guest.calls_of("copy_from_guest") == []
+
+
+def test_collect_missing_exit_code_is_reported_explicitly(fake_guest, tmp_path, fake_clock):
+    _seed_out(fake_guest, {"a.txt": b"a"})
+    fake_guest.on_run_program = lambda *_a, **_k: None
+    m = _collect(fake_guest, tmp_path, fake_clock, extract=False)
+    messages = [e["message"] for e in m.errors]
+    assert messages[:2] == ["Compress-Archive returned no exit code", "tar.exe returned no exit code"]
+
+
 def test_collect_retry_with_empty_out_dir_drops_previous_output(fake_guest, ps, tmp_path, fake_clock):
     _seed_out(fake_guest, {"a.txt": b"first"})
     fake_guest.write(f"{JOB_DIR}\\x.log", b"x")
@@ -1084,9 +1435,12 @@ def test_collect_retry_with_failed_zip_drops_previous_output(fake_guest, ps, tmp
     _seed_out(fake_guest, {"a.txt": b"first"})
     _collect(fake_guest, tmp_path, fake_clock)
     ps.exit_codes = [1]
+    ps.tar_exit_codes = [1]
+    _fail_copies_of(fake_guest, "\\out\\a.txt")
     m = _collect(fake_guest, tmp_path, fake_clock)
     assert m.partial and m.raw_zip is None
     _stale_check(tmp_path, m)
+    assert _prev_dirs(tmp_path) == []
 
 
 @pytest.mark.parametrize("bad", [{(1, 2): 3}, "cycle", float("nan")])
@@ -1150,9 +1504,14 @@ def test_collect_powershell_51_backslash_names(fake_guest, ps, tmp_path, fake_cl
     fake_guest.mkdir(f"{OUT_DIR}\\empty")
     m = _collect(fake_guest, tmp_path, fake_clock)
     status = {e.original_path: e.status for e in m.entries}
-    assert status == {"dump.bin": "ok", "empty\\": "skipped:directory", "logs\\x64dbg.log": "ok"}
+    assert status == {"dump.bin": "ok", "empty/": "skipped:directory", "logs/x64dbg.log": "ok"}
     listed = _collect(fake_guest, tmp_path, fake_clock, extract=False)
-    assert {e.original_path: e.status for e in listed.entries}["empty\\"] == "skipped:directory"
+    assert {e.original_path: e.status for e in listed.entries} == {
+        "dump.bin": "archived", "empty/": "skipped:directory", "logs/x64dbg.log": "archived"}
+    # safe_extract itself keeps the raw member name
+    raw = tmp_path / "job" / "artifacts" / "raw" / "out.zip"
+    names = {e.original_name for e in safe_extract(raw, tmp_path / "x", ExtractLimits())}
+    assert names == {"dump.bin", "empty\\", "logs\\x64dbg.log"}
 
 
 def test_collect_retry_replaces_previous_extraction(fake_guest, ps, tmp_path, fake_clock):
@@ -1359,6 +1718,16 @@ def test_upload_sample_through_vix_channel_hash_tool_failure(vix, fake_guest, ps
         upload_sample(chan, path, IN_DIR, sha256=sha, kind="exe", clock=fake_clock)
     assert not isinstance(ei.value, IntegrityError)
     assert "exit-code-5" in ei.value.details["observed"][0]
+
+
+def test_collect_tar_fallback_through_vix_channel(vix, fake_guest, ps, tmp_path, fake_clock):
+    chan, emu, _ = vix
+    _seed_out(fake_guest, {"dump [1].bin": b"d"})
+    ps.exit_codes = [1]
+    m = _collect(chan, tmp_path, fake_clock)
+    assert m.archive_method == "tar"
+    assert ("-a", "-c", "-f", f"{JOB_DIR}\\out.zip", "-C", OUT_DIR, ".") in emu.program_args
+    assert [(e.original_path, e.status) for e in m.entries if e.status == "ok"] == [("dump [1].bin", "ok")]
 
 
 def test_collect_through_vix_channel(vix, fake_guest, ps, tmp_path, fake_clock):
