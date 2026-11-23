@@ -36,7 +36,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import platform as gw_platform
@@ -59,7 +59,7 @@ from .contracts import (
 from .errors import BackendAuthError, ConfigError, GuestOperationError, VmNotReady
 from .guest import VixChannel
 from .locks import VmOpLock
-from .proxy import Proxy, sanitize_untrusted_text
+from .proxy import Proxy
 from .supervisor import HealthReport, Supervisor
 from .vmrun import NullProvider, VmrunCli, VmrunProvider
 
@@ -686,13 +686,3 @@ def build_app(
         return build_runtime(config, name, environ=env, clock=clock, cache_dir=cache_dir)
 
     return Gateway(config, runtime_factory=factory, default_profile=profile, clock=clock)
-
-
-def guest_dir_of(path: str) -> str:
-    """Parent directory of a guest (Windows) path."""
-    return str(PureWindowsPath(path).parent)
-
-
-def clip_untrusted(text: str, limit: int = 300) -> str:
-    """Guest-provided text for result fields: control/bidi characters removed, clipped."""
-    return sanitize_untrusted_text(str(text), max_len=limit)
