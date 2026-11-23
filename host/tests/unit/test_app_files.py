@@ -1,0 +1,119 @@
+"""file_upload / file_download through app.Gateway."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from tests.fakes.fake_runtime import EXE, GUEST_ROOT, make_lab
+from x64dbg_vm_gateway.errors import PathNotAllowed, StateViolation
+
+POSIX = os.name == "posix"
+
+
+@pytest.fixture
+def lab(tmp_path):
+    lab = make_lab(tmp_path)
+    yield lab
+    lab.close()
+
+
+# ── upload ──────────────────────────────────────────────────────────
+def test_upload_into_an_explicit_guest_dir_without_a_job(lab):
+    src = lab.samples / "tool.exe"
+    src.write_bytes(b"tool bytes")
+    out = lab.gateway().file_upload(str(src), guest_dir="C:\\Tools")
+    assert out["guest_path"] == "C:\\Tools\\tool.exe"
+    assert out["size"] == 10 and out["sha256"] == hashlib.sha256(b"tool bytes").hexdigest()
+    assert lab.guest.read("C:\\Tools\\tool.exe") == b"tool bytes"
+
+
+def test_upload_defaults_to_the_job_input_dir(lab):
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    src = lab.samples / "config.dat"
+    src.write_bytes(b"cfg")
+    out = gw.file_upload(str(src))
+    assert out["guest_path"] == f"{GUEST_ROOT}\\{job_id}\\in\\config.dat"
+
+
+def test_upload_without_job_needs_a_guest_dir(lab):
+    src = lab.samples / "a.bin"
+    src.write_bytes(b"a")
+    with pytest.raises(StateViolation):
+        lab.gateway().file_upload(str(src))
+
+
+def test_upload_outside_the_allowed_roots_is_refused(lab, tmp_path):
+    secret = tmp_path / "id_rsa"
+    secret.write_bytes(b"PRIVATE KEY")
+    with pytest.raises(PathNotAllowed):
+        lab.gateway().file_upload(str(secret), guest_dir="C:\\Tools")
+    assert not lab.guest.calls_of("copy_to_guest")
+
+
+@pytest.mark.skipif(not POSIX, reason="symlinks")
+def test_upload_symlink_escaping_the_root_is_refused(lab, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"s")
+    (lab.samples / "link.txt").symlink_to(secret)
+    with pytest.raises(PathNotAllowed):
+        lab.gateway().file_upload(str(lab.samples / "link.txt"), guest_dir="C:\\Tools")
+
+
+def test_upload_of_a_directory_is_refused(lab):
+    (lab.samples / "dir").mkdir()
+    with pytest.raises(PathNotAllowed):
+        lab.gateway().file_upload(str(lab.samples / "dir"), guest_dir="C:\\Tools")
+
+
+@pytest.mark.parametrize("guest_dir", ["\\\\server\\share", "C:\\a\\..\\b", "relative\\dir", "C:\\x:ads"])
+def test_upload_validates_the_guest_dir(lab, guest_dir):
+    src = lab.samples / "a.bin"
+    src.write_bytes(b"a")
+    with pytest.raises(PathNotAllowed):
+        lab.gateway().file_upload(str(src), guest_dir=guest_dir)
+
+
+# ── download ────────────────────────────────────────────────────────
+def test_download_from_the_job_dir(lab):
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    guest = f"{GUEST_ROOT}\\{job_id}\\out\\dump one.bin"
+    lab.guest.write(guest, b"DUMP")
+    out = gw.file_download(guest)
+    p = Path(out["host_path"])
+    assert p.parent == Path(lab.config.jobs_root) / job_id / "artifacts" / "raw" / "extra"
+    assert p.name == "0000_dump_one.bin"
+    assert p.read_bytes() == b"DUMP" and out["sha256"] == hashlib.sha256(b"DUMP").hexdigest()
+    assert out["size"] == 4
+    if POSIX:
+        assert stat.S_IMODE(p.stat().st_mode) == 0o600
+    second = Path(gw.file_download(guest)["host_path"])
+    assert second.name == "0001_dump_one.bin"
+
+
+def test_download_from_the_debugger_dir_is_allowed(lab):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+    ini = EXE["x64"].rsplit("\\", 1)[0] + "\\x64dbg.ini"
+    lab.guest.write(ini, b"[Engine]")
+    assert Path(gw.file_download(ini)["host_path"]).read_bytes() == b"[Engine]"
+
+
+@pytest.mark.parametrize("path", ["C:\\Windows\\System32\\config\\SAM", "C:\\mcp\\jobs\\other\\x.bin",
+                                  "C:\\mcp\\jobs\\..\\secret.txt", "\\\\host\\share\\x"])
+def test_download_outside_allowed_roots_is_refused(lab, path):
+    gw = lab.gateway()
+    gw.analysis_start(str(lab.sample()))
+    with pytest.raises(PathNotAllowed):
+        gw.file_download(path)
+
+
+def test_download_needs_a_job(lab):
+    with pytest.raises(StateViolation):
+        lab.gateway().file_download("C:\\mcp\\jobs\\x\\out\\a.bin")
