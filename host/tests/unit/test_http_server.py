@@ -14,12 +14,12 @@ from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
-from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOL_NAMES, TOOLS_BY_NAME, RiskTier
 
 from tests.fakes.fake_app import FakeApp
 from x64dbg_vm_gateway.config import HttpServerConfig
 from x64dbg_vm_gateway.errors import ConfigError
 from x64dbg_vm_gateway.frontends import http_server
+from x64dbg_vm_gateway.frontends.tool_defs import GATEWAY_TOOL_NAMES, TOOLS_BY_NAME, RiskTier
 
 READ_TOKEN = "r" * 24 + "-read-token"
 ANALYZE_TOKEN = "z" * 24 + "-analyze-token"
@@ -120,11 +120,11 @@ def test_missing_token_is_401_and_audited(app, tmp_path):
 
 
 @pytest.mark.parametrize("auth", ["Bearer wrong-token-but-long-enough", "Basic abc", "Bearer", "bearer  ",
-                                  "Bearer " + READ_TOKEN + "x", "Bearer éé"])
+                                  "Bearer " + READ_TOKEN + "x", "Bearer éé".encode()])
 def test_bad_tokens_are_401(app, tmp_path, auth):
     with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
-        h = headers(None)
-        h["Authorization"] = auth
+        h: dict[str, Any] = headers(None)
+        h["Authorization"] = auth  # bytes: a non-ASCII header value (httpx refuses non-ASCII str)
         r = c.post("/mcp", headers=h, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
     assert r.status_code == 401
     assert READ_TOKEN not in audit_text(tmp_path)
@@ -304,8 +304,8 @@ def test_refuses_without_any_token(app, tmp_path):
 
 def test_refuses_short_or_duplicate_tokens(app, tmp_path):
     with pytest.raises(ConfigError) as ei:
-        build(app, tmp_path, environ={"GW_READ": "short", "GW_ADMIN": ADMIN_TOKEN})
-    assert "short" not in ei.value.message  # never echo the secret
+        build(app, tmp_path, environ={"GW_READ": "tiny-secret", "GW_ADMIN": ADMIN_TOKEN})
+    assert "tiny-secret" not in ei.value.message  # never echo the secret
     with pytest.raises(ConfigError):
         build(app, tmp_path, environ={"GW_READ": ADMIN_TOKEN, "GW_ADMIN": ADMIN_TOKEN})
 

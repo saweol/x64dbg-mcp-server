@@ -298,7 +298,9 @@ def test_serve_http(tmp_path, wiring, fake, monkeypatch):
     from x64dbg_vm_gateway.frontends import http_server
 
     path = write_config(tmp_path, http_enabled=True)
+    monkeypatch.setenv("GW_ADMIN", "admin-token-" + "x" * 20)
     seen: list[tuple[Any, ...]] = []
+
     def fake_serve(app: Any, http_cfg: Any, *, environ: Any = None, jobs_root: Any = None) -> None:
         seen.append((app, http_cfg, jobs_root))
 
@@ -307,6 +309,17 @@ def test_serve_http(tmp_path, wiring, fake, monkeypatch):
     app, http_cfg, jobs_root = seen[0]
     assert app is fake and http_cfg.enabled is True and Path(jobs_root) == tmp_path / "jobs"
     assert wiring.calls[0]["profile"] == "win10" and fake.closed
+
+
+def test_serve_http_without_tokens_fails_before_building_the_app(tmp_path, wiring, monkeypatch, capsys):
+    from x64dbg_vm_gateway.frontends import http_server
+
+    path = write_config(tmp_path, http_enabled=True)
+    monkeypatch.delenv("GW_ADMIN", raising=False)
+    monkeypatch.setattr(http_server, "serve_http", lambda *a, **k: pytest.fail("must not start"))
+    assert run(["--config", str(path), "serve", "--transport", "http"]) == 1
+    assert "GW_ADMIN" not in capsys.readouterr().out
+    assert wiring.calls == []
 
 
 def test_serve_rejects_bad_transport(cfg_path, wiring):
