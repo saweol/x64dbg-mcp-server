@@ -109,6 +109,32 @@ class VmProvider(Protocol):
     def isolation_report(self) -> IsolationReport: ...
 
 
+# ── vmrun runner (shared by vmrun.VmrunProvider and guest.VixChannel) ──
+@dataclass(frozen=True)
+class VmrunResult:
+    returncode: int
+    stdout: str  # vmrun noise lines ([AppLoader]..., libxml warnings) already removed
+    stderr: str
+
+
+@runtime_checkable
+class VmrunRunner(Protocol):
+    """Executes ``vmrun -T <type> [-gu USER -gp PASS] <command> [<vmx>] <params...>``.
+
+    - argv list only (never a shell); the vmx path is inserted automatically
+      when ``vmx=True``.
+    - ``guest=True`` adds guest credentials (-gu/-gp); the password must never
+      appear in logs, exceptions or ``details`` (mask it as ``***``).
+    - On failure raises an errors.VmrunError subclass mapped from vmrun's
+      ``Error: ...`` text (VmNotRunning, ToolsNotRunning, GuestAuthFailed,
+      SnapshotNotFound, VmLocked, GuestOperationError, VmrunTimeout, VmrunError).
+      It never returns a result with a non-zero returncode.
+    """
+
+    def run(self, command: str, *params: str, guest: bool = False,
+            timeout_s: float = 120.0, vmx: bool = True) -> VmrunResult: ...
+
+
 # ── guest channel ───────────────────────────────────────────────────
 @dataclass(frozen=True)
 class GuestCredentials:

@@ -37,3 +37,12 @@ def test_builtin_tool_catalog_shape():
 def test_fakes_satisfy_protocols(fake_guest, fake_vm):
     assert isinstance(fake_guest, contracts.GuestChannel)
     assert isinstance(fake_vm, contracts.VmProvider)
+
+
+def test_fake_vmrun_runner_satisfies_protocol():
+    from tests.fakes.fake_vmrun import FakeVmrunRunner
+
+    r = FakeVmrunRunner()
+    assert isinstance(r, contracts.VmrunRunner)
+    r.queue("list", "Total running VMs: 0")
+    assert r.run("list", vmx=False).stdout == "Total running VMs: 0"
