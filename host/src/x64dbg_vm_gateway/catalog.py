@@ -183,7 +183,7 @@ class ToolCatalog:
         self._default_rel = builtin_json
         self._builtin = self._get_builtin(builtin_json).tools  # the default list (kept for callers)
         self._backend_rel: dict[str, str] = {}  # backend_id -> builtin chosen by its version
-        self._explicit: set[str] = set()  # backends whose version came from the plugin itself
+        self._explicit: dict[str, str | None] = {}  # backend -> version the plugin itself reported
         self._live: dict[str, tuple[str, list[ToolInfo]]] = {}  # backend_id -> (version, tools)
         self._live_raw: dict[str, tuple[list[ToolInfo], str]] = {}  # unclassified copy + source
         self._loaded_from_disk: set[str] = set()
@@ -219,7 +219,7 @@ class ToolCatalog:
             if not explicit and backend_id in self._explicit:
                 return False
             if explicit:
-                self._explicit.add(backend_id)
+                self._explicit[backend_id] = version
             before = self._backend_builtin(backend_id).rel
             self._backend_rel[backend_id] = builtin_for_version(version)
             after = self._backend_builtin(backend_id).rel
@@ -341,6 +341,12 @@ class ToolCatalog:
         with self._lock:
             self._load_cache(backend_id)  # a cached version must not override this one later
             return self._choose(backend_id, version, explicit=True)
+
+    def reported_version(self, backend_id: str) -> str | None:
+        """The version the backend's plugin last reported (``set_server_version`` or a live
+        list), or None when it has not reported one to this catalog yet."""
+        with self._lock:
+            return self._explicit.get(backend_id)
 
     def builtin_version(self, backend_id: str | None = None) -> str:
         """Plugin version of the builtin list ``backend_id`` uses (e.g. ``"1.9"``)."""

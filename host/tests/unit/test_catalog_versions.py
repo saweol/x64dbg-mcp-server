@@ -124,3 +124,20 @@ def test_a_plugin_upgrade_seen_by_the_health_check_switches_the_builtin(tmp_path
         assert rt.catalog.builtin_version("x64") == "1.10"
     finally:
         lab.close()
+
+
+def test_the_first_contact_probe_is_sent_once_per_process(tmp_path):
+    # GET / without the right token counts as a failed login on v1.10: probe only until the
+    # plugin has reported a version, not on every reconnect (clients are rebuilt after reverts).
+    lab = make_lab(tmp_path, plugin_version="1.10")
+    try:
+        rt = lab.runtime()
+        srv = lab.servers["x64"]
+        rt.connect("x64")
+        probes = len([r for r in srv.requests if r.method == "GET"])
+        assert probes == 1 and rt.catalog.reported_version("x64") == "1.10"
+        rt.invalidate_clients(drop_tokens=True, reason="test: revert")
+        rt.connect("x64")
+        assert len([r for r in srv.requests if r.method == "GET"]) == probes
+    finally:
+        lab.close()

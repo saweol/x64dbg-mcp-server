@@ -557,11 +557,13 @@ class Runtime:
         return client
 
     def _learn_version(self, backend_id: str, client: BackendClient) -> None:
-        """First contact with a new client: ask ``GET /`` for the plugin version, so the tool
-        flags are those of that version before the first call. Best effort: a backend that
-        does not answer is reported by the call or health check that follows."""
+        """First contact: ask ``GET /`` for the plugin version (once, until the plugin has
+        reported one), so the tool flags are those of that version before the first call.
+        Later changes arrive through the client's version listener (health checks). Best
+        effort: a backend that does not answer is reported by the call or check that follows;
+        asking only once also keeps a wrong token from adding failed logins (v1.10 lockout)."""
         probe = getattr(client, "server_info", None)
-        if not callable(probe):
+        if not callable(probe) or self.catalog.reported_version(backend_id) is not None:
             return
         try:
             probe(timeout_s=VERSION_PROBE_TIMEOUT_S)  # the client's version listener does the rest
