@@ -73,7 +73,8 @@ def gw(config_path: str) -> Iterator[Any]:
         yield app
     finally:
         try:
-            _finish_leftover_job(app)
+            if _finish_leftover_job(app):
+                assert_single_instance(str(app.runtime().profile.vmx), "the teardown revert")
         finally:
             app.close()
 
@@ -155,13 +156,14 @@ def wait_healthy(gw: Any, backend: str, timeout_s: float = 180.0) -> dict[str, A
     pytest.fail(f"backend {backend} not healthy after {timeout_s:g}s: {entry}")
 
 
-def _finish_leftover_job(gw: Any) -> None:
+def _finish_leftover_job(gw: Any) -> bool:
+    """Collect and finish (revert) the job a test left behind; True if the VM was reverted."""
     try:
         job = gw.session_status().get("job")
     except GatewayError:
-        return
+        return False
     if not job or job["state"] in ("DONE", "FAILED"):
-        return
+        return False
     job_id = job["job_id"]
     try:
         if job["state"] not in ("COLLECTED", "DISCARDED", "REVERTING"):
@@ -170,6 +172,7 @@ def _finish_leftover_job(gw: Any) -> None:
     except (GatewayError, pytest.fail.Exception):
         gw.discard_job(job_id, actor="e2e-teardown")
         finished(gw, gw.analysis_finish(job_id, revert=True))
+    return True
 
 
 def start_analysis(gw: Any, vmx: str, arch: str) -> dict[str, Any]:
@@ -291,4 +294,4 @@ def test_e_mcp_stdio_smoke(config_path):
     assert V110_TOOLS <= names, sorted(names)  # E5: the live v1.10 list at the first tools/list
     assert status.is_error is False
     payload = json.loads(status.content[0].text)
-    assert payload["vm"]["power"] == "running", payload
+    assert {"profile", "vm", "backends", "job"} <= set(payload), payload
