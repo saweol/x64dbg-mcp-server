@@ -39,7 +39,8 @@ program's file name (case-insensitive, then a unique match without extension:
   `[x64dbg: bookmark; hardware bp, disabled, condition rcx==1]`.
 * A name with no character the tool can use (for example all Korean for radare2) does not
   rename anything; it is kept in the tag as `[x64dbg: label 복호화_루틴]`.
-* Addresses outside the program's memory/sections are counted as `unmapped`.
+* Addresses outside the program's memory are counted as `unmapped`. radare2/rizin use the
+  section table (`iSj`), so the PE header (below the first section) counts as unmapped there.
 
 **Export** (tool → document) writes RVAs relative to the tool's image base, ready for the
 gateway's `ida_import_annotations` / `plan_import` (items `{rva, name?, comment?}`; the
@@ -208,7 +209,7 @@ fed to the gateway's `plan_import`:
 | Ghidra | 12.2 (JDK 25.0.5, PyGhidra 3.2.0, Python 3.12) headless via `pyghidraRun -H` | function `entry` → `gw_probe_entry` (`USER_DEFINED`), EOL comment `set by x64dbg_sync import probe\n[x64dbg: bookmark]`; `--comment=pre` writes the pre comment; idempotent; export = exactly that item. The Script Manager prompts (`askChoice`/`askFile`) ran against the real API in headless mode with answers from a `.properties` file; the GUI itself was not run. |
 | radare2 | 6.2.6 (built from the release tarball), r2pipe 2.1.0 | `afn` path after `-A` and flag path without analysis, then a flag import followed by an analysed re-import; comment byte for byte; idempotent; export; `#!pipe` inside a session. 25/25 checks. |
 | rizin | 0.9.1 (static Linux release), rzpipe 0.6.2 | same 25/25 checks, including `#!pipe` |
-| Cutter | 2.5.0 Qt6 AppImage (rizin 0.9.1, Python 3.12.4), 2.5.0 Qt5 AppImage (Python 3.11.11), under Xvfb | `cutter_import` (function renamed after `-A 1`), comment, second import unchanged, `cutter_export`, project saved, all through the real `cutter.cmd` |
+| Cutter | 2.5.0 Qt6 AppImage (rizin 0.9.1, Python 3.12.4), 2.5.0 Qt5 AppImage (Python 3.11.11), 2.4.1 Qt6 AppImage (rizin 0.8.1, Python 3.12.4), under Xvfb | `cutter_import` (function renamed after `-A 1`), comment, second import unchanged, `cutter_export`, `.rzdb` project saved, all through the real `cutter.cmd` |
 
 Not verified: the Ghidra GUI itself (only headless), Ghidra 11.x, radare2/rizin builds older
 than the ones above, and Cutter's interactive console (the same embedded interpreter was

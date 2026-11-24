@@ -96,6 +96,9 @@ _AUTO_COMMENT_RES = (
     re.compile(r"switch table \(\d+ cases\) at 0x[0-9a-fA-F]+"),
 )
 _CC_STAR_RE = re.compile(r"CCu base64:([A-Za-z0-9+/=]*) @ (0x[0-9a-fA-F]+)")
+# Names read back from the tool (flagspaces, our own old flags) are re-sent in a command line
+# only when they are plain tokens the r2/rizin parser cannot interpret.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:]+")
 
 
 def is_auto_function_name(name: str) -> bool:
@@ -215,12 +218,15 @@ class R2Ops:
 
     def _space_names(self) -> list[str]:
         spaces = self.c.cmdj(self.c.space_list)
-        return [r["name"] for r in spaces if isinstance(r, dict) and isinstance(r.get("name"), str)] \
-            if isinstance(spaces, list) else []
+        if not isinstance(spaces, list):
+            return []
+        return [r["name"] for r in spaces
+                if isinstance(r, dict) and isinstance(r.get("name"), str) and _TOKEN_RE.fullmatch(r["name"])]
 
     def _select(self, space: str) -> None:
-        # space names come from the tool itself or are FLAGSPACE; never document text
-        self.c.cmd("fs *" if space == "*" else f"fs {space}")
+        # space names come from the tool itself or are FLAGSPACE, never from the document; a name
+        # that is not a plain token is not re-sent (the selection falls back to all flagspaces)
+        self.c.cmd(f"fs {space}" if space != "*" and _TOKEN_RE.fullmatch(space) else "fs *")
 
     def _flags_in(self, space: str) -> list[tuple[str, int]]:
         self._select(space)
@@ -290,7 +296,7 @@ class R2Ops:
             if candidate is None:
                 return core.NAME_FAILED
             for old in ours:  # an earlier import's name here is replaced, like IDA's set_name
-                if old != candidate:
+                if old != candidate and _TOKEN_RE.fullmatch(old):
                     self.c.cmd(self.c.remove_flag(old))
                     index.get(old, set()).discard(address)
             self.c.cmd(f"f {candidate} @ {_hex(address)}")

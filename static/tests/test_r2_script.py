@@ -309,6 +309,18 @@ def test_hostile_text_never_reaches_a_command_line(tmp_path: Path) -> None:
     assert "한글" in fake.comments[ENTRY]
 
 
+def test_tool_supplied_names_are_checked_before_reuse(tmp_path: Path) -> None:
+    """Flagspace and flag names read back from the tool are only re-sent when they are plain tokens."""
+    fake = FakeCore("radare2")
+    fake.spaces.add("odd; f- *")
+    fake.selected = "odd; f- *"
+    fake.flags["weird name;x"] = (ENTRY, "x64dbg")
+    xr.import_document(ops_for(fake), write_doc(tmp_path, [{"rva": "0x102c", "name": "gw_probe_entry"}]))
+    for line in fake.calls:
+        assert SAFE_CMD_RE.fullmatch(line), line
+    assert fake.flags["gw_probe_entry"] == (ENTRY, "x64dbg")
+
+
 def test_unmapped_items_are_counted(tmp_path: Path) -> None:
     fake = FakeCore("rizin")
     counts = xr.import_document(ops_for(fake), write_doc(tmp_path, [{"rva": "0x90000", "name": "far"}]))
