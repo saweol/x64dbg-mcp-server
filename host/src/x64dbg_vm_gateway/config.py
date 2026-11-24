@@ -32,6 +32,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import static_tools as _static_tools
 from .contracts import Secret
 from .errors import ConfigError
 from .platform import host_system
@@ -93,6 +94,35 @@ class HttpServerConfig:
 
 
 @dataclass(frozen=True)
+class StaticServerConfig:
+    """``[static.servers.<id>]``: overrides the MCP registration recipe of one static tool
+    (``static_tools.effective_recipe``). ``command`` and ``url`` exclude each other;
+    ``transport`` is filled in by the loader ("stdio" for command, "http" for url unless
+    "sse" is given) and stays None when neither is set (a name-only override)."""
+
+    command: tuple[str, ...] | None = None  # argv of a stdio MCP server
+    url: str | None = None  # endpoint of an http / sse MCP server
+    transport: str | None = None  # "stdio" | "http" | "sse"
+    name: str | None = None  # MCP server name to register instead of the registry's
+
+
+@dataclass(frozen=True)
+class StaticConfig:
+    """``[static]``: the static-analysis tools used next to the gateway (plan 6.4).
+
+    Each tool's own MCP server is registered in the MCP client beside the gateway; the
+    gateway names them in its instructions and tool descriptions. ``tools[0]`` is the
+    default tool."""
+
+    tools: tuple[str, ...] = ("ida",)  # ids from static_tools.TOOL_IDS, no duplicates, at least one
+    servers: dict[str, StaticServerConfig] = field(default_factory=dict)  # tool id -> recipe override
+
+    @property
+    def default_tool(self) -> str:
+        return self.tools[0]
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     jobs_root: str = "~/mcp-lab/jobs"
     default_profile: str | None = None
@@ -105,6 +135,8 @@ class GatewayConfig:
     env_file: str | None = None
     # host directories samples / uploads may be read from (expanded with ~)
     upload_roots: tuple[str, ...] = ("~",)
+    # static-analysis tools beside the gateway; appended last so positional construction keeps its meaning
+    static: StaticConfig = field(default_factory=StaticConfig)
 
     def profile(self, name: str | None = None) -> ProfileConfig:
         key = name or self.default_profile
@@ -145,10 +177,14 @@ TOKEN_SOURCES = ("guest-config", "env")
 RELAUNCH_MODES = ("task", "direct")
 ARCHES = ("x64", "x32")
 HTTP_SCOPES = ("read", "analyze", "admin")
+STATIC_TOOL_IDS = _static_tools.TOOL_IDS
+STATIC_TRANSPORTS = _static_tools.TRANSPORTS
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _BACKEND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_STATIC_IDS_HINT = f"static tools are: {', '.join(STATIC_TOOL_IDS)}"
 
 # Keys that look like an inline secret. Matching keys are refused outright.
 _SECRET_KEYS = frozenset({"guest_password", "password", "passwd", "token", "auth_token", "secret",
@@ -169,9 +205,12 @@ _STR, _FLOAT, _INT, _BOOL, _STR_LIST, _STR_MAP = "string", "number", "integer", 
 # File keys per section -> kind. Structural keys (sub-tables) are listed separately.
 _GATEWAY_KEYS = {"jobs_root": _STR, "default_profile": _STR, "max_call_s": _FLOAT, "env_file": _STR,
                  "upload_roots": _STR_LIST}
-_GATEWAY_STRUCTURAL = frozenset({"profiles", "http", "config_path"})
+_GATEWAY_STRUCTURAL = frozenset({"profiles", "http", "config_path", "static"})
 _HTTP_KEYS = {"enabled": _BOOL, "bind": _STR, "port": _INT, "tls_cert": _STR, "tls_key": _STR,
               "allow_clients": _STR_LIST, "token_envs": _STR_MAP}
+_STATIC_KEYS = {"tools": _STR_LIST}
+_STATIC_STRUCTURAL = frozenset({"servers"})
+_STATIC_SERVER_KEYS = {"command": _STR_LIST, "url": _STR, "transport": _STR, "name": _STR}
 _PROFILE_KEYS = {
     "mode": _STR, "vmx": _STR, "vmrun": _STR, "vmrun_type": _STR, "clean_snapshot": _STR,
     "protected_snapshots": _STR_LIST, "guest_user": _STR, "guest_password_env": _STR,
@@ -186,6 +225,8 @@ _BACKEND_KEYS = {"id": _STR, "arch": _STR, "port": _INT, "url": _STR, "exe": _ST
 _SECTION_FIELDS: dict[str, frozenset[str]] = {
     "gateway": frozenset(_GATEWAY_KEYS) | _GATEWAY_STRUCTURAL,
     "http": frozenset(_HTTP_KEYS),
+    "static": frozenset(_STATIC_KEYS) | _STATIC_STRUCTURAL,
+    "static_server": frozenset(_STATIC_SERVER_KEYS),
     "profile": frozenset(_PROFILE_KEYS) | _PROFILE_STRUCTURAL,
     "retention": frozenset(_RETENTION_KEYS),
     "backend": frozenset(_BACKEND_KEYS),
@@ -354,7 +395,7 @@ class _Parser:
 
     # ── sections ────────────────────────────────────────────────────
     def gateway(self, data: Mapping[str, Any]) -> GatewayConfig:
-        self.check_keys(data, "", {"gateway", "http", "profiles"})
+        self.check_keys(data, "", {"gateway", "http", "profiles", "static"})
         gw = self.table(data.get("gateway", {}), "gateway")
         self.check_keys(gw, "gateway", set(_GATEWAY_KEYS))
         values = self.fields(gw, "gateway", _GATEWAY_KEYS)
@@ -369,6 +410,7 @@ class _Parser:
                                  "must be an absolute path or start with ~ (home directory)")
 
         http = self.http(self.table(data.get("http", {}), "http"))
+        static = self.static(self.table(data.get("static", {}), "static"))
 
         profiles_tbl = self.table(data.get("profiles", {}), "profiles")
         profiles: dict[str, ProfileConfig] = {}
@@ -379,7 +421,7 @@ class _Parser:
         if default is not None and default not in profiles:
             raise self.error("gateway.default_profile",
                              "names a profile that is not defined under [profiles]")
-        return GatewayConfig(**values, profiles=profiles, http=http, config_path=self.source)
+        return GatewayConfig(**values, profiles=profiles, http=http, config_path=self.source, static=static)
 
     def http(self, tbl: Mapping[str, Any]) -> HttpServerConfig:
         self.check_keys(tbl, "http", set(_HTTP_KEYS))
@@ -409,6 +451,74 @@ class _Parser:
                 hint="set http.token_envs.<read|analyze|admin> to environment variable NAMES",
             )
         return HttpServerConfig(**values)
+
+    def static(self, tbl: Mapping[str, Any]) -> StaticConfig:
+        self.check_keys(tbl, "static", set(_STATIC_KEYS) | _STATIC_STRUCTURAL)
+        values = self.fields(tbl, "static", _STATIC_KEYS)
+        tools: tuple[str, ...] = values.get("tools", StaticConfig.tools)
+        if not tools:
+            raise self.error("static.tools", "must name at least one static tool", hint=_STATIC_IDS_HINT)
+        for i, tool_id in enumerate(tools):
+            if tool_id not in STATIC_TOOL_IDS:
+                raise self.error(f"static.tools[{i}]", "unknown static tool", hint=_STATIC_IDS_HINT)
+            if tool_id in tools[:i]:
+                raise self.error(f"static.tools[{i}]", "duplicate static tool")
+
+        servers: dict[str, StaticServerConfig] = {}
+        for tool_id, body in self.table(tbl.get("servers", {}), "static.servers").items():
+            dotted = f"static.servers.{tool_id}"
+            if tool_id not in STATIC_TOOL_IDS:
+                raise self.error(dotted, "unknown static tool", hint=_STATIC_IDS_HINT)
+            servers[tool_id] = self.static_server(self.table(body, dotted), dotted)
+
+        # The configured tools are registered side by side: their MCP server names must differ.
+        # Registry names are distinct, so a clash always involves an overridden name: blame that one.
+        owner: dict[str, str] = {}
+        for tool_id in tools:
+            renamed = tool_id in servers and servers[tool_id].name is not None
+            name = _static_tools.server_name(tool_id, StaticConfig(tools=tools, servers=servers))
+            if name in owner:
+                blamed, other = (tool_id, owner[name]) if renamed else (owner[name], tool_id)
+                raise self.error(f"static.servers.{blamed}.name",
+                                 f"the MCP server name is already used by static tool {other!r}",
+                                 hint="give each configured static tool its own MCP server name")
+            owner[name] = tool_id
+        return StaticConfig(tools=tuple(tools), servers=servers)
+
+    def static_server(self, tbl: Mapping[str, Any], dotted: str) -> StaticServerConfig:
+        self.check_keys(tbl, dotted, set(_STATIC_SERVER_KEYS))
+        values = self.fields(tbl, dotted, _STATIC_SERVER_KEYS)
+        command, url = values.get("command"), values.get("url")
+        if command is not None:
+            if not command:
+                raise self.error(f"{dotted}.command", "must not be empty (the program and its arguments)")
+            for i, arg in enumerate(command):
+                if not arg.strip():
+                    raise self.error(f"{dotted}.command[{i}]", "must not be empty")
+        if url is not None:
+            if not _is_http_url(url):
+                raise self.error(f"{dotted}.url", "must be an http:// or https:// URL with a host")
+            if command is not None:
+                raise self.error(f"{dotted}.url", "give either command (stdio) or url, not both")
+        transport = values.get("transport")
+        if transport is not None:
+            key = f"{dotted}.transport"
+            self.choice(transport, STATIC_TRANSPORTS, key)
+            if command is not None and transport != "stdio":
+                raise self.error(key, "must be stdio for a command (http and sse need a url)")
+            if url is not None and transport == "stdio":
+                raise self.error(key, "must be http or sse for a url (stdio runs a command)")
+            if command is None and url is None:
+                raise self.error(key, "only applies together with command or url")
+        elif command is not None:
+            transport = "stdio"
+        elif url is not None:
+            transport = "http"
+        name = values.get("name")
+        if name is not None and not _MCP_NAME_RE.match(name):
+            raise self.error(f"{dotted}.name", "MCP server names may only contain letters, digits, '_' and "
+                                               "'-' (at most 64 characters)")
+        return StaticServerConfig(command=command, url=url, transport=transport, name=name)
 
     def profile(self, name: str, tbl: Mapping[str, Any]) -> ProfileConfig:
         prefix = f"profiles.{name}"
