@@ -243,7 +243,7 @@ def full_loop(gw: Any, vmx: str, arch: str) -> None:
             assert e["sha256"], e
             assert stored.get(e["original_path"]) and Path(stored[e["original_path"]]).is_file(), e
 
-    exported = finished(gw, gw.ida_export_annotations(job_id))
+    exported = finished(gw, gw.static_export_annotations(job_id))
     assert Path(exported["host_path"]).is_file(), exported
 
     done = finished(gw, gw.analysis_finish(job_id, revert=True))

@@ -2,7 +2,11 @@
 
 x64dbg works with runtime (ASLR) addresses, IDA with the image base of the
 IDB. Both sides agree on *module + RVA*, so everything here converts through
-that pair:
+that pair. Despite the IDA names (module, ``ida_*`` parameters, the schema
+name), nothing here is IDA specific: Ghidra, radare2/rizin and Cutter address a
+module the same way (image base of their database + RVA), and the gateway's
+tool-neutral ``static_*`` tools use this module for all of them
+(``static_tools``):
 
 - :func:`parse_module_list` turns the plugin tool ``ListModules`` output into
   a module map (name -> :class:`ModuleInfo`).

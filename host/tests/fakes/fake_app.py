@@ -225,19 +225,22 @@ class FakeApp:
         return self._record("analysis_finish", {"state": "DONE"}, job_id=job_id, revert=revert,
                             keep_snapshot=keep_snapshot, wait_s=wait_s)
 
-    # ── IDA ─────────────────────────────────────────────────────────
-    def ida_rebase(self, address: str | int, *, direction: str, module: str | None = None,
-                   ida_imagebase: str | int | None = None, job_id: str | None = None) -> JSON:
-        return self._record("ida_rebase", {"address": "0x140001000"}, address=address, direction=direction,
-                            module=module, ida_imagebase=ida_imagebase, job_id=job_id)
+    # ── static analysis (IDA, Ghidra, radare2/rizin, Cutter) ────────
+    def static_rebase(self, address: str | int, *, direction: str, module: str | None = None,
+                      imagebase: str | int | None = None, job_id: str | None = None,
+                      ida_imagebase: str | int | None = None) -> JSON:
+        return self._record("static_rebase", {"address": "0x140001000"}, address=address, direction=direction,
+                            module=module, imagebase=imagebase, job_id=job_id, ida_imagebase=ida_imagebase)
 
-    def ida_export_annotations(self, job_id: str | None = None) -> JSON:
-        return self._record("ida_export_annotations", {"host_path": "/tmp/annotations.json"}, job_id=job_id)
+    def static_export_annotations(self, job_id: str | None = None) -> JSON:
+        return self._record("static_export_annotations", {"host_path": "/tmp/annotations.json"},
+                            job_id=job_id)
 
-    def ida_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
-                               ida_imagebase: str | int | None = None, job_id: str | None = None) -> JSON:
-        return self._record("ida_import_annotations", {"applied": len(items)}, items=items, module=module,
-                            ida_imagebase=ida_imagebase, job_id=job_id)
+    def static_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
+                                  imagebase: str | int | None = None, job_id: str | None = None,
+                                  ida_imagebase: str | int | None = None) -> JSON:
+        return self._record("static_import_annotations", {"applied": len(items)}, items=items, module=module,
+                            imagebase=imagebase, job_id=job_id, ida_imagebase=ida_imagebase)
 
     # ── jobs (read-only) ────────────────────────────────────────────
     def list_jobs(self, profile: str | None = None) -> JSON:

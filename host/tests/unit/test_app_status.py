@@ -210,12 +210,12 @@ def test_debugger_call_validates_the_tool_name(lab):
 
 # ── stubs / misc ────────────────────────────────────────────────────
 @pytest.mark.parametrize("call", [
-    lambda gw: gw.ida_rebase("0x401000", direction="runtime_to_ida"),
-    lambda gw: gw.ida_export_annotations(),
-    lambda gw: gw.ida_import_annotations([], module="a.exe"),
+    lambda gw: gw.static_rebase("0x401000", direction="runtime_to_static"),
+    lambda gw: gw.static_export_annotations(),
+    lambda gw: gw.static_import_annotations([], module="a.exe"),
 ])
-def test_ida_tools_need_a_job(lab, call):
-    # The IDA tools are wired now (J-integ, see test_app_ida); this pinned the old stub.
+def test_static_tools_need_a_job(lab, call):
+    # The static tools are wired now (J-integ, see test_app_ida); this pinned the old stub.
     with pytest.raises(GatewayError) as ei:
         call(lab.gateway())
     assert ei.value.code == "STATE_VIOLATION" and ei.value.next_tool == "analysis_start"

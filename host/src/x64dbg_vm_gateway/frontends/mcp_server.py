@@ -3,10 +3,12 @@
 Tools offered:
 
 - the gateway tools of ``tool_defs.GATEWAY_TOOLS`` (dispatched to the app
-  method of the same contract), and
+  method of the same contract); the former ``ida_*`` names
+  (``tool_defs.DEPRECATED_ALIASES``) stay callable with their target's tier but are
+  not listed, and every such call logs a deprecation warning, and
 - the backend's x64dbg tools under their ORIGINAL names (``app.list_mirrored_tools``,
   dispatched to ``app.call_mirrored``). A mirrored name that collides with a
-  gateway tool is skipped; the gateway tool wins.
+  gateway tool or alias is skipped; the gateway tool wins.
 
 Results: gateway tools answer with one ``TextContent`` holding pretty JSON;
 mirrored tools and ``debugger_call`` answer with one ``TextContent`` per backend
@@ -76,9 +78,9 @@ from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
 from .tool_defs import (
-    GATEWAY_TOOL_NAMES,
+    CALLABLE_TOOLS,
     GATEWAY_TOOLS,
-    TOOLS_BY_NAME,
+    RESERVED_TOOL_NAMES,
     Forbidden,
     GatewayToolDef,
     InternalError,
@@ -204,12 +206,13 @@ def _mirrored_tool(info: ToolInfo) -> types.Tool:
 
 
 def _visible_mirrored(tools: Iterable[ToolInfo]) -> list[ToolInfo]:
-    """Mirrored tools as offered: gateway names win, the first of duplicate names wins."""
-    seen = set(GATEWAY_TOOL_NAMES)
+    """Mirrored tools as offered: gateway names (deprecated aliases included) win, the first
+    of duplicate names wins."""
+    seen = set(RESERVED_TOOL_NAMES)
     out: list[ToolInfo] = []
     for info in tools:
         if info.name in seen:
-            if info.name in GATEWAY_TOOL_NAMES:
+            if info.name in RESERVED_TOOL_NAMES:
                 log.warning("mirrored tool %s collides with a gateway tool and is hidden",
                             _log_name(info.name))
             continue
@@ -308,7 +311,7 @@ class _Handlers:
         name = params.name
         arguments = params.arguments
         try:
-            spec = TOOLS_BY_NAME.get(name)
+            spec = CALLABLE_TOOLS.get(name)
             if spec is not None:
                 result = await self._call_gateway(spec, arguments)
             else:
@@ -329,6 +332,9 @@ class _Handlers:
     async def _call_gateway(self, spec: GatewayToolDef,
                             arguments: Mapping[str, Any] | None) -> types.CallToolResult:
         self._require_tier(spec.name, spec.tier)
+        if spec.alias_of is not None:
+            log.warning("tool %s is deprecated; use %s (same arguments, imagebase for ida_imagebase)",
+                        spec.name, spec.alias_of)
         kwargs = check_arguments(spec, arguments)
         method = getattr(self.app, spec.method)
         value = await anyio.to_thread.run_sync(functools.partial(method, **kwargs),

@@ -336,7 +336,7 @@ def _function_body(text: str, name: str) -> str:
 
 def test_guest_script_turns_x64dbg_database_compression_off() -> None:
     """x64dbg LZ4-compresses databases saved to its default location unless
-    [Engine] DisableDatabaseCompression=1 (x64dbg database.cpp); ida_export_annotations
+    [Engine] DisableDatabaseCompression=1 (x64dbg database.cpp); static_export_annotations
     can only read plain JSON. The ini is <exe dir>\\<exe name>.ini (bridgemain.cpp derives it
     from the module file name): x64dbg.ini for x64dbg.exe, x32dbg.ini for x32dbg.exe."""
     text = GUEST_SCRIPT.read_text()

@@ -54,14 +54,17 @@ relaunched (BACKEND_RESTARTED), the sample is loaded again (SetArtifactDir when
 supported, LoadBinary, WaitForPause) before the error is returned, once per
 epoch; ``details.reloaded`` says whether the sample is loaded now.
 
-IDA (plan 6.4, interpretation D): ``ida_rebase`` / ``ida_export_annotations`` /
-``ida_import_annotations`` use ``ida_sync`` with the job's module map (a live
-ListModules while the sample is loaded, else the collected one); the export
-writes ``artifacts/ida_sync.json``, the import sets labels and comments through
-the mirrored ``CommentOrLabelAtAddress``.
+Static analysis (plan 6.4, interpretation D; IDA, Ghidra, radare2/rizin and Cutter
+alike, see ``static_tools``): ``static_rebase`` / ``static_export_annotations`` /
+``static_import_annotations`` use ``ida_sync`` with the job's module map (a live
+ListModules while the sample is loaded, else the collected one); a static address
+is the image base of the static tool's database + RVA. The export writes
+``artifacts/static_sync.json``, the import sets labels and comments through the
+mirrored ``CommentOrLabelAtAddress``. The static tools' own MCP servers are
+registered next to the gateway; ``instructions`` names the configured ones.
 
 Long operations (analysis_start/collect/finish, snapshot and power tools,
-file_download, the IDA export/import) run on the profile's
+file_download, the static export/import) run on the profile's
 ``ops.OperationRunner`` and answer ``{"state": "in_progress"}`` when they outlast
 ``wait_s``. The runner serialises them, so a download can never race with a
 collection that clears ``raw/extra``.
@@ -69,8 +72,9 @@ collection that clears ``raw/extra``.
 Host layout of a job (``<jobs_root>/<job_id>/``): ``input/sample.bin`` (the
 sample copy that is uploaded), ``screens/`` (screenshots), ``artifacts/``
 (``transfer.collect_artifacts`` output), ``artifacts/raw/extra/NNNN_<name>``
-for ``file_download`` and ``artifacts/ida_sync.json`` / ``ida_sync.dd64|dd32``
-for the IDA export. Because a collection starts by deleting ``raw/extra``,
+for ``file_download`` and ``artifacts/static_sync.json`` / ``static_sync.dd64|dd32``
+for the static export (``ida_sync.*`` before the rename; nothing reads either back).
+Because a collection starts by deleting ``raw/extra``,
 earlier downloads are moved to ``artifacts/downloads/`` first.
 
 Thread-safety: every public method may be called from several threads. The
@@ -226,13 +230,21 @@ _NO_SESSION_RE = re.compile(r"\bactive debug session\b", re.IGNORECASE)
 _POSIX = os.name == "posix"
 _TMP_SEQ = itertools.count()  # unique temp file names within this process
 LOAD_CALL_TIMEOUT_S = 60.0
-# IDA integration
-IDA_SYNC_FILE = "ida_sync.json"  # x64dbg-ida-sync/1 export under <job>/artifacts/
-IDA_LIST_MODULES_TIMEOUT_S = 10.0
+# static analysis (IDA, Ghidra, radare2/rizin, Cutter)
+STATIC_SYNC_FILE = "static_sync.json"  # x64dbg-ida-sync/1 export under <job>/artifacts/ (was ida_sync.json)
+STATIC_LIST_MODULES_TIMEOUT_S = 10.0
 #: job states in which the job's debugger still holds the sample (live module map, imports)
-IDA_LIVE_STATES = frozenset({JobState.ANALYZING, JobState.COLLECTED, JobState.COLLECTED_PARTIAL})
+LIVE_SAMPLE_STATES = frozenset({JobState.ANALYZING, JobState.COLLECTED, JobState.COLLECTED_PARTIAL})
 #: job states in which the job's debugger holds (or is loading) the sample
-DEBUGGEE_STATES = IDA_LIVE_STATES | {JobState.LOADING, JobState.COLLECTING}
+DEBUGGEE_STATES = LIVE_SAMPLE_STATES | {JobState.LOADING, JobState.COLLECTING}
+#: static_rebase directions: the tool-neutral names, then the IDA names they replace
+REBASE_DIRECTIONS = ("runtime_to_static", "static_to_runtime", "runtime_to_rva", "rva_to_runtime",
+                     "runtime_to_ida", "ida_to_runtime")
+_IDA_DIRECTION = {"runtime_to_static": "runtime_to_ida", "static_to_runtime": "ida_to_runtime"}
+_TO_RUNTIME = frozenset({"static_to_runtime", "ida_to_runtime"})
+IMAGEBASE_HOWTO = ("the image base of the static tool's database (IDA: idaapi.get_imagebase(); Ghidra: "
+                   "currentProgram.getImageBase(); radare2/rizin/Cutter: the binary's baddr, see iI)")
+IMAGEBASE_ALIAS_WARNING = "ida_imagebase is deprecated: pass imagebase instead"
 IMPORT_TOOL = "CommentOrLabelAtAddress"  # plugin tool: {address, value, mode: Comment|Label}
 MAX_IMPORT_FAILURES_LISTED = 50
 MAX_MANIFEST_BYTES = 64 * 1024 * 1024
@@ -334,6 +346,48 @@ def _parse_now(clock: Clock) -> datetime:
 
 def _gjoin(directory: str, name: str) -> str:
     return str(PureWindowsPath(directory) / name)
+
+
+def _resolve_imagebase(imagebase: str | int | None, ida_imagebase: str | int | None, *,
+                       stage: str) -> tuple[str | int | None, list[str]]:
+    """``imagebase`` or its deprecated alias ``ida_imagebase`` (plus the deprecation warning).
+    InvalidArgument when both are given with different values."""
+    if ida_imagebase is None:
+        return imagebase, []
+    log.info("%s: the deprecated parameter ida_imagebase was used", stage)
+    if imagebase is None:
+        return ida_imagebase, [IMAGEBASE_ALIAS_WARNING]
+    try:
+        same = (ida_sync.parse_address(imagebase, what="imagebase")
+                == ida_sync.parse_address(ida_imagebase, what="ida_imagebase"))
+    except ValueError as e:
+        raise InvalidArgument(_clip(str(e), 300), stage=stage) from None
+    if not same:
+        raise InvalidArgument(
+            "imagebase and its deprecated alias ida_imagebase give different image bases", stage=stage,
+            hint="pass only imagebase: " + IMAGEBASE_HOWTO,
+        )
+    return imagebase, [IMAGEBASE_ALIAS_WARNING]
+
+
+#: ida_sync words its messages for IDA (its parameter is ida_imagebase); the static_* tools are
+#: tool-neutral. Ordered: the longer phrases first.
+_NEUTRAL_WORDS = (
+    ("the IDB image base (idaapi.get_imagebase())", IMAGEBASE_HOWTO),
+    ("ida_imagebase", "imagebase"),
+    ("IDA address", "static address"),
+)
+
+
+def _neutral_message(text: str, direction: str | None = None) -> str:
+    """An ``ida_sync`` error message in the static tools' terms (``direction``: as the caller named it)."""
+    for old, new in _NEUTRAL_WORDS:
+        text = text.replace(old, new)
+    if direction is not None:
+        ida_name = _IDA_DIRECTION.get(direction)
+        if ida_name is not None:
+            text = text.replace(ida_name, direction)
+    return text
 
 
 class _Steps:
@@ -2746,12 +2800,14 @@ class Gateway(GatewayApp):
                 deleted.append(name)
         return deleted
 
-    # ── IDA integration (plan 6.4, interpretation D) ────────────────
-    # Module map: a live ListModules of the job's debugger (a direct read-only call: a
-    # rebase never relaunches a dead debugger) while the job has its sample loaded, else
-    # the map analysis_collect recorded in the manifest. The sample module gets its PE
-    # image base as preferred base (IDA's default image base). Imports need the live map:
-    # they set labels at today's runtime addresses.
+    # ── static analysis (plan 6.4, interpretation D) ────────────────
+    # Tool-neutral: IDA, Ghidra, radare2/rizin and Cutter all address the module at the
+    # image base of their database + RVA. Module map: a live ListModules of the job's
+    # debugger (a direct read-only call: a rebase never relaunches a dead debugger) while
+    # the job has its sample loaded, else the map analysis_collect recorded in the
+    # manifest. The sample module gets its PE image base as preferred base (the static
+    # tools' default image base). Imports need the live map: they set labels at today's
+    # runtime addresses.
     @staticmethod
     def _sample_module(job: Job) -> str | None:
         s = job.sample
@@ -2784,13 +2840,13 @@ class Gateway(GatewayApp):
         """(live module map, None), or (None, why there is none). The reason is None when no
         live map was expected (the job's debugger no longer holds the sample)."""
         bid = job.backend_id
-        if bid not in rt.backends or JobState(job.state) not in IDA_LIVE_STATES:
+        if bid not in rt.backends or JobState(job.state) not in LIVE_SAMPLE_STATES:
             return None, None
         try:
             if rt.profile.mode == "vmware" and rt.vm.power_state() != PowerState.RUNNING:
                 return None, "the VM is not running"
             with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
-                res = rt.connect(str(bid)).call_tool("ListModules", {}, IDA_LIST_MODULES_TIMEOUT_S)
+                res = rt.connect(str(bid)).call_tool("ListModules", {}, STATIC_LIST_MODULES_TIMEOUT_S)
         except GatewayError as e:
             log.info("job %s: no live module map (%s)", job.id, e.code)
             return None, f"ListModules failed ({e.code})"
@@ -2827,7 +2883,7 @@ class Gateway(GatewayApp):
         except ValueError:
             return None
 
-    def _ida_modules(
+    def _static_modules(
         self, rt: Runtime, job: Job, *, live_only: bool = False
     ) -> tuple[dict[str, Any], str, list[str]]:
         """(module map, "live" | "manifest", warnings). Raises StateViolation when there is
@@ -2840,7 +2896,7 @@ class Gateway(GatewayApp):
         if live_only:
             raise StateViolation(
                 f"job {job.id} ({state}) has no live debug session to apply annotations to",
-                stage="ida", details={"job_id": job.id, "state": state},
+                stage="static", details={"job_id": job.id, "state": state},
                 hint="annotations are set in the running debugger: the job must be ANALYZING (or collected) "
                      "with its sample loaded; see session_status",
                 next_tool="session_status",
@@ -2856,62 +2912,76 @@ class Gateway(GatewayApp):
         raise StateViolation(
             f"no module map for job {job.id}: its debugger has no debug session and no collection "
             "recorded one",
-            stage="ida", details={"job_id": job.id, "state": state},
+            stage="static", details={"job_id": job.id, "state": state},
             hint="load the sample (analysis_start) or run analysis_collect, which records the module map",
             next_tool="session_status",
         )
 
-    def ida_rebase(
+    def static_rebase(
         self,
         address: str | int,
         *,
         direction: str,
         module: str | None = None,
-        ida_imagebase: str | int | None = None,
+        imagebase: str | int | None = None,
         job_id: str | None = None,
+        ida_imagebase: str | int | None = None,
     ) -> dict[str, Any]:
-        if direction not in ida_sync.DIRECTIONS:
-            raise InvalidArgument(f"direction must be one of {', '.join(ida_sync.DIRECTIONS)}")
+        if direction not in REBASE_DIRECTIONS:
+            raise InvalidArgument(f"direction must be one of {', '.join(REBASE_DIRECTIONS)}",
+                                  stage="static_rebase")
+        base, base_warnings = _resolve_imagebase(imagebase, ida_imagebase, stage="static_rebase")
+        if direction in _TO_RUNTIME and base is None:
+            # no default: a rebased database would silently give a wrong runtime address
+            raise InvalidArgument(f"imagebase is required for {direction}: pass {IMAGEBASE_HOWTO}",
+                                  stage="static_rebase")
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
-        modules, source, map_warnings = self._ida_modules(rt, job)
-        if module is None and direction in ("rva_to_runtime", "ida_to_runtime"):
+        modules, source, map_warnings = self._static_modules(rt, job)
+        if module is None and (direction == "rva_to_runtime" or direction in _TO_RUNTIME):
             module = self._sample_module(job)
             if module is None:
                 raise InvalidArgument(f"module is required for {direction}: job {job.id} has no sample")
         try:
-            out = ida_sync.rebase(address, direction=direction, module_map=modules, module=module,
-                                  ida_imagebase=ida_imagebase)
+            out = ida_sync.rebase(address, direction=_IDA_DIRECTION.get(direction, direction),
+                                  module_map=modules, module=module, ida_imagebase=base)
         except ValueError as e:
             raise InvalidArgument(
-                _clip(str(e), 500), stage="ida_rebase",
+                _clip(_neutral_message(str(e), direction), 500), stage="static_rebase",
                 hint="check the module and the address against the module map (ListModules)",
             ) from None
-        return {**out, "warnings": [*out.get("warnings", []), *map_warnings], "job_id": job.id,
-                "module_map_source": source}
+        result = {k: v for k, v in out.items() if k not in ("ida", "ida_imagebase", "warnings")}
+        result.update(
+            direction=direction,
+            static=out.get("ida"), imagebase=out.get("ida_imagebase"),
+            ida=out.get("ida"), ida_imagebase=out.get("ida_imagebase"),  # the same values, for older clients
+            warnings=[*base_warnings, *(_neutral_message(w) for w in out.get("warnings", [])), *map_warnings],
+            job_id=job.id, module_map_source=source,
+        )
+        return result
 
-    def ida_export_annotations(self, job_id: str | None = None) -> dict[str, Any]:
+    def static_export_annotations(self, job_id: str | None = None) -> dict[str, Any]:
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
 
         def work(progress: Progress) -> dict[str, Any]:
-            return self._ida_export(rt, job.id, progress)
+            return self._static_export(rt, job.id, progress)
 
         # On the runner: it saves the debugger database and reads artifacts a collection rewrites.
-        return self._ops(rt).run("ida_export_annotations", job.id, work, wait_s=self._wait(None),
+        return self._ops(rt).run("static_export_annotations", job.id, work, wait_s=self._wait(None),
                                  job_id=job.id)
 
-    def _ida_export(self, rt: Runtime, job_id: str, progress: Progress) -> dict[str, Any]:
+    def _static_export(self, rt: Runtime, job_id: str, progress: Progress) -> dict[str, Any]:
         job = self._jobs().get(job_id)
         steps = _Steps(self._clock, progress)
         art = Path(job.host_root) / "artifacts"
         _private_dirs(art)
         database: dict[str, Any] | None = None
         bid = job.backend_id if job.backend_id in rt.backends else None
-        if bid is not None and rt.channel is not None and JobState(job.state) in IDA_LIVE_STATES:
+        if bid is not None and rt.channel is not None and JobState(job.state) in LIVE_SAMPLE_STATES:
             with steps.step("save_database") as st:
-                detail, _extra, guest_db, not_written = self._save_database(rt, bid, job,
-                                                                            stage="ida_export_annotations")
+                detail, _extra, guest_db, not_written = self._save_database(
+                    rt, bid, job, stage="static_export_annotations")
                 st["detail"] = detail
             if guest_db is not None:
                 with steps.step("fetch_database") as st:
@@ -2942,7 +3012,7 @@ class Gateway(GatewayApp):
                 if db_path.stat().st_size > ida_sync.MAX_DB_BYTES:
                     raise DatabaseFormatError(
                         f"the database is larger than {ida_sync.MAX_DB_BYTES} bytes",
-                        stage="ida_export_annotations", details={"host_path": str(db_path)},
+                        stage="static_export_annotations", details={"host_path": str(db_path)},
                     )
                 try:
                     ann = ida_sync.parse_x64dbg_db(db_path.read_bytes())
@@ -2952,12 +3022,12 @@ class Gateway(GatewayApp):
         modules: dict[str, Any] | None = None
         source: str | None = None
         try:
-            modules, source, map_warnings = self._ida_modules(rt, job)
+            modules, source, map_warnings = self._static_modules(rt, job)
             steps.warnings.extend(map_warnings)
         except StateViolation as e:
             steps.warnings.append(f"no module map, base_runtime is null: {e.message}")
         doc = ida_sync.export_for_ida(ann, modules)
-        target = art / IDA_SYNC_FILE
+        target = art / STATIC_SYNC_FILE
         with steps.step("write") as st:
             _write_private_json(target, doc)
             st["detail"] = str(target)
@@ -3004,10 +3074,10 @@ class Gateway(GatewayApp):
         return False
 
     def _fetch_database(self, rt: Runtime, job: Job, guest_db: str, art: Path) -> dict[str, Any]:
-        """Copy the saved database from the guest to ``artifacts/ida_sync.<dd64|dd32>`` (0600)."""
+        """Copy the saved database from the guest to ``artifacts/static_sync.<dd64|dd32>`` (0600)."""
         assert rt.channel is not None
         src = validate_guest_path(guest_db)
-        dest = art / f"{PureWindowsPath(IDA_SYNC_FILE).stem}{PureWindowsPath(src).suffix.lower()}"
+        dest = art / f"{PureWindowsPath(STATIC_SYNC_FILE).stem}{PureWindowsPath(src).suffix.lower()}"
         limits = transfer.FetchLimits(max_file_bytes=ida_sync.MAX_DB_BYTES,
                                       min_host_free_bytes=self._fetch_limits.min_host_free_bytes)
         # transfer's bounded fetch, as file_download uses it (size probe, free space, 0600)
@@ -3035,7 +3105,7 @@ class Gateway(GatewayApp):
         raise StateViolation(
             f"no x64dbg database for job {job.id}: its debugger has no debug session to save one and no "
             "collection brought one to the host",
-            stage="ida_export_annotations", details={"job_id": job.id, "state": JobState(job.state).value},
+            stage="static_export_annotations", details={"job_id": job.id, "state": JobState(job.state).value},
             hint="export while the sample is loaded, or run analysis_collect first (on Windows hosts "
                  "collections are not extracted: pass extract=true)",
             next_tool="analysis_collect",
@@ -3054,54 +3124,58 @@ class Gateway(GatewayApp):
             else "the file is not an x64dbg JSON database; see details.host_path"
         )
         return DatabaseFormatError(
-            _clip(message, 400), stage="ida_export_annotations", hint=hint,
+            _clip(message, 400), stage="static_export_annotations", hint=hint,
             details={"host_path": database.get("host_path"), "guest_path": database.get("guest_path"),
                      "compressed": compressed},
         )
 
-    def ida_import_annotations(
+    def static_import_annotations(
         self,
         items: Sequence[Mapping[str, Any]],
         *,
         module: str,
-        ida_imagebase: str | int | None = None,
+        imagebase: str | int | None = None,
         job_id: str | None = None,
+        ida_imagebase: str | int | None = None,
     ) -> dict[str, Any]:
         if isinstance(items, str | bytes | Mapping) or not isinstance(items, Sequence):
             raise InvalidArgument("items must be a list of objects ({rva | ida_address, name?, comment?})")
         if not isinstance(module, str) or not module.strip():
             raise InvalidArgument("module must be a module name such as 'sample.exe'")
+        base, base_warnings = _resolve_imagebase(imagebase, ida_imagebase, stage="static_import_annotations")
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
         batch = [dict(i) if isinstance(i, Mapping) else i for i in items]
         try:
-            blob = json.dumps([batch, module, ida_imagebase], sort_keys=True, default=str)
+            blob = json.dumps([batch, module, base], sort_keys=True, default=str)
         except (TypeError, ValueError, RecursionError):
             raise InvalidArgument("items must be JSON objects") from None
         key = (job.id, hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest())
 
         def work(progress: Progress) -> dict[str, Any]:
-            return self._ida_import(rt, job.id, batch, module, ida_imagebase, progress)
+            out = self._static_import(rt, job.id, batch, module, base, progress)
+            return {**out, "warnings": [*base_warnings, *out["warnings"]]}
 
-        return self._ops(rt).run("ida_import_annotations", key, work, wait_s=self._wait(None), job_id=job.id)
+        return self._ops(rt).run("static_import_annotations", key, work, wait_s=self._wait(None),
+                                 job_id=job.id)
 
-    def _ida_import(
+    def _static_import(
         self,
         rt: Runtime,
         job_id: str,
         items: list[Any],
         module: str,
-        ida_imagebase: str | int | None,
+        imagebase: str | int | None,
         progress: Progress,
     ) -> dict[str, Any]:
         job = self._jobs().get(job_id)
         bid = job.backend_id
-        if bid not in rt.backends or JobState(job.state) not in IDA_LIVE_STATES:
+        if bid not in rt.backends or JobState(job.state) not in LIVE_SAMPLE_STATES:
             state = JobState(job.state).value
             raise StateViolation(
                 f"job {job.id} is {state}: annotations are applied to its running debugger, which needs "
                 "the sample loaded (ANALYZING, COLLECTED or COLLECTED_PARTIAL)",
-                stage="ida_import_annotations", details={"job_id": job.id, "state": state},
+                stage="static_import_annotations", details={"job_id": job.id, "state": state},
                 next_tool="session_status",
             )
         bid = str(bid)
@@ -3110,18 +3184,18 @@ class Gateway(GatewayApp):
         if not {"address", "value", "mode"} <= set(props):
             raise BackendError(
                 f"backend {bid} has no {IMPORT_TOOL}(address, value, mode) tool",
-                stage="ida_import_annotations", details={"backend": bid},
+                stage="static_import_annotations", details={"backend": bid},
                 hint="update the plugin (x64dbg-vm-gateway install-plugin)",
             )
-        modules, source, _ = self._ida_modules(rt, job, live_only=True)
+        modules, source, _ = self._static_modules(rt, job, live_only=True)
         try:
             report = ida_sync.plan_import_report(items, module=module, module_map=modules,
-                                                 ida_imagebase=ida_imagebase)
+                                                 ida_imagebase=imagebase)
         except ValueError as e:
             raise InvalidArgument(
-                _clip(str(e), 500), stage="ida_import_annotations",
-                hint="items need rva or ida_address (with ida_imagebase) and a name and/or comment; nothing "
-                     "was applied",
+                _clip(_neutral_message(str(e)), 500), stage="static_import_annotations",
+                hint="items need rva or ida_address (with imagebase: " + IMAGEBASE_HOWTO + ") and a name "
+                     "and/or comment; nothing was applied",
             ) from None
         ops: list[tuple[dict[str, Any], str, str]] = []
         for entry in report["plan"]:

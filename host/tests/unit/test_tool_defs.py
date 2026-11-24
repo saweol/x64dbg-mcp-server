@@ -17,7 +17,7 @@ EXPECTED = {
     "session_status", "gateway_doctor", "vm_snapshots_list", "vm_snapshot_take", "vm_snapshot_revert",
     "vm_snapshot_delete", "vm_power", "vm_screenshot", "file_upload", "file_download", "debugger_select",
     "debugger_restart", "debugger_call", "analysis_start", "analysis_collect", "analysis_finish",
-    "ida_rebase", "ida_export_annotations", "ida_import_annotations", "jobs_list", "jobs_show",
+    "static_rebase", "static_export_annotations", "static_import_annotations", "jobs_list", "jobs_show",
 }
 #: tools whose GatewayApp method has another name
 METHODS = {"gateway_doctor": "doctor", "jobs_list": "list_jobs", "jobs_show": "get_job"}
@@ -81,10 +81,10 @@ def test_tier_matches_policy_or_local_table(tool):
     assert tool_defs.tool_tier(tool.name) is tool.tier
 
 
-def test_ida_tiers():
-    assert TOOLS_BY_NAME["ida_rebase"].tier is RiskTier.OBSERVE
-    assert TOOLS_BY_NAME["ida_export_annotations"].tier is RiskTier.GUEST_MUTATE
-    assert TOOLS_BY_NAME["ida_import_annotations"].tier is RiskTier.GUEST_MUTATE
+def test_static_tiers():
+    assert TOOLS_BY_NAME["static_rebase"].tier is RiskTier.OBSERVE
+    assert TOOLS_BY_NAME["static_export_annotations"].tier is RiskTier.GUEST_MUTATE
+    assert TOOLS_BY_NAME["static_import_annotations"].tier is RiskTier.GUEST_MUTATE
 
 
 def test_tool_tier_unknown_name_raises():
@@ -106,7 +106,7 @@ def test_annotations_follow_the_tier(tool):
 
 
 def test_idempotent_hints():
-    for name in ("vm_snapshot_delete", "debugger_select", "ida_import_annotations"):
+    for name in ("vm_snapshot_delete", "debugger_select", "static_import_annotations"):
         assert TOOLS_BY_NAME[name].annotations["idempotentHint"] is True
     # vm_power includes "reset" and a second revert bumps the epoch and discards changes again:
     # repeating either has additional effects, so neither may claim idempotence.
@@ -162,10 +162,11 @@ def test_check_arguments_accepts_none_as_empty():
     ("vm_snapshot_take", {"name": 7}, "name"),
     ("analysis_start", {"sample_path": "/x", "load": "yes"}, "load"),
     ("analysis_collect", {"extra_guest_paths": "C:\\x"}, "extra_guest_paths"),
-    ("ida_rebase", {"address": 1.5, "direction": "runtime_to_ida"}, "address"),
-    ("ida_rebase", {"address": "0x1000", "direction": "sideways"}, "direction"),
+    ("static_rebase", {"address": 1.5, "direction": "runtime_to_static"}, "address"),
+    ("static_rebase", {"address": "0x1000", "direction": "sideways"}, "direction"),
+    ("static_rebase", {"address": "0x1000", "direction": "runtime_to_rva", "imagebase": 1.5}, "imagebase"),
     ("debugger_call", {"tool": "run", "arguments": [1]}, "arguments"),
-    ("ida_import_annotations", {"items": [1], "module": "a.exe"}, "items"),
+    ("static_import_annotations", {"items": [1], "module": "a.exe"}, "items"),
 ])
 def test_check_arguments_rejects_bad_input(name, args, fragment):
     with pytest.raises(tool_defs.InvalidArguments) as ei:
@@ -182,19 +183,19 @@ def test_check_arguments_rejects_booleans_for_numbers():
         tool_defs.check_arguments(TOOLS_BY_NAME["vm_power"], {"action": "start", "wait_s": True})
 
 
-def test_ida_rebase_accepts_int_and_string_addresses():
+def test_static_rebase_accepts_int_and_string_addresses():
     for addr in (0x401000, "0x401000"):
-        kw = tool_defs.check_arguments(TOOLS_BY_NAME["ida_rebase"],
-                                       {"address": addr, "direction": "ida_to_runtime"})
+        kw = tool_defs.check_arguments(TOOLS_BY_NAME["static_rebase"],
+                                       {"address": addr, "direction": "static_to_runtime"})
         assert kw["address"] == addr
 
 
-# ── IDA tools follow ida_sync's item shape (J-integ) ────────────────
-IMPORT = "ida_import_annotations"
+# ── static tools follow ida_sync's item shape (J-integ) ─────────────
+IMPORT = "static_import_annotations"
 
 
 def _import_args(*items: object) -> dict:
-    return {"items": list(items), "module": "sample.exe", "ida_imagebase": "0x140000000"}
+    return {"items": list(items), "module": "sample.exe", "imagebase": "0x140000000"}
 
 
 @pytest.mark.parametrize("item", [
@@ -221,15 +222,15 @@ def test_import_items_reject_other_shapes(item, fragment):
     assert any(e["path"].startswith(fragment) for e in ei.value.details["errors"])
 
 
-def test_ida_tool_descriptions_name_the_real_mechanics():
+def test_static_tool_descriptions_name_the_real_mechanics():
     imp = TOOLS_BY_NAME[IMPORT]
     item = imp.input_schema["properties"]["items"]["items"]
     assert {"rva", "ida_address", "name", "comment"} <= set(item["properties"])
     assert "CommentOrLabelAtAddress" in imp.description and "ida_address" in imp.description
-    exp = TOOLS_BY_NAME["ida_export_annotations"].description
-    assert "ida_sync.json" in exp and "SaveDatabase" in exp and "x64dbg-ida-sync/1" in exp
-    reb = TOOLS_BY_NAME["ida_rebase"].description
-    assert "ListModules" in reb and "ida_imagebase" in reb
+    exp = TOOLS_BY_NAME["static_export_annotations"].description
+    assert "static_sync.json" in exp and "SaveDatabase" in exp and "x64dbg-ida-sync/1" in exp
+    reb = TOOLS_BY_NAME["static_rebase"].description
+    assert "ListModules" in reb and "imagebase" in reb
 
 
 def test_frontend_error_codes():
@@ -263,7 +264,7 @@ def test_wait_s_upper_bound_is_accepted():
 
 @pytest.mark.parametrize("name,args,path", [
     ("debugger_call", {"tool": "run", "arguments": {"timeoutMs": float("nan")}}, "arguments/timeoutMs"),
-    ("ida_import_annotations", {"items": [{"rva": float("inf")}], "module": "a.exe"}, "items/0/rva"),
+    ("static_import_annotations", {"items": [{"rva": float("inf")}], "module": "a.exe"}, "items/0/rva"),
 ])
 def test_non_finite_numbers_are_rejected_anywhere(name, args, path):
     with pytest.raises(tool_defs.InvalidArguments) as ei:
@@ -298,3 +299,55 @@ def test_null_for_required_arguments_is_still_rejected(name, args):
 def test_analysis_start_accepts_an_empty_command_line():
     kw = tool_defs.check_arguments(TOOLS_BY_NAME["analysis_start"], {"sample_path": "/s/a.exe", "args": ""})
     assert kw["args"] == ""
+
+
+# ── tool-neutral static side (IDA, Ghidra, radare2/rizin, Cutter) ───
+STATIC = ("static_rebase", "static_export_annotations", "static_import_annotations")
+OLD = {"ida_rebase": "static_rebase", "ida_export_annotations": "static_export_annotations",
+       "ida_import_annotations": "static_import_annotations"}
+
+
+@pytest.mark.parametrize("name", STATIC)
+def test_static_tool_descriptions_are_tool_neutral(name):
+    d = TOOLS_BY_NAME[name].description
+    for tool in ("IDA", "Ghidra", "radare2/rizin", "Cutter"):
+        assert tool in d, (name, tool)
+    assert "image base + RVA" in d
+    assert tool_defs.STATIC_TOOL_NAMES == frozenset(STATIC)
+
+
+@pytest.mark.parametrize("name", ["static_rebase", "static_import_annotations"])
+def test_imagebase_replaces_ida_imagebase_which_stays_a_deprecated_alias(name):
+    props = TOOLS_BY_NAME[name].input_schema["properties"]
+    assert "imagebase" in props
+    assert "deprecated" in props["ida_imagebase"]["description"].lower()
+    assert "imagebase" in props["ida_imagebase"]["description"]
+
+
+def test_rebase_offers_neutral_directions_and_keeps_the_old_ones():
+    enum = TOOLS_BY_NAME["static_rebase"].input_schema["properties"]["direction"]["enum"]
+    assert enum[:4] == ["runtime_to_static", "static_to_runtime", "runtime_to_rva", "rva_to_runtime"]
+    assert set(enum[4:]) == {"runtime_to_ida", "ida_to_runtime"}
+
+
+def test_old_ida_names_are_hidden_aliases():
+    assert dict(tool_defs.DEPRECATED_ALIASES) == OLD
+    for old, new in OLD.items():
+        assert old not in TOOLS_BY_NAME and old not in tool_defs.GATEWAY_TOOL_NAMES
+        alias = tool_defs.CALLABLE_TOOLS[old]
+        target = TOOLS_BY_NAME[new]
+        assert alias.name == old and alias.alias_of == new
+        assert alias.method == target.method and alias.input_schema == target.input_schema
+        assert alias.tier is target.tier and tool_defs.tool_tier(old) is target.tier
+        assert alias.annotations["readOnlyHint"] == target.annotations["readOnlyHint"]
+        assert target.alias_of is None
+    assert set(tool_defs.CALLABLE_TOOLS) == set(TOOLS_BY_NAME) | set(OLD)
+    assert tool_defs.RESERVED_TOOL_NAMES == frozenset(tool_defs.CALLABLE_TOOLS)
+
+
+def test_aliases_validate_like_their_targets_and_accept_the_old_arguments():
+    old_args = {"address": "0x1", "direction": "runtime_to_ida", "ida_imagebase": 0x400000}
+    kw = tool_defs.check_arguments(tool_defs.CALLABLE_TOOLS["ida_rebase"], old_args)
+    assert kw == old_args
+    with pytest.raises(tool_defs.InvalidArguments):
+        tool_defs.check_arguments(tool_defs.CALLABLE_TOOLS["ida_import_annotations"], {"items": [1]})

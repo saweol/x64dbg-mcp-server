@@ -1,6 +1,6 @@
 """Application facade contract between the orchestrator (app.py) and front-ends.
 
-Front-ends (MCP server, CLI, a future IDA client) talk ONLY to ``GatewayApp``.
+Front-ends (MCP server, CLI, a future static-tool client) talk ONLY to ``GatewayApp``.
 Every method is synchronous and thread-safe, returns JSON-serialisable data
 (dicts/lists/str/int/float/bool/None) and raises ``errors.GatewayError``
 subclasses on failure; front-ends turn those into the error schema
@@ -96,21 +96,29 @@ class GatewayApp(Protocol):
     def analysis_finish(self, job_id: str | None = None, *, revert: bool = True,
                         keep_snapshot: bool = False, wait_s: float | None = None) -> JSON: ...
 
-    # ── IDA integration (interpretation D) ──────────────────────────
-    def ida_rebase(self, address: str | int, *, direction: str, module: str | None = None,
-                   ida_imagebase: str | int | None = None, job_id: str | None = None) -> JSON:
-        """direction in {"runtime_to_ida", "ida_to_runtime", "runtime_to_rva", "rva_to_runtime"}.
+    # ── static analysis: IDA, Ghidra, radare2/rizin, Cutter (interpretation D) ──
+    # Tool-neutral: static address = image base of the static tool's database + RVA. The
+    # static tools' own MCP servers are registered next to the gateway, not proxied.
+    def static_rebase(self, address: str | int, *, direction: str, module: str | None = None,
+                      imagebase: str | int | None = None, job_id: str | None = None,
+                      ida_imagebase: str | int | None = None) -> JSON:
+        """direction in {"runtime_to_static", "static_to_runtime", "runtime_to_rva",
+        "rva_to_runtime"} (older names "runtime_to_ida" / "ida_to_runtime" are accepted).
+        ``ida_imagebase`` is a deprecated alias of ``imagebase`` (InvalidArgument when both
+        are given and differ).
 
-        ``ida_sync.rebase`` result plus ``job_id`` and ``module_map_source`` ("live":
+        ``ida_sync.rebase`` result plus ``static`` / ``imagebase`` (the same values as
+        ``ida`` / ``ida_imagebase``), ``job_id`` and ``module_map_source`` ("live":
         ListModules of the job's debugger; "manifest": the collected map). ``warnings``
         also says when the collected map stood in for an unavailable live one while the
         debugger should still hold the sample. Raises InvalidArgument for a bad
-        address/module/direction, StateViolation without a map."""
+        address/module/direction/image base, StateViolation without a map."""
         ...
 
-    def ida_export_annotations(self, job_id: str | None = None) -> JSON:
-        """SaveDatabase, copy it to the host, write ``<job>/artifacts/ida_sync.json``
-        (x64dbg-ida-sync/1). {"host_path", "modules", "items", "counts", "database",
+    def static_export_annotations(self, job_id: str | None = None) -> JSON:
+        """SaveDatabase, copy it to the host (``<job>/artifacts/static_sync.dd64|dd32``), write
+        ``<job>/artifacts/static_sync.json`` (x64dbg-ida-sync/1, tool-neutral: module + RVA).
+        {"host_path", "modules", "items", "counts", "database",
         "module_map_source", "skipped", "warnings", "steps"}. ``database.source`` is "saved",
         "collected" or "not_written" (x64dbg wrote no file; ``host_path`` is None and the
         document is empty; ``warnings`` says whether the plugin reported an empty session or,
@@ -119,10 +127,13 @@ class GatewayApp(Protocol):
         a failure. Long operation (may answer in_progress)."""
         ...
 
-    def ida_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
-                               ida_imagebase: str | int | None = None,
-                               job_id: str | None = None) -> JSON:
-        """Items ``{rva | ida_address, name?, comment?}`` (ida_sync.plan_import_report) are
+    def static_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
+                                  imagebase: str | int | None = None,
+                                  job_id: str | None = None,
+                                  ida_imagebase: str | int | None = None) -> JSON:
+        """Items ``{rva | ida_address, name?, comment?}`` (ida_sync.plan_import_report;
+        ``ida_address`` is an address in the static tool's database and needs ``imagebase``,
+        whose deprecated alias is ``ida_imagebase``) are
         set in the live debugger with CommentOrLabelAtAddress. {"applied", "failed",
         "not_attempted", "operations", "items", "failures", "skipped", "warnings", "stopped",
         ...}. ``stopped`` (else None) is the error that ended the run after something was
