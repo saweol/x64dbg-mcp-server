@@ -25,14 +25,20 @@ Design and rationale: [`../docs/VM_ORCHESTRATION_PLAN.md`](../docs/VM_ORCHESTRAT
 
 ## Install
 
-From the repository root:
+A release wheel carries a prebuilt plugin, so no Zig is needed. Download
+`x64dbg_vm_gateway-<version>-py3-none-any.whl` from a GitHub release (or build it, below) and:
 
 ```console
-uv tool install ./host            # puts x64dbg-vm-gateway on PATH
+uv tool install ./x64dbg_vm_gateway-0.1.0-py3-none-any.whl   # puts x64dbg-vm-gateway on PATH
 x64dbg-vm-gateway --help
 ```
 
-Without installing: `uvx --from ./host x64dbg-vm-gateway --help`.
+`scripts/build-release.sh` (Zig 0.14 and uv; runs from any directory) builds the plugin, bundles
+it into the package and writes `release/`: the wheel, the sdist,
+`x64dbg-mcp-plugin-<version>.zip` (`x64/plugins`, `x32/plugins`) and `SHA256SUMS`. Pushing a
+`v*` tag runs it in GitHub Actions and attaches `release/*` to the release. `uv tool install ./host`
+from a checkout also works; it has no bundled plugin unless the script ran first, so
+`install-plugin` then needs `--dist`.
 
 ## Configure
 
@@ -104,13 +110,31 @@ plugin listening, `C:\mcp\jobs` exists and is empty, shared folders are off and 
 host-only.
 
 1. In the guest: install VMware Tools, unpack x64dbg, create the analysis user (with a password).
-2. Copy a plugin build into the guest (optional when the plugin is already installed):
+2. On the host, with the VM running and the guest password exported, run everything at once:
 
    ```console
-   x64dbg-vm-gateway install-plugin --dist path/to/zig-out/bin   # --x64dbg-root, --no-relaunch
+   x64dbg-vm-gateway setup --dry-run      # the plan; nothing is contacted or changed
+   x64dbg-vm-gateway setup                # init (if no config), doctor, install-plugin, provision, doctor
    ```
 
-3. Provision. This writes both `mcp_config.json` files (keeping valid tokens, generating
+   Without a config, `setup` runs the `init` wizard (or takes its flags: `--non-interactive --vmx
+   ... --guest-user ... --x64dbg-root ...`). It stops with the doctor's hints when a check it cannot
+   fix fails (vmrun, .vmx, VM power, VMware Tools, guest credentials, guest IP, isolation, a second
+   VM instance, job roots), installs the bundled plugin (`--dist DIR` for another build), runs
+   `provision` with `--snapshot` (default: the profile's `clean_snapshot`), checks again and prints
+   the `claude mcp add` command. `--skip-plugin` and `--skip-provision` run parts of it. It never
+   replaces an existing snapshot: use `--snapshot NEW_NAME` and point `clean_snapshot` at it.
+   `setup` and the bundled-plugin install are covered by unit tests only; the real-VM runs used
+   steps 3 to 5, which are the same work one command at a time.
+3. Copy the plugin into the guest (the bundled build, or `--dist DIR` holding `x64/plugins` and
+   `x32/plugins`; `--x64dbg-root` defaults to the profile's backend paths). On a guest that is not
+   provisioned yet add `--no-relaunch`: the logon tasks that relaunch the debuggers come with step 4.
+
+   ```console
+   x64dbg-vm-gateway install-plugin                # --dist DIR, --x64dbg-root, --no-relaunch
+   ```
+
+4. Provision. This writes both `mcp_config.json` files (keeping valid tokens, generating
    missing or corrupt ones), registers the elevated `AtLogOn` scheduled tasks `MCP-x64dbg` and
    `MCP-x32dbg`, configures auto-logon, creates `C:\mcp\jobs`, reboots, waits until both plugins
    answer and finally takes the clean snapshot:
@@ -126,7 +150,7 @@ host-only.
    Auto-logon needs the guest password from `guest_password_env`. A memory snapshot of a 4 GB
    guest takes about three minutes.
 
-4. Check everything:
+5. Check everything:
 
    ```console
    x64dbg-vm-gateway doctor          # exit code 1 if a check fails; each failure has a hint
@@ -276,7 +300,8 @@ export NODE_EXTRA_CA_CERTS=/path/to/gw.crt     # Node-based clients and a self-s
 | `jobs [list \| show JOB_ID]` | read-only view of the job directories (works while a gateway runs) |
 | `discard JOB_ID [--yes]` | human-only: mark a job DISCARDED so it may be reverted without collection |
 | `provision --x64dbg-root PATH ...` | prepare the guest (see above) |
-| `install-plugin --dist DIR ...` | copy a plugin build into the guest |
+| `install-plugin [--dist DIR] ...` | copy a plugin build (default: the bundled one) into the guest |
+| `setup [--dry-run] ...` | init (no config yet), doctor, install-plugin, provision, doctor, registration command |
 
 Global options, before or after the command: `--config PATH`, `--profile NAME`, `--json`
 (machine-readable stdout), `-v`. Exit codes: 0 success, 1 failure (prints `error [CODE]: message`
