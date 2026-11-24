@@ -9,6 +9,8 @@ other CLI tests (no VM, no gateway is built):
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -271,6 +273,21 @@ def test_static_scripts_dest_json(tmp_path, capsys):
     assert run(["--json", "static-scripts", "--dest", str(dest)]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data == {"ok": True, "dest": str(dest), "copied": list(static_scripts.SCRIPT_FILES)}
+
+
+@pytest.mark.skipif(sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX permissions (root ignores them)")
+def test_static_scripts_dest_without_permission_prints_the_error(tmp_path, capsys):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)  # even looking inside fails (stat: EACCES)
+    try:
+        assert run(["static-scripts", "--dest", str(locked / "scripts")]) == 1
+    finally:
+        locked.chmod(0o700)
+    err = capsys.readouterr().err
+    assert "error [TRANSFER_FAILED]: cannot copy the static scripts to" in err
+    assert "Permission denied" in err and "unexpected" not in err and "Traceback" not in err
 
 
 def test_force_without_dest_is_a_usage_error(capsys):
