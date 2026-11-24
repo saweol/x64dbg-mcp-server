@@ -35,10 +35,14 @@ x64dbg-vm-gateway --help
 
 `scripts/build-release.sh` (Zig 0.14 and uv; runs from any directory) builds the plugin, bundles
 it into the package and writes `release/`: the wheel, the sdist,
-`x64dbg-mcp-plugin-<version>.zip` (`x64/plugins`, `x32/plugins`) and `SHA256SUMS`. Pushing a
-`v*` tag runs it in GitHub Actions and attaches `release/*` to the release. `uv tool install ./host`
-from a checkout also works; it has no bundled plugin unless the script ran first, so
-`install-plugin` then needs `--dist`.
+`x64dbg-mcp-plugin-<version>.zip` (`x64/plugins`, `x32/plugins`) and `SHA256SUMS`. The wheel
+also carries the static-tool sync scripts ([Static analysis tools](#static-analysis-tools)).
+Pushing a `v*` tag runs it in GitHub Actions and attaches `release/*` to the release. The tag
+is the gateway version: `vX.Y.Z` must equal `version` in `host/pyproject.toml` (the wheel's
+version), otherwise the workflow stops before building anything
+(`scripts/check-release-tag.sh vX.Y.Z` checks a tag locally). The plugin zip keeps the plugin
+version from `build.zig.zon`. `uv tool install ./host` from a checkout also works; it has no
+bundled plugin unless the script ran first, so `install-plugin` then needs `--dist`.
 
 ## Configure
 

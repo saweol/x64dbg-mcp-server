@@ -304,6 +304,51 @@ def test_shell_scripts_keep_lf_line_endings_in_every_checkout():
     assert any(re.fullmatch(r"\*\.sh\s+text\s+eol=lf", line.strip()) for line in lines)
 
 
+# ── the tag is the gateway version (scripts/check-release-tag.sh) ───
+TAG_SCRIPT = REPO / "scripts" / "check-release-tag.sh"
+
+
+def _check_tag(tag: str, *, cwd: Path = REPO) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([BASH, str(TAG_SCRIPT), tag], cwd=cwd, capture_output=True, text=True, timeout=60)
+
+
+def test_check_release_tag_is_strict_bash():
+    text = TAG_SCRIPT.read_text(encoding="utf-8")
+    assert text.startswith("#!/usr/bin/env bash\n") and "set -euo pipefail" in text
+    if sys.platform != "win32":
+        assert os.access(TAG_SCRIPT, os.X_OK)
+
+
+@needs_bash
+def test_the_tag_of_the_gateway_version_passes(tmp_path):
+    version = _pyproject()["project"]["version"]
+    res = _check_tag(f"v{version}", cwd=tmp_path)  # works from any directory
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize("tag", ["v9.9.9", "{version}", "v{version}.1", "vv{version}", "", "v{plugin}"])
+def test_other_tags_fail_and_name_both_versions(tag):
+    version, plugin = _pyproject()["project"]["version"], _plugin_version()
+    tag = tag.format(version=version, plugin=plugin)
+    if tag == f"v{version}":
+        pytest.skip("the plugin and the gateway have the same version")
+    res = _check_tag(tag)
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "host/pyproject.toml" in out and f"v{version}" in out
+
+
+def test_the_workflow_checks_the_tag_before_it_builds(workflow):
+    check = workflow.index("run: scripts/check-release-tag.sh")
+    assert check < workflow.index("zig build test") < workflow.index("run: scripts/build-release.sh")
+    line = workflow[check:].splitlines()[0]
+    assert '"$GITHUB_REF_NAME"' in line  # the tag from the environment, never ${{ }} inside run:
+    assert "${{" not in line
+    head = workflow[:workflow.index("\non:")]
+    assert "host/pyproject.toml" in head and "build.zig.zon" in head
+
+
 
 FAILING_ZIG = """#!/usr/bin/env bash
 if [ "${1:-}" = "version" ]; then echo 0.14.0; exit 0; fi

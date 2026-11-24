@@ -1,10 +1,13 @@
 name: Release
 
-# On a version tag: build the plugin and the host gateway wheel with the plugin bundled
-# (scripts/build-release.sh) and attach release/* (wheel, sdist, plugin zip, SHA256SUMS)
-# to the GitHub release of that tag. Ordinary pushes and pull requests do not run this.
-# The tag names the release; the assets keep their own versions (the wheel: host/pyproject.toml,
-# the plugin zip: build.zig.zon). Both test suites run before anything is built or published.
+# On a version tag: build the plugin and the host gateway wheel with the plugin and the
+# static-tool sync scripts bundled (scripts/build-release.sh) and attach release/* (wheel,
+# sdist, plugin zip, SHA256SUMS) to the GitHub release of that tag. Ordinary pushes and pull
+# requests do not run this.
+# The tag is the gateway version: tag vX.Y.Z must equal the [project] version in
+# host/pyproject.toml (the wheel's version), else the run stops before anything is built
+# (scripts/check-release-tag.sh). The plugin zip keeps the plugin version from build.zig.zon.
+# Both test suites run before anything is built or published.
 on:
   push:
     tags:
@@ -21,6 +24,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      - name: The tag must be v + the gateway version (host/pyproject.toml)
+        run: scripts/check-release-tag.sh "$GITHUB_REF_NAME"
 
       - name: Set up Zig 0.14.0
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
