@@ -143,3 +143,82 @@ def test_config_and_registry_agree_on_the_tool_ids():
     from x64dbg_vm_gateway import static_tools
 
     assert cfgmod.STATIC_TOOL_IDS == static_tools.TOOL_IDS
+
+
+# ── env / args / names / command paths ──────────────────────────────
+def test_env_and_args_are_parsed(tmp_path):
+    text = BASE + (
+        '\n[static]\ntools = ["ghidra"]\n'
+        '[static.servers.ghidra]\nargs = ["--transport", "stdio", "--project-path", "/p"]\n'
+        'env = { GHIDRA_INSTALL_DIR = "/g", JAVA_HOME = "/jdk" }\n'
+    )
+    s = load_text(tmp_path, text).static.servers["ghidra"]
+    assert s.args == ("--transport", "stdio", "--project-path", "/p") and s.command is None
+    assert s.env == {"GHIDRA_INSTALL_DIR": "/g", "JAVA_HOME": "/jdk"}
+    assert s.transport == "stdio"
+
+
+def test_env_defaults_to_empty_and_goes_with_a_command(tmp_path):
+    text = BASE + ('\n[static.servers.ghidra]\ncommand = ["/opt/venv/bin/ghidra-mcp", "--headless"]\n'
+                   '[static.servers.ghidra.env]\nJAVA_HOME = "/jdk"\n')
+    s = load_text(tmp_path, text).static.servers["ghidra"]
+    assert s.env == {"JAVA_HOME": "/jdk"} and s.args is None
+    assert StaticServerConfig().env == {} and StaticServerConfig().args is None
+
+
+@pytest.mark.parametrize("name", ["GW_TOKEN", "api_key", "MY_SECRET", "PASSWORD", "R2_PASSPHRASE"])
+def test_secret_looking_env_names_are_refused(tmp_path, name):
+    err = expect_error(tmp_path, BASE + f'\n[static.servers.ghidra]\nenv = {{ {name} = "v4lue-s3cr3t" }}\n',
+                       f"static.servers.ghidra.env.{name}")
+    assert "secret" in err.message and "v4lue-s3cr3t" not in err.message
+    assert err.hint and "mcp-config" in err.hint
+
+
+@pytest.mark.parametrize(
+    ("snippet", "key", "fragment"),
+    [
+        ('env = { "1BAD" = "x" }\n', "static.servers.ghidra.env.1BAD", "NAME of an environment variable"),
+        ('env = { "A-B" = "x" }\n', "static.servers.ghidra.env.A-B", "NAME of an environment variable"),
+        ('env = { JAVA_HOME = "" }\n', "static.servers.ghidra.env.JAVA_HOME", "must not be empty"),
+        ('env = { JAVA_HOME = 1 }\n', "static.servers.ghidra.env", "table of strings"),
+        ('env = "JAVA_HOME=/x"\n', "static.servers.ghidra.env", "table of strings"),
+        ('url = "http://127.0.0.1:1/"\nenv = { JAVA_HOME = "/x" }\n', "static.servers.ghidra.env",
+         "command"),
+        ('args = []\n', "static.servers.ghidra.args", "must not be empty"),
+        ('args = ["--x", " "]\n', "static.servers.ghidra.args[1]", "must not be empty"),
+        ('args = "--x"\n', "static.servers.ghidra.args", "array of strings"),
+        ('command = ["x"]\nargs = ["--y"]\n', "static.servers.ghidra.args", "not both"),
+        ('url = "http://127.0.0.1:1/"\nargs = ["--y"]\n', "static.servers.ghidra.args", "not both"),
+        ('args = ["--y"]\ntransport = "http"\n', "static.servers.ghidra.transport", "stdio"),
+        ('name = "x64dbg-vm"\n', "static.servers.ghidra.name", "gateway"),
+        ('name = "X64DBG-VM"\n', "static.servers.ghidra.name", "gateway"),
+        ('command = ["bin/pyghidra-mcp"]\n', "static.servers.ghidra.command[0]", "absolute path or a bare"),
+        ('command = ["./pyghidra-mcp"]\n', "static.servers.ghidra.command[0]", "absolute path or a bare"),
+        ("command = ['venv\\Scripts\\ghidra-mcp.exe']\n", "static.servers.ghidra.command[0]",
+         "absolute path or a bare"),
+        ('command = ["~/venv/bin/pyghidra-mcp"]\n', "static.servers.ghidra.command[0]", "~"),
+    ],
+)
+def test_invalid_env_args_name_and_command_settings(tmp_path, snippet, key, fragment):
+    err = expect_error(tmp_path, BASE + "\n[static.servers.ghidra]\n" + snippet, key)
+    assert fragment in err.message
+
+
+def test_args_need_a_registry_command(tmp_path):
+    err = expect_error(tmp_path, BASE + '\n[static.servers.cutter]\nargs = ["--x"]\n',
+                       "static.servers.cutter.args")
+    assert "no default command" in err.message and "command" in (err.hint or "")
+
+
+@pytest.mark.parametrize("program", ["/opt/venv/bin/pyghidra-mcp", "C:\\venv\\Scripts\\pyghidra-mcp.exe",
+                                     "\\\\server\\share\\ghidra-mcp.exe", "pyghidra-mcp", "python3"])
+def test_absolute_or_bare_programs_are_accepted(tmp_path, program):
+    s = load_text(tmp_path, BASE + f"\n[static.servers.ghidra]\ncommand = ['{program}']\n").static
+    assert s.servers["ghidra"].command == (program,)
+
+
+def test_the_gateway_name_constant_is_the_registration_name():
+    assert cfgmod.GATEWAY_MCP_NAME == "x64dbg-vm"
+    from x64dbg_vm_gateway import static_tools
+
+    assert all(t.mcp.name != cfgmod.GATEWAY_MCP_NAME for t in static_tools.TOOLS.values())

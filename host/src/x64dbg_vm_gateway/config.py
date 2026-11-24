@@ -96,14 +96,20 @@ class HttpServerConfig:
 @dataclass(frozen=True)
 class StaticServerConfig:
     """``[static.servers.<id>]``: overrides the MCP registration recipe of one static tool
-    (``static_tools.effective_recipe``). ``command`` and ``url`` exclude each other;
-    ``transport`` is filled in by the loader ("stdio" for command, "http" for url unless
-    "sse" is given) and stays None when neither is set (a name-only override)."""
+    (``static_tools.effective_recipe``). ``command``, ``args`` and ``url`` exclude each other;
+    ``transport`` is filled in by the loader ("stdio" for command / args, "http" for url unless
+    "sse" is given) and stays None when none is set (a name- or env-only override).
+
+    ``command[0]`` is an absolute path or a bare program name (looked up on PATH): the MCP
+    client starts it without a shell, from a working directory of its own. ``env`` values are
+    printed by ``mcp-config``, so names that look like secrets are refused."""
 
     command: tuple[str, ...] | None = None  # argv of a stdio MCP server
     url: str | None = None  # endpoint of an http / sse MCP server
     transport: str | None = None  # "stdio" | "http" | "sse"
     name: str | None = None  # MCP server name to register instead of the registry's
+    args: tuple[str, ...] | None = None  # arguments for the registry's program (replaces its arguments)
+    env: dict[str, str] = field(default_factory=dict)  # stdio: environment of the server (NAME -> value)
 
 
 @dataclass(frozen=True)
@@ -168,6 +174,7 @@ def resolve_secret(env_name: str | None, environ: dict[str, str] | None = None) 
 # ════════════════════════════════════════════════════════════════════
 
 ENV_CONFIG_PATH = "X64DBG_VM_GATEWAY_CONFIG"
+GATEWAY_MCP_NAME = "x64dbg-vm"  # the name the gateway itself is registered under in the MCP client
 APP_DIR_NAME = "x64dbg-vm-gateway"
 CONFIG_FILE_NAME = "config.toml"
 
@@ -210,7 +217,8 @@ _HTTP_KEYS = {"enabled": _BOOL, "bind": _STR, "port": _INT, "tls_cert": _STR, "t
               "allow_clients": _STR_LIST, "token_envs": _STR_MAP}
 _STATIC_KEYS = {"tools": _STR_LIST}
 _STATIC_STRUCTURAL = frozenset({"servers"})
-_STATIC_SERVER_KEYS = {"command": _STR_LIST, "url": _STR, "transport": _STR, "name": _STR}
+_STATIC_SERVER_KEYS = {"command": _STR_LIST, "url": _STR, "transport": _STR, "name": _STR, "args": _STR_LIST,
+                       "env": _STR_MAP}
 _PROFILE_KEYS = {
     "mode": _STR, "vmx": _STR, "vmrun": _STR, "vmrun_type": _STR, "clean_snapshot": _STR,
     "protected_snapshots": _STR_LIST, "guest_user": _STR, "guest_password_env": _STR,
@@ -469,7 +477,7 @@ class _Parser:
             dotted = f"static.servers.{tool_id}"
             if tool_id not in STATIC_TOOL_IDS:
                 raise self.error(dotted, "unknown static tool", hint=_STATIC_IDS_HINT)
-            servers[tool_id] = self.static_server(self.table(body, dotted), dotted)
+            servers[tool_id] = self.static_server(tool_id, self.table(body, dotted), dotted)
 
         # The configured tools are registered side by side: their MCP server names must differ.
         # Registry names are distinct, so a clash always involves an overridden name: blame that one.
@@ -485,40 +493,88 @@ class _Parser:
             owner[name] = tool_id
         return StaticConfig(tools=tuple(tools), servers=servers)
 
-    def static_server(self, tbl: Mapping[str, Any], dotted: str) -> StaticServerConfig:
+    def static_server(self, tool_id: str, tbl: Mapping[str, Any], dotted: str) -> StaticServerConfig:
         self.check_keys(tbl, dotted, set(_STATIC_SERVER_KEYS))
         values = self.fields(tbl, dotted, _STATIC_SERVER_KEYS)
-        command, url = values.get("command"), values.get("url")
+        command, url, args = values.get("command"), values.get("url"), values.get("args")
         if command is not None:
-            if not command:
-                raise self.error(f"{dotted}.command", "must not be empty (the program and its arguments)")
-            for i, arg in enumerate(command):
-                if not arg.strip():
-                    raise self.error(f"{dotted}.command[{i}]", "must not be empty")
+            self.argv(command, f"{dotted}.command", "the program and its arguments")
+            self.program(command[0], f"{dotted}.command[0]")
+        if args is not None:
+            self.argv(args, f"{dotted}.args", "the arguments for the registry's program")
+            if command is not None or url is not None:
+                raise self.error(f"{dotted}.args",
+                                 "give either command (the program and its arguments), args (arguments for "
+                                 "the registry's program) or url, not both")
+            if not _static_tools.get_tool(tool_id).mcp.command:
+                raise self.error(f"{dotted}.args", f"static tool {tool_id!r} has no default command to pass "
+                                                   "arguments to",
+                                 hint=f"give {dotted}.command = [\"<program>\", \"<args>\"...] instead")
         if url is not None:
             if not _is_http_url(url):
                 raise self.error(f"{dotted}.url", "must be an http:// or https:// URL with a host")
             if command is not None:
                 raise self.error(f"{dotted}.url", "give either command (stdio) or url, not both")
+        stdio = command is not None or args is not None
         transport = values.get("transport")
         if transport is not None:
             key = f"{dotted}.transport"
             self.choice(transport, STATIC_TRANSPORTS, key)
-            if command is not None and transport != "stdio":
-                raise self.error(key, "must be stdio for a command (http and sse need a url)")
+            if stdio and transport != "stdio":
+                raise self.error(key, "must be stdio for a command or args (http and sse need a url)")
             if url is not None and transport == "stdio":
                 raise self.error(key, "must be http or sse for a url (stdio runs a command)")
-            if command is None and url is None:
-                raise self.error(key, "only applies together with command or url")
-        elif command is not None:
+            if not stdio and url is None:
+                raise self.error(key, "only applies together with command or url (or args)")
+        elif stdio:
             transport = "stdio"
         elif url is not None:
             transport = "http"
         name = values.get("name")
-        if name is not None and not _MCP_NAME_RE.match(name):
-            raise self.error(f"{dotted}.name", "MCP server names may only contain letters, digits, '_' and "
-                                               "'-' (at most 64 characters)")
-        return StaticServerConfig(command=command, url=url, transport=transport, name=name)
+        if name is not None:
+            if not _MCP_NAME_RE.match(name):
+                raise self.error(f"{dotted}.name", "MCP server names may only contain letters, digits, '_' "
+                                                   "and '-' (at most 64 characters)")
+            if name.lower() == GATEWAY_MCP_NAME:
+                raise self.error(f"{dotted}.name",
+                                 f"{GATEWAY_MCP_NAME!r} is the gateway's own MCP server name",
+                                 hint="give the static tool's MCP server another name")
+        env = values.get("env", {})
+        if env and url is not None:
+            raise self.error(f"{dotted}.env", "only applies to a command (stdio): an http / sse server is "
+                                              "not started by the MCP client")
+        for var, value in env.items():
+            key = f"{dotted}.env.{var}"
+            if not _ENV_NAME_RE.match(var):
+                raise self.error(key, "must be the NAME of an environment variable ([A-Za-z_][A-Za-z0-9_]*)")
+            if _static_tools.looks_like_secret_name(var):
+                raise self.error(
+                    key, "looks like a secret (TOKEN, KEY, SECRET or PASS in the name); secrets do not "
+                         "belong in the config file",
+                    hint=f"`x64dbg-vm-gateway mcp-config` prints {dotted}.env values: pass the secret to the "
+                         "MCP server outside this file (for example in the server's own configuration)")
+            if not value.strip():
+                raise self.error(key, "must not be empty")
+        return StaticServerConfig(command=command, url=url, transport=transport, name=name, args=args,
+                                  env=env)
+
+    def argv(self, argv: tuple[str, ...], key: str, what: str) -> None:
+        if not argv:
+            raise self.error(key, f"must not be empty ({what})")
+        for i, arg in enumerate(argv):
+            if not arg.strip():
+                raise self.error(f"{key}[{i}]", "must not be empty")
+
+    def program(self, program: str, key: str) -> None:
+        """The MCP client starts ``program`` without a shell, in a working directory of its own:
+        an absolute path or a bare name looked up on PATH; never a relative path or ``~``."""
+        if program.startswith("~"):
+            raise self.error(key, "must not start with ~: the MCP client starts the command without a shell, "
+                                  "so ~ is not expanded", hint="write the full path")
+        if ("/" in program or "\\" in program) and not (
+                posixpath.isabs(program) or PureWindowsPath(program).is_absolute()):
+            raise self.error(key, "must be an absolute path or a bare command name found on PATH (a relative "
+                                  "path depends on the MCP client's working directory)")
 
     def profile(self, name: str, tbl: Mapping[str, Any]) -> ProfileConfig:
         prefix = f"profiles.{name}"

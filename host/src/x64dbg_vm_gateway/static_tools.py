@@ -1,30 +1,35 @@
 """Registry of the static-analysis tools used next to the gateway (IDA, Ghidra, radare2, Cutter).
 
 The gateway does not proxy static analysis. Each tool's own MCP server is registered in
-the MCP client NEXT TO the gateway (for example ``claude mcp add ghidra -- pyghidra-mcp``),
-and the gateway only offers the tool-neutral side: address rebasing between x64dbg runtime
-addresses and ``static image base + RVA`` (``static_rebase``) and the module + RVA
-annotation document ``x64dbg-ida-sync/1`` (``static_export_annotations`` /
-``static_import_annotations``, see ``ida_sync`` and ``static/ida/README.md``).
+the MCP client NEXT TO the gateway (``x64dbg-vm-gateway mcp-config`` prints the
+``claude mcp add`` commands), and the gateway only offers the tool-neutral side: address
+rebasing between x64dbg runtime addresses and ``static image base + RVA``
+(``static_rebase``) and the module + RVA annotation document ``x64dbg-ida-sync/1``
+(``static_export_annotations`` / ``static_import_annotations``, see ``ida_sync`` and
+``static/ida/README.md``).
 
 This module is DATA ONLY: one :class:`StaticTool` per supported tool with
 
-- ``executables``: program names ``gateway_doctor`` looks for on PATH (any one is enough);
+- ``executables``: names of the tool's own programs that ``gateway_doctor`` looks for on
+  PATH (any one is enough; never the MCP server's program);
 - ``sync_script``: repository path of the tool's script that imports / exports
-  ``x64dbg-ida-sync/1`` documents inside the tool;
+  ``x64dbg-ida-sync/1`` documents inside the tool (the wheel carries a copy, see
+  ``static_scripts``);
 - ``mcp``: the :class:`McpRecipe` for registering the tool's MCP server.
 
-``McpRecipe.verified`` is True only for recipes checked against a real installation;
-the others are taken from the projects' documentation and may need correcting (edit the
-data here, nothing else depends on the values). Values never carry host-specific paths:
-a user-specific location belongs in the config, ``[static.servers.<id>]``
-(``config.StaticServerConfig``), which :func:`effective_recipe` applies.
+``McpRecipe.verified`` is True only for recipes checked against a real installation
+(IDA: ida-multi-mcp; Ghidra 12.2 with JDK 25: pyghidra-mcp 0.3.0; radare2 6.2.6: r2mcp
+1.9.0). Values never carry host-specific paths: the user-specific parts of a recipe are
+placeholders written ``<...>`` (:func:`placeholders`), and the user's values belong in the
+config, ``[static.servers.<id>]`` (``config.StaticServerConfig``), which
+:func:`effective_recipe` applies.
 
 Thread-safety: everything is immutable after import.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -35,14 +40,18 @@ from .errors import ConfigError
 if TYPE_CHECKING:
     from .config import StaticConfig
 
-__all__ = ["TOOLS", "TOOL_IDS", "TRANSPORTS", "McpRecipe", "StaticTool", "effective_recipe", "get_tool",
-           "server_name"]
+__all__ = ["PLACEHOLDER_RE", "TOOLS", "TOOL_IDS", "TRANSPORTS", "McpRecipe", "StaticTool", "effective_recipe",
+           "get_tool", "looks_like_secret_name", "placeholders", "server_name"]
 
 #: Supported tool ids, in documentation order (``config.STATIC_TOOL_IDS`` re-exports it; this module
 #: imports ``config`` only for type checking, so the loader can import it without a cycle).
 TOOL_IDS: tuple[str, ...] = ("ida", "ghidra", "radare2", "cutter")
 #: MCP transports: "stdio" runs ``command``; "http" (streamable HTTP) and "sse" connect to ``url``.
 TRANSPORTS: tuple[str, ...] = ("stdio", "http", "sse")
+#: a user-specific part of a recipe, e.g. ``<project-dir>``
+PLACEHOLDER_RE = re.compile(r"<[^<>\s]+>")
+#: environment variable names that suggest a secret (the config refuses them)
+_SECRET_NAME_RE = re.compile(r"TOKEN|KEY|SECRET|PASS", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -53,21 +62,30 @@ class McpRecipe:
     project: str  # MCP server project
     homepage: str  # project page ("" when not recorded)
     transport: str  # one of TRANSPORTS
-    command: tuple[str, ...]  # stdio: argv to start the server; () when there is no generic one
+    command: tuple[str, ...]  # stdio: argv to start the server (may hold placeholders); () when none
     url: str | None  # http / sse: endpoint
     install: str  # how to install the server ("" when the homepage is the only reference)
-    notes: str  # prerequisites and caveats for the user
+    notes: tuple[str, ...]  # prerequisites and caveats, one line each
     verified: bool  # recipe checked against a real installation
+    env: tuple[tuple[str, str], ...] = ()  # stdio: (NAME, value) the server needs; values may be placeholders
+    warning: str = ""  # safety warning to show before everything else ("" when there is none)
 
 
 @dataclass(frozen=True)
 class StaticTool:
     id: str  # one of TOOL_IDS
     display: str  # human-readable name
-    executables: tuple[str, ...]  # program names on PATH that show the tool is installed
+    executables: tuple[str, ...]  # the tool's own programs on PATH that show it is installed
     sync_script: str  # repository path of the in-tool x64dbg-ida-sync/1 import / export script
     mcp: McpRecipe
 
+
+_CUTTER_WARNING = (
+    "CutterMCP 2.0 is unsafe as shipped: its Cutter plugin listens on all interfaces (port 8000) "
+    "without authentication and pastes request parameters unescaped into cutter.cmd (rizin commands, "
+    "including ! shell commands), so it is not registered by default. Use the sync script inside Cutter "
+    "instead, or radare2's r2mcp (static tool radare2) on the same binary. If you still use CutterMCP, "
+    "first patch its plugin to bind 127.0.0.1, then set [static.servers.cutter] command (or url).")
 
 _TOOLS = (
     StaticTool(
@@ -83,28 +101,49 @@ _TOOLS = (
             command=("python3", "-m", "ida_multi_mcp"),
             url=None,
             install="",
-            notes="Routes calls to the running IDA instances (one per IDB); open the sample in IDA first. "
-                  "Image base: idaapi.get_imagebase().",
+            notes=(
+                "Routes calls to the running IDA instances (one per IDB): open the sample in IDA first.",
+                "Tools: rename, set_comments, decompile; idb_save writes the IDB.",
+                "Image base: idaapi.get_imagebase().",
+            ),
             verified=True,
         ),
     ),
     StaticTool(
         id="ghidra",
         display="Ghidra",
-        executables=("ghidraRun", "analyzeHeadless", "pyghidra-mcp"),
+        executables=("ghidraRun", "analyzeHeadless", "pyghidraRun"),
         sync_script="static/ghidra/x64dbg_sync_ghidra.py",
         mcp=McpRecipe(
             name="ghidra",
             project="pyghidra-mcp (headless Ghidra)",
             homepage="https://github.com/clearbluejar/pyghidra-mcp",
             transport="stdio",
-            command=("pyghidra-mcp",),
+            command=("pyghidra-mcp", "--transport", "stdio", "--project-path", "<project-dir>",
+                     "--project-name", "<project-name>", "--wait-for-analysis", "<binary>"),
+            env=(("GHIDRA_INSTALL_DIR", "<ghidra-install-dir>"), ("JAVA_HOME", "<jdk25-home>")),
             url=None,
             install="pip install pyghidra-mcp",
-            notes="Needs GHIDRA_INSTALL_DIR pointing at the Ghidra installation. Alternative: the GUI "
-                  "server LaurieWired/GhidraMCP (a Ghidra plugin plus a bridge; register it with a "
-                  "[static.servers.ghidra] override). Image base: currentProgram.getImageBase().",
-            verified=False,
+            notes=(
+                "Ghidra 12.2 needs JDK 25: JAVA_HOME names the JDK, GHIDRA_INSTALL_DIR the Ghidra "
+                "installation.",
+                "With --wait-for-analysis the first initialize answers only after Ghidra's analysis: raise "
+                "the client's start-up timeout (Claude Code: MCP_TIMEOUT) or drop the option.",
+                "Tools: rename_function(binary_name, name_or_address, new_name) (functions only), "
+                "set_comment(binary_name, target, comment, comment_type eol|pre|post|plate|repeatable|"
+                "decompiler), decompile_function(binary_name, name_or_address), save() writes the project; "
+                "binary_name comes from list_project_binaries.",
+                "Alternative: LaurieWired GhidraMCP 2.0 headless (ghidra_mcp-2.0.0[headless] wheel and "
+                "GhidraMCP.jar from the release zip): [static.servers.ghidra] command = [\"ghidra-mcp\", "
+                "\"--headless\", \"--binary\", \"<binary>\", \"--project\", \"<project-dir>\", "
+                "\"--extension-jar\", \"<GhidraMCP.jar>\"] with the same env; tools "
+                "rename_function_by_address, rename_data, set_disassembly_comment (EOL), "
+                "set_decompiler_comment (PRE), decompile_function_by_address; its GUI mode was not verified.",
+                "Sync script: run it with pyghidraRun -H (plain analyzeHeadless cannot run Python scripts) "
+                "or from the Script Manager of a Ghidra started with pyghidraRun. Image base: "
+                "currentProgram.getImageBase().",
+            ),
+            verified=True,
         ),
     ),
     StaticTool(
@@ -120,15 +159,21 @@ _TOOLS = (
             command=("r2pm", "-r", "r2mcp"),
             url=None,
             install="r2pm -ci r2mcp",
-            notes="Installed through radare2's package manager r2pm. Image base: the binary's baddr "
-                  "(iI).",
-            verified=False,
+            notes=(
+                "Needs r2pm and radare2 on PATH (verified with radare2 6.2.6 and r2mcp 1.9.0).",
+                "Tools: open_file, analyze, rename_function(address, name) (after analyze), rename_flag, "
+                "set_comment(address, message), decompile_function.",
+                "r2mcp has no project-save tool: renames and comments made through it are lost when it "
+                "exits; use the sync script with --project for anything that must persist.",
+                "Image base: the binary's baddr (iI).",
+            ),
+            verified=True,
         ),
     ),
     StaticTool(
         id="cutter",
         display="Cutter",
-        executables=("cutter", "Cutter", "rizin"),
+        executables=("cutter", "Cutter"),
         sync_script="static/radare2/x64dbg_sync_r2.py",
         mcp=McpRecipe(
             name="cutter",
@@ -138,10 +183,16 @@ _TOOLS = (
             command=(),
             url=None,
             install="",
-            notes="A Cutter plugin plus an MCP bridge script whose location is user specific: set "
-                  "[static.servers.cutter] command = [...] (or url) to register it. Cutter is built on "
-                  "rizin, so the radare2 sync script applies. Image base: the binary's baddr (iI).",
+            notes=(
+                "CutterMCP 2.0's set_decompiler_comment is broken: the 404 comes back as text with isError "
+                "false.",
+                "The sync script runs in Cutter's Python console (cutter.cmd; checked on Cutter 2.5.0 and "
+                "2.4.1); the Cutter 2.5.0 Qt6 AppImage cannot load Python plugins (rizinorg/cutter#3659).",
+                "Cutter is built on rizin, so the radare2 sync script applies. Image base: the binary's "
+                "baddr (iI).",
+            ),
             verified=False,
+            warning=_CUTTER_WARNING,
         ),
     ),
 )
@@ -163,6 +214,20 @@ def get_tool(tool_id: str) -> StaticTool:
     return tool
 
 
+def looks_like_secret_name(name: str) -> bool:
+    """An environment variable name that suggests a secret (TOKEN, KEY, SECRET or PASS, any case)."""
+    return bool(_SECRET_NAME_RE.search(name))
+
+
+def placeholders(recipe: McpRecipe) -> tuple[str, ...]:
+    """The ``<...>`` placeholders left in ``recipe`` (env values, then the command), each once."""
+    found: dict[str, None] = {}
+    for text in (*(value for _name, value in recipe.env), *recipe.command):
+        for match in PLACEHOLDER_RE.findall(text):
+            found.setdefault(match)
+    return tuple(found)
+
+
 def server_name(tool_id: str, static_config: StaticConfig | None = None) -> str:
     """MCP server name the tool is registered under (override, else the registry's).
 
@@ -176,31 +241,43 @@ def server_name(tool_id: str, static_config: StaticConfig | None = None) -> str:
 def effective_recipe(tool_id: str, static_config: StaticConfig | None = None) -> McpRecipe:
     """The registry recipe of ``tool_id`` with ``[static.servers.<id>]`` applied.
 
-    An override's ``command`` replaces the command (url None, transport "stdio" unless
-    given), its ``url`` replaces both (command (), transport "http" unless given), its
-    ``name`` the server name; the documentation fields stay. Raises ConfigError when the
-    result can not be registered: neither a command nor a url (Cutter without an override,
-    whose bridge location is user specific).
+    An override's ``command`` replaces the server: its command and its env (only the
+    override's ``env``; url None, transport "stdio" unless given). ``args`` replaces the
+    arguments after the registry's program. ``url`` replaces both (command (), no env,
+    transport "http" unless given). Without ``command`` / ``url`` the override's ``env``
+    fills in and extends the registry's env by name. ``name`` replaces the server name; the
+    documentation fields stay, except ``verified``, which is False once ``command``, ``args``
+    or ``url`` replaced the checked recipe. Raises ConfigError when the result can not be registered:
+    neither a command nor a url (Cutter without an override; see its warning).
     """
     tool = get_tool(tool_id)
     recipe = tool.mcp
     override = static_config.servers.get(tool_id) if static_config is not None else None
     if override is not None:
+        env = dict(override.env)
         if override.command:
-            recipe = replace(recipe, command=tuple(override.command), url=None,
-                             transport=override.transport or "stdio")
+            recipe = replace(recipe, command=tuple(override.command), url=None, env=tuple(env.items()),
+                             transport=override.transport or "stdio", verified=False)
         elif override.url:
-            recipe = replace(recipe, command=(), url=override.url, transport=override.transport or "http")
+            recipe = replace(recipe, command=(), url=override.url, env=(),
+                             transport=override.transport or "http", verified=False)
+        else:
+            if override.args is not None and recipe.command:
+                recipe = replace(recipe, command=(recipe.command[0], *override.args), verified=False)
+            recipe = replace(recipe, env=tuple({**dict(recipe.env), **env}.items()))
         if override.name:
             recipe = replace(recipe, name=override.name)
     if not recipe.command and not recipe.url:
         key = f"static.servers.{tool.id}"
         raise ConfigError(
-            f"{tool.display}: the {recipe.project} MCP server has no default command (its location is "
-            "user specific), so it cannot be registered",
+            f"{tool.display}: no MCP server is registered by default ({recipe.project} 2.0 is unsafe as "
+            "shipped: it listens on all interfaces without authentication and runs rizin commands built "
+            "from request parameters)",
             stage="static",
-            hint=f"add [{key}] to the gateway config with command = [\"<program>\", \"<args>\"...] (stdio) "
-                 f"or url = \"http://<host>:<port>/<path>\" (transport \"http\" or \"sse\")"
+            hint="use the sync script inside Cutter, or radare2's r2mcp (static tool radare2) on the same "
+                 f"binary; to register a CutterMCP patched to bind 127.0.0.1, add [{key}] with "
+                 "command = [\"<program>\", \"<args>\"...] (stdio) or "
+                 "url = \"http://127.0.0.1:<port>/<path>\" (transport \"http\" or \"sse\")"
                  + (f"; see {recipe.homepage}" if recipe.homepage else ""),
             details={"key": key, "tool": tool.id},
         )

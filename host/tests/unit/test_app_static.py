@@ -147,11 +147,12 @@ def test_doctor_reports_every_configured_tool(lab):
     assert c["ok"] is True and c["level"] == "warn"
     parts = c["detail"].split(" | ")
     assert parts[0] == ("ghidra: ghidraRun found (/tools/ghidra/ghidraRun); MCP server 'ghidra' "
-                        "(stdio: pyghidra-mcp; recipe not verified)")
+                        "(stdio: pyghidra-mcp --transport stdio --project-path <project-dir> --project-name "
+                        "<project-name> --wait-for-analysis <binary>)")
     assert parts[1].startswith("radare2: r2 found (/tools/bin/r2); MCP server 'radare2' "
-                               "(stdio: r2pm -r r2mcp; recipe not verified)")
+                               "(stdio: r2pm -r r2mcp)")
     assert "WARN MCP command r2pm not found" in parts[1]
-    assert parts[2].startswith("cutter: WARN none of cutter, Cutter, rizin on PATH")
+    assert parts[2].startswith("cutter: WARN none of cutter, Cutter on PATH")
     assert "WARN no MCP recipe" in parts[2] and "[static.servers.cutter]" in parts[2]
     assert [t["id"] for t in c["tools"]] == ["ghidra", "radare2", "cutter"]
     assert c["tools"][2]["mcp"] is None
