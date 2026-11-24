@@ -11,7 +11,9 @@ Commands::
     provision --x64dbg-root PATH ...    prepare the guest (plugin config, tasks, auto-logon)
     install-plugin [--dist DIR] ...     copy a plugin build (default: the bundled one) into the guest
     setup [--dry-run] ...               init (no config yet), doctor, install-plugin, provision,
-                                        doctor, then print the ``claude mcp add`` command
+                                        doctor, then print the ``claude mcp add`` commands
+    mcp-config [--client claude]        the ``claude mcp add`` commands for the gateway and the
+                                        configured static tools (placeholders as <...>)
     static-scripts [--dest DIR]         where the packaged static-tool sync scripts are, or a copy
 
 Global options (before or after the command): ``--config PATH``, ``--profile NAME``,
@@ -956,8 +958,7 @@ def cmd_init(args: argparse.Namespace, out: _Output) -> int:
 
 
 # ── setup ───────────────────────────────────────────────────────────
-MCP_SERVER_NAME = "x64dbg-vm"
-STATIC_TOOLS_LINE = f"static analysis tools: see `{PROG} mcp-config`"
+MCP_SERVER_NAME = gw_config.GATEWAY_MCP_NAME  # "x64dbg-vm"
 SETUP_STEPS = ("init", "precheck", "install-plugin", "provision", "doctor")
 #: doctor checks about what setup never changes (VM, vmrun, guest credentials, isolation, job
 #: roots): one of them failing stops setup before the plugin install or provisioning changes the
@@ -1330,12 +1331,9 @@ def _format_setup(report: Mapping[str, Any]) -> str:
         lines.append(f"problem [{problem['code']}]: {_safe(problem['message'])}")
         if problem.get("hint"):
             lines.append(f"  hint: {_safe(problem['hint'])}")
-    register = report.get("register")
-    if register:
-        lines += ["", "register the gateway with Claude Code:", f"  {register['command']}"]
-        if register.get("note"):
-            lines.append(f"  ({_safe(register['note'])})")
-        lines.append(str(report.get("static_tools", "")))
+    if report.get("mcp_config"):  # the same block as `mcp-config`
+        lines += ["", "register the MCP servers with Claude Code:", "",
+                  format_mcp_config(report["mcp_config"]), ""]
     if report["dry_run"]:
         lines.append("dry run: nothing was changed")
     elif report["ok"]:
@@ -1376,12 +1374,117 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
         note = _password_note(config, prof)
         if note:
             report.data["register"]["note"] = note
-        report.data["static_tools"] = STATIC_TOOLS_LINE
+        report.data["mcp_config"] = mcp_config_entries(args, config, path)
     out.data(report.data, _format_setup)
     if error is not None and not out.json_mode:
         sys.stdout.flush()  # the summary first, then the error with its hint
         out.error(error)
     return EXIT_OK if ok else EXIT_FAILURE
+
+
+# ── mcp-config ──────────────────────────────────────────────────────
+MCP_CLIENTS = ("claude",)
+
+
+def _sync_script_path(tool_id: str) -> str | None:
+    """The tool's sync script inside this installation (None for a zipped one)."""
+    root = static_scripts.installed_root()
+    if root is None:
+        return None
+    rel = static_scripts.relative_path(static_tools.get_tool(tool_id).sync_script)
+    return str(root.joinpath(*rel.split("/")))
+
+
+def _gateway_entry(args: argparse.Namespace, config: gw_config.GatewayConfig, path: Path) -> dict[str, Any]:
+    argv = _register_argv(args, path)
+    notes: list[str] = []
+    try:
+        note = _password_note(config, config.profile(args.profile))
+    except ConfigError:  # no profile to name (several and no default): nothing to say about it
+        note = None
+    if note:
+        notes.append(note)
+    return {"id": "gateway", "display": PROG, "name": MCP_SERVER_NAME, "transport": "stdio", "verified": True,
+            "argv": argv, "command": shell_join(argv), "fill_in": [], "notes": notes}
+
+
+def _static_entry(tool_id: str, static: gw_config.StaticConfig) -> dict[str, Any]:
+    """One static tool's registration (``claude mcp add``) from its effective recipe; placeholders
+    stay visible as ``<...>`` and are listed under ``fill_in``."""
+    tool = static_tools.get_tool(tool_id)
+    entry: dict[str, Any] = {"id": tool_id, "display": tool.display,
+                             "name": static_tools.server_name(tool_id, static)}
+    try:
+        recipe = static_tools.effective_recipe(tool_id, static)
+    except ConfigError as e:
+        recipe, argv = tool.mcp, None
+        entry["error"] = {"message": e.message, "hint": e.hint}
+    else:
+        if recipe.command:
+            argv = ["claude", "mcp", "add", recipe.name]
+            for name, value in recipe.env:
+                argv += ["-e", f"{name}={value}"]
+            argv += ["--", *recipe.command]
+        else:
+            argv = ["claude", "mcp", "add", "--transport", recipe.transport, recipe.name, recipe.url or ""]
+    entry.update(
+        project=recipe.project, homepage=recipe.homepage or None, transport=recipe.transport,
+        verified=recipe.verified, argv=argv, command=shell_join(argv) if argv else None,
+        fill_in=list(static_tools.placeholders(recipe)) if argv else [], install=recipe.install or None,
+        sync_script=_sync_script_path(tool_id), notes=list(recipe.notes), warning=recipe.warning or None)
+    return entry
+
+
+def mcp_config_entries(args: argparse.Namespace, config: gw_config.GatewayConfig, path: Path
+                       ) -> list[dict[str, Any]]:
+    """The MCP client registrations: the gateway first, then every configured static tool in
+    ``[static] tools`` order (``mcp-config`` and ``setup`` print them)."""
+    return [_gateway_entry(args, config, path),
+            *(_static_entry(tid, config.static) for tid in config.static.tools)]
+
+
+def format_mcp_config(entries: Sequence[Mapping[str, Any]]) -> str:
+    blocks: list[str] = []
+    for e in entries:
+        if e["id"] == "gateway":
+            lines = [f"{e['name']}: the gateway ({e['display']})"]
+        elif e["argv"]:
+            verified = "verified" if e["verified"] else "recipe not verified"
+            lines = [f"{e['id']}: {e['display']} via {e['project']} (MCP server '{e['name']}', {verified})"]
+        else:
+            lines = [f"{e['id']}: {e['display']}: no MCP server is registered by default"]
+        if e.get("warning"):
+            lines.append(f"  WARNING: {e['warning']}")
+        if e["command"]:
+            lines.append(f"  {e['command']}")
+        elif e.get("error") and not e.get("warning"):
+            hint = e["error"]["hint"]
+            lines.append(f"  {e['error']['message']}" + (f" ({hint})" if hint else ""))
+        if e["fill_in"]:
+            lines.append(f"  fill in: {', '.join(e['fill_in'])}")
+        if e.get("install"):
+            lines.append(f"  install: {e['install']}")
+        if "sync_script" in e:
+            lines.append(f"  sync script: {e['sync_script']}" if e["sync_script"] else
+                         f"  sync script: inside the zipped package (`{PROG} static-scripts --dest DIR` "
+                         "copies it)")
+        lines.extend(f"  note: {note}" for note in e["notes"])
+        blocks.append("\n".join(_safe(line) for line in lines))
+    return "\n\n".join(blocks)
+
+
+def _format_mcp_config_result(result: Mapping[str, Any]) -> str:
+    return format_mcp_config(result["servers"])
+
+
+def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
+    """Print the registration commands for the gateway and the configured static tools (MCP client
+    ``--client``, only Claude Code so far); nothing is run or written."""
+    path = _config_target(args)
+    config = gw_config.load_config(path, environ=os.environ)
+    out.data({"ok": True, "client": args.client, "config": str(path),
+              "servers": mcp_config_entries(args, config, path)}, _format_mcp_config_result)
+    return EXIT_OK
 
 
 # ── static-scripts ──────────────────────────────────────────────────
@@ -1530,6 +1633,11 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--wait-ready", type=float, default=DEFAULT_WAIT_READY_S, metavar="SECONDS",
                        help="how long to wait for the plugins after the reboot "
                             f"(default: {DEFAULT_WAIT_READY_S:g})")
+
+    p = command("mcp-config", cmd_mcp_config,
+                "print the MCP client registration commands for the gateway and the configured static "
+                "tools (IDA, Ghidra, radare2, Cutter)")
+    p.add_argument("--client", choices=MCP_CLIENTS, default="claude", help="MCP client (default: claude)")
 
     p = command("static-scripts", cmd_static_scripts,
                 "show where the static-tool sync scripts (IDA, Ghidra, radare2/rizin/Cutter) are installed, "

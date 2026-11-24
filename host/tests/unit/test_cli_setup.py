@@ -25,7 +25,7 @@ from x64dbg_vm_gateway.frontends import cli
 
 PW_ENV = "GW_TEST_GUEST_PW"
 REGISTER = "claude mcp add x64dbg-vm -- x64dbg-vm-gateway serve"
-STATIC_LINE = "static analysis tools: see `x64dbg-vm-gateway mcp-config`"
+IDA_LINE = "  claude mcp add ida-multi-mcp -- python3 -m ida_multi_mcp"
 ANY_ADDR = "0.0.0.0"  # noqa: S104 - a value under test, nothing binds
 ROOT = "C:\\x64dbg\\release"  # what write_config's backend paths imply
 
@@ -189,7 +189,7 @@ def test_setup_runs_every_step_in_order(cfg_path, wiring, provision, fake, capsy
                       "invalidate_clients", "lock.release", "supervisor.resume"]
     # the config is not at the default location, so the registration names it
     assert cli.shell_join(register_argv(cfg_path)) in captured.out
-    assert STATIC_LINE in captured.out and "setup complete" in captured.out
+    assert IDA_LINE in captured.out.splitlines() and "setup complete" in captured.out
     assert "guest-pass" not in captured.out + captured.err
 
 
@@ -210,7 +210,12 @@ def test_setup_json_report(cfg_path, capsys):
     assert steps["doctor"]["status"] == "done" and steps["doctor"]["result"]["ok"] is True
     assert data["register"]["command"] == cli.shell_join(register_argv(cfg_path))
     assert data["register"]["argv"] == register_argv(cfg_path)
-    assert data["static_tools"] == STATIC_LINE
+    # the same block as `mcp-config --json` (servers): the gateway first, then the static tools
+    assert [s["id"] for s in data["mcp_config"]] == ["gateway", "ida"]
+    assert data["mcp_config"][0]["argv"] == register_argv(cfg_path)
+    assert data["mcp_config"][1]["argv"] == ["claude", "mcp", "add", "ida-multi-mcp", "--", "python3", "-m",
+                                             "ida_multi_mcp"]
+    assert "static_tools" not in data
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready")
@@ -554,7 +559,7 @@ def test_setup_dry_run_changes_nothing(cfg_path, wiring, provision, fake, capsys
     out = captured.out
     assert "[planned] install-plugin" in out and "bundled build v1.10.0" in out
     assert "[planned] provision" in out and "MCP_CLEAN" in out and ROOT in out
-    assert cli.shell_join(register_argv(cfg_path)) in out and STATIC_LINE in out
+    assert cli.shell_join(register_argv(cfg_path)) in out and IDA_LINE in out.splitlines()
     assert "dry run: nothing was changed" in out
 
 
