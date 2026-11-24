@@ -56,6 +56,7 @@ def test_instructions_name_every_configured_tool_default_first(lab):
     ]
     assert "ida-multi-mcp" not in text
     assert "gateway_doctor" in text  # where the AI learns that a server is not registered
+    assert "x64dbg-vm-gateway mcp-config" in text  # what the user runs to get the registration commands
 
 
 def test_instructions_keep_the_static_tools_without_a_runtime(lab):
@@ -119,9 +120,9 @@ def test_doctor_warns_but_never_fails_when_no_static_tool_is_installed(lab):
     assert c["ok"] is True and c["_report_ok"] is True  # the rest of the lab is green
     assert c["level"] == "warn"
     assert "ida: WARN none of ida, ida64, idat, idat64 on PATH" in c["detail"]
-    assert "MCP server 'ida-multi-mcp' (stdio: python3 -m ida_multi_mcp)" in c["detail"]
-    assert "WARN MCP command python3 not found" in c["detail"]
-    assert c["hint"]
+    assert "MCP server 'ida-multi-mcp' (stdio: python3, 2 args)" in c["detail"]
+    assert "WARN MCP program python3 not found" in c["detail"]
+    assert c["hint"] and "mcp-config" in c["hint"]
 
 
 def test_doctor_reports_a_found_tool_without_warning(lab):
@@ -129,13 +130,12 @@ def test_doctor_reports_a_found_tool_without_warning(lab):
     c = static_check(lab.gateway(which=which))
     assert c["ok"] is True and c["level"] == "ok", c
     assert c["detail"] == ("ida: ida64 found (/tools/ida/ida64); MCP server 'ida-multi-mcp' "
-                           "(stdio: python3 -m ida_multi_mcp)")
+                           "(stdio: python3, 2 args)")
     assert c["hint"] is None
     (tool,) = c["tools"]
     assert tool["id"] == "ida" and tool["executable"] == "/tools/ida/ida64" and tool["warnings"] == []
-    assert tool["mcp"] == {"name": "ida-multi-mcp", "transport": "stdio",
-                           "command": ["python3", "-m", "ida_multi_mcp"], "url": None, "verified": True,
-                           "command_found": True}
+    assert tool["mcp"] == {"name": "ida-multi-mcp", "transport": "stdio", "program": "python3", "args": 2,
+                           "program_found": True, "url": None, "verified": True}
     assert "ida" in which.calls and "ida64" in which.calls  # first executable missing, second found
 
 
@@ -147,18 +147,18 @@ def test_doctor_reports_every_configured_tool(lab):
     assert c["ok"] is True and c["level"] == "warn"
     parts = c["detail"].split(" | ")
     assert parts[0] == ("ghidra: ghidraRun found (/tools/ghidra/ghidraRun); MCP server 'ghidra' "
-                        "(stdio: pyghidra-mcp --transport stdio --project-path <project-dir> --project-name "
-                        "<project-name> --wait-for-analysis <binary>)")
+                        "(stdio: pyghidra-mcp, 8 args)")
     assert parts[1].startswith("radare2: r2 found (/tools/bin/r2); MCP server 'radare2' "
-                               "(stdio: r2pm -r r2mcp)")
-    assert "WARN MCP command r2pm not found" in parts[1]
+                               "(stdio: r2pm, 2 args)")
+    assert "WARN MCP program r2pm not found" in parts[1]
     assert parts[2].startswith("cutter: WARN none of cutter, Cutter on PATH")
     assert "WARN no MCP recipe" in parts[2] and "[static.servers.cutter]" in parts[2]
+    assert "unsafe" in parts[2]
     assert [t["id"] for t in c["tools"]] == ["ghidra", "radare2", "cutter"]
     assert c["tools"][2]["mcp"] is None
 
 
-def test_doctor_checks_the_override_command(lab, tmp_path):
+def test_doctor_names_only_the_program_of_an_override_command(lab, tmp_path):
     bridge = tmp_path / "tools" / "bridge.py"
     bridge.parent.mkdir()
     bridge.write_text("# placeholder\n", encoding="utf-8")
@@ -167,13 +167,25 @@ def test_doctor_checks_the_override_command(lab, tmp_path):
         "cutter": StaticServerConfig(command=(str(bridge), "--stdio"), transport="stdio")}), which=which)
     c = static_check(ok)
     assert c["level"] == "ok", c
-    assert f"MCP server 'cutter' (stdio: {bridge} --stdio; recipe not verified)" in c["detail"]
-    assert c["tools"][0]["mcp"]["command_found"] is True
+    assert "MCP server 'cutter' (stdio: bridge.py, 1 arg; recipe not verified)" in c["detail"]
+    assert str(tmp_path) not in str(c) and "--stdio" not in str(c)
+    assert c["tools"][0]["mcp"]["program_found"] is True
     missing = with_static(lab, StaticConfig(tools=("cutter",), servers={
         "cutter": StaticServerConfig(command=(str(tmp_path / "nope.py"),), transport="stdio")}), which=which)
     c = static_check(missing)
     assert c["ok"] is True and c["level"] == "warn"
-    assert f"WARN MCP command {tmp_path / 'nope.py'} not found" in c["detail"]
+    assert "(stdio: nope.py, 0 args; recipe not verified)" in c["detail"]
+    assert "WARN MCP program nope.py not found" in c["detail"] and str(tmp_path) not in str(c)
+    assert c["tools"][0]["mcp"]["program_found"] is False
+
+
+def test_doctor_names_a_windows_program_by_its_base_name(lab):
+    gw = with_static(lab, StaticConfig(tools=("ghidra",), servers={"ghidra": StaticServerConfig(
+        command=("C:\\Users\\someone\\venv\\Scripts\\ghidra-mcp.exe", "--headless"), transport="stdio")}),
+        which=which_from({}))
+    c = static_check(gw)
+    assert "(stdio: ghidra-mcp.exe, 1 arg; recipe not verified)" in c["detail"]
+    assert "someone" not in str(c)
 
 
 def test_doctor_shows_a_url_recipe_without_credentials(lab):
@@ -184,16 +196,22 @@ def test_doctor_shows_a_url_recipe_without_credentials(lab):
     assert c["level"] == "ok", c
     assert "MCP server 'ghidra' (sse: http://127.0.0.1:8089/sse; recipe not verified)" in c["detail"]
     assert "s3cr3t" not in str(c)
+    assert c["tools"][0]["mcp"]["program"] is None and c["tools"][0]["mcp"]["args"] == 0
 
 
-def test_doctor_masks_secret_looking_command_arguments(lab):
+@pytest.mark.parametrize("argv", [
+    ("srv", "--token", "s3cr3t", "--api-key=s3cr3t", "--port", "8089"),
+    ("srv", "s3cr3t"),  # a positional secret: no option name gives it away
+    ("srv", "--config", "/home/someone/s3cr3t.json"),
+])
+def test_doctor_never_prints_command_arguments(lab, argv):
     which = which_from({"ghidraRun": "/g", "srv": "/tools/bin/srv"})
     gw = with_static(lab, StaticConfig(tools=("ghidra",), servers={"ghidra": StaticServerConfig(
-        command=("srv", "--token", "s3cr3t", "--api-key=s3cr3t", "--port", "8089"), transport="stdio")}),
-        which=which)
+        command=argv, transport="stdio", env={"JAVA_HOME": "/home/someone/jdk"})}), which=which)
     c = static_check(gw)
-    assert "stdio: srv --token *** --api-key=*** --port 8089" in c["detail"]
-    assert "s3cr3t" not in str(c)
+    n = len(argv) - 1
+    assert f"stdio: srv, {n} arg{'s' if n != 1 else ''}; recipe not verified" in c["detail"]
+    assert "s3cr3t" not in str(c) and "someone" not in str(c)
 
 
 def test_doctor_static_check_survives_a_failing_lookup(lab):

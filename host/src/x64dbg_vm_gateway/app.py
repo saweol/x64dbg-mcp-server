@@ -355,29 +355,15 @@ def _gjoin(directory: str, name: str) -> str:
     return str(PureWindowsPath(directory) / name)
 
 
-#: an option name that announces a secret (its value is masked in doctor output)
-_SECRET_OPTION_RE = re.compile(
-    r"^-{1,2}[A-Za-z0-9_-]*(token|secret|password|passwd|api[-_]?key)[A-Za-z0-9_-]*$", re.IGNORECASE)
+def _program_name(program: str) -> str:
+    """The base name of a command's program (``/opt/v/bin/srv`` and ``C:\\v\\srv.exe`` give ``srv`` /
+    ``srv.exe``). Doctor output reaches remote clients, so it never carries the program's directory
+    or the arguments: either may hold a user name or a secret."""
+    return re.split(r"[\\/]", program)[-1] or program
 
 
-def _display_argv(argv: Sequence[str]) -> list[str]:
-    """``argv`` for display: the value of a secret-looking option (``--token X``, ``--api-key=X``) is
-    masked. Inline secrets do not belong in the config, but doctor output reaches remote clients."""
-    out: list[str] = []
-    mask_next = False
-    for arg in argv:
-        if mask_next:
-            out.append("***")
-            mask_next = False
-            continue
-        name, eq, _value = arg.partition("=")
-        if _SECRET_OPTION_RE.match(name):
-            if eq:
-                out.append(f"{name}=***")
-                continue
-            mask_next = True
-        out.append(arg)
-    return out
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def _display_url(url: str) -> str:
@@ -1313,8 +1299,9 @@ class Gateway(GatewayApp):
                     "tools": []}
         warn = any(t["warnings"] for t in tools)
         hint = ("static tools are optional for the gateway: install the tool and register its MCP server "
-                "next to the gateway (the recipe above; override it with [static.servers.<id>] command or "
-                "url in the gateway config)") if warn else None
+                "next to the gateway (`x64dbg-vm-gateway mcp-config` on the gateway host prints the "
+                "registration commands; [static.servers.<id>] in the gateway config overrides a recipe)"
+                ) if warn else None
         return {"name": "static_tools", "ok": True, "level": "warn" if warn else "ok",
                 "detail": " | ".join(t.pop("summary") for t in tools), "hint": hint, "tools": tools}
 
@@ -1331,23 +1318,25 @@ class Gateway(GatewayApp):
         try:
             recipe = static_tools.effective_recipe(tool_id, self.config.static)
         except ConfigError as e:
-            warnings.append(f"no MCP recipe: add [static.servers.{tool_id}] with command or url "
-                            f"({e.message})")
+            warnings.append(f"no MCP recipe: {e.message}; to register one, add [static.servers.{tool_id}] "
+                            "with command or url")
             parts.append(f"WARN {warnings[-1]}")
         else:
-            command = _display_argv(recipe.command)
+            # never the full command line: arguments (and the program's directory) may hold secrets
+            program = _program_name(recipe.command[0]) if recipe.command else None
+            args = max(len(recipe.command) - 1, 0)
             found = self._command_found(recipe.command[0]) if recipe.command else None
-            how = f"stdio: {' '.join(command)}" if recipe.command else \
+            how = f"stdio: {program}, {_plural(args, 'arg')}" if recipe.command else \
                 f"{recipe.transport}: {_display_url(recipe.url or '')}"
             if not recipe.verified:
                 how += "; recipe not verified"
             parts.append(f"MCP server '{recipe.name}' ({how})")
             if found is False:
-                warnings.append(f"MCP command {recipe.command[0]} not found")
+                warnings.append(f"MCP program {program} not found")
                 parts.append(f"WARN {warnings[-1]}")
-            mcp = {"name": recipe.name, "transport": recipe.transport, "command": command,
-                   "url": _display_url(recipe.url) if recipe.url else None, "verified": recipe.verified,
-                   "command_found": found}
+            mcp = {"name": recipe.name, "transport": recipe.transport, "program": program, "args": args,
+                   "program_found": found, "url": _display_url(recipe.url) if recipe.url else None,
+                   "verified": recipe.verified}
         return {"id": tool_id, "display": tool.display, "executable": path, "mcp": mcp,
                 "warnings": warnings, "summary": f"{tool_id}: " + "; ".join(parts)}
 
@@ -1557,7 +1546,8 @@ class Gateway(GatewayApp):
         lines.append("Use that server to decompile, rename and comment at static image base + RVA; pass "
                      "the image base of its database as imagebase to static_rebase / "
                      "static_import_annotations. If no such MCP server is connected, tell the user: "
-                     "gateway_doctor (check static_tools) shows the registration recipe.")
+                     "`x64dbg-vm-gateway mcp-config` on the gateway host prints the registration commands, "
+                     "and gateway_doctor (check static_tools) shows what is installed.")
         return "\n".join(lines)
 
     def instructions(self) -> str:
