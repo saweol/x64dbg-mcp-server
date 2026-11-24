@@ -231,7 +231,9 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "gateway_doctor", "Gateway doctor",
         "Run the gateway's configuration and environment checks: vmrun, VMX file, clean snapshot, VMware "
         "Tools, guest credentials, guest IP, backend ports and tokens, VM isolation (shared folders, network "
-        "type) and job directories. Returns {ok, checks: [{name, ok, detail, hint}]}. Use it before the "
+        "type) and job directories, plus static_tools: whether the configured static-analysis tools (IDA, "
+        "Ghidra, radare2, Cutter) are on PATH and which MCP server recipe is registered for them (it only "
+        "warns, level 'warn'). Returns {ok, checks: [{name, ok, detail, hint}]}. Use it before the "
         "first analysis and whenever a tool fails in a way the error hint does not explain. Read-only.",
         _obj({"profile": _PROFILE}), method="doctor",
     ),

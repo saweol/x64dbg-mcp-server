@@ -36,7 +36,9 @@ class GatewayApp(Protocol):
 
     def doctor(self, profile: str | None = None) -> JSON:
         """{"ok": bool, "checks": [{"name", "ok", "detail", "hint"}]} — never raises for
-        a failing check; raises only for unusable configuration."""
+        a failing check; raises only for unusable configuration. A check may add "level"
+        ("ok" | "warn") and data: ``static_tools`` (always ok) adds "tools", one entry per
+        configured static tool {"id", "display", "executable", "mcp", "warnings"}."""
         ...
 
     def instructions(self) -> str:

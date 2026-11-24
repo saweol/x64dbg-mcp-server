@@ -96,6 +96,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -354,6 +355,45 @@ def _gjoin(directory: str, name: str) -> str:
     return str(PureWindowsPath(directory) / name)
 
 
+#: an option name that announces a secret (its value is masked in doctor output)
+_SECRET_OPTION_RE = re.compile(
+    r"^-{1,2}[A-Za-z0-9_-]*(token|secret|password|passwd|api[-_]?key)[A-Za-z0-9_-]*$", re.IGNORECASE)
+
+
+def _display_argv(argv: Sequence[str]) -> list[str]:
+    """``argv`` for display: the value of a secret-looking option (``--token X``, ``--api-key=X``) is
+    masked. Inline secrets do not belong in the config, but doctor output reaches remote clients."""
+    out: list[str] = []
+    mask_next = False
+    for arg in argv:
+        if mask_next:
+            out.append("***")
+            mask_next = False
+            continue
+        name, eq, _value = arg.partition("=")
+        if _SECRET_OPTION_RE.match(name):
+            if eq:
+                out.append(f"{name}=***")
+                continue
+            mask_next = True
+        out.append(arg)
+    return out
+
+
+def _display_url(url: str) -> str:
+    """scheme://host[:port]/path of ``url``: user info, query and fragment (credentials) dropped."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "<invalid url>"
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def _resolve_imagebase(imagebase: str | int | None, ida_imagebase: str | int | None, *,
                        stage: str) -> tuple[str | int | None, list[str]]:
     """``imagebase`` or its deprecated alias ``ida_imagebase`` (plus the deprecation warning).
@@ -583,8 +623,9 @@ class Gateway(GatewayApp):
     """``app_api.GatewayApp`` implementation. Build it with ``wiring.build_app``.
 
     ``runtime_factory(profile_name)`` builds a profile's runtime on first use.
-    ``find_vmrun`` / ``vmrun_version`` / ``host_system`` exist for tests and for
-    the doctor checks; ``start_join_s`` bounds the wait on a blocking ``vmrun start``;
+    ``find_vmrun`` / ``vmrun_version`` / ``host_system`` / ``which`` (PATH lookup of the
+    static tools, default ``shutil.which``) exist for tests and for the doctor checks;
+    ``start_join_s`` bounds the wait on a blocking ``vmrun start``;
     ``fetch_limits`` bounds file_download (default ``transfer.DEFAULT_FETCH_LIMITS``).
     """
 
@@ -600,6 +641,7 @@ class Gateway(GatewayApp):
         vmrun_version: Callable[[str], str] | None = None,
         start_join_s: float = VM_START_JOIN_S,
         fetch_limits: transfer.FetchLimits | None = None,
+        which: Callable[[str], str | None] | None = None,
     ) -> None:
         self.config = config
         self._factory = runtime_factory
@@ -608,6 +650,7 @@ class Gateway(GatewayApp):
         self._system = gw_platform.host_system(host_system)
         self._find_vmrun = find_vmrun or gw_platform.find_vmrun
         self._vmrun_version = vmrun_version or probe_vmrun_version
+        self._which: Callable[[str], str | None] = which or shutil.which
         self._start_join_s = start_join_s
         self._fetch_limits = fetch_limits or transfer.DEFAULT_FETCH_LIMITS
         self._lock = threading.RLock()
@@ -1253,7 +1296,67 @@ class Gateway(GatewayApp):
             for bid in rt.backends:
                 self._doctor_backend(rt, bid, check, skipped)
         check("host_jobs_root", self._check_jobs_root)
+        checks.append(self._static_tools_check())
         return {"ok": all(c["ok"] for c in checks), "profile": name, "checks": checks}
+
+    # ── doctor: static tools (optional for the gateway: WARN, never FAIL) ──
+    def _static_tools_check(self) -> dict[str, Any]:
+        """``static_tools``: per configured tool, whether one of its executables is on PATH and
+        which MCP recipe is registered next to the gateway (and whether its command exists).
+        Always ``ok``; ``level`` is "warn" when something is missing."""
+        try:
+            tools = [self._static_tool_report(tid) for tid in self.config.static.tools]
+        except Exception as e:  # a broken lookup must not fail the doctor
+            log.warning("static tool check failed", exc_info=True)
+            return {"name": "static_tools", "ok": True, "level": "warn",
+                    "detail": f"WARN the static tool check failed ({type(e).__name__})", "hint": None,
+                    "tools": []}
+        warn = any(t["warnings"] for t in tools)
+        hint = ("static tools are optional for the gateway: install the tool and register its MCP server "
+                "next to the gateway (the recipe above; override it with [static.servers.<id>] command or "
+                "url in the gateway config)") if warn else None
+        return {"name": "static_tools", "ok": True, "level": "warn" if warn else "ok",
+                "detail": " | ".join(t.pop("summary") for t in tools), "hint": hint, "tools": tools}
+
+    def _static_tool_report(self, tool_id: str) -> dict[str, Any]:
+        tool = static_tools.get_tool(tool_id)
+        warnings: list[str] = []
+        exe, path = next(((e, p) for e in tool.executables if (p := self._which(e))), (None, None))
+        if path:
+            parts = [f"{exe} found ({path})"]
+        else:
+            warnings.append(f"none of {', '.join(tool.executables)} on PATH")
+            parts = [f"WARN {warnings[-1]}"]
+        mcp: dict[str, Any] | None = None
+        try:
+            recipe = static_tools.effective_recipe(tool_id, self.config.static)
+        except ConfigError as e:
+            warnings.append(f"no MCP recipe: add [static.servers.{tool_id}] with command or url "
+                            f"({e.message})")
+            parts.append(f"WARN {warnings[-1]}")
+        else:
+            command = _display_argv(recipe.command)
+            found = self._command_found(recipe.command[0]) if recipe.command else None
+            how = f"stdio: {' '.join(command)}" if recipe.command else \
+                f"{recipe.transport}: {_display_url(recipe.url or '')}"
+            if not recipe.verified:
+                how += "; recipe not verified"
+            parts.append(f"MCP server '{recipe.name}' ({how})")
+            if found is False:
+                warnings.append(f"MCP command {recipe.command[0]} not found")
+                parts.append(f"WARN {warnings[-1]}")
+            mcp = {"name": recipe.name, "transport": recipe.transport, "command": command,
+                   "url": _display_url(recipe.url) if recipe.url else None, "verified": recipe.verified,
+                   "command_found": found}
+        return {"id": tool_id, "display": tool.display, "executable": path, "mcp": mcp,
+                "warnings": warnings, "summary": f"{tool_id}: " + "; ".join(parts)}
+
+    def _command_found(self, program: str) -> bool:
+        """A path (absolute, or with a separator) must be a file; a bare name must be on PATH."""
+        expanded = os.path.expanduser(program)
+        if os.path.isabs(expanded) or "/" in program or "\\" in program:
+            return Path(expanded).is_file()
+        return self._which(program) is not None
 
     def _doctor_vm(
         self, rt: Runtime, check: Callable[..., bool], skipped: Callable[[str, str], None]
