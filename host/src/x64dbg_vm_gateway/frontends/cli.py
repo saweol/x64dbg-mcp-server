@@ -135,6 +135,14 @@ def _safe(text: Any) -> str:
     return sanitize_untrusted_text(str(text), max_len=10_000)
 
 
+def _safe_command(text: Any) -> str:
+    """``_safe`` for a line that carries a printed command, which is never cut short. The config
+    refuses the characters the sanitiser strips (so the command is printed as configured);
+    stripping stays as a last line of defence."""
+    text = str(text)
+    return sanitize_untrusted_text(text, max_len=max(len(text), 1))
+
+
 def _dumps(value: Any, *, ascii_only: bool = False) -> str:
     return json.dumps(value, indent=2, ensure_ascii=ascii_only, default=str)
 
@@ -1349,7 +1357,7 @@ def _format_setup(report: Mapping[str, Any]) -> str:
         if (step.get("blockers") or final_failed) and isinstance(step.get("result"), Mapping):
             lines.extend("    " + line for line in _format_doctor(step["result"]).splitlines())
         if report["dry_run"] and step.get("command"):
-            lines.append(f"    = {_safe(step['command'])}")
+            lines.append(f"    = {_safe_command(step['command'])}")
     lines.extend(f"note: {_safe(n)}" for n in report.get("notes", ()))
     for problem in report.get("problems", ()):
         lines.append(f"problem [{problem['code']}]: {_safe(problem['message'])}")
@@ -1494,7 +1502,7 @@ def format_mcp_config(entries: Sequence[Mapping[str, Any]], *, shell: str | None
                          f"  sync script: inside the zipped package (`{PROG} static-scripts --dest DIR` "
                          "copies it)")
         lines.extend(f"  note: {note}" for note in e["notes"])
-        blocks.append("\n".join(_safe(line) for line in lines))
+        blocks.append("\n".join(_safe_command(line) for line in lines))  # each line whole
     return "\n\n".join(blocks)
 
 

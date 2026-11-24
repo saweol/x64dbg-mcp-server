@@ -273,7 +273,8 @@ query parameter such as `token=`, and options, `NAME=VALUE` / `Name: value` pair
 with a name segment such as TOKEN, KEY, SECRET, PASS(WORD), AUTH, BEARER, COOKIE or CREDENTIALS
 (`--api-key`, `GH_TOKEN`, `DB_PASS`; KEYBOARD, COMPASS or BYPASS are fine, and so is a name ending
 in FILE, PATH or ENV, such as `--token-file`). Keep secrets in the MCP server's own configuration
-or environment.
+or environment. Control characters (TAB, CR, LF, NUL, ESC, C1) and Unicode bidi controls are
+refused there too, so the printed commands are exactly the configured ones.
 
 Register them:
 

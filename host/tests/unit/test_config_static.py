@@ -9,6 +9,7 @@ import pytest
 
 from x64dbg_vm_gateway import config as cfgmod
 from x64dbg_vm_gateway.config import GatewayConfig, StaticConfig, StaticServerConfig
+from x64dbg_vm_gateway.errors import ConfigError
 
 from .test_config import BASE, expect_error, load_text
 
@@ -293,3 +294,50 @@ def test_names_that_only_contain_a_secret_word_are_accepted(tmp_path):
     s = load_text(tmp_path, text).static.servers["ghidra"]
     assert s.command is not None and s.command[1:4] == ("--keyboard", "--compass", "--bypass")
     assert set(s.env) == {"KEYBOARD", "COMPASS", "BYPASS", "HTTPS_PROXY"}
+
+
+# ── control characters: the printed command must be the configured one ──
+#: what the output sanitiser would strip or what would break the printed line: C0 (TAB, LF, CR, NUL,
+#: ESC), DEL, C1 (NEL, CSI), bidi controls, line / paragraph separators
+UNPRINTABLE = ["\n", "\r", "\t", "\x00", "\x1b", "\x7f", "\x85", "\x9b", "؜", "‎", "‏",
+               "‪", "‮", "⁦", "⁩", " ", " "]
+
+
+def _unprintable_cases():
+    for ch in UNPRINTABLE:
+        bad = json.dumps(f"x{ch}s3cr3t")
+        yield f"command = [\"/opt/g/run\", {bad}]\n", "static.servers.ghidra.command[1]"
+        yield f"command = [{json.dumps(f'/opt/g/run{ch}')}]\n", "static.servers.ghidra.command[0]"
+        yield f"args = [\"--x\", {bad}]\n", "static.servers.ghidra.args[1]"
+        yield f"url = {json.dumps(f'http://127.0.0.1:1/s3cr3t{ch}')}\n", "static.servers.ghidra.url"
+        yield f"env = {{ JAVA_HOME = {bad} }}\n", "static.servers.ghidra.env.JAVA_HOME"
+        yield f"name = {json.dumps(f'g{ch}')}\n", "static.servers.ghidra.name"
+    # a variable NAME with a control character: the key names the table, not the broken name
+    yield 'env = { "JAVA_HOME\\n" = "/jdk" }\n', "static.servers.ghidra.env"
+    yield 'env = { "JAVA\\u202eHOME" = "/jdk" }\n', "static.servers.ghidra.env"
+
+
+@pytest.mark.parametrize(("body", "key"), list(_unprintable_cases()))
+def test_control_and_bidi_characters_are_refused(tmp_path, body, key):
+    err = expect_error(tmp_path, BASE + "\n[static.servers.ghidra]\n" + body, key)
+    assert "s3cr3t" not in err.message
+    assert any(word in err.message for word in ("control", "letters", "NAME of an environment variable"))
+
+
+def test_control_characters_are_named_in_the_message(tmp_path):
+    err = expect_error(tmp_path, BASE + '\n[static.servers.ghidra]\nargs = ["a\\u001b[31mb"]\n',
+                       "static.servers.ghidra.args[0]")
+    assert "control characters" in err.message and "bidi" in err.message
+
+
+def test_a_lone_surrogate_is_refused_from_a_dict():
+    with pytest.raises(ConfigError) as ei:
+        cfgmod.config_from_dict({"static": {"servers": {"ghidra": {"args": ["a\ud800b"]}}}})
+    assert ei.value.details["key"] == "static.servers.ghidra.args[0]"
+
+
+@pytest.mark.parametrize("program", ["C:pyghidra-mcp.exe", "c:tools\\ghidra-mcp.exe", "C:"])
+def test_a_drive_relative_windows_program_is_refused(tmp_path, program):
+    err = expect_error(tmp_path, BASE + f"\n[static.servers.ghidra]\ncommand = ['{program}']\n",
+                       "static.servers.ghidra.command[0]")
+    assert "drive" in err.message

@@ -171,6 +171,21 @@ def test_mcp_config_quotes_configured_metacharacters_for_the_host_shell(tmp_path
     assert expected.endswith(" pyghidra-mcp " + tail)
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_mcp_config_prints_a_long_command_in_full(tmp_path, capsys, monkeypatch, windows):
+    """The output sanitiser cuts text after 10000 characters: never a command line."""
+    monkeypatch.setattr(cli, "_windows_host", lambda: windows)
+    long_path = "/srv/" + "p" * 12_000 + "/s.exe"
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ghidra"]\n[static.servers.ghidra]\n'
+                                  f'args = ["{long_path}"]\nenv = {{ JAVA_HOME = "/jdk" }}\n')
+    assert run(["--config", str(cfg), "mcp-config"]) == 0
+    out = capsys.readouterr().out
+    argv = ["claude", "mcp", "add", "ghidra", "-e", "GHIDRA_INSTALL_DIR=<ghidra-install-dir>", "-e",
+            "JAVA_HOME=/jdk", "--", "pyghidra-mcp", long_path]
+    assert "  " + cli.shell_join(argv, windows=windows) in out.splitlines()
+    assert "truncated" not in out
+
+
 def test_mcp_config_at_the_default_location_needs_no_env(tmp_path, capsys, monkeypatch):
     target = tmp_path / "xdg" / "x64dbg-vm-gateway" / "config.toml"
     target.parent.mkdir(parents=True)
