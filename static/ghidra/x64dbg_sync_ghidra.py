@@ -132,7 +132,8 @@ def parse_script_args(args: list[str]) -> dict[str, Any]:
     rest = positional[1:]
     limit = 2 if out["action"] == "import" else 1
     if not rest or len(rest) > limit:
-        raise ValueError(f"'{out['action']}' takes {'a document path and an optional module' if limit == 2 else 'an output path'}")
+        wanted = "a document path and an optional module" if limit == 2 else "an output path"
+        raise ValueError(f"'{out['action']}' takes {wanted}")
     out["path"] = rest[0]
     if len(rest) == 2:
         out["module"] = rest[1]

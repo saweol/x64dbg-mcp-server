@@ -51,7 +51,8 @@ import json
 import os
 import re
 import sys
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 SCRIPT_VERSION = "1.0"
 FLAGSPACE = "x64dbg"
@@ -191,7 +192,9 @@ class R2Ops:
     def is_mapped(self, address: int) -> bool:
         if self._sections is None:
             data = self.c.cmdj("iSj")
-            rows = data if isinstance(data, list) else (data or {}).get("sections", []) if isinstance(data, dict) else []
+            if isinstance(data, dict):  # {"sections": [...]} in some versions, a list in 6.2 / 0.9
+                data = data.get("sections", [])
+            rows = data if isinstance(data, list) else []
             self._sections = []
             for row in rows:
                 if isinstance(row, dict) and isinstance(row.get("vaddr"), int):
@@ -554,7 +557,7 @@ def main(
         if pipe is not None and not in_pipe and hasattr(pipe, "quit"):
             try:
                 pipe.quit()
-            except Exception:  # noqa: BLE001 - closing a dead pipe
+            except Exception:  # noqa: BLE001, S110 - closing a pipe whose tool already exited
                 pass
 
 

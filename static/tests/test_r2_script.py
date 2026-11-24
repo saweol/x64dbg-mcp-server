@@ -131,7 +131,8 @@ class FakeCore:
             return ""
         if head == "CC*" and self.flavor == "radare2":
             return "".join(
-                f"CCu base64:{base64.b64encode(t.encode()).decode()} @ 0x{a:x}\n" for a, t in sorted(self.comments.items())
+                f"CCu base64:{base64.b64encode(t.encode()).decode()} @ 0x{a:x}\n"
+                for a, t in sorted(self.comments.items())
             )
         if head == "CClj" and self.flavor == "rizin":
             # rizin escapes non-ASCII bytes as \\xNN in this listing; the script must not rely on its text
@@ -140,7 +141,7 @@ class FakeCore:
             self.saved.append(head[3:])
             return ""
         if head == "e dir.projects":
-            return "/home/u/.local/share/radare2/projects\n"
+            return "/work/.local/share/radare2/projects\n"
         if head == "Pl":
             return ""
         return ""
@@ -455,7 +456,7 @@ def test_main_loads_an_existing_r2_project_from_a_directory(tmp_path: Path) -> N
 @pytest.mark.parametrize(
     ("tool", "spec"),
     [("radare2", "bad;name"), ("radare2", "a b"), ("radare2", "/x/.."), ("rizin", "p.r2"),
-     ("rizin", "/tmp/with space.rzdb"), ("rizin", "x;Ps y.rzdb")],
+     ("rizin", "/work/with space.rzdb"), ("rizin", "x;Ps y.rzdb")],
 )
 def test_project_specs_are_checked(tool: str, spec: str) -> None:
     with pytest.raises(ValueError):

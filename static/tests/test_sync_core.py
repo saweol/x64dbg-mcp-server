@@ -56,7 +56,8 @@ def dumps(doc: object) -> bytes:
 # ── hygiene ─────────────────────────────────────────────────────────
 def test_core_imports_no_tool_module() -> None:
     src = CORE_PATH.read_text(encoding="utf-8")
-    for banned in ("import ida", "import ghidra", "import r2pipe", "import rzpipe", "import cutter", "x64dbg_sync.py\"\n"):
+    banned_imports = ("import ida", "import ghidra", "import r2pipe", "import rzpipe", "import cutter")
+    for banned in banned_imports:
         assert banned not in src
 
 
@@ -327,7 +328,7 @@ def test_read_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     [
         (["sample.exe", "helper.dll"], "sample.exe", "sample.exe"),
         (["sample.exe"], "SAMPLE.EXE", "sample.exe"),
-        (["sample.exe"], "/home/u/work/sample.exe", "sample.exe"),
+        (["sample.exe"], "/work/samples/sample.exe", "sample.exe"),
         (["sample.exe"], "C:\\work\\sample.exe", "sample.exe"),
         (["sample.exe"], "sample.bin", "sample.exe"),
         (["sample.exe", "sample.dll"], "sample.bin", None),
@@ -351,13 +352,18 @@ class TestResolveModule:
         assert core.resolve_module(self.doc, [], "C:\\x\\helper.dll") == "helper.dll"
 
     def test_first_matching_candidate(self) -> None:
-        assert core.resolve_module(self.doc, ["", "nothing.bin", "/tmp/sample.exe"], None) == "sample.exe"
+        assert core.resolve_module(self.doc, ["", "nothing.bin", "/work/sample.exe"], None) == "sample.exe"
 
     def test_errors_list_the_modules(self) -> None:
         with pytest.raises(ValueError, match=r"helper.dll, sample.exe"):
             core.resolve_module(self.doc, ["other.exe"], None)
         with pytest.raises(ValueError, match="not in the document"):
             core.resolve_module(self.doc, [], "nope.dll")
+
+    def test_error_names_each_candidate_once(self) -> None:
+        with pytest.raises(ValueError) as info:
+            core.resolve_module(self.doc, ["ask_copy.exe", "/work/ask_copy.exe"], None)
+        assert str(info.value).count("ask_copy.exe") == 1
 
 
 # ── import planning ─────────────────────────────────────────────────

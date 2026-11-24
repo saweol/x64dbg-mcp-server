@@ -30,7 +30,8 @@ import os
 import re
 import tempfile
 import unicodedata
-from typing import Any, Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any
 
 SCHEMA = "x64dbg-ida-sync/1"
 SCHEMA_FAMILY = "x64dbg-ida-sync/"
@@ -429,11 +430,12 @@ def resolve_module(doc: dict[str, Any], file_names: Iterable[str], module: str |
         if found is None:
             raise ValueError(f"module {module!r} is not in the document (has: {_known(doc)})")
         return found
-    tried = []
+    tried: list[str] = []
     for name in file_names:
         if not name:
             continue
-        tried.append(_base_name(name))
+        if _base_name(name) not in tried:
+            tried.append(_base_name(name))
         found = match_module(modules, name)
         if found is not None:
             return found
@@ -472,7 +474,7 @@ def build_import_plan(
     modules = doc.get("modules", {})
     key = (module_key or "").lower()
     if key not in modules:
-        raise ValueError("module {!r} is not in the document (has: {})".format(module_key, _known(doc)))
+        raise ValueError(f"module {module_key!r} is not in the document (has: {_known(doc)})")
     base = parse_hex(imagebase, "imagebase")
     plan = []
     for item in modules[key]["items"]:
