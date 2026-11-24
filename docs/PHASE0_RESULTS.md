@@ -217,3 +217,47 @@
 - 위 `SaveDatabase` 표의 7가지 경우를 최종 빌드로 다시 돌려 같은 결과를 얻었다.
 - `test_d`(x64dbg 강제 종료)는 69 s 걸렸다. 내역은 `analysis_start` 약 15 s, vmrun 종료 약 6 s, 연결 한도 10 s, 재기동 약 20 s다. 테스트 기본 한도 60 s로는 여유가 없어 이 테스트만 180 s로 올렸다.
 - 단위 테스트 2,952개 통과(5개 건너뜀), `zig build test` 통과, ruff 통과.
+
+## 정적 도구 연동과 원스톱 설치 검증 (2026-11-24 오후)
+
+### 확인한 것
+
+- **원스톱 설치(실 VM)**
+  - `scripts/build-release.sh`로 만든 wheel을 격리된 폴더에 `uv tool install`로 설치했다. 이 wheel에는 플러그인과 정적 스크립트가 들어 있다.
+  - 설치본의 `setup --snapshot MCP_CLEAN_V110F`가 248 s에 끝났다. 순서는 사전 점검 → 번들 플러그인 배포 → 프로비저닝(재부팅) → 스냅샷 → 재점검 → 등록 명령 출력이다.
+  - 이 실행에서 결함 1건을 찾았다(아래 표).
+- **정적 도구(E2E 샘플, rva 0x102C)**
+  - 동기화 스크립트로 이름 변경, 주석, 재적용(멱등), 내보내기를 확인했다.
+    - Ghidra 12.2: `pyghidraRun -H`. 일반 `analyzeHeadless`는 Python 스크립트를 실행하지 못한다.
+    - radare2 6.2.6, rizin 0.9.1
+    - Cutter 2.5.0(Qt6·Qt5)·2.4.1: 내장 Python
+  - MCP 서버를 실제 MCP 클라이언트로 붙여 이름 변경, 주석, 디컴파일을 확인했다.
+    - pyghidra-mcp 0.3.0
+    - GhidraMCP 2.0(헤드리스)
+    - r2mcp 1.9.0
+  - CutterMCP 2.0은 기본 등록에서 뺐다.
+    - 플러그인이 모든 인터페이스에 인증 없이 바인드한다.
+    - 요청 값을 이스케이프 없이 rizin 명령에 넣는다.
+    - 주석 기능이 404를 성공처럼 돌려준다.
+- **정적·동적 왕복(실제 Claude Code)**
+  - 게이트웨이(설치본)와 r2mcp를 나란히 등록했다.
+  - radare2로 `Sleep` 루프 함수(정적 `0x14000102C`, baddr `0x140000000`)를 찾았다.
+  - `static_rebase`가 런타임 주소 `0x7FF6…102C`를 돌려줬고, x64dbg BP가 첫 `run`에서 걸렸다.
+  - radare2에 이름 `gw_main_loop`와 주석을 남긴 뒤 회수하고 복원했다. 전체 84 s.
+
+### 이 검증에서 찾아 고친 결함
+
+| 결함 | 원인 | 조치 |
+|---|---|---|
+| 실제 `setup`이 만든 클린 스냅샷에 `C:\mcp\tmp\ps-<id>.out`이 남음. 경고는 "손으로 지우라"고 했지만 스냅샷이 찍힌 뒤라 의미가 없었다. | 재부팅이 끊은 PowerShell 실행이 자기 출력 파일을 지우지 못했다. 그 시점에 VMware Tools가 내려가는 중이었다. | 프로비저닝이 스냅샷 직전에 게스트 임시 폴더의 `ps-<16 hex>.out/.ps1`만 지운다. 실패하면 경고만 남긴다. |
+| (리뷰) Windows용 `mcp-config` 출력이 cmd·PowerShell 메타문자를 막지 못했다. 테스트는 POSIX host를 가정했다. | `subprocess.list2cmdline`은 셸 인용이 아니다. | PowerShell 기준 작은따옴표 인용으로 바꿨다. 테스트는 host 셸을 고정한다. |
+| (리뷰) 정적 서버 설정의 `args`·`command`·`url`·`env` 값에 넣은 비밀값이 등록 명령으로 출력될 수 있었다. | 비밀 검사가 `env` 이름에만 있었다. | 비밀처럼 보이는 옵션·`KEY=VALUE`·URL 자격 증명·헤더를 설정 단계에서 거부한다. 제어·양방향 문자도 거부한다. |
+
+다른 모델 리뷰는 기능별로 받았다(정적 코어 Sonnet, 패키징 Sonnet·Fable·Mythos, 통합 Sonnet). 반영하지 않은 지적과 그 이유는 각 커밋 메시지에 있다.
+
+### 아직 확인하지 않은 것
+
+- Windows·macOS host. Windows용 PowerShell 출력은 단위 테스트만 했고, pwsh 왕복 테스트는 이 host에 pwsh가 없어 건너뛰었다.
+- Ghidra GUI와 GhidraMCP GUI 모드, Ghidra 11.x
+- 태그 릴리스 워크플로의 실제 실행
+- ida-multi-mcp의 툴 이름은 문서 기준이다. 이번에 다시 실행해 보지는 않았다.
