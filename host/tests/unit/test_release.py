@@ -339,6 +339,27 @@ def test_other_tags_fail_and_name_both_versions(tag):
     assert "host/pyproject.toml" in out and f"v{version}" in out
 
 
+@needs_bash
+@pytest.mark.parametrize(("pyproject", "says"), [
+    ('[project]\nname = "x"\n', "has no [project] version"),
+    ('[project]\nname = "x"\ndynamic = ["version"]\n', "dynamic"),
+    ('[tool.x]\ny = 1\n', "has no [project] version"),
+    ('[project]\nname = "x"\nversion = 1\n', "has no [project] version"),
+    ('[project\nname = "x"\n', "not valid TOML"),
+])
+def test_a_missing_or_dynamic_version_is_a_clear_error(tmp_path, pyproject, says):
+    (tmp_path / "scripts").mkdir()
+    script = tmp_path / "scripts" / TAG_SCRIPT.name
+    shutil.copy2(TAG_SCRIPT, script)
+    (tmp_path / "host").mkdir()
+    (tmp_path / "host" / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    res = subprocess.run([BASH, str(script), "v1.0.0"], cwd=tmp_path, capture_output=True, text=True,
+                         timeout=60)
+    assert res.returncode == 1
+    assert res.stderr.startswith("check-release-tag: error: ") and says in res.stderr, res.stderr
+    assert "Traceback" not in res.stderr and res.stdout == ""
+
+
 def test_the_workflow_checks_the_tag_before_it_builds(workflow):
     check = workflow.index("run: scripts/check-release-tag.sh")
     assert check < workflow.index("zig build test") < workflow.index("run: scripts/build-release.sh")

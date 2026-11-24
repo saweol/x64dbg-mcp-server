@@ -66,7 +66,6 @@ import math
 import os
 import re
 import shlex
-import subprocess  # noqa: S404 - only list2cmdline (quoting), nothing is run
 import sys
 import tempfile
 import tomllib
@@ -77,6 +76,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 from .. import config as gw_config
 from .. import envfile, plugin_bundle, static_scripts, static_tools
 from .. import platform as gw_platform
+from .. import ps as gw_ps
 from ..errors import (
     ConfigError,
     GatewayError,
@@ -133,6 +133,14 @@ class UsageError(Exception):
 def _safe(text: Any) -> str:
     """Strip terminal control characters from text that may come from the guest."""
     return sanitize_untrusted_text(str(text), max_len=10_000)
+
+
+def _safe_command(text: Any) -> str:
+    """``_safe`` for a line that carries a printed command, which is never cut short. The config
+    refuses the characters the sanitiser strips (so the command is printed as configured);
+    stripping stays as a last line of defence."""
+    text = str(text)
+    return sanitize_untrusted_text(text, max_len=max(len(text), 1))
 
 
 def _dumps(value: Any, *, ascii_only: bool = False) -> str:
@@ -976,15 +984,38 @@ _ENDPOINT_INIT_DEFAULTS = {"mode": None, "force": False, "x64_url": None, "x64_t
                            "x32_url": None, "x32_token_env": None}
 
 
+#: printed above the commands on a Windows host (``shell`` "powershell" in the JSON)
+POWERSHELL_NOTE = "The commands are for PowerShell (in cmd.exe the quoting differs)."
+# A PowerShell word that needs no quotes: a path or plain word that does not start with a digit
+# (1kb, 0x10 would be numbers), or a plain option name (-e, --project-path; "--" itself is the
+# end-of-parameters token, and an option with "." or ":" is split by Windows PowerShell).
+_PS_BAREWORD_RE = re.compile(r"[A-Za-z/\\][A-Za-z0-9_\-./:=+~\\]*|--?[A-Za-z][A-Za-z0-9-]*")
+
+
 def _windows_host() -> bool:
     return os.name == "nt"
 
 
+def command_shell() -> str:
+    """The shell the printed commands are for: "powershell" on a Windows host, else "posix"."""
+    return "powershell" if _windows_host() else "posix"
+
+
+def powershell_quote(arg: str) -> str:
+    """``arg`` as one PowerShell argument: plain words stay, anything else becomes a verbatim
+    single-quoted literal (``ps.ps_quote``: nothing inside is expanded, quote characters are doubled)."""
+    return arg if _PS_BAREWORD_RE.fullmatch(arg) else gw_ps.ps_quote(arg)
+
+
 def shell_join(argv: Sequence[str], *, windows: bool | None = None) -> str:
-    """A command line to paste into a shell: POSIX quoting, or cmd/PowerShell quoting on Windows."""
-    if windows if windows is not None else _windows_host():
-        return subprocess.list2cmdline(list(argv))
-    return shlex.join(argv)
+    """A command line to paste into a shell: POSIX quoting (``shlex``), or on Windows PowerShell
+    quoting (``powershell_quote``; a quoted program is run with the call operator ``&``)."""
+    if not (windows if windows is not None else _windows_host()):
+        return shlex.join(argv)
+    words = [powershell_quote(arg) for arg in argv]
+    if words and words[0] != argv[0]:
+        words.insert(0, "&")
+    return " ".join(words)
 
 
 def _is_default_config(path: Path) -> bool:
@@ -1014,7 +1045,7 @@ def _global_argv(args: argparse.Namespace) -> list[str]:
 class _SetupReport:
     def __init__(self, args: argparse.Namespace, path: Path) -> None:
         self.data: dict[str, Any] = {
-            "ok": False, "dry_run": bool(args.dry_run),
+            "ok": False, "dry_run": bool(args.dry_run), "shell": command_shell(),
             "config": {"path": str(path), "created": False, "profile": None},
             "steps": [{"step": name, "status": "not_run", "detail": ""} for name in SETUP_STEPS],
             "notes": [],
@@ -1316,7 +1347,8 @@ _STATUS_WORDS = {"not_run": "not run"}
 
 
 def _format_setup(report: Mapping[str, Any]) -> str:
-    lines: list[str] = []
+    shows_commands = report["dry_run"] or bool(report.get("mcp_config"))
+    lines = [POWERSHELL_NOTE, ""] if shows_commands and report.get("shell") == "powershell" else []
     for step in report["steps"]:
         status = _STATUS_WORDS.get(step["status"], step["status"])
         detail = _safe(step.get("detail") or "")
@@ -1325,7 +1357,7 @@ def _format_setup(report: Mapping[str, Any]) -> str:
         if (step.get("blockers") or final_failed) and isinstance(step.get("result"), Mapping):
             lines.extend("    " + line for line in _format_doctor(step["result"]).splitlines())
         if report["dry_run"] and step.get("command"):
-            lines.append(f"    = {_safe(step['command'])}")
+            lines.append(f"    = {_safe_command(step['command'])}")
     lines.extend(f"note: {_safe(n)}" for n in report.get("notes", ()))
     for problem in report.get("problems", ()):
         lines.append(f"problem [{problem['code']}]: {_safe(problem['message'])}")
@@ -1443,8 +1475,9 @@ def mcp_config_entries(args: argparse.Namespace, config: gw_config.GatewayConfig
             *(_static_entry(tid, config.static) for tid in config.static.tools)]
 
 
-def format_mcp_config(entries: Sequence[Mapping[str, Any]]) -> str:
-    blocks: list[str] = []
+def format_mcp_config(entries: Sequence[Mapping[str, Any]], *, shell: str | None = None) -> str:
+    """The registrations as text; ``shell`` "powershell" puts ``POWERSHELL_NOTE`` first."""
+    blocks: list[str] = [POWERSHELL_NOTE] if shell == "powershell" else []
     for e in entries:
         if e["id"] == "gateway":
             lines = [f"{e['name']}: the gateway ({e['display']})"]
@@ -1469,12 +1502,12 @@ def format_mcp_config(entries: Sequence[Mapping[str, Any]]) -> str:
                          f"  sync script: inside the zipped package (`{PROG} static-scripts --dest DIR` "
                          "copies it)")
         lines.extend(f"  note: {note}" for note in e["notes"])
-        blocks.append("\n".join(_safe(line) for line in lines))
+        blocks.append("\n".join(_safe_command(line) for line in lines))  # each line whole
     return "\n\n".join(blocks)
 
 
 def _format_mcp_config_result(result: Mapping[str, Any]) -> str:
-    return format_mcp_config(result["servers"])
+    return format_mcp_config(result["servers"], shell=result.get("shell"))
 
 
 def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
@@ -1482,7 +1515,7 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
     ``--client``, only Claude Code so far); nothing is run or written."""
     path = _config_target(args)
     config = gw_config.load_config(path, environ=os.environ)
-    out.data({"ok": True, "client": args.client, "config": str(path),
+    out.data({"ok": True, "client": args.client, "config": str(path), "shell": command_shell(),
               "servers": mcp_config_entries(args, config, path)}, _format_mcp_config_result)
     return EXIT_OK
 

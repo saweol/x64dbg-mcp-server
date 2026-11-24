@@ -34,6 +34,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qsl, urlsplit
 
 from .errors import ConfigError
 
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
     from .config import StaticConfig
 
 __all__ = ["PLACEHOLDER_RE", "TOOLS", "TOOL_IDS", "TRANSPORTS", "McpRecipe", "StaticTool", "effective_recipe",
-           "get_tool", "looks_like_secret_name", "placeholders", "server_name"]
+           "get_tool", "looks_like_secret_name", "placeholders", "secret_in_argument", "server_name"]
 
 #: Supported tool ids, in documentation order (``config.STATIC_TOOL_IDS`` re-exports it; this module
 #: imports ``config`` only for type checking, so the loader can import it without a cycle).
@@ -50,8 +51,18 @@ TOOL_IDS: tuple[str, ...] = ("ida", "ghidra", "radare2", "cutter")
 TRANSPORTS: tuple[str, ...] = ("stdio", "http", "sse")
 #: a user-specific part of a recipe, e.g. ``<project-dir>``
 PLACEHOLDER_RE = re.compile(r"<[^<>\s]+>")
-#: environment variable names that suggest a secret (the config refuses them)
-_SECRET_NAME_RE = re.compile(r"TOKEN|KEY|SECRET|PASS", re.IGNORECASE)
+#: name segments that suggest a secret (``looks_like_secret_name``; the config refuses them)
+_SECRET_SEGMENTS = frozenset({
+    "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pwd", "pass", "passphrase",
+    "auth", "authorization", "bearer", "credential", "credentials", "cookie", "cookies", "key", "keys",
+    "apikey", "apikeys", "privatekey"})
+#: a last segment that names where a secret is kept rather than the secret (TOKEN_FILE, KEY_PATH)
+_SECRET_LOCATIONS = frozenset({"file", "path", "env"})
+#: name segments: runs of capitals, capitalised or lower-case words, digits (apiKey -> api, Key)
+_SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_URL_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+_HEADER_RE = re.compile(r"\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*\S")  # Authorization: ..., token:abc
+_ASSIGNED_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")  # NAME in NAME=VALUE
 
 
 @dataclass(frozen=True)
@@ -215,8 +226,57 @@ def get_tool(tool_id: str) -> StaticTool:
 
 
 def looks_like_secret_name(name: str) -> bool:
-    """An environment variable name that suggests a secret (TOKEN, KEY, SECRET or PASS, any case)."""
-    return bool(_SECRET_NAME_RE.search(name))
+    """A variable, option or header name that suggests a secret: one of its segments (split at
+    ``_``, ``-``, ``.`` and other separators and where the case changes) is TOKEN, SECRET, PASSWORD,
+    PASSWD, PWD, PASS, PASSPHRASE, AUTH, AUTHORIZATION, BEARER, CREDENTIAL(S), COOKIE, KEY or APIKEY
+    (API_KEY, GH_TOKEN, DB_PASS, AUTH_HEADER, apiKey), unless the last segment is FILE, PATH or ENV
+    (TOKEN_FILE names where the secret is). A word that only contains one is no secret: KEYBOARD,
+    COMPASS, BYPASS."""
+    segments = [seg.lower() for seg in _SEGMENT_RE.findall(name)]
+    if not segments or segments[-1] in _SECRET_LOCATIONS:
+        return False
+    return any(seg in _SECRET_SEGMENTS for seg in segments)
+
+
+def secret_in_argument(arg: str) -> str | None:
+    """Why the command-line argument or environment value ``arg`` seems to carry a secret, or None.
+
+    Looks at a URL with a user name or password (``user:pass@``) or with a query parameter
+    named like a secret; ``Name: value`` (an HTTP header) and ``NAME=VALUE`` pairs and options
+    (``--token``, ``--api-key=...``, also inside a value such as ``JAVA_TOOL_OPTIONS``) whose name
+    suggests a secret (:func:`looks_like_secret_name`); and ``Bearer <token>``. Positional words
+    are not judged (``pass``, ``/opt/token-mcp/run``). The reason never quotes ``arg``."""
+    for url in _URL_IN_TEXT_RE.findall(arg):
+        why = _secret_in_url(url)
+        if why:
+            return why
+    header = _HEADER_RE.match(arg)
+    if header and looks_like_secret_name(header.group(1)):
+        return "a 'Name: value' pair (an HTTP header) whose name suggests a secret"
+    words = arg.split()
+    for i, word in enumerate(words):
+        if word.startswith("-"):
+            if looks_like_secret_name(re.split(r"[=:]", word.lstrip("-"), maxsplit=1)[0]):
+                return "an option whose name suggests a secret"
+        elif "=" in word:
+            name = word.split("=", 1)[0]
+            if _ASSIGNED_NAME_RE.fullmatch(name) and looks_like_secret_name(name):
+                return "a NAME=VALUE pair whose name suggests a secret"
+        elif word.lower() == "bearer" and i + 1 < len(words):
+            return "a bearer token"
+    return None
+
+
+def _secret_in_url(url: str) -> str | None:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if "@" in parts.netloc:
+        return "a URL with a user name or password (user:password@host)"
+    if any(looks_like_secret_name(name) for name, _value in parse_qsl(parts.query, keep_blank_values=True)):
+        return "a URL query parameter whose name suggests a secret"
+    return None
 
 
 def placeholders(recipe: McpRecipe) -> tuple[str, ...]:

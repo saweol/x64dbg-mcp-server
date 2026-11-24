@@ -101,8 +101,11 @@ class StaticServerConfig:
     "sse" is given) and stays None when none is set (a name- or env-only override).
 
     ``command[0]`` is an absolute path or a bare program name (looked up on PATH): the MCP
-    client starts it without a shell, from a working directory of its own. ``env`` values are
-    printed by ``mcp-config``, so names that look like secrets are refused."""
+    client starts it without a shell, from a working directory of its own. ``mcp-config`` and
+    ``setup`` print command, args, url and env verbatim, so whatever looks like it carries a
+    secret is refused (``static_tools.looks_like_secret_name`` for env names,
+    ``static_tools.secret_in_argument`` for the values): secrets belong in the MCP server's own
+    configuration or environment."""
 
     command: tuple[str, ...] | None = None  # argv of a stdio MCP server
     url: str | None = None  # endpoint of an http / sse MCP server
@@ -191,6 +194,14 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _BACKEND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# What the output sanitiser (proxy.sanitize_untrusted_text) strips, or what breaks a printed command
+# line: C0 controls (TAB, LF, CR, NUL, ESC, ...), DEL, C1 controls, the Unicode bidi controls, the line
+# and paragraph separators, lone surrogates. Refused in [static.servers.<id>] so that mcp-config
+# prints exactly the configured command.
+_UNPRINTABLE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029"
+                             r"\ud800-\udfff]")
+_UNPRINTABLE_PROBLEM = ("must not contain control characters (TAB, CR, LF, NUL, ESC, C1) or Unicode bidi "
+                        "controls: mcp-config prints the command exactly as configured")
 _STATIC_IDS_HINT = f"static tools are: {', '.join(STATIC_TOOL_IDS)}"
 
 # Keys that look like an inline secret. Matching keys are refused outright.
@@ -395,7 +406,7 @@ class _Parser:
         return value
 
     def env_name(self, value: str, key: str) -> str:
-        if not _ENV_NAME_RE.match(value):
+        if not _ENV_NAME_RE.fullmatch(value):
             # Never echo the value: users sometimes paste the secret itself here.
             raise self.error(key, "must be the NAME of an environment variable ([A-Za-z_][A-Za-z0-9_]*)",
                              hint="put the secret in the environment and only its variable name here")
@@ -497,11 +508,12 @@ class _Parser:
         self.check_keys(tbl, dotted, set(_STATIC_SERVER_KEYS))
         values = self.fields(tbl, dotted, _STATIC_SERVER_KEYS)
         command, url, args = values.get("command"), values.get("url"), values.get("args")
+        self.printable(values, dotted)
         if command is not None:
-            self.argv(command, f"{dotted}.command", "the program and its arguments")
+            self.argv(command, f"{dotted}.command", "the program and its arguments", dotted)
             self.program(command[0], f"{dotted}.command[0]")
         if args is not None:
-            self.argv(args, f"{dotted}.args", "the arguments for the registry's program")
+            self.argv(args, f"{dotted}.args", "the arguments for the registry's program", dotted)
             if command is not None or url is not None:
                 raise self.error(f"{dotted}.args",
                                  "give either command (the program and its arguments), args (arguments for "
@@ -513,6 +525,7 @@ class _Parser:
         if url is not None:
             if not _is_http_url(url):
                 raise self.error(f"{dotted}.url", "must be an http:// or https:// URL with a host")
+            self.no_secret(url, f"{dotted}.url", dotted)
             if command is not None:
                 raise self.error(f"{dotted}.url", "give either command (stdio) or url, not both")
         stdio = command is not None or args is not None
@@ -532,7 +545,7 @@ class _Parser:
             transport = "http"
         name = values.get("name")
         if name is not None:
-            if not _MCP_NAME_RE.match(name):
+            if not _MCP_NAME_RE.fullmatch(name):
                 raise self.error(f"{dotted}.name", "MCP server names may only contain letters, digits, '_' "
                                                    "and '-' (at most 64 characters)")
             if name.lower() == GATEWAY_MCP_NAME:
@@ -545,29 +558,57 @@ class _Parser:
                                               "not started by the MCP client")
         for var, value in env.items():
             key = f"{dotted}.env.{var}"
-            if not _ENV_NAME_RE.match(var):
+            if not _ENV_NAME_RE.fullmatch(var):
                 raise self.error(key, "must be the NAME of an environment variable ([A-Za-z_][A-Za-z0-9_]*)")
             if _static_tools.looks_like_secret_name(var):
-                raise self.error(
-                    key, "looks like a secret (TOKEN, KEY, SECRET or PASS in the name); secrets do not "
-                         "belong in the config file",
-                    hint=f"`x64dbg-vm-gateway mcp-config` prints {dotted}.env values: pass the secret to the "
-                         "MCP server outside this file (for example in the server's own configuration)")
+                raise self.error(key, "looks like a secret (a name segment such as TOKEN, KEY, SECRET, PASS "
+                                      "or AUTH); secrets do not belong in the gateway config",
+                                 hint=_secret_hint(dotted))
             if not value.strip():
                 raise self.error(key, "must not be empty")
+            self.no_secret(value, key, dotted)
         return StaticServerConfig(command=command, url=url, transport=transport, name=name, args=args,
                                   env=env)
 
-    def argv(self, argv: tuple[str, ...], key: str, what: str) -> None:
+    def printable(self, values: Mapping[str, Any], dotted: str) -> None:
+        """Refuse control and bidi characters in what mcp-config prints (never echoes the value)."""
+        for field_name in ("command", "args"):
+            for i, arg in enumerate(values.get(field_name) or ()):
+                if _UNPRINTABLE_RE.search(arg):
+                    raise self.error(f"{dotted}.{field_name}[{i}]", _UNPRINTABLE_PROBLEM)
+        for field_name in ("url", "name"):
+            if values.get(field_name) is not None and _UNPRINTABLE_RE.search(values[field_name]):
+                raise self.error(f"{dotted}.{field_name}", _UNPRINTABLE_PROBLEM)
+        for var, value in values.get("env", {}).items():
+            if _UNPRINTABLE_RE.search(var):  # the key names the table: the name itself is what is broken
+                raise self.error(f"{dotted}.env", f"a variable name {_UNPRINTABLE_PROBLEM}")
+            if _UNPRINTABLE_RE.search(value):
+                raise self.error(f"{dotted}.env.{var}", _UNPRINTABLE_PROBLEM)
+
+    def argv(self, argv: tuple[str, ...], key: str, what: str, dotted: str) -> None:
         if not argv:
             raise self.error(key, f"must not be empty ({what})")
         for i, arg in enumerate(argv):
             if not arg.strip():
                 raise self.error(f"{key}[{i}]", "must not be empty")
+            self.no_secret(arg, f"{key}[{i}]", dotted)
+
+    def no_secret(self, value: str, key: str, dotted: str) -> None:
+        """Refuse a value that ``mcp-config`` would print with a secret in it (never echoes it)."""
+        why = _static_tools.secret_in_argument(value)
+        if why:
+            raise self.error(key, f"looks like it carries a secret ({why}); secrets do not belong in the "
+                                  "gateway config", hint=_secret_hint(dotted))
 
     def program(self, program: str, key: str) -> None:
         """The MCP client starts ``program`` without a shell, in a working directory of its own:
-        an absolute path or a bare name looked up on PATH; never a relative path or ``~``."""
+        an absolute path or a bare name looked up on PATH; never a relative path, a drive-relative
+        Windows path (``C:name``) or ``~``."""
+        windows = PureWindowsPath(program)
+        if windows.drive and not windows.root and not windows.drive.startswith(("\\\\", "//")):
+            raise self.error(key, "must not be a drive-relative Windows path (C:name depends on the current "
+                                  "directory of that drive)",
+                             hint="write the full path, e.g. C:\\path\\to\\x.exe")
         if program.startswith("~"):
             raise self.error(key, "must not start with ~: the MCP client starts the command without a shell, "
                                   "so ~ is not expanded", hint="write the full path")
@@ -578,7 +619,7 @@ class _Parser:
 
     def profile(self, name: str, tbl: Mapping[str, Any]) -> ProfileConfig:
         prefix = f"profiles.{name}"
-        if not _PROFILE_NAME_RE.match(name):
+        if not _PROFILE_NAME_RE.fullmatch(name):
             raise self.error(prefix, "profile names may only contain letters, digits, '_', '-' and '.'")
         self.check_keys(tbl, prefix, set(_PROFILE_KEYS) | {"retention", "backends"})
         values = self.fields(tbl, prefix, _PROFILE_KEYS)
@@ -649,7 +690,7 @@ class _Parser:
         values = self.fields(tbl, dotted, _BACKEND_KEYS)
 
         bid = values.pop("id", key)
-        if not _BACKEND_ID_RE.match(bid):
+        if not _BACKEND_ID_RE.fullmatch(bid):
             raise self.error(f"{dotted}.id" if "id" in tbl else dotted,
                              "backend ids may only contain letters, digits, '_' and '-'")
         arch = values.pop("arch", None)
@@ -670,6 +711,11 @@ class _Parser:
         if "port" not in values and "url" not in values:
             raise self.error(dotted, "a backend needs a port (vmware mode) or a url")
         return BackendConfig(id=bid, arch=arch, **values)
+
+
+def _secret_hint(dotted: str) -> str:
+    return (f"`x64dbg-vm-gateway mcp-config` prints {dotted} verbatim: keep secrets in the MCP server's own "
+            "configuration or environment, never in the gateway config")
 
 
 def _is_loopback_host(host: str) -> bool:

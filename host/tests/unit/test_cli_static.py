@@ -9,7 +9,11 @@ other CLI tests (no VM, no gateway is built):
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
+
+import pytest
 
 from tests.unit.test_cli import run, write_config
 from x64dbg_vm_gateway import config as gw_config
@@ -22,6 +26,13 @@ GHIDRA_ARGV = ["claude", "mcp", "add", "ghidra", "-e", "GHIDRA_INSTALL_DIR=<ghid
                "-e", "JAVA_HOME=<jdk25-home>", "--", "pyghidra-mcp", "--transport", "stdio", "--project-path",
                "<project-dir>", "--project-name", "<project-name>", "--wait-for-analysis", "<binary>"]
 GHIDRA_FILL_IN = ["<ghidra-install-dir>", "<jdk25-home>", "<project-dir>", "<project-name>", "<binary>"]
+
+
+@pytest.fixture(autouse=True)
+def posix_host(monkeypatch) -> None:
+    """The printed commands follow the host's shell: the tests pin a POSIX host (CI runs them on
+    Windows too); the Windows tests set ``_windows_host`` to True themselves."""
+    monkeypatch.setattr(cli, "_windows_host", lambda: False)
 
 
 def static_config(tmp_path: Path, extra: str = ALL_TOOLS) -> Path:
@@ -115,12 +126,66 @@ def test_mcp_config_uses_the_overrides(tmp_path, capsys):
     assert "'/srv/ghidra projects'" in out and "fill in" not in out.split("\nradare2:")[0]
 
 
-def test_mcp_config_quotes_for_windows_shells(tmp_path, capsys, monkeypatch):
+def test_mcp_config_prints_powershell_commands_on_windows(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(cli, "_windows_host", lambda: True)
-    cfg = static_config(tmp_path, '\n[static]\ntools = ["ghidra"]\n[static.servers.ghidra]\n'
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ida", "ghidra"]\n[static.servers.ghidra]\n'
                                   "command = ['C:\\Program Files\\g\\ghidra-mcp.exe']\n")
     assert run(["--config", str(cfg), "mcp-config"]) == 0
-    assert '-- "C:\\Program Files\\g\\ghidra-mcp.exe"' in capsys.readouterr().out
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert lines[0] == cli.POWERSHELL_NOTE and "PowerShell" in lines[0] and lines[1] == ""
+    assert "  " + cli.shell_join(gateway_argv(cfg), windows=True) in lines
+    assert "  claude mcp add ida-multi-mcp '--' python3 -m ida_multi_mcp" in lines
+    assert "  claude mcp add ghidra '--' 'C:\\Program Files\\g\\ghidra-mcp.exe'" in lines
+    assert run(["--config", str(cfg), "--json", "mcp-config"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["shell"] == "powershell"
+    assert data["servers"][0]["command"] == cli.shell_join(gateway_argv(cfg), windows=True)
+
+
+def test_mcp_config_prints_posix_commands_elsewhere(tmp_path, capsys):
+    cfg = static_config(tmp_path)
+    assert run(["--config", str(cfg), "mcp-config"]) == 0
+    assert "PowerShell" not in capsys.readouterr().out
+    assert run(["--config", str(cfg), "--json", "mcp-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["shell"] == "posix"
+
+
+#: configured arguments a shell must not interpret (none of them looks like a secret)
+METACHAR_ARGS = ["a&b", "c;d", "50%", "$HOME", "x^y", 'say "hi"', "it's", "<in>", "a>b", "a b", "a|b"]
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_mcp_config_quotes_configured_metacharacters_for_the_host_shell(tmp_path, capsys, monkeypatch,
+                                                                         windows):
+    monkeypatch.setattr(cli, "_windows_host", lambda: windows)
+    args = ", ".join(json.dumps(a) for a in METACHAR_ARGS)
+    cfg = static_config(tmp_path, f'\n[static]\ntools = ["ghidra"]\n[static.servers.ghidra]\n'
+                                  f'args = [{args}]\n')
+    assert run(["--config", str(cfg), "mcp-config"]) == 0
+    out = capsys.readouterr().out
+    argv = ["claude", "mcp", "add", "ghidra", "-e", "GHIDRA_INSTALL_DIR=<ghidra-install-dir>", "-e",
+            "JAVA_HOME=<jdk25-home>", "--", "pyghidra-mcp", *METACHAR_ARGS]
+    expected = cli.shell_join(argv, windows=windows)
+    assert "  " + expected in out.splitlines()  # printed exactly, nothing stripped or cut
+    tail = ("'a&b' 'c;d' '50%' '$HOME' 'x^y' 'say \"hi\"' 'it''s' '<in>' 'a>b' 'a b' 'a|b'" if windows else
+            "'a&b' 'c;d' 50% '$HOME' 'x^y' 'say \"hi\"' 'it'\"'\"'s' '<in>' 'a>b' 'a b' 'a|b'")
+    assert expected.endswith(" pyghidra-mcp " + tail)
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_mcp_config_prints_a_long_command_in_full(tmp_path, capsys, monkeypatch, windows):
+    """The output sanitiser cuts text after 10000 characters: never a command line."""
+    monkeypatch.setattr(cli, "_windows_host", lambda: windows)
+    long_path = "/srv/" + "p" * 12_000 + "/s.exe"
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ghidra"]\n[static.servers.ghidra]\n'
+                                  f'args = ["{long_path}"]\nenv = {{ JAVA_HOME = "/jdk" }}\n')
+    assert run(["--config", str(cfg), "mcp-config"]) == 0
+    out = capsys.readouterr().out
+    argv = ["claude", "mcp", "add", "ghidra", "-e", "GHIDRA_INSTALL_DIR=<ghidra-install-dir>", "-e",
+            "JAVA_HOME=/jdk", "--", "pyghidra-mcp", long_path]
+    assert "  " + cli.shell_join(argv, windows=windows) in out.splitlines()
+    assert "truncated" not in out
 
 
 def test_mcp_config_at_the_default_location_needs_no_env(tmp_path, capsys, monkeypatch):
@@ -208,6 +273,21 @@ def test_static_scripts_dest_json(tmp_path, capsys):
     assert run(["--json", "static-scripts", "--dest", str(dest)]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data == {"ok": True, "dest": str(dest), "copied": list(static_scripts.SCRIPT_FILES)}
+
+
+@pytest.mark.skipif(sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX permissions (root ignores them)")
+def test_static_scripts_dest_without_permission_prints_the_error(tmp_path, capsys):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)  # even looking inside fails (stat: EACCES)
+    try:
+        assert run(["static-scripts", "--dest", str(locked / "scripts")]) == 1
+    finally:
+        locked.chmod(0o700)
+    err = capsys.readouterr().err
+    assert "error [TRANSFER_FAILED]: cannot copy the static scripts to" in err
+    assert "Permission denied" in err and "unexpected" not in err and "Traceback" not in err
 
 
 def test_force_without_dest_is_a_usage_error(capsys):

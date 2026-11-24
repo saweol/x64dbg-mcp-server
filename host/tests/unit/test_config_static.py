@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
 from x64dbg_vm_gateway import config as cfgmod
 from x64dbg_vm_gateway.config import GatewayConfig, StaticConfig, StaticServerConfig
+from x64dbg_vm_gateway.errors import ConfigError
 
 from .test_config import BASE, expect_error, load_text
 
@@ -222,3 +224,142 @@ def test_the_gateway_name_constant_is_the_registration_name():
     from x64dbg_vm_gateway import static_tools
 
     assert all(t.mcp.name != cfgmod.GATEWAY_MCP_NAME for t in static_tools.TOOLS.values())
+
+
+# ── secrets: mcp-config prints command, args, url and env values verbatim ──
+def _refused_as_secret(tmp_path, body: str, key: str, value: str = "s3cr3t") -> None:
+    err = expect_error(tmp_path, BASE + "\n[static.servers.ghidra]\n" + body, key)
+    assert "secret" in err.message and value not in err.message
+    assert err.hint and "own configuration" in err.hint and "never in the gateway config" in err.hint
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:s3cr3t@10.0.0.5:8443/mcp",
+    "https://s3cr3t@10.0.0.5:8443/mcp",  # a token as the user name
+    "http://127.0.0.1:8089/sse?token=s3cr3t",
+    "http://127.0.0.1:8089/sse?x=1&API_KEY=s3cr3t",
+])
+def test_a_url_carrying_credentials_is_refused(tmp_path, url):
+    _refused_as_secret(tmp_path, f'url = "{url}"\n', "static.servers.ghidra.url")
+
+
+@pytest.mark.parametrize(("args", "index"), [
+    (["--api-key", "s3cr3t"], 0),
+    (["--transport", "stdio", "--token=s3cr3t"], 2),
+    (["--apiKey", "s3cr3t"], 0),
+    (["--password", "s3cr3t"], 0),
+    (["--private-key", "s3cr3t"], 0),
+    (["--credentials", "s3cr3t"], 0),
+    (["--auth-header", "s3cr3t"], 0),
+    (["--cookie=s3cr3t"], 0),
+    (["API_KEY=s3cr3t"], 0),
+    (["-H", "Authorization: Bearer s3cr3t"], 1),
+    (["--header", "Cookie: session=s3cr3t"], 1),
+    (["Bearer s3cr3t"], 0),
+    (["--url", "https://user:s3cr3t@h/mcp"], 1),
+    (["-Djavax.net.ssl.keyStorePassword=s3cr3t"], 0),
+])
+def test_args_carrying_a_secret_are_refused(tmp_path, args, index):
+    body = "args = [" + ", ".join(json.dumps(a) for a in args) + "]\n"
+    _refused_as_secret(tmp_path, body, f"static.servers.ghidra.args[{index}]")
+
+
+def test_a_command_carrying_a_secret_is_refused(tmp_path):
+    body = 'command = ["/opt/ghidra-mcp/run", "--headless", "--secret", "s3cr3t"]\n'
+    _refused_as_secret(tmp_path, body, "static.servers.ghidra.command[2]")
+
+
+@pytest.mark.parametrize("name", ["API_KEY", "GH_TOKEN", "DB_PASS", "AUTH_HEADER", "PRIVATE_KEY", "COOKIE",
+                                  "AWS_CREDENTIALS", "BEARER"])
+def test_env_names_with_a_secret_segment_are_refused(tmp_path, name):
+    _refused_as_secret(tmp_path, f'env = {{ {name} = "s3cr3t" }}\n', f"static.servers.ghidra.env.{name}")
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("HTTPS_PROXY", "http://user:s3cr3t@proxy:3128"),
+    ("JAVA_TOOL_OPTIONS", "-Xmx2g -Djavax.net.ssl.trustStorePassword=s3cr3t"),
+])
+def test_env_values_carrying_a_secret_are_refused(tmp_path, name, value):
+    _refused_as_secret(tmp_path, f'env = {{ {name} = "{value}" }}\n', f"static.servers.ghidra.env.{name}")
+
+
+def test_names_that_only_contain_a_secret_word_are_accepted(tmp_path):
+    """Segment matching: KEYBOARD, COMPASS and BYPASS are not KEY, PASS or a secret."""
+    text = BASE + (
+        '\n[static.servers.ghidra]\n'
+        'command = ["/opt/token-mcp/run", "--keyboard", "--compass", "--bypass", "--token-file", "/run/t",'
+        ' "MONKEY=1", "--project-path", "/srv/pass word", "http://127.0.0.1:1/sse?verbose=1"]\n'
+        'env = { KEYBOARD = "us", COMPASS = "n", BYPASS = "1", HTTPS_PROXY = "http://proxy:3128" }\n'
+    )
+    s = load_text(tmp_path, text).static.servers["ghidra"]
+    assert s.command is not None and s.command[1:4] == ("--keyboard", "--compass", "--bypass")
+    assert set(s.env) == {"KEYBOARD", "COMPASS", "BYPASS", "HTTPS_PROXY"}
+
+
+# ── control characters: the printed command must be the configured one ──
+#: what the output sanitiser would strip or what would break the printed line: C0 (TAB, LF, CR, NUL,
+#: ESC), DEL, C1 (NEL, CSI), bidi controls, line / paragraph separators
+UNPRINTABLE = ["\n", "\r", "\t", "\x00", "\x1b", "\x7f", "\x85", "\x9b", "؜", "‎", "‏",
+               "‪", "‮", "⁦", "⁩", " ", " "]
+
+
+def _unprintable_cases():
+    for ch in UNPRINTABLE:
+        bad = json.dumps(f"x{ch}s3cr3t")
+        yield f"command = [\"/opt/g/run\", {bad}]\n", "static.servers.ghidra.command[1]"
+        yield f"command = [{json.dumps(f'/opt/g/run{ch}')}]\n", "static.servers.ghidra.command[0]"
+        yield f"args = [\"--x\", {bad}]\n", "static.servers.ghidra.args[1]"
+        yield f"url = {json.dumps(f'http://127.0.0.1:1/s3cr3t{ch}')}\n", "static.servers.ghidra.url"
+        yield f"env = {{ JAVA_HOME = {bad} }}\n", "static.servers.ghidra.env.JAVA_HOME"
+        yield f"name = {json.dumps(f'g{ch}')}\n", "static.servers.ghidra.name"
+    # a variable NAME with a control character: the key names the table, not the broken name
+    yield 'env = { "JAVA_HOME\\n" = "/jdk" }\n', "static.servers.ghidra.env"
+    yield 'env = { "JAVA\\u202eHOME" = "/jdk" }\n', "static.servers.ghidra.env"
+
+
+@pytest.mark.parametrize(("body", "key"), list(_unprintable_cases()))
+def test_control_and_bidi_characters_are_refused(tmp_path, body, key):
+    err = expect_error(tmp_path, BASE + "\n[static.servers.ghidra]\n" + body, key)
+    assert "s3cr3t" not in err.message
+    assert any(word in err.message for word in ("control", "letters", "NAME of an environment variable"))
+
+
+def test_control_characters_are_named_in_the_message(tmp_path):
+    err = expect_error(tmp_path, BASE + '\n[static.servers.ghidra]\nargs = ["a\\u001b[31mb"]\n',
+                       "static.servers.ghidra.args[0]")
+    assert "control characters" in err.message and "bidi" in err.message
+
+
+def test_a_lone_surrogate_is_refused_from_a_dict():
+    with pytest.raises(ConfigError) as ei:
+        cfgmod.config_from_dict({"static": {"servers": {"ghidra": {"args": ["a\ud800b"]}}}})
+    assert ei.value.details["key"] == "static.servers.ghidra.args[0]"
+
+
+@pytest.mark.parametrize("program", ["C:pyghidra-mcp.exe", "c:tools\\ghidra-mcp.exe", "C:"])
+def test_a_drive_relative_windows_program_is_refused(tmp_path, program):
+    err = expect_error(tmp_path, BASE + f"\n[static.servers.ghidra]\ncommand = ['{program}']\n",
+                       "static.servers.ghidra.command[0]")
+    assert "drive" in err.message
+
+
+PROFILE_WITH = '''
+[profiles.{name}]
+vmx = "/vm/x.vmx"
+guest_user = "mcp"
+guest_password_env = {password_env}
+
+[profiles.{name}.backends.{backend}]
+arch = "x64"
+port = 9094
+'''
+
+
+@pytest.mark.parametrize(("name", "password_env", "backend", "key"), [
+    ('"p\\n"', '"GW_GUEST_PW"', "x64", "profiles.p\n"),
+    ("p", '"GW_GUEST_PW\\n"', "x64", "profiles.p.guest_password_env"),
+    ("p", '"GW_GUEST_PW"', '"x64\\n"', "profiles.p.backends.x64\n"),
+])
+def test_names_with_a_trailing_newline_are_refused(tmp_path, name, password_env, backend, key):
+    """A regex ending in $ also matches before a final newline: names are matched in full."""
+    expect_error(tmp_path, PROFILE_WITH.format(name=name, password_env=password_env, backend=backend), key)

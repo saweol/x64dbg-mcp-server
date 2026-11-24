@@ -14,8 +14,9 @@ The files are read through :mod:`importlib.resources`, so a zipped installation 
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
-import tempfile
+import secrets
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path
@@ -67,43 +68,122 @@ def _join(root: Traversable, rel: str) -> Traversable:
 
 def copy_to(dest: Path, *, force: bool = False) -> list[str]:
     """Copy the scripts into ``dest`` (created if needed) with the package layout; returns the
-    copied paths relative to ``dest``. Refuses (InvalidArgument, nothing written) when one of
-    the files already exists, unless ``force``: then each file is written to a temporary file
-    and renamed over the old one (a symlink there is replaced, never written through)."""
+    copied paths relative to ``dest``.
+
+    Refuses (InvalidArgument, nothing written) when ``dest`` or a subdirectory it writes into
+    (``common``, ``ida``, ...) is a symlink, or when one of the files already exists, unless
+    ``force``. Every file is written to a temporary file next to it and renamed into place, so
+    an interrupted copy never leaves a truncated script: without ``force`` the rename never
+    replaces a file (one that appeared after the check stops the copy with InvalidArgument),
+    with ``force`` it replaces the old file (a symlink there is replaced, never written
+    through). In both modes the files get the mode of any new file (0o666 minus the umask). An
+    OSError (PermissionError, a full disk, ...) becomes TransferError. A run that fails part-way
+    can leave the files it copied before the failure in place; run it again with ``force``."""
+    try:
+        return _copy_to(dest, force)
+    except OSError as e:
+        where = f" ({e.filename})" if e.filename else ""
+        raise TransferError(f"cannot copy the static scripts to {dest}: {e.strerror or e}{where}",
+                            stage="static-scripts",
+                            hint="check that you may write there, or pick another --dest (files copied "
+                                 "before the error stay)",
+                            details={"path": str(dest)}) from None
+
+
+def _copy_to(dest: Path, force: bool) -> list[str]:
+    if _is_link(dest):
+        raise _symlink_refused(dest, [str(dest)])
     if dest.exists() and not dest.is_dir():
         raise InvalidArgument(f"{dest} is not a directory", stage="static-scripts",
                               details={"path": str(dest)})
-    root = scripts_root()
+    linked = [sub for sub in _SUBDIRS if _is_link(dest.joinpath(sub))]
+    if linked:
+        raise _symlink_refused(dest, linked)
     targets = [(rel, dest.joinpath(*rel.split("/"))) for rel in SCRIPT_FILES]
     existing = [rel for rel, target in targets if target.exists() or target.is_symlink()]
     if existing and not force:
-        raise InvalidArgument(f"{', '.join(existing)} already exist in {dest}; refusing to overwrite",
-                              stage="static-scripts",
-                              hint="pass --force to replace them, or pick another --dest",
-                              details={"path": str(dest), "existing": existing})
-    try:
-        for rel, target in targets:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            data = _join(root, rel).read_bytes()
+        raise _exists_refused(dest, existing)
+    root = scripts_root()
+    for rel, target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if _is_link(target.parent):  # appeared after the check above
+            raise _symlink_refused(dest, [rel.split("/")[0]])
+        temp = _write_temp(target.parent, target.name, _join(root, rel).read_bytes())
+        try:
             if force:
-                _replace(target, data)
+                os.replace(temp, target)
             else:
-                with open(target, "xb") as f:  # O_EXCL: never follows or replaces what appeared meanwhile
-                    f.write(data)
-    except OSError as e:
-        raise TransferError(f"cannot copy the static scripts to {dest}: {e.strerror or e}",
-                            stage="static-scripts", details={"path": str(dest)}) from None
+                _rename_new(temp, target)
+        except BaseException as e:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+            if isinstance(e, FileExistsError):
+                raise _exists_refused(dest, [rel]) from None
+            raise
     return [rel for rel, _target in targets]
 
 
-def _replace(target: Path, data: bytes) -> None:
-    fd, temp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+#: the subdirectories of the layout (each holds scripts)
+_SUBDIRS: tuple[str, ...] = tuple(sorted({rel.split("/")[0] for rel in SCRIPT_FILES}))
+_O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: no newline translation
+
+
+def _is_link(path: Path) -> bool:
+    """A symlink, or a Windows junction (Python 3.12+ can tell)."""
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or (is_junction is not None and is_junction())
+
+
+def _symlink_refused(dest: Path, linked: list[str]) -> InvalidArgument:
+    return InvalidArgument(f"{', '.join(linked)} in {dest} is a symlink; refusing to write through it",
+                           stage="static-scripts",
+                           hint="give a --dest whose directories are real directories",
+                           details={"path": str(dest), "symlinks": linked})
+
+
+def _exists_refused(dest: Path, existing: list[str]) -> InvalidArgument:
+    return InvalidArgument(f"{', '.join(existing)} already exist in {dest}; refusing to overwrite",
+                           stage="static-scripts",
+                           hint="pass --force to replace them, or pick another --dest",
+                           details={"path": str(dest), "existing": existing})
+
+
+def _write_temp(directory: Path, name: str, data: bytes) -> Path:
+    """A new file holding ``data`` beside ``name`` in ``directory``, created with mode 0o666 so
+    that the umask applies as for any new file; flushed to disk before it is renamed."""
+    for _attempt in range(100):
+        temp = directory / f".{name}.{secrets.token_hex(6)}.tmp"
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+            raise
+        return temp
+    raise FileExistsError(errno.EEXIST, "no free temporary file name", str(directory))
+
+
+def _rename_new(temp: Path, target: Path) -> None:
+    """Rename ``temp`` to ``target`` unless ``target`` exists (FileExistsError then): os.rename
+    refuses an existing target on Windows; elsewhere a hard link does, and a file system without
+    hard links falls back to a check right before os.rename."""
+    if os.name == "nt":
+        os.rename(temp, target)
+        return
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.chmod(temp_name, 0o644)
-        os.replace(temp_name, target)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temp_name)
+        os.link(temp, target)
+    except FileExistsError:
         raise
+    except OSError:  # no hard links here (FAT, some network file systems)
+        if os.path.lexists(target):
+            raise FileExistsError(errno.EEXIST, "File exists", str(target)) from None
+        os.rename(temp, target)
+        return
+    os.unlink(temp)

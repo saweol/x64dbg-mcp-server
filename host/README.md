@@ -266,9 +266,15 @@ env = { GHIDRA_INSTALL_DIR = "/path/to/ghidra_12.2_PUBLIC", JAVA_HOME = "/path/t
 
 `[static.servers.<id>]` takes `command` (program and arguments; the program is an absolute path or a
 bare name found on `PATH`), `args` (arguments for the default program), `url` with `transport`
-(`http` or `sse`), `env` (environment of a stdio server; names containing TOKEN, KEY, SECRET or PASS
-are refused, because `mcp-config` prints the values) and `name` (the MCP server name; not
-`x64dbg-vm`, which is the gateway's).
+(`http` or `sse`), `env` (environment of a stdio server) and `name` (the MCP server name; not
+`x64dbg-vm`, which is the gateway's). `mcp-config` prints `command`, `args`, `url` and `env`
+verbatim, so the config refuses whatever looks like a secret: a URL with `user:password@` or a
+query parameter such as `token=`, and options, `NAME=VALUE` / `Name: value` pairs and `env` names
+with a name segment such as TOKEN, KEY, SECRET, PASS(WORD), AUTH, BEARER, COOKIE or CREDENTIALS
+(`--api-key`, `GH_TOKEN`, `DB_PASS`; KEYBOARD, COMPASS or BYPASS are fine, and so is a name ending
+in FILE, PATH or ENV, such as `--token-file`). Keep secrets in the MCP server's own configuration
+or environment. Control characters (TAB, CR, LF, NUL, ESC, C1) and Unicode bidi controls are
+refused there too, so the printed commands are exactly the configured ones.
 
 Register them:
 
@@ -276,6 +282,9 @@ Register them:
 x64dbg-vm-gateway mcp-config          # `claude mcp add` for the gateway and every [static] tool
 x64dbg-vm-gateway mcp-config --json   # the same as a list
 ```
+
+On Windows the printed commands are for PowerShell (every argument that is not a plain word is
+single-quoted, including `'--'`); elsewhere they are for a POSIX shell.
 
 User-specific parts stay as `<...>` placeholders and are listed under `fill in`. Each tool's entry
 also names its install command, its sync script in this installation and its caveats; `setup` ends

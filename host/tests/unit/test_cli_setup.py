@@ -5,7 +5,10 @@ are replaced in ``sys.modules`` so nothing reaches a VM."""
 
 from __future__ import annotations
 
+import base64
 import json
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -40,6 +43,13 @@ FRESH_GUEST = {"ok": False, "checks": [  # a guest before setup: no plugin answe
     {"name": "catalog:x64", "ok": True, "detail": "builtin list", "hint": None},
 ]}
 ALL_GREEN = {"ok": True, "checks": [{"name": "vmrun", "ok": True, "detail": "/usr/bin/vmrun", "hint": None}]}
+
+
+@pytest.fixture(autouse=True)
+def posix_host(monkeypatch) -> None:
+    """The printed commands follow the host's shell: the tests pin a POSIX host (CI runs them on
+    Windows too); the Windows tests set ``_windows_host`` to True themselves."""
+    monkeypatch.setattr(cli, "_windows_host", lambda: False)
 
 
 @pytest.fixture
@@ -162,7 +172,68 @@ def test_setup_help_lists_its_options(capsys):
 def test_shell_join_quotes_for_the_host_shell():
     argv = ["claude", "-e", "X=/a b/c.toml", "--", "serve"]
     assert cli.shell_join(argv, windows=False) == "claude -e 'X=/a b/c.toml' -- serve"
-    assert cli.shell_join(argv, windows=True) == 'claude -e "X=/a b/c.toml" -- serve'
+    assert cli.shell_join(argv, windows=True) == "claude -e 'X=/a b/c.toml' '--' serve"
+
+
+#: arguments a shell must not interpret: (argument, POSIX form, PowerShell form)
+SHELL_METACHARACTERS = [
+    ("a&b", "'a&b'", "'a&b'"),
+    ("a;b", "'a;b'", "'a;b'"),
+    ("50%", "50%", "'50%'"),  # %VAR% in cmd; POSIX shells leave % alone
+    ("%PATH%", "%PATH%", "'%PATH%'"),
+    ("$HOME", "'$HOME'", "'$HOME'"),
+    ("$(whoami)", "'$(whoami)'", "'$(whoami)'"),
+    ("x^y", "'x^y'", "'x^y'"),
+    ('say "hi"', "'say \"hi\"'", "'say \"hi\"'"),
+    ("it's", "'it'\"'\"'s'", "'it''s'"),
+    ("it\u2019s", "'it\u2019s'", "'it\u2019\u2019s'"),  # PowerShell also ends a string at typographic quotes
+    ("<in>", "'<in>'", "'<in>'"),
+    ("a>b", "'a>b'", "'a>b'"),
+    ("a|b", "'a|b'", "'a|b'"),
+    ("a b", "'a b'", "'a b'"),
+    ("back`tick", "'back`tick'", "'back`tick'"),
+    ("#comment", "'#comment'", "'#comment'"),
+    ("@scope/pkg", "@scope/pkg", "'@scope/pkg'"),  # @name splats a variable in PowerShell
+    ("a,b", "a,b", "'a,b'"),  # an array in PowerShell
+    ("{x}", "'{x}'", "'{x}'"),
+    ("(x)", "'(x)'", "'(x)'"),
+    ("1kb", "1kb", "'1kb'"),  # a number (1024) in PowerShell
+    ("-Dfoo.bar=1", "-Dfoo.bar=1", "'-Dfoo.bar=1'"),  # Windows PowerShell splits it at the dot
+    ("--", "--", "'--'"),  # PowerShell's end-of-parameters token, eaten by .ps1 shims
+    ("--%", "--%", "'--%'"),  # PowerShell's stop-parsing token
+]
+
+
+@pytest.mark.parametrize(("arg", "posix", "powershell"), SHELL_METACHARACTERS)
+def test_shell_join_quotes_shell_metacharacters(arg, posix, powershell):
+    argv = ["claude", "mcp", "add", "x", arg]
+    assert cli.shell_join(argv, windows=False) == "claude mcp add x " + posix
+    assert cli.shell_join(argv, windows=True) == "claude mcp add x " + powershell
+
+
+@pytest.mark.parametrize("arg", ["-e", "--project-path", "ida-multi-mcp", "X=/a/b.toml", "python3",
+                                 "C:\\x64dbg\\release", "C:\\PROGRA~1\\x.exe", "/opt/ghidra",
+                                 "\\\\server\\share\\m.exe", "a+b", "host:9100"])
+def test_plain_words_stay_unquoted_for_powershell(arg):
+    assert cli.shell_join(["claude", arg], windows=True) == f"claude {arg}"
+
+
+def test_a_program_that_needs_quotes_is_called_with_the_call_operator():
+    argv = ["C:\\Program Files\\x\\x.exe", "serve"]
+    assert cli.shell_join(argv, windows=True) == "& 'C:\\Program Files\\x\\x.exe' serve"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell 7 (pwsh)")
+def test_powershell_passes_every_argument_unchanged():
+    values = [arg for arg, _posix, _ps in SHELL_METACHARACTERS] + [
+        "C:\\x64dbg\\release", "X=C:\\a b\\c.toml", "<project-dir>", "-e", "0x10"]
+    code = "import json, sys; print(json.dumps(sys.argv[1:]))"
+    line = cli.shell_join([sys.executable, "-c", code, *values], windows=True)
+    encoded = base64.b64encode(line.encode("utf-16-le")).decode("ascii")
+    res = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                         capture_output=True, text=True, timeout=120, check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert json.loads(res.stdout) == values
 
 
 # ── the full run ────────────────────────────────────────────────────
@@ -576,16 +647,40 @@ def test_setup_dry_run_json_plan(cfg_path, capsys):
                                 "--snapshot", "MCP_CLEAN"])
     assert steps["provision"]["command"].startswith(provision)
     assert steps["provision"]["command"].endswith(" " + cli.shell_join(["--config", str(cfg_path)]))
-    if sys.platform != "win32":
-        assert f"install-plugin --x64dbg-root '{ROOT}' --no-relaunch" in steps["install-plugin"]["command"]
+    assert f"install-plugin --x64dbg-root '{ROOT}' --no-relaunch" in steps["install-plugin"]["command"]
+    assert data["shell"] == "posix"
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready")
-def test_setup_dry_run_commands_use_windows_quoting_on_windows(cfg_path, monkeypatch, capsys):
+def test_setup_dry_run_commands_are_powershell_commands_on_windows(cfg_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_windows_host", lambda: True)
     _, data = json_run(["--config", str(cfg_path), "--json", "setup", "--dry-run"], capsys)
-    assert f"--x64dbg-root {ROOT} --no-relaunch" in steps_of(data)["install-plugin"]["command"]
-    assert "'" not in steps_of(data)["provision"]["command"]
+    assert data["shell"] == "powershell"
+    install = steps_of(data)["install-plugin"]["command"]
+    assert install == cli.shell_join(["x64dbg-vm-gateway", "install-plugin", "--x64dbg-root", ROOT,
+                                      "--no-relaunch", "--config", str(cfg_path)], windows=True)
+    assert f"--x64dbg-root {ROOT} --no-relaunch" in install  # a Windows path needs no quotes there
+    register = data["register"]["command"]
+    assert register == cli.shell_join(register_argv(cfg_path), windows=True)
+    assert register.endswith(" '--' x64dbg-vm-gateway serve")
+    assert data["mcp_config"][1]["command"] == "claude mcp add ida-multi-mcp '--' python3 -m ida_multi_mcp"
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_dry_run_says_the_commands_are_for_powershell_on_windows(cfg_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_windows_host", lambda: True)
+    assert run(["--config", str(cfg_path), "setup", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == cli.POWERSHELL_NOTE and out.count("PowerShell") == 1
+    assert "  claude mcp add ida-multi-mcp '--' python3 -m ida_multi_mcp" in out.splitlines()
+    assert "    = " + cli.shell_join(["x64dbg-vm-gateway", "install-plugin", "--x64dbg-root", ROOT,
+                                      "--no-relaunch", "--config", str(cfg_path)], windows=True) in out
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_on_a_posix_host_does_not_mention_powershell(cfg_path, capsys):
+    assert run(["--config", str(cfg_path), "setup", "--dry-run"]) == 0
+    assert "PowerShell" not in capsys.readouterr().out
 
 
 @pytest.mark.usefixtures("provision", "ready", "vmrun_found")

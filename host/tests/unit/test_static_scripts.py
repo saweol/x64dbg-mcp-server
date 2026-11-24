@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from x64dbg_vm_gateway import static_scripts, static_tools
-from x64dbg_vm_gateway.errors import InvalidArgument
+from x64dbg_vm_gateway.errors import InvalidArgument, TransferError
 
 HOST_DIR = Path(__file__).resolve().parents[2]
 REPO = HOST_DIR.parent
@@ -43,6 +43,23 @@ def test_the_ida_script_lives_with_the_other_static_scripts() -> None:
     assert (STATIC_DIR / "ida" / "x64dbg_sync.py").is_file()
     assert (STATIC_DIR / "ida" / "tests").is_dir()
     assert not (REPO / "ida").exists(), "the IDA script moved to static/ida"
+
+
+def _markdown_files() -> list[Path]:
+    return sorted([*STATIC_DIR.rglob("*.md"), *(REPO / "docs").glob("*.md"), REPO / "README.md",
+                   HOST_DIR / "README.md"])
+
+
+def test_markdown_tables_end_with_a_blank_line() -> None:
+    """A line right after a table renders as one more table row."""
+    for path in _markdown_files():
+        fenced = False
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for number, (line, following) in enumerate(zip(lines, lines[1:], strict=False), start=2):
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+            elif not fenced and line.startswith("|") and following.strip() and not following.startswith("|"):
+                raise AssertionError(f"{path.relative_to(REPO)}:{number}: add a blank line after the table")
 
 
 # ── packaged copies (data/static) ───────────────────────────────────
@@ -142,3 +159,119 @@ def test_copy_to_refuses_a_file_as_destination(tmp_path) -> None:
     target.write_text("x", encoding="utf-8")
     with pytest.raises(InvalidArgument):
         static_scripts.copy_to(target)
+
+
+needs_symlinks = pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+SUBDIRS = sorted({rel.split("/")[0] for rel in static_scripts.SCRIPT_FILES})
+
+
+def _files(root: Path) -> list[Path]:
+    return sorted(p for p in root.rglob("*") if p.is_file())
+
+
+@needs_symlinks
+@pytest.mark.parametrize("force", [False, True])
+def test_copy_to_refuses_a_symlinked_destination(tmp_path, force) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    dest = tmp_path / "link"
+    dest.symlink_to(real, target_is_directory=True)
+    with pytest.raises(InvalidArgument) as ei:
+        static_scripts.copy_to(dest, force=force)
+    assert "symlink" in ei.value.message
+    assert list(real.iterdir()) == []
+
+
+@needs_symlinks
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("sub", SUBDIRS)
+def test_copy_to_refuses_a_symlinked_subdirectory_and_writes_nothing(tmp_path, sub, force) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    dest = tmp_path / "scripts"
+    dest.mkdir()
+    (dest / sub).symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(InvalidArgument) as ei:
+        static_scripts.copy_to(dest, force=force)
+    assert sub in ei.value.message and "symlink" in ei.value.message
+    assert list(elsewhere.iterdir()) == []
+    assert [p.name for p in dest.iterdir()] == [sub]  # nothing else was written
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_an_interrupted_copy_never_leaves_a_partial_script(tmp_path, monkeypatch, force) -> None:
+    """Each file is written under a temporary name and renamed into place: interrupted before the
+    rename, there is no script (and no temporary file) under dest."""
+    dest = tmp_path / "scripts"
+    if force:
+        static_scripts.copy_to(dest)
+        (dest / "ida" / "x64dbg_sync.py").write_text("old\n", encoding="utf-8")
+    before = {p: p.read_bytes() for p in _files(dest)} if dest.exists() else {}
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    for name in ("replace", "rename", "link"):
+        monkeypatch.setattr(static_scripts.os, name, interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        static_scripts.copy_to(dest, force=force)
+    assert {p: p.read_bytes() for p in _files(dest)} == before
+
+
+def test_without_force_a_file_that_appears_meanwhile_is_never_replaced(tmp_path, monkeypatch) -> None:
+    dest = tmp_path / "scripts"
+    write_temp = static_scripts._write_temp
+
+    def racing(directory: Path, name: str, data: bytes) -> Path:
+        if name == "x64dbg_sync.py":  # someone else creates it after the existence check
+            (directory / name).write_text("mine\n", encoding="utf-8")
+        return write_temp(directory, name, data)
+
+    monkeypatch.setattr(static_scripts, "_write_temp", racing)
+    with pytest.raises(InvalidArgument) as ei:
+        static_scripts.copy_to(dest)
+    assert "ida/x64dbg_sync.py" in ei.value.message
+    assert (dest / "ida" / "x64dbg_sync.py").read_text(encoding="utf-8") == "mine\n"
+    assert not [p for p in _files(dest) if p.name.endswith(".tmp")]
+
+
+def test_without_hard_links_the_copy_still_works(tmp_path, monkeypatch) -> None:
+    def no_links(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")  # FAT, some network file systems
+
+    monkeypatch.setattr(static_scripts.os, "link", no_links)
+    dest = tmp_path / "scripts"
+    assert static_scripts.copy_to(dest) == list(static_scripts.SCRIPT_FILES)
+    for rel in static_scripts.SCRIPT_FILES:
+        assert (dest / rel).read_bytes() == (STATIC_DIR / rel).read_bytes()
+    assert len(_files(dest)) == len(static_scripts.SCRIPT_FILES)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_both_modes_give_the_files_the_umask_mode(tmp_path) -> None:
+    old = os.umask(0o027)
+    try:
+        static_scripts.copy_to(tmp_path / "new")
+        static_scripts.copy_to(tmp_path / "forced")
+        static_scripts.copy_to(tmp_path / "forced", force=True)
+    finally:
+        os.umask(old)
+    for where in ("new", "forced"):
+        for rel in static_scripts.SCRIPT_FILES:
+            assert (tmp_path / where / rel).stat().st_mode & 0o777 == 0o640, (where, rel)
+
+
+def test_an_os_error_becomes_a_transfer_error(tmp_path, monkeypatch) -> None:
+    def denied(directory: Path, name: str, data: bytes) -> Path:
+        raise PermissionError(13, "Permission denied", str(directory / name))
+
+    monkeypatch.setattr(static_scripts, "_write_temp", denied)
+    with pytest.raises(TransferError) as ei:
+        static_scripts.copy_to(tmp_path / "scripts")
+    assert "Permission denied" in ei.value.message and str(tmp_path / "scripts") in ei.value.message
+    assert ei.value.hint and "--dest" in ei.value.hint
+
+
+def test_the_docstring_says_a_failed_run_can_leave_files() -> None:
+    doc = " ".join((static_scripts.copy_to.__doc__ or "").split())
+    assert "can leave the files it copied before the failure" in doc

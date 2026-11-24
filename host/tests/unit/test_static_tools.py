@@ -122,6 +122,8 @@ def test_registry_env_names_are_plain_and_not_secrets():
             assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
             assert not static_tools.looks_like_secret_name(name), name
             assert value.startswith("<") and value.endswith(">"), "user-specific values are placeholders"
+        for arg in (*tool.mcp.command, tool.mcp.url or ""):
+            assert static_tools.secret_in_argument(arg) is None, (tool.id, arg)
 
 
 def test_registry_holds_no_host_specific_paths():
@@ -140,14 +142,44 @@ def test_registry_holds_no_host_specific_paths():
         assert isinstance(m.notes, tuple) and all("\n" not in n for n in m.notes)
 
 
-@pytest.mark.parametrize("name", ["GW_TOKEN", "api_key", "MY_SECRET", "PASSWORD", "passphrase", "KEYFILE"])
+@pytest.mark.parametrize("name", [
+    "GW_TOKEN", "GH_TOKEN", "api_key", "API_KEY", "APIKEY", "api-key", "apiKey", "X-Api-Key", "MY_SECRET",
+    "PASSWORD", "passwd", "DB_PWD", "DB_PASS", "passphrase", "R2_PASSPHRASE", "AUTH_HEADER", "authorization",
+    "BEARER", "CREDENTIAL", "aws-credentials", "COOKIE", "private-key", "PRIVATE_KEY", "privateKey",
+    "SSH_KEY", "OPENAI_KEY", "keyStorePassword", "MyPass"])
 def test_secret_looking_names(name):
     assert static_tools.looks_like_secret_name(name)
 
 
-@pytest.mark.parametrize("name", ["GHIDRA_INSTALL_DIR", "JAVA_HOME", "PATH", "R2_HOME"])
+@pytest.mark.parametrize("name", [
+    "GHIDRA_INSTALL_DIR", "JAVA_HOME", "PATH", "R2_HOME", "KEYBOARD", "COMPASS", "BYPASS", "KEYFILE",
+    "MONKEY", "PASSAGE", "SECRETARY", "AUTHOR", "TOKENIZER", "project-path", "wait-for-analysis",
+    # where a secret is kept is not the secret: a file, path or variable name
+    "TOKEN_FILE", "password-file", "API_KEY_PATH", "token-env"])
 def test_plain_names(name):
     assert not static_tools.looks_like_secret_name(name)
+
+
+@pytest.mark.parametrize("arg", [
+    "--token", "--api-key", "--apiKey", "--password=hunter2", "-Dx.trustStorePassword=x", "--auth-header",
+    "--private-key", "--credentials", "--cookie=a", "API_KEY=sk-x", "GH_TOKEN=x", "db.password=x",
+    "Authorization: Bearer x", "Cookie: a=b", "X-Api-Key: x", "Bearer x", "token:abc",
+    "https://user:pw@host/mcp", "https://user@host/mcp", "http://h/mcp?token=x", "http://h/mcp?a=1&api_key=x",
+    "--url=https://u:p@h/", "-e GH_TOKEN=x", "JAVA_OPTS=-Xmx1g --password=x"])
+def test_arguments_that_carry_a_secret(arg):
+    reason = static_tools.secret_in_argument(arg)
+    assert reason  # what kind of secret, never the value
+    for value in ("hunter2", "sk-x", "pw@", "abc"):
+        assert value not in reason
+
+
+@pytest.mark.parametrize("arg", [
+    "--keyboard", "--compass", "--bypass", "--transport", "stdio", "--project-path", "/srv/pass word",
+    "--token-file", "--password-file=/run/pw", "MONKEY=1", "pass", "show", "mcp/token", "/opt/token-mcp/run",
+    "C:\\tools\\token.exe", "http://127.0.0.1:8089/sse", "https://h/mcp?verbose=1", "<project-dir>",
+    "host:9100", "--wait-for-analysis", "the bearer"])
+def test_arguments_without_a_secret(arg):
+    assert static_tools.secret_in_argument(arg) is None
 
 
 @pytest.mark.parametrize("bad", ["binja", "", "IDA", None, 3])

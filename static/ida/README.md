@@ -84,6 +84,7 @@ brackets):
 | `rva_to_runtime` | RVA | `module` | The RVA is bounds-checked against the module size. |
 | `runtime_to_static` (`runtime_to_ida`) | runtime address | `imagebase` or a known preferred base | |
 | `static_to_runtime` (`ida_to_runtime`) | IDA address | `module` and `imagebase` | There is no default, because a rebased IDB would silently give wrong addresses. |
+
 Module names are matched case-insensitively. They can be given as a file name, a path or
 a name without extension (`sample`). If the same DLL is loaded twice, each copy is keyed
 as `name@0x<base>`, and the bare name is rejected as ambiguous.
