@@ -1,366 +1,282 @@
-<p align="center"><img src="https://raw.githubusercontent.com/duty1g/x64dbg-mcp-server/main/logo.png" width="75%"/></p>
+# x64dbg-mcp-server — VMware 분석 루프 포크
 
-<h1 align="center">x64dbg-MCP Server</h1>
-<h4 align="center">MCP-powered agentic reverse engineering for x64dbg.</h4>
+> 이 저장소는 [duty1g/x64dbg-mcp-server](https://github.com/duty1g/x64dbg-mcp-server)(MIT)의 **포크**입니다. 원작자의 공식 배포판이 아닙니다.
+> 원본의 x64dbg MCP 플러그인을 바탕으로, **host에서 VMware 분석 VM과 디버거를 함께 다루는 MCP 게이트웨이**를 더했습니다.
+> 포크 기준점은 upstream `main @ 31c05bc`(플러그인 v1.9)입니다. 라이선스는 [아래](#라이선스)에 정리했습니다.
 
-<p align="center">
-  <img src="https://img.shields.io/github/stars/duty1g/x64dbg-mcp-server" alt="Stars"/>
-  <a href="https://github.com/duty1g/x64dbg-mcp-server/releases"><img src="https://img.shields.io/github/v/release/duty1g/x64dbg-mcp-server" alt="Version"/></a>
-  <a href="https://github.com/duty1g/x64dbg-mcp-server/releases"><img src="https://img.shields.io/github/downloads/duty1g/x64dbg-mcp-server/total" alt="Downloads"/></a>
-  <img src="https://img.shields.io/github/languages/top/duty1g/x64dbg-mcp-server" alt="Language"/>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"/></a>
-  <a href="https://duty1g.online"><img src="https://img.shields.io/badge/Red-Team-red" alt="Red Team"/></a>
-  <a href="https://duty1g.online"><img src="https://img.shields.io/badge/Reverse%20Engineering-purple" alt="Reverse Engineering"/></a>
-  <a href="https://twitter.com/duty_1g"><img src="https://img.shields.io/twitter/follow/duty_1g.svg?logo=twitter" alt="Twitter"/></a>
-</p>
-
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#install">Install</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#tools">Tools</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#building">Building</a> •
-  <a href="#project-structure">Structure</a>
-</p>
-
-#
-
-x64dbg-MCP Server is a native [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) plugin for [x64dbg](https://x64dbg.com/) that exposes the debugger's full functionality over HTTP. Connect any MCP-compatible AI assistant and control x64dbg programmatically: set breakpoints, step through code, read memory, dump registers, and more.
-
-Built with [Zig](https://ziglang.org/) — zero dependencies, single-binary output, cross-compiles to both x32 and x64 from any host. No .NET, no Python, no runtime — just drop the plugin into your x64dbg plugins folder and go.
-
-> **MCP 2024-11-05** — Streamable HTTP + SSE transports, JSON-RPC 2.0.
-
-
-## Features
-
-- **82 MCP Tools:** Full debugger control — disassembly, stepping, breakpoints, memory allocation, registers, modules, threads, call stack, pattern scanning, string extraction, xrefs, symbols, bookmarks, PE analysis, OEP detection, module dumping, PEB/SEH inspection, tracing, and more.
-- **22 Event Callbacks:** Full debugger event coverage — init, stop, breakpoint, exception, step, attach/detach, DLL load/unload, threads, and more.
-- **Zero Dependencies:** Pure native plugin, no runtime or framework needed.
-- **x32 and x64:** Single codebase, builds both architectures from one command.
-- **Dual Transport:** Streamable HTTP + SSE — compatible with any MCP client (new and legacy). SSE can be switched off.
-- **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request (compared in constant time, with a per-IP lockout of remote clients and a short lockout of local clients after repeated failures).
-- **Hardened Networking:** Loopback by default, fail-closed bind, client IP allowlist, request timeouts, bounded client threads, exclusive port binding.
-- **Config Dialog:** Change IP/port/token from the Plugins menu, auto-restarts the server on save.
-- **Auto-Start:** MCP server starts automatically when x64dbg launches.
-- **Cross-Compile:** Build Windows plugins from Linux, macOS, or WSL.
-
-
-## Install
-
-Download the latest release or build from source:
-
-1. Copy the contents of `dist/` into your x64dbg root folder (deploys both x32 and x64)
-2. Launch x64dbg
-
-The MCP server starts automatically. Default addresses (loopback only):
-- **x64:** `127.0.0.1:9094`
-- **x32:** `127.0.0.1:9095`
-
-
-## Usage
-
-Add to your MCP client config (`.mcp.json`, etc.):
-
-**Streamable HTTP (recommended):**
-```json
-{
-  "mcpServers": {
-    "x64dbg": {
-      "type": "http",
-      "url": "http://localhost:9094/",
-      "headers": {
-        "Authorization": "Bearer YOUR_TOKEN_HERE"
-      }
-    }
-  }
-}
-```
-
-**SSE (legacy clients):**
-```json
-{
-  "mcpServers": {
-    "x64dbg": {
-      "type": "sse",
-      "url": "http://localhost:9094/sse",
-      "headers": {
-        "Authorization": "Bearer YOUR_TOKEN_HERE"
-      }
-    }
-  }
-}
-```
-
-If connecting from WSL or a remote machine, prefer an SSH tunnel to `127.0.0.1`. To bind another address (for example `0.0.0.0`) you must also opt in through `mcp_config.json`: set `"AllowExternal": true`, list the permitted clients in `"AllowedClients"`, and use a token of at least 32 characters (see [Remote access](#remote-access)). Otherwise the server refuses to start. The traffic is plain HTTP, so only expose it on a trusted, isolated network.
-
-**Example — AI-assisted reverse engineering session:**
-```
-You:    Load calc.exe and break at the entry point
-AI: [calls LoadBinary, SetBreakpoint, run, WaitForPause]
-        Loaded calc.exe, hit breakpoint at 0x7FF7A1234000 in calc.exe
-
-You:    What are the current registers?
-AI: [calls GetAllRegisters]
-        RAX: 0x0, RCX: 0x7FF7A1234000, RDX: 0x1, ...
-
-You:    Read 64 bytes at the current instruction pointer
-AI: [calls ReadMemory]
-        48 83 EC 28 E8 12 34 00 00 ...
-
-You:    Step over the next 3 instructions and show me the stack
-AI: [calls StepOver x3, GetCallStack]
-        Stepped to 0x7FF7A1234010, call stack: ...
-```
-
-
-## Tools
-
-82 MCP tools covering the full x64dbg debugging workflow.
-
-### Always available
-| Tool | Description |
-|------|-------------|
-| `GetDebugState` | Current debugger state, PID, instruction pointer |
-| `GetServerInfo` | Identify the backend: arch, version, x64dbg PID, debuggee path, ArtifactDir (JSON) |
-| `ProbeFile` | Diagnostics: check a file from inside x64dbg exactly like `init` does (attributes, open with `FILE_SHARE_READ`, final path, PE machine) |
-| `LoadBinary` | Load an executable (optional arguments / working directory) and wait until it is paused |
-| `SetArtifactDir` | Set the directory that relative dump/database paths are written to |
-| `ExecuteDebuggerCommand` | Run any x64dbg command |
-| `ListCommandsByCategory` | List available MCP tools |
-| `SearchForStrings` | Search process memory for text |
-| `GetEventLog` | Last N debugger events (exceptions, breakpoints, DLL loads) |
-| `ClearEventLog` | Clear the event log |
-| `EvalExpression` | Evaluate any x64dbg expression (address, register, arithmetic) |
-| `AttachProcess` | Attach to a running process by PID |
-| `Echo` | Echo input back |
-| `WaitForEvent` | Long-poll for debugger events (breakpoint, pause, resume, exception) |
-
-### Requires active debug session
-| Tool | Description |
-|------|-------------|
-| `GetCurrentAddress` | Current EIP/RIP with label and comment |
-| `Disassemble` | Disassemble N instructions at an address |
-| `DisassembleFunction` | Disassemble an entire function by boundaries |
-| `ReadMemory` | Hex dump of process memory |
-| `WaitForPause` | Block until target pauses |
-| `run` | Resume execution (F9) |
-| `StepInto` | Single-step into calls (F7) |
-| `StepOver` | Step over calls (F8) |
-| `StepOut` | Run until return (Ctrl+F9) |
-| `PauseDebug` | Pause the target (F12) |
-| `StopDebug` | Terminate debug session |
-| `RestartDebug` | Restart debug session (reuses `LoadBinary`'s arguments / working directory) |
-| `SetBreakpoint` | Set INT3 breakpoint at address/symbol |
-| `SetHardwareBreakpoint` | Set hardware breakpoint (DR0-DR3, read/write/execute; `size` 1, 2, 4 or 8, 8 on x64 only) |
-| `SetConditionalBreakpoint` | Set breakpoint with condition expression and optional log |
-| `EnableBreakpoint` | Enable a breakpoint at a given address |
-| `DisableBreakpoint` | Disable a breakpoint without deleting it |
-| `ToggleBreakpoint` | Toggle a breakpoint between enabled and disabled |
-| `DeleteBreakpoint` | Remove a breakpoint |
-| `DeleteAllBreakpoints` | Remove all breakpoints (normal, hardware, memory) |
-| `ResetHitCount` | Reset a breakpoint's hit counter to zero |
-| `ListBreakpoints` | List all active breakpoints |
-| `GetAllRegisters` | Dump all general-purpose registers |
-| `SetRegister` | Set a CPU register value |
-| `GetCallStack` | Current thread call stack |
-| `GetThreads` | List all threads with IDs and instruction pointers |
-| `SwitchThread` | Switch active thread context |
-| `SuspendThread` | Suspend a thread by its thread ID |
-| `ResumeThread` | Resume a suspended thread |
-| `ListModules` | List loaded modules with base addresses and sizes |
-| `GetMemoryMap` | Memory regions with addresses, sizes, and protection |
-| `GetDumpableRegions` | List committed, readable memory regions |
-| `AllocateMemory` | Allocate memory in the target process |
-| `FreeMemory` | Free allocated memory in the target process |
-| `WriteMemToAddress` | Patch memory with hex bytes |
-| `RestorePatches` | Restore all patches to original bytes |
-| `Assemble` | Assemble an instruction at an address |
-| `CommentOrLabelAtAddress` | Add comment/label in disassembly |
-| `SetBookmark` | Set a bookmark at an address |
-| `DeleteBookmark` | Delete a bookmark |
-| `ListBookmarks` | List all bookmarks |
-| `GetImports` | Show module import table |
-| `GetExports` | Show module export table |
-| `SearchSymbols` | Search for symbols matching a pattern |
-| `ListSymbols` | List exported symbols of a module |
-| `GetPatches` | List all memory patches |
-| `FindPattern` | Scan module memory for byte pattern with ?? wildcards |
-| `GetStrings` | Extract ASCII strings from a module's memory |
-| `GetReferences` | Find CALL/JMP xrefs to a target address |
-| `GetFunctions` | List analyzed functions with addresses and labels |
-| `AnalyzeModule` | PE structure analysis: sections, EP, image size |
-| `DetectOEP` | Detect Original Entry Point for packed executables |
-| `DumpMemory` | Save memory region to file on disk (relative paths go to ArtifactDir) |
-| `DumpModule` | Dump an entire module to a file (relative paths go to ArtifactDir) |
-| `RunToAddress` | Run until hitting a specific address |
-| `TraceInto` | Step N instructions recording address + disassembly |
-| `FollowPointer` | Dereference pointer chain N levels deep |
-| `WatchExpressions` | Evaluate multiple expressions in one call |
-| `GetSEHChain` | Walk Structured Exception Handler chain (x32) |
-| `GetPEB` | Read Process Environment Block fields |
-| `GetArguments` | Read function arguments from stack/registers |
-| `SetMemoryBreakpoint` | Set memory breakpoint (read/write/execute) |
-| `SetExceptionBreakpoint` | Configure exception breakpoint (break or ignore, first/second/all chance) |
-| `DeleteExceptionBreakpoint` | Delete an exception breakpoint |
-| `AnalyzeCode` | Run code analysis (function, module, or control flow) |
-| `TraceOver` | Trace N instructions stepping over calls |
-| `SetBreakpointCommand` | Set a command to execute when a breakpoint is hit |
-| `SetBreakpointFastResume` | Enable/disable fast resume (auto-continue) on a breakpoint |
-| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file (`filePath` omitted or `""` = default location) |
-
-
-## Configuration
-
-Go to **Plugins > x64dbg-MCP Server > Configure MCP Server...** to change the bind address, port, auto-start and auth token.
-
-- `127.0.0.1` — local-only access (default)
-- any other address (e.g. `0.0.0.0`) — needs the file-only keys described under [Remote access](#remote-access)
-
-Saving restarts the server. Config is persisted to `mcp_config.json` next to the x64dbg executable (x32dbg and x64dbg each have their own file and token).
-
-**A restart can be delayed.** The port is bound with `SO_EXCLUSIVEADDRUSE`, so the restarted server cannot bind it while connections accepted by the previous instance are still open (for example a `run`, `WaitForPause` or `ExecuteDebuggerCommand` call that is still waiting for the target). It retries the bind once per second and logs `Port <n> is in use (another process, or connections of the previous server instance are still open); retrying every 1 s.` (once a minute) until those connections have drained, then starts listening. If the port is still busy 30 seconds after the last old connection closed (11 minutes at most), the server logs that and stops; see [Remote access](#remote-access).
-
-### Authentication
-
-A Bearer token is auto-generated on first run and required on every request, for every HTTP method (including `OPTIONS`, which is answered with `405` once authenticated; the server sends no CORS headers because MCP clients are not browsers). The MCP server has full debugger control and can read/write process memory — all requests without a valid token receive `401 Unauthorized`. Click **Generate** in the config dialog to rotate the token, or **Copy** to copy it to clipboard. Clients must include the token as an `Authorization: Bearer <token>` header.
-
-Tokens are compared in constant time. After `AuthMaxFailures` failed attempts within 60 seconds the client is locked out: every request from it is still read and then answered with `429 Too Many Requests` (even one with the correct token) until the lockout expires, with a `Retry-After` header and a JSON body `{"error": "Too many failed authentication attempts", "retry_after_s": <seconds>}`. A client can therefore tell "locked out" (`429`) from "wrong token" (`401`) and "server down" (connection refused); connections are never dropped because of a lockout.
-
-- **Remote clients** are tracked per IP address and locked out for `AuthLockoutSeconds`.
-- **Loopback clients** (`127.0.0.0/8`) count as one client (a local process can pick any `127.x.y.z` source address) and are locked out for only 5 seconds (or `AuthLockoutSeconds`, if that is shorter). Every local process shares that lockout, so it is kept short: each lockout lasts at most 5 seconds, but a local process that keeps sending wrong tokens can lock the loopback clients out again as soon as one ends, and your MCP client gets `429` meanwhile. The lockout only slows a local token guesser down; on loopback the token itself is the security boundary. Loopback requests without any `Authorization` header are answered with `401` but not counted: a web page open in a local browser can make it send such requests to `127.0.0.1`, but cannot add an `Authorization` header to a cross-origin request without a CORS preflight, which this server never approves, so ordinary web pages cannot trigger the lockout.
-
-A remote client should stop after a `401` instead of retrying with the same token, and wait `Retry-After` seconds after a `429`. (The host gateway in `host/` does not read `Retry-After` yet: while the plugin answers `429` it reports that backend as unhealthy.)
-
-### mcp_config.json
-
-The dialog edits the first four keys; all other keys are **file-only** (edit the JSON while x64dbg is closed, or edit it and then press **Save** in the dialog to restart the server; unknown keys are preserved when the dialog saves).
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `IpAddress` | `"127.0.0.1"` | IPv4 address to bind. Must be a valid dotted IPv4 address — an invalid value makes the server refuse to start (it no longer falls back to `0.0.0.0`). |
-| `Port` | `9094` (x64) / `9095` (x32) | TCP port, 1–65535. |
-| `AutoStart` | `true` | Start the server when the plugin loads. |
-| `AuthToken` | generated | 1–64 characters, no control characters and no leading/trailing space (those can never match an `Authorization` header). Generated tokens are 32 hex characters. Tokens with inner spaces or non-ASCII characters (accepted by v1.9) still load, but the server logs a warning because some HTTP clients cannot send them. |
-| `AllowExternal` | `false` | Must be `true` to bind any non-loopback address. Then the token must be at least 32 characters. |
-| `AllowedClients` | `[]` | IPv4 addresses or CIDR ranges (`"192.168.56.0/24"`, `"10.0.0.5"`) allowed to connect, max 64. Required (non-empty) for a non-loopback bind. Loopback clients are always allowed. |
-| `MaxClients` | `16` | Maximum concurrent connections (1–256); extra connections are closed immediately. |
-| `EnableSse` | `true` | Serve the legacy SSE transport (`/sse`, `/messages`). Set `false` when exposing the server; Streamable HTTP keeps working. |
-| `ArtifactDir` | `""` | Absolute directory (drive or UNC path) for relative `filePath` arguments of `DumpMemory`, `DumpModule` and `SaveDatabase`. |
-| `AuthMaxFailures` | `5` | Failed authentications (within 60 s) before a lockout, 1–1000. Counted per remote IP; all loopback clients share one count, which only includes requests that sent an `Authorization` header and is not reset by a successful request (it may come from another local process). |
-| `AuthLockoutSeconds` | `300` | Lockout duration for remote clients in seconds, 1–86400. Loopback clients are locked out for 5 seconds (or this value, if shorter). |
-
-If `mcp_config.json` exists but cannot be parsed (invalid JSON, a duplicate key, a wrong type or an out-of-range value), the plugin logs the offending key, leaves the file untouched and does not start the server. Fix the file, or open the dialog and press **Save** to replace it.
-
-### Remote access
-
-The server speaks plain HTTP. Prefer an SSH tunnel to `127.0.0.1`. If you must listen on another interface (for example for a host-side gateway talking to a VM over a host-only network):
-
-```json
-{
-  "IpAddress": "0.0.0.0",
-  "Port": 9094,
-  "AutoStart": true,
-  "AuthToken": "<at least 32 characters>",
-  "AllowExternal": true,
-  "AllowedClients": ["192.168.56.1"],
-  "EnableSse": false
-}
-```
-
-Hardening that applies to every bind:
-
-- The request line and headers must arrive within 5 seconds and the whole request within 10 seconds of connecting; responses use a 10 second send timeout.
-- At most `MaxClients` connections are served at once; the peer address is checked against `AllowedClients` **before** a thread is created for it (rejected peers get a connection reset). Locked-out peers, loopback or remote, are admitted and answered with `429` (plus `Retry-After`) after their request has been read.
-- The port is bound with `SO_EXCLUSIVEADDRUSE`, so another process cannot share it. If the port is busy when the server (re)starts, it retries once per second while connections of the previous server instance are still open and for 30 seconds after that (11 minutes at most), then logs that the port is in use and stops; start it again from the plugin menu (or with the `StartMCPServer` command) once the port is free. A port owned by another process (for example a second x64dbg) therefore fails after about 30 seconds instead of looking "running".
-- SSE session ids are random 64-bit values, so one SSE client cannot address another client's stream.
-- SSE notifications are queued per client in a 1 MiB buffer allocated when the client connects (queueing an event copies into it and never allocates on the debugger thread); a client that stops reading is dropped when its buffer is full or after a 5 second send timeout, and never blocks the debugger thread.
-- State-changing tools are serialised (**new in v1.10**: v1.9 let them interleave). While one runs, another state-changing call waits up to 10 seconds and then returns `BUSY` without executing. A blocking `run` or `ExecuteDebuggerCommand` holds the lock until the target pauses, its timeout expires, or its HTTP client disconnects; so, for example, `SetBreakpoint` while a `run` is waiting returns `BUSY` — call `PauseDebug` (or `WaitForPause`) and retry. Read-only tools, `PauseDebug`, `WaitForEvent`, `WaitForPause` and `GetDebugState` are never blocked.
-
-### Artifact directory
-
-`GetServerInfo` reports the current `artifact_dir`. Set it in `mcp_config.json` (`ArtifactDir`) or at runtime with `SetArtifactDir` (runtime only; saving the dialog or reloading the plugin restores the file value). Relative `filePath` values are joined to it; absolute paths are used as-is. Paths with `..`, alternate data streams (`file:stream`), device prefixes (`\\?\`, `\\.\`), reserved names (`CON`, `NUL`, ...) or control characters are rejected. Without an `ArtifactDir`, relative paths are passed to x64dbg unchanged, as before.
-
-
-## Building
-
-Requires [Zig 0.14.0](https://ziglang.org/download/#release-0.14.0) (the version CI uses). Builds on Windows, WSL, Linux, or macOS.
-
-```console
-zig build -Doptimize=ReleaseSafe --prefix dist
-```
-
-Run the unit tests (pure logic: JSON, config parsing, network policy, path resolution, queues; they run on the build host):
-
-```console
-zig build test
-```
-
-Output mirrors x64dbg's folder structure — copy the contents of `dist/` into your x64dbg root to deploy both architectures at once:
-```
-dist/
-├── x32/
-│   └── plugins/
-│       └── x64dbg-MCP-Server.dp32
-└── x64/
-    └── plugins/
-        └── x64dbg-MCP-Server.dp64
-```
-
-
-## Project Structure
-
-```
-├── build.zig                     # build config — x32 + x64 cross-compilation
-├── build.zig.zon                 # package manifest
-└── src/
-    ├── main.zig                  # plugin entry point, menu, callbacks
-    ├── core/
-    │   ├── bridge.zig            # x64dbg SDK bindings (runtime-resolved)
-    │   ├── config.zig            # Win32 config dialog and persistence
-    │   ├── cfgjson.zig           # mcp_config.json parse/serialize (tested)
-    │   ├── http.zig              # HTTP request framing helpers (tested)
-    │   ├── launch.zig            # LoadBinary/RestartDebug launch tracking (tested)
-    │   ├── mcp_server.zig        # HTTP server and JSON-RPC dispatch
-    │   ├── netpolicy.zig         # bind policy, allowlist, token, lockout (tested)
-    │   ├── pathutil.zig          # ArtifactDir path resolution (tested)
-    │   ├── ring.zig              # locked event queues (tested)
-    │   ├── ssehub.zig            # SSE client table and per-client send buffers (tested)
-    │   └── sync.zig              # SRWLOCK wrapper (tested)
-    ├── mcp/
-    │   ├── cmdline.zig           # x64dbg command quoting and numbers (tested)
-    │   ├── json.zig              # JSON writer and parser helpers (tested)
-    │   ├── serverinfo.zig        # GetServerInfo payload (tested)
-    │   ├── toolpolicy.zig        # which tools are serialised (tested)
-    │   └── tools.zig             # MCP tool definitions and handlers
-    └── resources/
-        └── icons.zig             # embedded PNG icon data
-```
-
-
-## How It Works
-
-The plugin loads into x64dbg at startup, resolves the debugger's API symbols at runtime from `x64bridge.dll` and `x64dbg.dll`, then spins up an HTTP server on a background thread. MCP clients connect over HTTP and send JSON-RPC requests to invoke tools — each tool maps directly to x64dbg SDK calls (breakpoints, memory reads, command execution, etc.).
-
-No polling, no external processes — the plugin lives inside x64dbg's address space with direct access to the debugger API.
-
+**English summary.** A fork of duty1g/x64dbg-mcp-server (MIT). It adds `x64dbg-vm-gateway`, a host-side MCP server that reverts a VMware analysis VM to a clean snapshot, uploads the sample, keeps x64dbg/x32dbg alive in the guest, relays the plugin's 83 debugger tools under their original names and collects the artifacts back to the host. English references: [`host/README.md`](host/README.md) (gateway) and [`docs/PLUGIN.md`](docs/PLUGIN.md) (plugin). Licensed under MIT like the original; see [License](#라이선스).
 
 ---
 
-## Disclaimer
+## 한눈에 보기
 
-> This tool is intended for legitimate reverse engineering, malware analysis, security research, and educational purposes only. It provides full debugger control over running processes — including memory read/write, code execution, and process manipulation — over a network interface.
->
-> By using this software, you accept full responsibility for how it is used. The author is not liable for any misuse, damage, or legal consequences resulting from the use of this tool. Always ensure you have proper authorization before debugging or analyzing any software.
->
-> Do not expose the MCP server to untrusted networks. While Bearer token authentication is enforced, the server communicates over unencrypted HTTP, and anyone holding the token can run arbitrary debugger commands (and therefore code) on the debugging machine.
+AI 클라이언트(Claude Code 등)는 host에서 도는 게이트웨이 **하나에만** 연결합니다. 나머지는 게이트웨이가 맡습니다.
 
+```
+Claude Code ──stdio──────► x64dbg-vm-gateway (host, Python)
+원격 PC ─────HTTPS────────►   ├─ vmrun ──────────► VMware: 전원, 스냅샷, 게스트 파일·프로세스
+                              └─ HTTP + Bearer ──► 게스트 x64dbg :9094 / x32dbg :9095 (플러그인 v1.10)
+```
 
----
+분석 한 바퀴는 다음과 같이 돕니다.
 
-### License
+```
+analysis_start ──► 분석 (x64dbg 툴 83개를 원래 이름으로) ──► analysis_collect ──► analysis_finish
+ 클린 스냅샷 복원       SetBreakpoint, run, DumpMemory ...        결과물을 host로 회수     클린 스냅샷으로 복원
+ 샘플 업로드·해시 확인                                            (덤프, x64dbg DB, zip)
+ 디버거에 로드(정지 상태)
+```
 
-MIT. See [LICENSE](./LICENSE).
+AI에게 보이는 툴은 게이트웨이 툴 21개와 플러그인 툴 83개, 합계 104개입니다.
 
-Made with 🖤 by [@duty1g](https://github.com/duty1g)
+## 왜 만들었나
+
+원본 플러그인은 x64dbg 안에서 MCP 서버를 띄웁니다. 설치가 간단하고 디버거를 직접 다루기에 좋습니다. 그런데 악성코드를 VM에서 반복 분석하는 데 쓰려니 불편한 점이 넷 있었습니다.
+
+1. **디버거가 죽으면 연결도 끊깁니다.** 샘플이 디버거를 죽이거나 x64dbg가 크래시하면 MCP 엔드포인트도 함께 사라집니다. AI 세션은 그 사실을 모른 채 실패만 반복합니다.
+2. **VM 제어는 사람 몫이었습니다.** 분석 전 클린 스냅샷 복원, 전원 관리를 VMware 화면에서 손으로 했습니다.
+3. **파일을 넣고 빼는 것도 손으로 했습니다.** 샘플을 VM에 넣고 덤프나 DB를 꺼내려면 공유 폴더를 켜야 했고, 그러면 격리가 깨집니다.
+4. **클린 상태로 돌아가는 것을 사람이 챙겨야 했습니다.** 결과물을 챙기기 전에 복원하면 분석이 날아가고, 복원을 잊으면 다음 분석이 오염됩니다.
+
+그래서 **"MCP가 로드된 클린 VM → 샘플 전송 → 지시에 따른 분석 → 결과물 회수 → 복원"** 루프를 AI가 처음부터 끝까지 돌릴 수 있게 하는 것을 목표로 삼았습니다. 사람은 무엇을 분석할지 지시하고, 되돌릴 수 없는 결정만 내립니다.
+
+## 설계 철학
+
+| 원칙 | 의미 |
+|---|---|
+| **단일 제어자** | VM과 분석 작업(job) 상태를 바꾸는 프로세스는 게이트웨이 하나뿐입니다. 게이트웨이의 수명은 VM·디버거와 무관하므로, x64dbg가 죽거나 VM을 복원해도 AI의 MCP 연결은 그대로입니다. 죽은 디버거는 게이트웨이가 다시 띄웁니다. |
+| **원본을 감싸되 바꾸지 않는다** | 플러그인 툴은 원래 이름(`SetBreakpoint`, `run`, `DumpMemory` …) 그대로 중계합니다. 원본 사용법과 `SKILL.md`가 그대로 통하고, 플러그인은 게이트웨이 없이 단독으로도 예전처럼 쓸 수 있습니다. |
+| **fail-closed** | 결과물 회수가 확인되기 전에는 복원하지 않습니다. AI가 `force` 같은 플래그로 이 규칙을 넘을 수 없습니다. 작업을 버리는 결정은 사람만 CLI(`discard`)로 내립니다. 클린·보호 스냅샷은 지울 수 없고, VM이 격리되어 있지 않으면(공유 폴더가 켜져 있거나, 네트워크가 host-only가 아닌 bridged·NAT 등) 분석을 시작하지 않습니다. |
+| **상태 변경은 자동 재시도하지 않는다** | `run`, step, 브레이크포인트처럼 상태를 바꾸는 호출은 두 번 실행되면 분석이 틀어집니다. 그래서 자동 재시도는 읽기 호출에만 합니다. |
+| **세상이 바뀌면 알린다(epoch)** | 디버거가 재기동되거나 VM이 복원되면 epoch를 올립니다. 그다음 상태 변경 호출은 `BACKEND_RESTARTED`로 막혀서, AI가 사라진 주소나 BP를 믿고 계속 진행하지 못합니다. AI가 `session_status`로 상황을 확인하면 다시 진행할 수 있습니다. |
+| **게스트는 적대적이다** | 게스트에서 온 문자열·파일·zip·JSON은 모두 공격자 입력으로 다룹니다. 게스트 출력은 `<untrusted_guest_output>`으로 감싸 프롬프트 인젝션을 막고, zip은 안전하게 풀고, 회수한 파일은 host에서 실행하지 않습니다. |
+| **비밀값은 설정 파일에 두지 않는다** | 설정 파일에는 환경 변수 **이름**만 적고, 값은 권한 0600인 env 파일에 둡니다. 플러그인 토큰은 게스트 설정에서 읽어 옵니다. |
+| **검증한 것만 "된다"고 쓴다** | 실제 VM에서 확인한 것과 코드상 지원만 하는 것을 문서에서 구분합니다([검증 현황](#검증-현황)). |
+
+## 원본 대비 달라진 점
+
+| 영역 | 원본 (v1.9, `31c05bc`) | 이 포크 |
+|---|---|---|
+| x64dbg 플러그인 `src/` | v1.9, 툴 80개 | **v1.10, 툴 83개.** 네트워크 하드닝: 잘못된 bind 주소를 `0.0.0.0`으로 되돌리던 동작을 없애고 시작을 거부, 외부 바인드에 `AllowExternal`·`AllowedClients`·32자 이상 토큰 요구, 요청 타임아웃, 동시 연결 상한, 포트 독점 바인드. 인증 실패 잠금(429)과 SSE 끄기 옵션. 상태 변경 툴 직렬화. `GetServerInfo`·`SetArtifactDir`·`ProbeFile` 추가. `GetDebugState`가 정지 상태를 `LOCKED` 대신 `PAUSED`로 보고합니다. 자세한 내용은 [`docs/PLUGIN.md`](docs/PLUGIN.md)를 보세요. |
+| host 게이트웨이 `host/` | 없음 | 새로 작성(Python). VM 제어, 파일 전송, 디버거 감시·재기동, job 상태기계, 원격 HTTPS, 감사 로그 |
+| 게스트 준비 `guest/` | 없음 | `provision.ps1`: 자동 로그온, 디버거 자동 실행 예약 작업, 플러그인 설정, 작업 폴더 |
+| IDA 연동 `ida/` | 없음 | x64dbg 런타임 주소 ↔ IDA 주소 변환, 주석·이름 주고받기 |
+| 문서 | `README.md` | 원본 README는 [`docs/PLUGIN.md`](docs/PLUGIN.md)로 옮겼습니다. 설계·실측·빠른 시작 문서를 더했습니다. |
+
+## 요구 사항
+
+| 항목 | 내용 |
+|---|---|
+| host | Linux(실검증). Windows와 macOS(Intel)는 코드상 지원하지만 실검증 전입니다. |
+| VMware | Workstation 17(`vmrun` 포함). 검증 환경은 17.6입니다. |
+| 도구 | [uv](https://docs.astral.sh/uv/)(Python 3.11 이상을 알아서 준비합니다). 플러그인을 직접 빌드할 때만 [Zig 0.14.0](https://ziglang.org/download/#release-0.14.0)이 필요합니다. |
+| 게스트 | Windows 10 이상, VMware Tools, x64dbg(`release\x64`, `release\x32`), 암호가 있는 로컬 관리자 계정 |
+| 네트워크 | host-only(또는 네트워크 없음). 격리 점검이 공유 폴더가 켜진 VM과 host-only가 아닌 네트워크(bridged, NAT 등)를 거부합니다. |
+
+## 설치와 준비
+
+전체 절차와 설정 예시는 [`docs/QUICKSTART_KO.md`](docs/QUICKSTART_KO.md)에 있습니다. 아래는 요약입니다.
+
+**1. 빌드와 설치**
+
+```bash
+zig build -Doptimize=ReleaseSafe --prefix dist   # 플러그인: dist/x64/plugins/*.dp64, dist/x32/plugins/*.dp32
+uv tool install ./host                           # 게이트웨이: x64dbg-vm-gateway 명령
+```
+
+**2. 설정.** 비밀값은 0600 env 파일에 두고, 설정 파일에는 변수 이름만 적습니다.
+
+```bash
+mkdir -p ~/.config/x64dbg-vm-gateway
+install -m 600 /dev/null ~/.config/x64dbg-vm-gateway/lab.env
+#   X64DBG_GW_GUEST_PW=<게스트 암호>
+x64dbg-vm-gateway init        # 대화식으로 config.toml 작성 (vmx 경로, 클린 스냅샷 이름, 게스트 계정, x64dbg 경로 등)
+```
+
+`init`은 게스트 계정을 `guest_user`에, 암호는 변수 이름만 `guest_password_env`(기본 `X64DBG_GW_GUEST_PW`)에 적습니다. 그다음 `config.toml`의 `[gateway]`에 `env_file = "~/.config/x64dbg-vm-gateway/lab.env"`와 `upload_roots`(분석할 샘플을 둘 host 경로)를 추가합니다. 계정 이름도 env 파일에 두려면 프로필에 `guest_user_env`를 씁니다.
+
+**3. 게스트 준비 (한 번만)**
+
+```bash
+# 플러그인 배포: 디버거 종료 → 기존 플러그인을 plugins_backup\에 백업 → 복사 → 재기동
+x64dbg-vm-gateway install-plugin --dist dist --x64dbg-root 'C:\x64dbg\release'
+
+# 프로비저닝: 자동 로그온, 디버거 자동 실행(최고 권한), 플러그인 설정·토큰, 작업 폴더
+#             → 재부팅 → 두 플러그인 응답 확인 → 메모리 포함 클린 스냅샷
+x64dbg-vm-gateway provision --x64dbg-root 'C:\x64dbg\release' --snapshot MCP_CLEAN
+```
+
+**4. 점검**
+
+```bash
+x64dbg-vm-gateway doctor      # vmrun, 스냅샷, VMware Tools, 게스트 계정, 격리, VM 인스턴스 수, 백엔드 토큰·버전
+```
+
+**5. Claude Code에 등록**
+
+```bash
+claude mcp add x64dbg-vm -- x64dbg-vm-gateway serve
+```
+
+## 사용법
+
+Claude Code에서 평소처럼 지시하면 됩니다.
+
+> `~/samples/a.exe` 분석 시작해. kernel32.CreateFileW에 BP 걸고 실행해서 인자 확인하고, 스택 덤프 저장한 다음 artifact 회수하고 복원해.
+
+AI는 대략 다음 순서로 툴을 호출합니다.
+
+1. `analysis_start`: 격리를 점검하고 클린 스냅샷으로 복원합니다. 샘플을 해시 확인과 함께 올리고, 아키텍처에 맞는 디버거에 정지 상태로 로드합니다. 샘플을 자동으로 실행하지는 않습니다.
+2. `SetBreakpoint` → `run` → `GetArguments` → `DumpMemory`: 상대 경로로 지정한 덤프는 job의 게스트 `out` 폴더에 저장됩니다.
+3. `analysis_collect`: x64dbg DB를 저장하고 `out`을 묶어 host로 가져온 뒤, 안전하게 풀고 manifest를 돌려줍니다.
+4. `analysis_finish`: 클린 스냅샷으로 복원합니다. 회수 전에는 거부됩니다.
+
+회수한 결과물은 `~/mcp-lab/jobs/<job_id>/artifacts/`(`manifest.json`, `files/`, `raw/out.zip`)에 쌓입니다.
+
+알아 두면 좋은 동작은 다음과 같습니다.
+
+- **오래 걸리는 작업**(`analysis_start`, 복원, 전원)은 정해진 시간이 지나면 `{"state": "in_progress"}`를 돌려주고 백그라운드에서 계속합니다. 진행 상황은 `session_status`로 확인합니다.
+- **디버거가 죽으면** 게이트웨이가 다시 띄웁니다. 다음 상태 변경 호출은 `BACKEND_RESTARTED`를 받고, `session_status`로 확인한 뒤 이어서 진행합니다. `analysis_start(reload_on_restart=true)`를 주면 샘플도 다시 로드합니다.
+- **목록에 없는 플러그인 툴**은 `debugger_call`로 부를 수 있습니다.
+
+### 게이트웨이 툴 (21개)
+
+| 등급 | 툴 |
+|---|---|
+| 관찰(읽기 전용) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `ida_rebase`, `jobs_list`, `jobs_show` |
+| 게스트 변경 | `file_upload`, `debugger_select`, `debugger_restart`, `debugger_call`, `analysis_start`, `analysis_collect`, `ida_export_annotations`, `ida_import_annotations` |
+| host·VM 파괴적 | `vm_snapshot_take`, `vm_snapshot_revert`, `vm_snapshot_delete`, `vm_power`, `file_download`, `analysis_finish` |
+
+마지막 등급은 MCP 클라이언트의 권한 설정에서 **사람의 승인을 받도록** 두기를 권합니다. 오류는 `{code, message, stage, retryable, hint, next_tool, details}` 형태로 돌아오므로 AI가 다음 행동을 정할 수 있습니다.
+
+### CLI
+
+| 명령 | 용도 |
+|---|---|
+| `serve [--transport stdio\|http]` | MCP 서버 (Claude Code는 stdio) |
+| `doctor`, `status` | 환경 점검, 현재 상태 |
+| `init` | 설정 파일 작성 |
+| `jobs [list \| show JOB_ID]` | job 조회 (게이트웨이가 돌고 있어도 읽기 가능) |
+| `discard JOB_ID` | **사람 전용.** 회수 없이 버려도 되는 job으로 표시 |
+| `provision`, `install-plugin` | 게스트 준비, 플러그인 배포 |
+
+### 다른 PC에서 접속
+
+`serve --transport http`로 같은 툴을 `https://<host>:9100/mcp`에 엽니다.
+
+- 비루프백 주소에 바인드하려면 TLS가 필요합니다.
+- 토큰은 범위별로 따로 둡니다. `read`는 관찰만, `analyze`는 게스트 변경과 디버거 조작, `admin`은 전체입니다.
+- 클라이언트 허용 목록과 요청 속도 제한이 있고, 모든 호출은 `<jobs_root>/_audit/`에 감사 로그로 남습니다.
+
+설정은 [`docs/QUICKSTART_KO.md`](docs/QUICKSTART_KO.md) §8과 [`host/README.md`](host/README.md#remote-access-m3)에 있습니다.
+
+### IDA 연동
+
+IDA 쪽 MCP 서버(예: ida-multi-mcp)와 함께 쓰는 것을 전제로 합니다. 게이트웨이의 `ida_rebase`는 x64dbg 런타임 주소(ASLR)와 IDA 주소·RVA를 서로 변환합니다. `ida_export_annotations`와 `ida_import_annotations`는 라벨·주석·북마크를 주고받습니다. IDA 안에서는 `ida/x64dbg_sync.py`를 씁니다. 자세한 내용은 [`ida/README.md`](ida/README.md)에 있습니다.
+
+## 안전 수칙
+
+- **샘플은 VM 안에서만 실행합니다.** host-only 네트워크를 쓰고 공유 폴더는 끕니다. 설정 기본값(`require_isolation = true`)에서는 격리되지 않은 VM으로 분석을 시작하지 않습니다.
+- **회수한 파일은 신뢰하지 않습니다.** 덤프, DB, 내려받은 파일을 host에서 실행하지 마세요.
+- **토큰은 곧 권한입니다.**
+  - 플러그인 토큰은 게스트에서 코드를 실행할 수 있는 권한입니다. 게스트의 악성코드가 읽을 수 있고 스냅샷 파일에도 남습니다.
+  - 게이트웨이 HTTP 토큰은 VM 제어 권한이므로 환경 변수에 두고 범위별로 따로 씁니다.
+- **플러그인 포트를 토큰 없이 두드리지 마세요.** 게스트 밖(host 등)에서 온 요청은 토큰이 없어도 인증 실패로 셉니다. 5회 실패하면 그 IP는 300초 동안 잠깁니다(429).
+
+## 검증 현황
+
+2026-11-24 기준입니다. 환경은 Linux host, VMware Workstation 17.6, Windows 10(PowerShell 5.1) 게스트이고, 사용자의 분석 VM을 하드 클론한 VM에서 확인했습니다. 기록은 [`docs/PHASE0_RESULTS.md`](docs/PHASE0_RESULTS.md)에 있습니다.
+
+**확인한 것**
+
+- 실 VM 테스트 10건 통과(E2E 5건, 게스트 동작 점검 5건)
+  - `doctor`, `install-plugin`, `provision`(재부팅 감지부터 스냅샷까지)
+  - x64·x32 전체 루프. 분석 명령을 뺀 한 바퀴가 약 48초입니다.
+  - x64dbg 강제 종료 → `BACKEND_RESTARTED` → 재기동 → 분석 재개
+  - MCP stdio
+- 실제 Claude Code 클라이언트
+  - 툴 104개가 보였습니다.
+  - BP → `run` → 스택 → 덤프 → 회수 → 복원까지 분석 루프 전체가 68초에 끝났습니다.
+- 클린 스냅샷 복원 후 x64dbg가 응답하기까지 11~14초가 걸렸습니다.
+
+**아직 확인하지 않은 것**
+
+- Windows·macOS host
+- 다른 PC에서 실제로 원격 HTTPS 접속(단위 테스트만 함)
+- VM 없이 고정 주소의 플러그인에 붙는 `endpoint` 프로필의 실환경 사용
+- 110초를 넘는 장시간 호출이 실제 Claude Code에서 `in_progress` 경로를 타는지
+- 실제 IDA에서 `ida/x64dbg_sync.py` 실행
+- `run`/step 직후 과도 상태의 `GetDebugState`
+
+## 개발 방식과 테스트
+
+이 포크는 Claude Code(Claude Opus)와 함께 아래 순서로 만들었습니다.
+
+1. **계획:** 저장소 분석 → 설계 → 여러 모델의 독립 검토(Claude Sonnet: 신뢰성·보안, Fable: 완결성·아키텍처, Mythos: 기술 타당성) → 반영. 결과는 [`docs/VM_ORCHESTRATION_PLAN.md`](docs/VM_ORCHESTRATION_PLAN.md)에 있습니다.
+2. **Phase 0:** 사용자의 분석 VM을 건드리지 않고 하드 클론을 떠서, vmrun·VIX·플러그인 동작을 실측했습니다.
+3. **기능별 TDD:** 실패하는 테스트 → 구현 → 다른 모델들의 코드 리뷰 → 반영 → 테스트 통과. 이 과정을 모두 거쳐야 기능을 완료로 봤습니다. 기능마다 에이전트를 따로 붙여 병렬로 개발했습니다.
+4. **마지막 관문:** 실 VM E2E와 실제 Claude Code 클라이언트 확인. 여기서 나온 결함(응답 소켓 처리, 인증 잠금, `GetDebugState LOCKED`, PowerShell 5.1 JSON 등)도 같은 절차로 고쳤습니다.
+
+```bash
+cd host
+uv run pytest                 # 단위 테스트 (VM 불필요: VM·게스트·플러그인은 fake)
+uv run ruff check src tests
+uv run pytest -m vm tests/vm  # 실 VM E2E: VM을 복원·변경하므로 버려도 되는 클론에서만 실행
+cd .. && zig build test       # 플러그인 단위 테스트
+```
+
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| [`docs/QUICKSTART_KO.md`](docs/QUICKSTART_KO.md) | 실 VM에서 검증한 설치·사용 절차, 실제로 겪은 문제 해결 |
+| [`host/README.md`](host/README.md) | 게이트웨이 영문 레퍼런스 (설정, 툴, 원격 접속, 테스트) |
+| [`docs/PLUGIN.md`](docs/PLUGIN.md) | x64dbg 플러그인 레퍼런스 (원본 README + v1.10 변경) |
+| [`ida/README.md`](ida/README.md) | IDA 연동 |
+| [`docs/VM_ORCHESTRATION_PLAN.md`](docs/VM_ORCHESTRATION_PLAN.md) | 설계, 상태 모델, 다중 모델 검토 반영 기록 |
+| [`docs/PHASE0_RESULTS.md`](docs/PHASE0_RESULTS.md) | 실측 기록, 발견·수정한 결함 |
+| [`SKILL.md`](SKILL.md) | 원본의 x64dbg MCP 사용 스킬 |
+
+## 라이선스
+
+이 포크는 원본과 같은 **MIT 라이선스**를 따릅니다. 전문은 [`LICENSE`](LICENSE)에 있습니다.
+
+**저작권 표기.** `LICENSE`에는 저작권 줄이 두 개 있습니다.
+
+```
+Copyright (c) 2026 duty1g          ← 원본 x64dbg-MCP Server
+Copyright (c) 2026 saweol (...)    ← 이 포크에서 추가·변경한 부분 (README.md에 범위 명시)
+```
+
+MIT는 원본의 저작권 표시와 허가 문구를 유지하는 것을 조건으로 수정·재배포를 허락합니다. 그래서 원본 표기는 그대로 두고 포크 표기를 덧붙였습니다.
+
+**어느 부분이 누구의 것인가.**
+
+| 부분 | 출처 |
+|---|---|
+| `src/`, `build.zig`, `build.zig.zon`, `.github/`, `.gitignore`, `SKILL.md`, `logo.png`, `docs/PLUGIN.md` | 원본(duty1g와 upstream 기여자들, git 이력 참고). 이 포크에서 수정한 내용은 같은 파일에 함께 들어 있습니다. |
+| `host/`, `guest/`, `ida/`, `docs/`의 나머지 문서, 이 `README.md` | 이 포크에서 새로 작성 |
+
+**이 코드를 가져다 쓸 때.** 일부만 가져가더라도 `LICENSE` 파일(두 저작권 줄과 허가 문구)을 함께 넣어 주세요. MIT가 요구하는 것은 이것뿐입니다. 소프트웨어는 "있는 그대로" 제공되며 어떤 보증도 없습니다.
+
+**이 저장소에 포함되지 않은 것.** 아래는 각자의 라이선스를 따르며, 사용자가 따로 설치합니다.
+
+| 구성 요소 | 라이선스 |
+|---|---|
+| [x64dbg](https://x64dbg.com/) | GPLv3. 플러그인은 x64dbg에 로드되지만 x64dbg 자체는 이 저장소에 없습니다. |
+| VMware Workstation / `vmrun` | 상용(Broadcom) |
+| IDA Pro | 상용(Hex-Rays) |
+| ida-multi-mcp | 별도 프로젝트 |
+| 게이트웨이의 Python 직접 의존성(uv가 설치) | `mcp`, `anyio`, `jsonschema`: MIT / `starlette`, `uvicorn`: BSD-3-Clause. 간접 의존성 전체는 `host/uv.lock`에 있습니다. |
+
+이 포크는 원작자, x64dbg 프로젝트, Broadcom(VMware), Hex-Rays와 관계가 없습니다. 각 이름은 해당 소유자의 상표입니다. 이 절은 저장소의 표기 방침을 정리한 것이며 법률 자문이 아닙니다.
+
+## 면책
+
+이 도구는 정당한 리버스 엔지니어링, 악성코드 분석, 보안 연구, 교육 목적으로만 써야 합니다. 디버거 완전 제어(메모리 읽기·쓰기, 코드 실행, 프로세스 조작)와 VM 제어를 네트워크로 노출합니다. 사용에 따른 책임은 사용자에게 있습니다. 분석 권한이 있는 소프트웨어에만 쓰고, 플러그인이나 게이트웨이를 신뢰할 수 없는 네트워크에 노출하지 마세요.
+
+## 감사의 말
+
+- x64dbg MCP 플러그인을 만들고 MIT로 공개한 [@duty1g](https://github.com/duty1g)와 upstream 기여자들
+- [x64dbg](https://x64dbg.com/) 프로젝트
+- [Model Context Protocol](https://modelcontextprotocol.io/)

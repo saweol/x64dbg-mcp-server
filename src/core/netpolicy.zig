@@ -754,7 +754,7 @@ test "AuthLimiter gives loopback peers a much shorter lockout" {
 }
 
 test "AuthLimiter bounds each loopback lockout, not how often it re-locks" {
-    // What the README states: failures during a lockout are not counted,
+    // What docs/PLUGIN.md states: failures during a lockout are not counted,
     // but a local process that keeps failing re-locks the shared loopback
     // bucket right after each lockout ends.
     var lim = AuthLimiter.init(3, 60_000, 300_000);
