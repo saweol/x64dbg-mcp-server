@@ -682,3 +682,9 @@ def test_every_check_the_real_doctor_emits_is_classified_by_setup(tmp_path):
     assert "vm_power" in names and any(n.startswith("backend:") for n in names)
     assert [n for n in names if cli.setup_check_kind(n) == "unknown"] == []
     assert cli.setup_check_kind("runtime") == "blocking"  # emitted only when the runtime cannot be built
+
+
+def test_the_static_tools_check_is_advisory_and_never_stops_setup():
+    """static_tools only reports which static tools and MCP servers are found (WARN, never FAIL)."""
+    assert cli.setup_check_kind("static_tools") == "advisory"
+    assert "static_tools" not in cli.SETUP_BLOCKING_CHECKS

@@ -337,16 +337,21 @@ def _format_doctor(result: Any) -> str:
     raw = result.get("checks") if isinstance(result, Mapping) else None
     checks = [c for c in raw if isinstance(c, Mapping)] if isinstance(raw, list) else []
     lines = []
+    warnings = 0
     for check in checks:
         ok = bool(check.get("ok"))
+        warn = ok and check.get("level") == "warn"  # passes, but needs attention (e.g. static_tools)
+        warnings += warn
         detail = check.get("detail")
-        line = f"[{' ok ' if ok else 'FAIL'}] {_safe(check.get('name'))}"
+        tag = "WARN" if warn else (" ok " if ok else "FAIL")
+        line = f"[{tag}] {_safe(check.get('name'))}"
         lines.append(f"{line}: {_safe(detail)}" if detail else line)
-        if not ok and check.get("hint"):
+        if (warn or not ok) and check.get("hint"):
             lines.append(f"       hint: {_safe(check['hint'])}")
     failed = sum(1 for c in checks if not c.get("ok"))
     ok_all = isinstance(result, Mapping) and bool(result.get("ok"))
-    lines.append("doctor: all checks passed" if ok_all else f"doctor: {failed} check(s) failed")
+    note = f" ({warnings} warning{'s' if warnings != 1 else ''})" if warnings else ""
+    lines.append(f"doctor: all checks passed{note}" if ok_all else f"doctor: {failed} check(s) failed{note}")
     return "\n".join(lines)
 
 
@@ -960,6 +965,8 @@ SETUP_BLOCKING_CHECKS = frozenset({
     "vmrun", "runtime", "vmx", "single_vm_instance", "vm_power", "tools", "guest_credentials", "guest_ip",
     "isolation", "guest_job_root", "host_jobs_root",
 })
+#: doctor checks that only inform (they never fail): setup reports them and goes on
+SETUP_ADVISORY_CHECKS = frozenset({"static_tools"})
 #: init options that only matter while setup creates the config (--x64dbg-root also feeds the guest steps)
 _SETUP_INIT_ONLY = ("profile_name", "vmx", "clean_snapshot", "guest_user", "guest_password_env", "jobs_root",
                     "vmrun", "non_interactive")
@@ -1172,9 +1179,12 @@ def _failed_checks(result: Any) -> list[str]:
 def setup_check_kind(name: str) -> str:
     """What setup makes of a failed doctor check: "blocking" (it cannot fix it), "snapshot"
     (provisioning takes it), "token" (provisioning rewrites the token configs), "backend"
-    (installing or provisioning brings the plugin up) or "unknown"."""
+    (installing or provisioning brings the plugin up), "advisory" (only informs, never fails:
+    static_tools) or "unknown"."""
     if name in SETUP_BLOCKING_CHECKS:
         return "blocking"
+    if name in SETUP_ADVISORY_CHECKS:
+        return "advisory"
     if name == "clean_snapshot":
         return "snapshot"
     if name.startswith("backend:") and name.endswith(":token"):

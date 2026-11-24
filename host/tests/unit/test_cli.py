@@ -951,3 +951,18 @@ def test_provision_an_empty_shell_variable_does_not_hide_the_env_file(
     assert run(["--config", str(cfg), "provision", "--x64dbg-root", "C:\\x", "--no-reboot"]) == 0
     _, _, kw = provision.calls[0]
     assert kw["user"] == "labuser" and kw["password"].reveal() == "from-env-file"
+
+
+def test_doctor_text_shows_a_warning_check_as_warn_with_its_hint():
+    """A check with level "warn" passes (doctor still succeeds) but must not look like [ ok ]."""
+    text = cli._format_doctor({"ok": True, "checks": [
+        {"name": "vm_power", "ok": True, "detail": "running"},
+        {"name": "static_tools", "ok": True, "level": "warn",
+         "detail": "WARN ghidra: none of ghidraRun on PATH",
+         "hint": "install Ghidra or set [static.servers.ghidra]"},
+    ]})
+    lines = text.splitlines()
+    assert lines[0].startswith("[ ok ] vm_power")
+    assert lines[1].startswith("[WARN] static_tools")
+    assert lines[2].strip() == "hint: install Ghidra or set [static.servers.ghidra]"
+    assert lines[-1] == "doctor: all checks passed (1 warning)"
