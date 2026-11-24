@@ -87,6 +87,11 @@ if TYPE_CHECKING:  # catalog and backend import the sanitiser from here; avoid a
 
 log = logging.getLogger(__name__)
 
+
+def _not_sent(exc: GatewayError) -> bool:
+    """A connect() that never completed (backend.ConnectTimeout): the request was not sent."""
+    return isinstance(exc, BackendUnavailable) and exc.details.get("error") == "ConnectTimeout"
+
 # ── untrusted text ──────────────────────────────────────────────────
 UNTRUSTED_OPEN = "<untrusted_guest_output>"
 UNTRUSTED_CLOSE = "</untrusted_guest_output>"
@@ -337,9 +342,13 @@ class Proxy:
                               (self._clock.monotonic() - t0) * 1000, timeout_s, retried)
                     break
                 except BackendUnavailable as e:
-                    if retryable and not retried:
+                    # A connect that never completed would only take its whole budget again.
+                    if retryable and not retried and not _not_sent(e):
                         retried = True
                         log.info("backend %s: retrying read-only %s once after %s", backend_id, tool, e.code)
+                        # the retry gets what is left of the client's call budget
+                        spent = self._clock.monotonic() - t_entry
+                        timeout_s = max(1.0, min(timeout_s, self._max_call_s - BUDGET_MARGIN_S - spent))
                         continue
                     failure = e
                     break
@@ -396,6 +405,9 @@ class Proxy:
         epoch_now = self._sup.epoch(backend_id)
         details: dict[str, Any] = {"backend": backend_id, "tool": tool, "epoch": epoch_now,
                                    "state": str(state), "cause": exc.code}
+        not_sent = _not_sent(exc)
+        if not_sent:
+            details["not_sent"] = True
         pending = False
         if recovery_error is not None:
             details["recovery_error"] = recovery_error.code
@@ -405,9 +417,10 @@ class Proxy:
                 details["relaunch_pending"] = True
         if epoch_now != epoch_before:
             details.update(previous_epoch=epoch_before, lost=list(LOST_ON_RESTART))
+            outcome = ("it was not sent (the connection never completed)" if not_sent
+                       else "its result is unknown")
             message = (f"backend {backend_id} was restarted while {tool} was in flight "
-                       f"(epoch {epoch_before} -> {epoch_now}); its result is unknown and "
-                       "debuggee state is gone")
+                       f"(epoch {epoch_before} -> {epoch_now}); {outcome} and debuggee state is gone")
             hint = "call session_status to acknowledge, then reload the sample if needed"
             if pending:
                 message += " (the new debugger is not ready yet)"
@@ -417,6 +430,12 @@ class Proxy:
                 hint += "; the relaunch failed (see recovery_message), so check the guest before retrying"
             return BackendRestarted(message, stage="call", next_tool="session_status", details=details,
                                     hint=hint)
+        if not_sent:
+            exc.details.update(details)
+            exc.hint = (f"{tool} was not sent: the connection to backend {backend_id} never completed "
+                        f"(state {state}); check session_status, then repeat it if still wanted")
+            exc.next_tool = "session_status"
+            return exc
         if not retryable:
             mutating = not self._catalog.is_read_only(tool, backend_id)
             return ResultUnknown(

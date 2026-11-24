@@ -88,6 +88,15 @@ MAX_RETRY_AFTER_S = 86_400
 _DELTA_SECONDS_RE = re.compile(r"[0-9]+")  # RFC 9110 delay-seconds: ASCII digits only
 _MAX_VERSION_CHARS = 64
 _CONNECT_POLL_S = 0.1  # granularity at which a pending connect() notices cancel_all()
+#: A connect() still pending after this long fails as BackendUnavailable (the request was not sent).
+#: After x64dbg was killed in the spike VM the guest answered SYNs to the closed port with nothing,
+#: so the next call waited in connect() for its whole timeout (over 60 s) before recovery started.
+CONNECT_TIMEOUT_S = 10.0
+MIN_CONNECT_SHARE_S = 2.0  # each address gets at least this much of what is left of the budget
+
+
+class ConnectTimeout(ConnectionError):
+    """connect() did not complete within CONNECT_TIMEOUT_S (or the call's own deadline)."""
 _READ_CHUNK = 65536
 _MAX_ERROR_TEXT = 500  # untrusted text copied into exception details is truncated
 # connect_ex() results that mean "in progress" (POSIX and Windows)
@@ -322,8 +331,20 @@ class HttpBackendClient:
     # ── transport ───────────────────────────────────────────────────
     def _connect(self, call: _InFlight, deadline: float) -> socket.socket:
         infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        # One connect budget for all addresses (localhost may resolve to several), shared so that a
+        # first address that drops SYNs still leaves time for the next one; the call's own deadline
+        # when that comes first, which stays a TimeoutError (BackendTimeout) as before.
+        # Once the budget is spent, the remaining addresses fail at once.
+        started = time.monotonic()
+        call_bound = deadline <= started + CONNECT_TIMEOUT_S  # the call's deadline is the tighter one
+        connect_deadline = deadline if call_bound else started + CONNECT_TIMEOUT_S
         last: OSError | None = None
-        for family, socktype, proto, _canon, addr in infos:
+        for index, (family, socktype, proto, _canon, addr) in enumerate(infos):
+            now = time.monotonic()
+            left = max(0.0, connect_deadline - now)
+            share = max(left / (len(infos) - index), min(MIN_CONNECT_SHARE_S, left))
+            whole_rest = share >= left  # this address gets everything left (no float round trip)
+            candidate_deadline = connect_deadline if whole_rest else now + share
             sock = _socket_factory(family, socktype, proto)
             try:
                 call.attach(sock)
@@ -332,7 +353,13 @@ class HttpBackendClient:
                 if rc not in _CONNECT_PENDING:
                     raise OSError(rc, f"connect failed (errno {rc})")
                 if rc != 0:
-                    _wait_connected(sock, call, deadline)
+                    try:
+                        _wait_connected(sock, call, candidate_deadline)
+                    except TimeoutError:
+                        if call_bound and whole_rest:  # the call's own deadline: BackendTimeout as before
+                            raise
+                        raise ConnectTimeout(f"connect did not complete within "
+                                             f"{candidate_deadline - now:.1f}s") from None
                 # A cancel that landed before the socket was connected could not shut it down
                 # (ENOTCONN); only the flag recorded it. Once connected, shutdown() works.
                 if call.cancelled:
@@ -342,7 +369,7 @@ class HttpBackendClient:
             except (TimeoutError, _Cancelled):
                 sock.close()
                 raise
-            except OSError as e:
+            except OSError as e:  # refused, unreachable, or ConnectTimeout: try the next address
                 sock.close()
                 last = e
         raise last if last is not None else OSError("no addresses for backend host")

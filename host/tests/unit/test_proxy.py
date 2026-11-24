@@ -368,6 +368,30 @@ def test_mutating_never_retried_result_unknown(proxy, client, exc):
     assert ei.value.next_tool == "GetDebugState"
 
 
+def _connect_timeout() -> BackendUnavailable:
+    """What HttpBackendClient raises for a connect() that never completed (nothing was sent)."""
+    return BackendUnavailable("backend x64 is unavailable: ConnectTimeout",
+                              details={"error": "ConnectTimeout"})
+
+
+def test_read_only_call_is_not_retried_after_a_connect_timeout(proxy, client):
+    """A second 10 s connect to a guest that drops SYNs only delays the recovery."""
+    client.queue("ReadMemory", _connect_timeout(), BackendUnavailable("refused"))
+    with pytest.raises(BackendUnavailable) as ei:
+        proxy.call("x64", "ReadMemory", {"address": "0"})
+    assert len(client.calls_of("ReadMemory")) == 1
+    assert ei.value.details["not_sent"] is True
+
+
+def test_a_mutating_call_whose_connect_timed_out_is_not_sent_not_result_unknown(proxy, client):
+    client.queue("StepInto", _connect_timeout())
+    with pytest.raises(BackendUnavailable) as ei:
+        proxy.call("x64", "StepInto", {})
+    assert not isinstance(ei.value, ResultUnknown)
+    assert ei.value.details["not_sent"] is True and ei.value.details["tool"] == "StepInto"
+    assert "not sent" in (ei.value.hint or "")
+
+
 def test_mutating_failure_backend_dead_endpoint_mode(proxy, client):
     client.queue("StepOver", BackendUnavailable("refused"))
     client.l1 = False

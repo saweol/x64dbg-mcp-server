@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import sys
 import threading
 import time
 
@@ -499,6 +500,112 @@ def test_cancel_while_connect_is_pending():
         t.join(timeout=3)
         assert time.monotonic() - t0 < 1.5
         assert errors and isinstance(errors[0], CancelledByVmOp)
+    finally:
+        for f in fillers:
+            f.close()
+        lsock.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="relies on Linux dropping SYNs to a full accept queue")
+def test_a_connect_that_never_completes_fails_fast_as_unavailable(monkeypatch):
+    """The first call after x64dbg was killed in the spike VM (2026-11-24) stayed in connect()
+    for more than 60 s: the guest answered the SYNs to the closed port with nothing. A connect
+    gets CONNECT_TIMEOUT_S of its own; the request was not sent, so it is BackendUnavailable
+    (the proxy then health-checks and relaunches), not BackendTimeout after the whole timeout."""
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONNECT_TIMEOUT_S", 0.5)
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(0)
+    port = lsock.getsockname()[1]
+    fillers = []
+    for _ in range(4):
+        f = socket.socket()
+        f.setblocking(False)
+        f.connect_ex(("127.0.0.1", port))
+        fillers.append(f)
+    c = make_client(f"http://127.0.0.1:{port}/")
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(BackendUnavailable) as ei:
+            c.call_tool("GetDebugState", {}, timeout_s=20)
+        assert time.monotonic() - t0 < 5
+        assert ei.value.details.get("error") == "ConnectTimeout", ei.value.details
+        assert "connect" in ei.value.message.lower() or "ConnectTimeout" in ei.value.message
+    finally:
+        for f in fillers:
+            f.close()
+        lsock.close()
+
+
+def _syn_dropping_listener() -> tuple[socket.socket, int, list[socket.socket]]:
+    """A listener with a full accept queue: Linux drops further SYNs, so a connect stays pending."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(0)
+    port = lsock.getsockname()[1]
+    fillers = []
+    for _ in range(4):
+        f = socket.socket()
+        f.setblocking(False)
+        f.connect_ex(("127.0.0.1", port))
+        fillers.append(f)
+    return lsock, port, fillers
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="relies on Linux dropping SYNs to a full accept queue")
+def test_the_connect_budget_is_shared_by_all_addresses(monkeypatch):
+    """localhost can resolve to several addresses: the budget is not paid once per address."""
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONNECT_TIMEOUT_S", 0.5)
+    lsock, port, fillers = _syn_dropping_listener()
+    one = socket.getaddrinfo("127.0.0.1", port, type=socket.SOCK_STREAM)
+    monkeypatch.setattr(backend_mod.socket, "getaddrinfo", lambda *a, **k: one * 3)
+    c = make_client(f"http://127.0.0.1:{port}/")
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(BackendUnavailable) as ei:
+            c.call_tool("GetDebugState", {}, timeout_s=20)
+        assert time.monotonic() - t0 < 1.2, "one budget for all addresses"
+        assert ei.value.details.get("error") == "ConnectTimeout"
+    finally:
+        for f in fillers:
+            f.close()
+        lsock.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="relies on Linux dropping SYNs to a full accept queue")
+def test_an_address_that_drops_syns_leaves_time_for_the_next_one(server, monkeypatch):
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONNECT_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(backend_mod, "MIN_CONNECT_SHARE_S", 0.2)
+    lsock, port, fillers = _syn_dropping_listener()
+    dead = socket.getaddrinfo("127.0.0.1", port, type=socket.SOCK_STREAM)
+    live_port = int(server.url.rsplit(":", 1)[1].rstrip("/"))
+    live = socket.getaddrinfo("127.0.0.1", live_port, type=socket.SOCK_STREAM)
+    monkeypatch.setattr(backend_mod.socket, "getaddrinfo", lambda *a, **k: dead + live)
+    try:
+        res = make_client(server.url).call_tool("GetDebugState", {}, timeout_s=20)
+        assert not res.is_error
+    finally:
+        for f in fillers:
+            f.close()
+        lsock.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="relies on Linux dropping SYNs to a full accept queue")
+def test_a_call_deadline_shorter_than_the_connect_budget_stays_a_timeout(monkeypatch):
+    import x64dbg_vm_gateway.backend as backend_mod
+
+    monkeypatch.setattr(backend_mod, "CONNECT_TIMEOUT_S", 30.0)
+    lsock, port, fillers = _syn_dropping_listener()
+    c = make_client(f"http://127.0.0.1:{port}/")
+    try:
+        with pytest.raises(BackendTimeout):
+            c.call_tool("GetDebugState", {}, timeout_s=0.5)
     finally:
         for f in fillers:
             f.close()
