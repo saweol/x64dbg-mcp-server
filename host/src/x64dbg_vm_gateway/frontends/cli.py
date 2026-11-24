@@ -9,7 +9,9 @@ Commands::
     jobs [list | show JOB_ID]           read-only view of the job directories
     discard JOB_ID [--yes]              human-only: mark a job DISCARDED so it may be reverted
     provision --x64dbg-root PATH ...    prepare the guest (plugin config, tasks, auto-logon)
-    install-plugin --dist DIR ...       copy a plugin build into the guest
+    install-plugin [--dist DIR] ...     copy a plugin build (default: the bundled one) into the guest
+    setup [--dry-run] ...               init (no config yet), doctor, install-plugin, provision,
+                                        doctor, then print the ``claude mcp add`` command
 
 Global options (before or after the command): ``--config PATH``, ``--profile NAME``,
 ``--json`` (machine-readable stdout), ``-v/--verbose``.
@@ -29,37 +31,62 @@ a gateway is serving.
 
 A serving gateway holds the jobs root (``JobStore`` process lock). Commands
 that need it (``discard``, ``status``, ``doctor``, ``provision``,
-``install-plugin``) then fail with LOCK_TIMEOUT naming the gateway's pid and
-what to do instead (stop it, or use its MCP tools). ``provision`` and
+``install-plugin``, ``setup``) then fail with LOCK_TIMEOUT naming the gateway's
+pid and what to do instead (stop it, or use its MCP tools). ``provision`` and
 ``install-plugin`` claim the jobs root first (so they never run next to a
 serving gateway), pause supervision and hold the VM write lock while they
 change the guest; after a plugin install (or a provisioning reboot) every
 backend starts a new epoch and cached clients/tokens are dropped.
+
+``install-plugin`` without ``--dist`` installs the build bundled in the package
+(``plugin_bundle``; a release wheel carries it) and derives ``--x64dbg-root``
+from the profile's backend paths. ``setup`` chains the commands with one
+gateway instance: everything that can be checked locally (plugin build, guest
+user and password, x64dbg root) is checked before the VM is contacted; then
+the doctor precheck stops on a failed check setup cannot fix
+(``SETUP_BLOCKING_CHECKS``, plus the clean snapshot without provisioning) and
+on an existing target snapshot (provisioning never replaces one). With
+provisioning the plugin is installed without relaunch (on a fresh guest the
+logon tasks do not exist yet; the provisioning reboot starts the debuggers).
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import importlib
 import json
 import logging
 import os
 import re
+import shlex
+import subprocess  # noqa: S404 - only list2cmdline (quoting), nothing is run
 import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PureWindowsPath
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from .. import config as gw_config
-from .. import envfile
+from .. import envfile, plugin_bundle
 from .. import platform as gw_platform
-from ..errors import ConfigError, GatewayError, JobNotFound, LockTimeout, StateViolation, VmrunNotFound
+from ..errors import (
+    ConfigError,
+    GatewayError,
+    JobNotFound,
+    LockTimeout,
+    StateViolation,
+    TransferError,
+    VmrunNotFound,
+)
 from ..jobs import DISCARD_ACTOR, JOB_ID_RE, Job, validate_job_id
 from ..proxy import sanitize_untrusted_text
 from .tool_defs import InternalError
+
+if TYPE_CHECKING:
+    from ..contracts import Secret
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +112,7 @@ _SERVING_ADVICE = {
     "doctor": "use the running gateway's MCP tool gateway_doctor instead, or stop the gateway first",
     "provision": "stop that gateway first: provisioning reboots the guest and must not run next to it",
     "install-plugin": "stop that gateway first: installing the plugin kills and relaunches the debuggers",
+    "setup": "stop that gateway first: setup installs the plugin and reboots the guest",
     "serve": "a gateway is already serving this jobs root: connect to it, or stop it first",
 }
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -429,12 +457,104 @@ def _result_ok(result: Any) -> bool:
     return not (isinstance(result, Mapping) and result.get("ok") is False)
 
 
-def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
-    x64dbg_root = _require_windows_abs(args.x64dbg_root, "--x64dbg-root")
+def _derive_x64dbg_root(prof: gw_config.ProfileConfig) -> str | None:
+    """``<root>`` of the backends' ``<root>\\<arch>\\x64dbg.exe`` / ``mcp_config.json`` paths (the
+    layout ``init`` writes); None when they name no such path or disagree."""
+    roots: dict[str, str] = {}
+    for backend in prof.backends:
+        for value in (backend.exe, backend.config):
+            if not value or not _is_windows_abs(value):
+                continue
+            path = PureWindowsPath(value.replace("/", "\\"))
+            if path.parent.name.casefold() != backend.arch.casefold():
+                return None
+            root = str(path.parent.parent)
+            roots.setdefault(root.casefold(), root)
+    return next(iter(roots.values())) if len(roots) == 1 else None
+
+
+def _x64dbg_root(args: argparse.Namespace, prof: gw_config.ProfileConfig) -> str:
+    if args.x64dbg_root:
+        return _require_windows_abs(args.x64dbg_root, "--x64dbg-root")
+    root = _derive_x64dbg_root(prof)
+    if root is None:
+        raise UsageError("--x64dbg-root is needed: the profile's backends do not name guest paths of the "
+                         "form <root>\\x64\\x64dbg.exe or <root>\\x64\\mcp_config.json")
+    return root
+
+
+@dataclasses.dataclass(frozen=True)
+class _PluginSource:
+    """The plugin build to install: a ``--dist`` folder or the build bundled in the package."""
+
+    dist: Path | None
+    bundle: plugin_bundle.PluginBundle | None
+
+    def describe(self) -> dict[str, Any]:
+        if self.bundle is not None:
+            return self.bundle.describe()
+        return {"source": "dist", "path": str(self.dist)}
+
+    def label(self) -> str:
+        if self.bundle is not None:
+            return f"bundled build v{self.bundle.version}" if self.bundle.version else "bundled build"
+        return f"build from {self.dist}"
+
+    @contextlib.contextmanager
+    def directory(self) -> Iterator[Path]:
+        """A folder holding ``x64/plugins/...`` and ``x32/plugins/...`` (a temporary copy for the bundle)."""
+        if self.bundle is None:
+            assert self.dist is not None
+            yield self.dist
+            return
+        with plugin_bundle.materialize(self.bundle) as dist:
+            yield dist
+
+
+def _plugin_source(dist_arg: str | None, *, also: str = "") -> _PluginSource:
+    """``--dist`` (must be a folder), else the bundled build; TransferError when there is none."""
+    if dist_arg:
+        dist = Path(dist_arg).expanduser()
+        if not dist.is_dir():
+            raise UsageError(f"--dist is not a directory: {dist}")
+        return _PluginSource(dist, None)
+    bundle = plugin_bundle.find_bundle()
+    if bundle is None:
+        raise TransferError(
+            "this installation has no bundled plugin build",
+            stage="install_plugin",
+            details={"missing": plugin_bundle.missing_files()},
+            hint="install a release wheel (scripts/build-release.sh in the repository builds one into "
+                 "release/), or pass --dist DIR, a folder holding x64/plugins and x32/plugins "
+                 "(`zig build -Doptimize=ReleaseSafe --prefix dist` writes one)" + also,
+        )
+    return _PluginSource(None, bundle)
+
+
+def _install_plugin_step(app: Any, runtime: Any, profile: str | None, source: _PluginSource, *,
+                         x64dbg_root: str, relaunch: bool, out: _Output) -> Any:
+    provision = _import("provision")
+    with source.directory() as dist, _holding_vm(runtime):
+        result = provision.install_plugin(runtime, dist_dir=dist, x64dbg_root=x64dbg_root, relaunch=relaunch)
+        if _result_ok(result):
+            reason = "plugin reinstalled (debuggers killed" + (" and relaunched)" if relaunch else ")")
+            lost = _new_epochs(app, runtime, profile, reason)
+            result = _report_lost(result, lost, out)
+    return {**result, "plugin": source.describe()} if isinstance(result, Mapping) else result
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProvisionInputs:
+    user: str
+    password: Secret | None
+    autologon: bool
+
+
+def _provision_inputs(args: argparse.Namespace, config: gw_config.GatewayConfig,
+                      prof: gw_config.ProfileConfig) -> _ProvisionInputs:
+    """The guest user and password (``--user``, the profile, gateway.env_file); fails before any VM work."""
     if args.wait_ready <= 0:
         raise UsageError("--wait-ready must be greater than 0")
-    config = _load_config(args)
-    prof = config.profile(args.profile)
     # the same resolution as the serving gateway: the real environment over gateway.env_file
     environ = envfile.resolve_environ(config, os.environ)
     user = args.user or prof.guest_user or (environ.get(prof.guest_user_env) if prof.guest_user_env else None)
@@ -455,46 +575,56 @@ def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
             hint="export the guest password in that variable, or pass --no-autologon",
             details={"key": f"profiles.{prof.name}.guest_password_env"},
         )
+    return _ProvisionInputs(user, password, autologon)
+
+
+def _provision_step(app: Any, runtime: Any, profile: str | None, inputs: _ProvisionInputs, *,
+                    x64dbg_root: str, bind: str, reboot: bool, wait_ready_s: float, snapshot: str | None,
+                    out: _Output) -> Any:
     provision = _import("provision")
+    with _holding_vm(runtime):
+        result = provision.provision_guest(
+            runtime,
+            x64dbg_root=x64dbg_root,
+            user=inputs.user,
+            password=inputs.password,
+            autologon=inputs.autologon,
+            bind=bind,
+            reboot=reboot,
+            wait_ready_s=float(wait_ready_s),
+            clean_snapshot=snapshot,
+        )
+        if isinstance(result, Mapping) and result.get("rebooted") is True:
+            lost = _new_epochs(app, runtime, profile, "guest rebooted by provision")
+            result = _report_lost(result, lost, out)
+    return result
+
+
+def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
+    x64dbg_root = _require_windows_abs(args.x64dbg_root, "--x64dbg-root")
+    config = _load_config(args)
+    inputs = _provision_inputs(args, config, config.profile(args.profile))
+    _import("provision")  # an installation without it fails here, before the gateway is built
     with _app(args, config) as app:
         _claim_jobs_root(app)
         runtime = _runtime(app, args.profile)
-        with _holding_vm(runtime):
-            result = provision.provision_guest(
-                runtime,
-                x64dbg_root=x64dbg_root,
-                user=user,
-                password=password,
-                autologon=autologon,
-                bind=args.bind,
-                reboot=not args.no_reboot,
-                wait_ready_s=float(args.wait_ready),
-                clean_snapshot=args.snapshot,
-            )
-            if isinstance(result, Mapping) and result.get("rebooted") is True:
-                lost = _new_epochs(app, runtime, args.profile, "guest rebooted by provision")
-                result = _report_lost(result, lost, out)
+        result = _provision_step(app, runtime, args.profile, inputs, x64dbg_root=x64dbg_root,
+                                 bind=args.bind, reboot=not args.no_reboot, wait_ready_s=args.wait_ready,
+                                 snapshot=args.snapshot, out=out)
     out.data(result)
     return EXIT_OK if _result_ok(result) else EXIT_FAILURE
 
 
 def cmd_install_plugin(args: argparse.Namespace, out: _Output) -> int:
-    dist = Path(args.dist).expanduser()
-    if not dist.is_dir():
-        raise UsageError(f"--dist is not a directory: {dist}")
-    x64dbg_root = _require_windows_abs(args.x64dbg_root, "--x64dbg-root") if args.x64dbg_root else None
+    source = _plugin_source(args.dist)
     config = _load_config(args)
-    provision = _import("provision")
+    x64dbg_root = _x64dbg_root(args, config.profile(args.profile))
+    _import("provision")  # an installation without it fails here, before the gateway is built
     with _app(args, config) as app:
         _claim_jobs_root(app)
         runtime = _runtime(app, args.profile)
-        with _holding_vm(runtime):
-            result = provision.install_plugin(runtime, dist_dir=dist, x64dbg_root=x64dbg_root,
-                                              relaunch=not args.no_relaunch)
-            if _result_ok(result):
-                lost = _new_epochs(app, runtime, args.profile,
-                                   "plugin reinstalled (debuggers killed and relaunched)")
-                result = _report_lost(result, lost, out)
+        result = _install_plugin_step(app, runtime, args.profile, source, x64dbg_root=x64dbg_root,
+                                      relaunch=not args.no_relaunch, out=out)
     out.data(result)
     return EXIT_OK if _result_ok(result) else EXIT_FAILURE
 
@@ -757,20 +887,36 @@ def _format_init(result: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+@dataclasses.dataclass(frozen=True)
+class _InitPlan:
+    answers: dict[str, Any]
+    document: dict[str, Any]
+    config: gw_config.GatewayConfig
+    text: str
+    vmrun_path: str | None
+
+
+def _plan_init(args: argparse.Namespace, out: _Output, path: Path) -> _InitPlan:
+    """Ask (or take from the flags) the init answers and build the validated config text."""
+    answers = _init_answers(args)
+    vmrun_value, vmrun_path = _discover_vmrun(answers, out)
+    doc = _init_document(answers, vmrun_value)
+    config = gw_config.config_from_dict(doc, source=str(path))  # same validation as load_config
+    text = to_toml(doc, header=f"x64dbg-vm-gateway configuration (written by `{PROG} init`).\n"
+                               "Secrets are never stored here: *_env keys name environment variables.")
+    if tomllib.loads(text) != json.loads(json.dumps(doc)):  # belt and braces for the TOML writer
+        raise InternalError("generated TOML does not round-trip", stage="init")
+    return _InitPlan(answers, doc, config, text + _HTTP_EXAMPLE, vmrun_path)
+
+
 def cmd_init(args: argparse.Namespace, out: _Output) -> int:
     path = _config_target(args)
     if path.exists() and not args.force:
         raise ConfigError(f"{path} already exists; refusing to overwrite it", stage="init",
                           hint="pass --force to replace it", details={"path": str(path)})
-    answers = _init_answers(args)
-    vmrun_value, vmrun_path = _discover_vmrun(answers, out)
-    doc = _init_document(answers, vmrun_value)
-    gw_config.config_from_dict(doc, source=str(path))  # same validation as load_config
-    text = to_toml(doc, header=f"x64dbg-vm-gateway configuration (written by `{PROG} init`).\n"
-                               "Secrets are never stored here: *_env keys name environment variables.")
-    if tomllib.loads(text) != json.loads(json.dumps(doc)):  # belt and braces for the TOML writer
-        raise InternalError("generated TOML does not round-trip", stage="init")
-    _write_private(path, text + _HTTP_EXAMPLE, replace=args.force)
+    plan = _plan_init(args, out, path)
+    answers, vmrun_path = plan.answers, plan.vmrun_path
+    _write_private(path, plan.text, replace=args.force)
     name = answers["profile_name"]
     steps = []
     if answers["mode"] == "vmware":
@@ -789,6 +935,357 @@ def cmd_init(args: argparse.Namespace, out: _Output) -> int:
     return EXIT_OK
 
 
+# ── setup ───────────────────────────────────────────────────────────
+MCP_SERVER_NAME = "x64dbg-vm"
+STATIC_TOOLS_LINE = f"static analysis tools: see `{PROG} mcp-config`"
+SETUP_STEPS = ("init", "precheck", "install-plugin", "provision", "doctor")
+#: doctor checks about what setup never changes (VM, vmrun, guest credentials, isolation, job
+#: roots): one of them failing stops setup before anything in the guest changes
+SETUP_BLOCKING_CHECKS = frozenset({
+    "vmrun", "runtime", "vmx", "single_vm_instance", "vm_power", "tools", "guest_credentials", "guest_ip",
+    "isolation", "guest_job_root", "host_jobs_root",
+})
+#: init options that only matter while setup creates the config (--x64dbg-root also feeds the guest steps)
+_SETUP_INIT_ONLY = ("profile_name", "vmx", "clean_snapshot", "guest_user", "guest_password_env", "jobs_root",
+                    "vmrun", "non_interactive")
+_ENDPOINT_INIT_DEFAULTS = {"mode": None, "force": False, "x64_url": None, "x64_token_env": None,
+                           "x32_url": None, "x32_token_env": None}
+
+
+def shell_join(argv: Sequence[str], *, windows: bool | None = None) -> str:
+    """A command line to paste into a shell: POSIX quoting, or cmd/PowerShell quoting on Windows."""
+    if windows if windows is not None else os.name == "nt":
+        return subprocess.list2cmdline(list(argv))
+    return shlex.join(argv)
+
+
+def _is_default_config(path: Path) -> bool:
+    def norm(p: Path) -> str:
+        return os.path.normcase(os.path.abspath(p.expanduser()))
+
+    return norm(path) == norm(gw_config.default_config_path())
+
+
+def _register_argv(args: argparse.Namespace, path: Path) -> list[str]:
+    """``claude mcp add`` for this gateway; ``-e`` names the config only when it is not the default one."""
+    argv = ["claude", "mcp", "add", MCP_SERVER_NAME]
+    if not _is_default_config(path):
+        argv += ["-e", f"{gw_config.ENV_CONFIG_PATH}={path.expanduser().absolute()}"]
+    argv += ["--", PROG, "serve"]
+    if args.profile:
+        argv += ["--profile", args.profile]
+    return argv
+
+
+def _global_suffix(args: argparse.Namespace) -> str:
+    """The global options a step's equivalent command needs to reach the same config and profile."""
+    suffix = f" --config {shlex.quote(args.config)}" if args.config else ""
+    return suffix + (f" --profile {shlex.quote(args.profile)}" if args.profile else "")
+
+
+class _SetupReport:
+    def __init__(self, args: argparse.Namespace, path: Path) -> None:
+        self.data: dict[str, Any] = {
+            "ok": False, "dry_run": bool(args.dry_run),
+            "config": {"path": str(path), "created": False, "profile": None},
+            "steps": [{"step": name, "status": "not_run", "detail": ""} for name in SETUP_STEPS],
+            "notes": [],
+        }
+        if args.dry_run:
+            self.data["problems"] = []
+
+    def step(self, name: str) -> dict[str, Any]:
+        return next(s for s in self.data["steps"] if s["step"] == name)
+
+    def set(self, name: str, status: str, detail: str = "", **extra: Any) -> None:
+        self.step(name).update(status=status, detail=detail, **extra)
+
+    def note(self, text: str) -> None:
+        self.data["notes"].append(text)
+
+
+def _setup_init_args(args: argparse.Namespace) -> argparse.Namespace:
+    """The init options of ``setup`` as ``init`` sees them (vmware mode, never --force); the global
+    --profile and --snapshot name the new profile and its clean snapshot unless given explicitly."""
+    ns = argparse.Namespace(**{**_ENDPOINT_INIT_DEFAULTS, **vars(args)})
+    ns.profile_name = args.profile_name or args.profile
+    ns.clean_snapshot = args.clean_snapshot or args.snapshot
+    return ns
+
+
+def _setup_config(args: argparse.Namespace, out: _Output, path: Path,
+                  report: _SetupReport) -> gw_config.GatewayConfig:
+    """(a) The existing config, or a new one written with the init logic (planned only for --dry-run)."""
+    if path.exists():
+        config = gw_config.load_config(path, environ=os.environ)
+        report.set("init", "skipped", f"using the existing config {path}")
+        given = [f"--{k.replace('_', '-')}" for k in _SETUP_INIT_ONLY if getattr(args, k, None)]
+        if given:
+            report.note(f"the config exists, so {', '.join(given)} were not used (edit {path}, or run "
+                        f"`{PROG} init --force`)")
+        return config
+    plan = _plan_init(_setup_init_args(args), out, path)
+    name = plan.answers["profile_name"]
+    if args.dry_run:
+        report.set("init", "planned", f"write {path} (profile {name!r})", document=plan.document)
+        return plan.config
+    _write_private(path, plan.text, replace=False)
+    report.data["config"]["created"] = True
+    out.note(f"setup: wrote {path}")
+    report.set("init", "done", f"wrote {path} (profile {name!r})", vmrun=plan.vmrun_path)
+    return gw_config.load_config(path, environ=os.environ)
+
+
+@dataclasses.dataclass(frozen=True)
+class _SetupPlan:
+    x64dbg_root: str | None
+    install: bool
+    source: _PluginSource | None  # None with install: a dry-run problem
+    relaunch: bool
+    provision: bool
+    inputs: _ProvisionInputs | None  # None with provision: a dry-run problem
+    snapshot: str
+
+
+def _plan_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig,
+                report: _SetupReport) -> _SetupPlan:
+    """Everything that can be checked without the VM (usage errors always raise; other problems are
+    listed for --dry-run and raised otherwise), and the planned steps in the report."""
+    vmware = prof.mode == "vmware"
+    install = vmware and not args.skip_plugin
+    provision = vmware and not args.skip_provision
+    problems: list[GatewayError] = []
+
+    def attempt(fn: Callable[[], Any]) -> Any:
+        try:
+            return fn()
+        except GatewayError as e:
+            if not args.dry_run:
+                raise
+            problems.append(e)
+            return None
+
+    root = _x64dbg_root(args, prof) if install or provision else None
+    if args.wait_ready <= 0:
+        raise UsageError("--wait-ready must be greater than 0")
+    skip_hint = ", or run setup with --skip-plugin"
+    source = attempt(lambda: _plugin_source(args.dist, also=skip_hint)) if install else None
+    inputs = attempt(lambda: _provision_inputs(args, config, prof)) if provision else None
+    snapshot = args.snapshot or prof.clean_snapshot or DEFAULT_CLEAN_SNAPSHOT
+    plan = _SetupPlan(root, install, source, relaunch=not provision, provision=provision, inputs=inputs,
+                      snapshot=snapshot)
+
+    pending = "planned" if args.dry_run else "not_run"
+    suffix = _global_suffix(args)
+    blocking = ", ".join(sorted(SETUP_BLOCKING_CHECKS))
+    report.set("precheck", pending, f"doctor; setup stops if a check it cannot fix fails ({blocking})"
+               + (f", or if snapshot {snapshot!r} exists already" if provision else ""))
+    skip_why = "endpoint profile: there is no guest to prepare" if not vmware else None
+    if install:
+        what = source.label() if source is not None else "no plugin build (see problems)"
+        after = ("the debuggers are relaunched" if plan.relaunch
+                 else "the debuggers are stopped and come back with the provisioning reboot")
+        command = f"{PROG} install-plugin --x64dbg-root '{root}'"
+        if source is not None and source.dist is not None:
+            command += f" --dist {shlex.quote(str(source.dist))}"
+        report.set("install-plugin", pending, f"{what} into {root}; {after}",
+                   command=command + ("" if plan.relaunch else " --no-relaunch") + suffix)
+    else:
+        report.set("install-plugin", "skipped", skip_why or "--skip-plugin")
+    if provision:
+        who = (f"user {inputs.user}, auto-logon {'on' if inputs.autologon else 'off'}, " if inputs is not None
+               else "")
+        command = f"{PROG} provision --x64dbg-root '{root}' --snapshot {shlex.quote(snapshot)}"
+        command += f" --user {shlex.quote(args.user)}" if args.user else ""
+        command += " --no-autologon" if args.no_autologon else ""
+        command += f" --bind {args.bind}" if args.bind != DEFAULT_PLUGIN_BIND else ""
+        command += f" --wait-ready {args.wait_ready:g}" if args.wait_ready != DEFAULT_WAIT_READY_S else ""
+        report.set("provision", pending,
+                   f"{who}bind {args.bind}, reboot, wait up to {args.wait_ready:g} s for the plugins, "
+                   f"take snapshot {snapshot!r}", command=command + suffix)
+        if snapshot != prof.clean_snapshot:
+            report.note(f"the profile's clean_snapshot is {prof.clean_snapshot!r}: set "
+                        f"profiles.{prof.name}.clean_snapshot (and protected_snapshots) to {snapshot!r} so "
+                        "analyses revert to the new snapshot")
+    else:
+        report.set("provision", "skipped", skip_why or "--skip-provision")
+    report.set("doctor", pending, "doctor again, after the changes")
+    if args.dry_run:
+        report.data["problems"] = [p.to_dict() for p in problems]
+    return plan
+
+
+def _failed_checks(result: Any) -> list[str]:
+    raw = result.get("checks") if isinstance(result, Mapping) else None
+    checks = [c for c in raw if isinstance(c, Mapping)] if isinstance(raw, list) else []
+    return [str(c.get("name")) for c in checks if not c.get("ok")]
+
+
+def _classify_precheck(result: Any, plan: _SetupPlan) -> tuple[list[str], list[str], list[str]]:
+    """(blockers, fixable, unknown) among the failed doctor checks. Plugin answers and tokens are
+    fixed by installing and provisioning, the clean snapshot by provisioning; checks this
+    version does not know never stop setup (the final doctor still reports them)."""
+    blockers: list[str] = []
+    fixable: list[str] = []
+    unknown: list[str] = []
+    for name in _failed_checks(result):
+        if name in SETUP_BLOCKING_CHECKS:
+            blockers.append(name)
+        elif name == "clean_snapshot":
+            (fixable if plan.provision else blockers).append(name)
+        elif name.startswith(("backend:", "catalog:")):
+            (fixable if plan.install or plan.provision else blockers).append(name)
+        else:
+            unknown.append(name)
+    return blockers, fixable, unknown
+
+
+def _snapshot_exists(app: Any, profile: str | None, name: str) -> bool:
+    listing = app.vm_snapshots_list(profile)
+    snaps = listing.get("snapshots") if isinstance(listing, Mapping) else None
+    names = [s.get("name") for s in snaps if isinstance(s, Mapping)] if isinstance(snaps, list) else []
+    return any(isinstance(n, str) and n.casefold() == name.casefold() for n in names)
+
+
+def _doctor_ok(result: Any) -> bool:
+    return isinstance(result, Mapping) and bool(result.get("ok"))
+
+
+def _run_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig,
+               plan: _SetupPlan, report: _SetupReport, out: _Output, current: list[str]) -> bool:
+    """(b)-(e) against the VM; ``current[0]`` names the running step (for error reports)."""
+    with _app(args, config) as app:
+        current[0] = "precheck"
+        _claim_jobs_root(app)
+        out.note("setup: checking the configuration, the VM and the guest (doctor) ...")
+        before = app.doctor(args.profile)
+        blockers, fixable, unknown = _classify_precheck(before, plan)
+        found = {"result": before, "blockers": blockers, "fixable": fixable, "unknown": unknown}
+        if blockers:
+            report.set("precheck", "blocked", f"setup cannot fix: {', '.join(blockers)} (hints below)",
+                       **found)
+            return False
+        if plan.provision and _snapshot_exists(app, args.profile, plan.snapshot):
+            report.set("precheck", "blocked", f"snapshot {plan.snapshot!r} exists already", **found)
+            raise StateViolation(
+                f"snapshot {plan.snapshot!r} already exists, and provisioning never replaces it",
+                stage="setup", details={"snapshot": plan.snapshot},
+                hint=f"if `{PROG} doctor` passes, the guest is set up already. To install a new plugin build "
+                     "and take a new clean snapshot, run setup --snapshot NEW_NAME and then point "
+                     f"profiles.{prof.name}.clean_snapshot at it; setup --skip-provision only reinstalls the "
+                     "plugin (the clean snapshot keeps the old one)")
+        detail = (f"{len(fixable)} failed check(s) that setup addresses: {', '.join(fixable)}" if fixable
+                  else "all checks passed" if not unknown else "")
+        if unknown:
+            detail += ("; " if detail else "") + f"not judged by setup: {', '.join(unknown)}"
+        report.set("precheck", "done", detail, **found)
+        runtime = _runtime(app, args.profile) if plan.install or plan.provision else None
+        if plan.install:
+            assert plan.source is not None and plan.x64dbg_root is not None
+            current[0] = "install-plugin"
+            out.note(f"setup: installing the {plan.source.label()} into {plan.x64dbg_root} "
+                     "(the debuggers are stopped) ...")
+            result = _install_plugin_step(app, runtime, args.profile, plan.source,
+                                          x64dbg_root=plan.x64dbg_root, relaunch=plan.relaunch, out=out)
+            installed = result.get("installed") if isinstance(result, Mapping) else None
+            archs = f" ({', '.join(installed)})" if isinstance(installed, Mapping) and installed else ""
+            if not _result_ok(result):
+                report.set("install-plugin", "failed", "install-plugin reported a failure", result=result)
+                return False
+            report.set("install-plugin", "done", f"{plan.source.label()} -> {plan.x64dbg_root}{archs}",
+                       result=result)
+        if plan.provision:
+            assert plan.inputs is not None and plan.x64dbg_root is not None
+            current[0] = "provision"
+            out.note(f"setup: provisioning the guest: reboot, wait for the plugins, take snapshot "
+                     f"{plan.snapshot!r} (this takes a few minutes) ...")
+            result = _provision_step(app, runtime, args.profile, plan.inputs, x64dbg_root=plan.x64dbg_root,
+                                     bind=args.bind, reboot=True, wait_ready_s=args.wait_ready,
+                                     snapshot=plan.snapshot, out=out)
+            if not _result_ok(result):
+                report.set("provision", "failed", "provision reported a failure", result=result)
+                return False
+            snap = result.get("snapshot") if isinstance(result, Mapping) else None
+            taken = snap.get("name") if isinstance(snap, Mapping) else None
+            parts = (["rebooted"] if isinstance(result, Mapping) and result.get("rebooted") else []) + (
+                [f"snapshot {taken!r} taken"] if taken else [])
+            report.set("provision", "done", ", ".join(parts) or "done", result=result)
+        current[0] = "doctor"
+        out.note("setup: checking again (doctor) ...")
+        after = app.doctor(args.profile)
+        failed = _failed_checks(after)
+        ok = _doctor_ok(after)
+        report.set("doctor", "done" if ok else "failed",
+                   "all checks passed" if ok else f"{len(failed)} check(s) failed: {', '.join(failed)}",
+                   result=after)
+        return ok
+
+
+_STATUS_WORDS = {"not_run": "not run"}
+
+
+def _format_setup(report: Mapping[str, Any]) -> str:
+    lines: list[str] = []
+    for step in report["steps"]:
+        status = _STATUS_WORDS.get(step["status"], step["status"])
+        detail = _safe(step.get("detail") or "")
+        lines.append(f"[{status}] {step['step']}" + (f": {detail}" if detail else ""))
+        final_failed = step["step"] == "doctor" and step["status"] == "failed"
+        if (step.get("blockers") or final_failed) and isinstance(step.get("result"), Mapping):
+            lines.extend("    " + line for line in _format_doctor(step["result"]).splitlines())
+        if report["dry_run"] and step.get("command"):
+            lines.append(f"    = {_safe(step['command'])}")
+    lines.extend(f"note: {_safe(n)}" for n in report.get("notes", ()))
+    for problem in report.get("problems", ()):
+        lines.append(f"problem [{problem['code']}]: {_safe(problem['message'])}")
+        if problem.get("hint"):
+            lines.append(f"  hint: {_safe(problem['hint'])}")
+    register = report.get("register")
+    if register:
+        lines += ["", "register the gateway with Claude Code:", f"  {register['command']}",
+                  str(report.get("static_tools", ""))]
+    if report["dry_run"]:
+        lines.append("dry run: nothing was changed")
+    elif report["ok"]:
+        lines.append("setup complete")
+    else:
+        lines.append("setup stopped: fix what is shown above and run setup again")
+    return "\n".join(lines)
+
+
+def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
+    path = _config_target(args)
+    report = _SetupReport(args, path)
+    config = _setup_config(args, out, path, report)
+    prof = config.profile(args.profile)
+    report.data["config"]["profile"] = prof.name
+    plan = _plan_setup(args, config, prof, report)
+    error: GatewayError | None = None
+    if args.dry_run:
+        ok = not report.data["problems"]
+    else:
+        current = ["precheck"]
+        try:
+            ok = _run_setup(args, config, prof, plan, report, out, current)
+        except GatewayError as e:
+            error = _explain(e, "setup")
+            step = report.step(current[0])
+            if step["status"] != "blocked":
+                report.set(current[0], "failed", f"{error.code}: {error.message}")
+            report.data["error"] = error.to_dict()
+            ok = False
+    report.data["ok"] = ok
+    if ok or args.dry_run:
+        argv = _register_argv(args, path)
+        report.data["register"] = {"command": shell_join(argv), "argv": argv}
+        report.data["static_tools"] = STATIC_TOOLS_LINE
+    out.data(report.data, _format_setup)
+    if error is not None and not out.json_mode:
+        sys.stdout.flush()  # the summary first, then the error with its hint
+        out.error(error)
+    return EXIT_OK if ok else EXIT_FAILURE
+
+
 # ── parser ──────────────────────────────────────────────────────────
 def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     def default(value: Any) -> Any:
@@ -802,6 +1299,20 @@ def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> N
     group.add_argument("--json", action="store_true", default=default(False), help="machine-readable output")
     group.add_argument("-v", "--verbose", action="store_true", default=default(False),
                        help="debug logging on stderr")
+
+
+def _add_init_options(p: Any, *,
+                      x64dbg_root_help: str = "guest directory containing x64\\ and x32\\") -> None:
+    """The config values ``init`` asks for (``setup`` passes them through to it)."""
+    p.add_argument("--non-interactive", action="store_true", help="take every value from flags")
+    p.add_argument("--profile-name", metavar="NAME")
+    p.add_argument("--vmx", metavar="PATH", help="host path of the VM's .vmx file")
+    p.add_argument("--clean-snapshot", metavar="NAME", help=f"default: {DEFAULT_CLEAN_SNAPSHOT}")
+    p.add_argument("--guest-user", metavar="USER")
+    p.add_argument("--guest-password-env", metavar="VAR", help=f"default: {DEFAULT_PASSWORD_ENV}")
+    p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help=x64dbg_root_help)
+    p.add_argument("--jobs-root", metavar="DIR", help="host directory for job artifacts")
+    p.add_argument("--vmrun", metavar="PATH", help="vmrun executable (default: auto-detect)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -824,17 +1335,9 @@ def build_parser() -> argparse.ArgumentParser:
     command("status", cmd_status, "show VM, backend and job status")
 
     p = command("init", cmd_init, "create a config file (interactive unless --non-interactive)")
-    p.add_argument("--non-interactive", action="store_true", help="take every value from flags")
     p.add_argument("--force", action="store_true", help="overwrite an existing config file")
     p.add_argument("--mode", choices=gw_config.MODES)
-    p.add_argument("--profile-name", metavar="NAME")
-    p.add_argument("--vmx", metavar="PATH", help="host path of the VM's .vmx file")
-    p.add_argument("--clean-snapshot", metavar="NAME", help=f"default: {DEFAULT_CLEAN_SNAPSHOT}")
-    p.add_argument("--guest-user", metavar="USER")
-    p.add_argument("--guest-password-env", metavar="VAR", help=f"default: {DEFAULT_PASSWORD_ENV}")
-    p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help="guest directory containing x64\\ and x32\\")
-    p.add_argument("--jobs-root", metavar="DIR", help="host directory for job artifacts")
-    p.add_argument("--vmrun", metavar="PATH", help="vmrun executable (default: auto-detect)")
+    _add_init_options(p)
     for arch in ("x64", "x32"):
         p.add_argument(f"--{arch}-url", metavar="URL", help=f"endpoint mode: {arch} plugin URL")
         p.add_argument(f"--{arch}-token-env", metavar="VAR",
@@ -863,9 +1366,37 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default: {DEFAULT_WAIT_READY_S:g})")
 
     p = command("install-plugin", cmd_install_plugin, "copy a plugin build into the guest and relaunch")
-    p.add_argument("--dist", required=True, metavar="DIR", help="host directory with the built .dp64/.dp32")
+    p.add_argument("--dist", metavar="DIR",
+                   help="host folder holding x64/plugins/*.dp64 and x32/plugins/*.dp32 "
+                        "(default: the build bundled with this installation)")
     p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help="default: derived from the profile's backends")
     p.add_argument("--no-relaunch", action="store_true", help="do not restart the debuggers")
+
+    p = command("setup", cmd_setup,
+                "one-shot setup: init (if there is no config), doctor, install-plugin, provision, doctor, "
+                "and the MCP client registration command")
+    p.add_argument("--dry-run", action="store_true", help="print the plan; change and contact nothing")
+    p.add_argument("--skip-plugin", action="store_true", help="do not install the plugin")
+    p.add_argument("--skip-provision", action="store_true",
+                   help="do not provision (the debuggers are then relaunched after the plugin install)")
+    group = p.add_argument_group("config creation (used only when there is no config file; see init)")
+    _add_init_options(group, x64dbg_root_help="guest directory containing x64\\ and x32\\ "
+                                              "(default: derived from the profile's backends)")
+    group = p.add_argument_group("plugin")
+    group.add_argument("--dist", metavar="DIR",
+                       help="host folder holding x64/plugins and x32/plugins (default: the bundled build)")
+    group = p.add_argument_group("provisioning (see provision)")
+    group.add_argument("--snapshot", metavar="NAME",
+                       help="clean snapshot to take (default: the profile's clean_snapshot, "
+                            f"{DEFAULT_CLEAN_SNAPSHOT})")
+    group.add_argument("--user", metavar="USER",
+                       help="interactive guest user (default: the profile's guest_user)")
+    group.add_argument("--no-autologon", action="store_true", help="do not configure Windows auto-logon")
+    group.add_argument("--bind", metavar="ADDR", default=DEFAULT_PLUGIN_BIND,
+                       help=f"plugin bind address in the guest (default: {DEFAULT_PLUGIN_BIND})")
+    group.add_argument("--wait-ready", type=float, default=DEFAULT_WAIT_READY_S, metavar="SECONDS",
+                       help="how long to wait for the plugins after the reboot "
+                            f"(default: {DEFAULT_WAIT_READY_S:g})")
     return parser
 
 
