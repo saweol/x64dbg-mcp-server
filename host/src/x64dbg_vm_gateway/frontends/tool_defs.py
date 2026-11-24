@@ -65,6 +65,7 @@ __all__ = [
     "RiskTier",
     "UnknownTool",
     "check_arguments",
+    "static_servers_note",
     "tool_tier",
 ]
 
@@ -505,6 +506,38 @@ def _alias(old: str, new: str) -> GatewayToolDef:
         description=f"Deprecated name of {new}, kept callable for older clients (not listed). "
                     + target.description,
     )
+
+
+_NOTE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _-./+()")
+_NOTE_MAX_CHARS = 64
+_NOTE_MAX_SERVERS = 8
+
+
+def _note_text(value: object) -> str:
+    text = "".join(c for c in value if c in _NOTE_CHARS) if isinstance(value, str) else ""
+    return text.strip()[:_NOTE_MAX_CHARS]
+
+
+def static_servers_note(servers: object) -> str | None:
+    """The sentence appended to the ``STATIC_TOOL_NAMES`` descriptions: which static tool (and
+    MCP server) this gateway is configured for, the default first. ``servers`` is what
+    ``app.Gateway.static_servers`` returns (``[{"display", "server", ...}]``); malformed
+    entries are skipped and names are reduced to plain characters. None when nothing is usable."""
+    if not isinstance(servers, list | tuple):
+        return None
+    entries: list[str] = []
+    for entry in servers[:_NOTE_MAX_SERVERS]:
+        if not isinstance(entry, Mapping):
+            continue
+        display, server = _note_text(entry.get("display")), _note_text(entry.get("server"))
+        if display and server:
+            entries.append(f"{display} via MCP server '{server}'")
+    if not entries:
+        return None
+    note = f"Static tool configured for this gateway: {entries[0]}"
+    if len(entries) > 1:
+        note += "; also " + ", ".join(entries[1:])
+    return note + "."
 
 
 CALLABLE_TOOLS: Mapping[str, GatewayToolDef] = MappingProxyType({

@@ -32,7 +32,7 @@ def test_exactly_the_gateway_tools_are_defined():
 
 
 @pytest.mark.parametrize("hidden", ["discard_job", "close", "call_mirrored", "list_mirrored_tools",
-                                    "instructions"])
+                                    "instructions", "static_servers"])
 def test_human_only_and_internal_methods_are_not_tools(hidden):
     assert hidden not in TOOLS_BY_NAME
     assert all(t.method != hidden for t in GATEWAY_TOOLS)

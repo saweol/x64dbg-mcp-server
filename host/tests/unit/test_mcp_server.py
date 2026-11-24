@@ -115,6 +115,56 @@ def test_mirrored_names_colliding_with_deprecated_aliases_are_skipped():
     assert not app.called("call_mirrored")
 
 
+# ── the configured static tools in the static_* descriptions ────────
+class StaticApp(FakeApp):
+    def __init__(self, servers: Any, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.servers = servers
+
+    def static_servers(self) -> Any:
+        if isinstance(self.servers, Exception):
+            raise self.servers
+        return self.servers
+
+
+GHIDRA_R2 = [{"id": "ghidra", "display": "Ghidra", "server": "ghidra", "default": True},
+             {"id": "radare2", "display": "radare2", "server": "r2", "default": False}]
+
+
+def _descriptions(app: Any) -> dict[str, str]:
+    res = drive(mcp_server.build_server(app), lambda c: c.list_tools())
+    return {t.name: t.description for t in res.tools}
+
+
+def test_static_tool_descriptions_name_the_configured_servers():
+    by = _descriptions(StaticApp(GHIDRA_R2))
+    for name in ("static_rebase", "static_export_annotations", "static_import_annotations"):
+        d = by[name]
+        assert d.startswith(TOOLS_BY_NAME[name].description)
+        assert d.endswith("Static tool configured for this gateway: Ghidra via MCP server 'ghidra'; "
+                          "also radare2 via MCP server 'r2'.")
+    static = {"static_rebase", "static_export_annotations", "static_import_annotations"}
+    for name in GATEWAY_TOOL_NAMES - static:
+        assert by[name] == TOOLS_BY_NAME[name].description  # control: other tools are untouched
+
+
+@pytest.mark.parametrize("servers", [
+    RuntimeError("config gone"), None, "ghidra", [], [{"id": "ghidra"}], [{"display": 1, "server": "x"}],
+])
+def test_without_usable_static_servers_the_descriptions_stay_as_defined(servers):
+    by = _descriptions(StaticApp(servers))
+    assert by["static_rebase"] == TOOLS_BY_NAME["static_rebase"].description
+
+
+def test_static_server_note_skips_malformed_entries_and_clips_names():
+    from x64dbg_vm_gateway.frontends import tool_defs
+
+    note = tool_defs.static_servers_note([{"display": "Ghidra", "server": "g" * 500}, 3,
+                                          {"display": "radare2", "server": "r2\n'evil'"}])
+    assert note is not None and "g" * 65 not in note and "\n" not in note
+    assert note.startswith("Static tool configured for this gateway: Ghidra via MCP server 'ggg")
+
+
 # ── deprecated ida_* names ──────────────────────────────────────────
 @pytest.mark.parametrize("mode", MODES)
 def test_old_ida_tool_names_are_callable_but_not_listed(app, mode, caplog):

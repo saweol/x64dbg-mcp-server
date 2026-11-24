@@ -81,17 +81,19 @@ from .tool_defs import (
     CALLABLE_TOOLS,
     GATEWAY_TOOLS,
     RESERVED_TOOL_NAMES,
+    STATIC_TOOL_NAMES,
     Forbidden,
     GatewayToolDef,
     InternalError,
     UnknownTool,
     check_arguments,
+    static_servers_note,
 )
 
 log = logging.getLogger(__name__)
 
-__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "ToolCallRecord", "WarmUpApp", "allowed_tiers",
-           "build_server", "run_stdio", "warm_up"]
+__all__ = ["SCOPES", "SERVER_NAME", "AuditHook", "StaticToolsApp", "ToolCallRecord", "WarmUpApp",
+           "allowed_tiers", "build_server", "run_stdio", "warm_up"]
 
 SERVER_NAME = "x64dbg-vm-gateway"
 SCOPES: tuple[str, ...] = ("read", "analyze", "admin")
@@ -182,11 +184,14 @@ def _log_name(name: str) -> str:
 
 
 # ── tool listing ────────────────────────────────────────────────────
-def _gateway_tool(spec: GatewayToolDef) -> types.Tool:
+def _gateway_tool(spec: GatewayToolDef, static_note: str | None = None) -> types.Tool:
+    description = spec.description
+    if static_note and spec.name in STATIC_TOOL_NAMES:
+        description = f"{description} {static_note}"
     return types.Tool(
         name=spec.name,
         title=spec.title,
-        description=spec.description,
+        description=description,
         input_schema=json.loads(json.dumps(spec.input_schema)),  # private copy
         annotations=types.ToolAnnotations.model_validate(spec.annotations),
     )
@@ -285,17 +290,19 @@ class _Pools:
 
 
 class _Handlers:
-    def __init__(self, app: GatewayApp, scope: str | None, audit: AuditHook | None) -> None:
+    def __init__(self, app: GatewayApp, scope: str | None, audit: AuditHook | None,
+                 static_note: str | None = None) -> None:
         self.app = app
         self.scope = scope
         self.tiers = allowed_tiers(scope)
         self.audit = audit
         self.mirrors = _MirrorIndex(app)
         self.pools = _Pools()
+        self.static_note = static_note
 
     # ── tools/list ──────────────────────────────────────────────────
     async def list_tools(self, ctx: Any, params: Any) -> types.ListToolsResult:
-        tools = [_gateway_tool(t) for t in GATEWAY_TOOLS if t.tier in self.tiers]
+        tools = [_gateway_tool(t, self.static_note) for t in GATEWAY_TOOLS if t.tier in self.tiers]
         try:
             mirrored = await anyio.to_thread.run_sync(self.mirrors.fetch, limiter=self.pools.get(status=True))
         except Exception:
@@ -409,6 +416,30 @@ def warm_up(app: GatewayApp) -> None:
         log.warning("warm-up failed; serving the cached / builtin tool list", exc_info=True)
 
 
+@runtime_checkable
+class StaticToolsApp(Protocol):
+    """An app that knows the static-analysis tools configured next to it (``[static]``).
+
+    Kept beside the front-end like ``WarmUpApp``; ``app.Gateway`` satisfies it (a unit test
+    checks). An app without it is served with the static_* descriptions as defined."""
+
+    def static_servers(self) -> Any:
+        """``[{"id", "display", "server", "default"}]``, the default tool first."""
+        ...
+
+
+def _static_note(app: GatewayApp) -> str | None:
+    """The configured static tools for the static_* descriptions (never fatal)."""
+    if not isinstance(app, StaticToolsApp):
+        return None
+    try:
+        return static_servers_note(app.static_servers())
+    except Exception:
+        log.warning("app.static_servers() failed; the static_* descriptions do not name a server",
+                    exc_info=True)
+        return None
+
+
 def _instructions(app: GatewayApp) -> str:
     try:
         text = app.instructions()
@@ -428,9 +459,11 @@ def build_server(app: GatewayApp, *, scope: str | None = None, audit: AuditHook 
     The server instructions are read from ``app.instructions()`` once, here: the
     SDK serves a static string, so backend instructions that change later (plugin
     reinstall, revert to an older snapshot) reach clients only after the server
-    is rebuilt, i.e. after ``serve`` is restarted.
+    is rebuilt, i.e. after ``serve`` is restarted. The configured static tools
+    (``StaticToolsApp``), appended to the static_* tool descriptions, are read once
+    here too.
     """
-    handlers = _Handlers(app, scope, audit)
+    handlers = _Handlers(app, scope, audit, _static_note(app))
     return Server(
         SERVER_NAME,
         version=__version__,
