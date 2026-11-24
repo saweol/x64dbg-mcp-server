@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         "src/mcp/serverinfo.zig",
         "src/mcp/toolpolicy.zig",
         "src/mcp/debugstate.zig",
+        "src/mcp/dbsave.zig",
         "src/core/sync.zig",
         "src/core/ring.zig",
         "src/core/netpolicy.zig",

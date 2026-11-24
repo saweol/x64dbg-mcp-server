@@ -1550,7 +1550,7 @@
   },
   {
    "name": "SaveDatabase",
-   "description": "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions. Optional filePath saves to that file instead of the default database location (relative paths resolve against ArtifactDir).",
+   "description": "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions. Optional filePath saves to that file instead of the default database location (relative paths resolve against ArtifactDir). With filePath the plugin waits up to 10 s for x64dbg and answers 'Database saved to ...', 'No database file written to ...' (the session has no labels, comments, bookmarks, breakpoints or functions, so x64dbg writes no file) or an error.",
    "debug_only": true,
    "read_only": false,
    "inputSchema": {

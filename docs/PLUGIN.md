@@ -203,7 +203,7 @@ AI: [calls StepOver x3, GetCallStack]
 | `TraceOver` | Trace N instructions stepping over calls |
 | `SetBreakpointCommand` | Set a command to execute when a breakpoint is hit |
 | `SetBreakpointFastResume` | Enable/disable fast resume (auto-continue) on a breakpoint |
-| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file (`filePath` omitted or `""` = default location) |
+| `SaveDatabase` | Save the x64dbg database (.dd64/.dd32), optionally to a given file (`filePath` omitted or `""` = default location). x64dbg writes no file, and deletes an existing one, while the session has no labels, comments, bookmarks, breakpoints or functions. With `filePath` the plugin makes sure a file is at the path, queues `dbsave` and watches the file for up to 10 s: removed = `No database file written to "..."`, rewritten = `Database saved to "..."`, untouched = an error; a path it cannot create is an error too. Without `filePath` the save is only queued (`Database saved.`). |
 
 
 ## Configuration

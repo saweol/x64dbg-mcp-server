@@ -13,6 +13,7 @@ const launch = @import("../core/launch.zig");
 const cmdline = @import("cmdline.zig");
 const serverinfo = @import("serverinfo.zig");
 const debugstate = @import("debugstate.zig");
+const dbsave = @import("dbsave.zig");
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -20,6 +21,18 @@ extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.wi
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn GetFileAttributesExW(lpFileName: [*:0]const u16, fInfoLevelId: c_int, lpFileInformation: *Win32FileAttributeData) callconv(.winapi) i32;
+extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) i32;
+
+/// WIN32_FILE_ATTRIBUTE_DATA (GetFileExInfoStandard)
+const Win32FileAttributeData = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+};
 extern "kernel32" fn ReadFile(hFile: ?*anyopaque, lpBuffer: [*]u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetFinalPathNameByHandleW(hFile: ?*anyopaque, lpszFilePath: [*]u16, cchFilePath: u32, dwFlags: u32) callconv(.winapi) u32;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
@@ -716,7 +729,7 @@ pub const tools = [_]ToolDef{
     },
     .{
         .name = "SaveDatabase",
-        .description = "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions. Optional filePath saves to that file instead of the default database location (relative paths resolve against ArtifactDir).",
+        .description = "Saves the x64dbg database (labels, comments, breakpoints, analysis) for the current module. Persists your work across sessions. Optional filePath saves to that file instead of the default database location (relative paths resolve against ArtifactDir). With filePath the plugin waits up to 10 s for x64dbg and answers 'Database saved to ...', 'No database file written to ...' (the session has no labels, comments, bookmarks, breakpoints or functions, so x64dbg writes no file) or an error.",
         .debug_only = true,
         .read_only = false,
         .handler = saveDatabase,
@@ -1128,6 +1141,9 @@ fn schemaProbeFile(w: *JsonWriter) void {
 
 // ── ProbeFile ───────────────────────────────────────────────────────
 const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const CREATE_NEW: u32 = 1;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_SHARE_READ: u32 = 0x1;
 const FILE_SHARE_WRITE: u32 = 0x2;
 const OPEN_EXISTING: u32 = 3;
@@ -4154,7 +4170,8 @@ fn setBreakpointFastResume(params: ?std.json.Value, out: []u8) ToolResult {
 // ── SaveDatabase ─────────────────────────────────────────────────
 fn saveDatabase(params: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging()) return errResult(out, "Error: No active debug session.");
-    // "" means "the default location", like omitting filePath.
+    // "" means "the default location", like omitting filePath. That path is x64dbg's own, so
+    // the save is only queued there, as before.
     const file_path = (if (params) |p| json.getOptionalStringField(p, "filePath") else null) orelse {
         const ok = bridge.cmdExec("dbsave\x00");
         return fmtResult(out, "{s}", .{if (ok) "Database saved." else "Failed to save database."});
@@ -4165,6 +4182,55 @@ fn saveDatabase(params: ?std.json.Value, out: []u8) ToolResult {
     var cmd_buf: [pathutil.MAX_PATH_LEN + 32]u8 = undefined;
     const cmd = cmdline.buildDbSave(&cmd_buf, resolved) catch
         return errResult(out, "Error: filePath too long or cannot be quoted.");
-    const ok = bridge.cmdExec(cmd.ptr);
-    return fmtResult(out, "{s} \"{s}\".", .{ if (ok) "Database saved to" else "Failed to save database to", resolved });
+    var wide: [pathutil.MAX_PATH_LEN + 1]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..pathutil.MAX_PATH_LEN], resolved) catch
+        return errResult(out, "Error: filePath is not valid UTF-8.");
+    wide[n] = 0;
+    const wpath: [*:0]const u16 = @ptrCast(&wide);
+
+    // A file must be at the path before dbsave, so that what x64dbg does to it tells the
+    // outcome (see dbsave.zig); a placeholder that cannot be created means the save cannot work.
+    var placeholder = false;
+    const before: dbsave.Stamp = switch (statFile(wpath)) {
+        .file => |st| st,
+        .unknown => return fmtErr(out, "Error: cannot check \"{s}\" (Win32 error {d}); the database was not saved.", .{ resolved, GetLastError() }),
+        .directory => return fmtErr(out, "Error: \"{s}\" is a directory; the database was not saved.", .{resolved}),
+        .missing, .missing_dir => blk: {
+            const h = CreateFileW(wpath, GENERIC_WRITE, 0, null, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, null);
+            if (h == null or @intFromPtr(h) == std.math.maxInt(usize))
+                return fmtErr(out, "Error: cannot create \"{s}\" (Win32 error {d}); the database was not saved.", .{ resolved, GetLastError() });
+            _ = CloseHandle(h);
+            placeholder = true;
+            break :blk switch (statFile(wpath)) {
+                .file => |st| st,
+                else => {
+                    _ = DeleteFileW(wpath);
+                    return fmtErr(out, "Error: cannot check \"{s}\" after creating it; the database was not saved.", .{resolved});
+                },
+            };
+        },
+    };
+    // Queued, not DbgCmdExecDirect: DbSave waits for the GUI thread (debuggee notes), which must
+    // not happen on this connection thread while it holds the tool lock.
+    if (!bridge.cmdExec(cmd.ptr)) {
+        if (placeholder) _ = DeleteFileW(wpath);
+        return errResult(out, "Error: x64dbg did not accept the dbsave command.");
+    }
+    var watch = dbsave.Watch{ .before = before };
+    var waited: u32 = 0;
+    while (true) {
+        watch.observe(statFile(wpath));
+        if (watch.done or waited >= dbsave.wait_ms) break;
+        Sleep(dbsave.poll_ms);
+        waited += dbsave.poll_ms;
+    }
+    if (watch.outcome == .failed and placeholder) _ = DeleteFileW(wpath);
+    const r = dbsave.reply(out, watch.outcome, resolved) catch return errResult(out, "Error: reply too long.");
+    return .{ .text = r.text, .is_error = r.is_error };
+}
+
+fn statFile(wpath: [*:0]const u16) dbsave.Stat {
+    var data: Win32FileAttributeData = undefined;
+    const ok = GetFileAttributesExW(wpath, 0, &data) != 0;
+    return dbsave.statFromWin32(ok, if (ok) 0 else GetLastError(), data.dwFileAttributes, data.nFileSizeHigh, data.nFileSizeLow, data.ftLastWriteTime[0], data.ftLastWriteTime[1]);
 }

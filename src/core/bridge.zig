@@ -424,11 +424,11 @@ pub fn valFromString(expr: [*:0]const u8) duint {
 }
 
 pub fn cmdExec(cmd: [*:0]const u8) bool {
-    return DbgCmdExec(cmd) != 0;
+    return (@as(u32, @bitCast(DbgCmdExec(cmd))) & 0xFF) != 0;
 }
 
 pub fn cmdExecDirect(cmd: [*:0]const u8) bool {
-    return DbgCmdExecDirect(cmd) != 0;
+    return (@as(u32, @bitCast(DbgCmdExecDirect(cmd))) & 0xFF) != 0;
 }
 
 pub fn memRead(addr: duint, buf: []u8) bool {
