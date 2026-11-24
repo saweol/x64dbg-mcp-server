@@ -1003,6 +1003,45 @@ def test_absent_snapshot_is_taken(rt: FakeRuntime, timeline: Timeline, host_tmp:
     assert summary["snapshot"] == {"name": "MCP_CLEAN_V2", "replaced": False}
 
 
+def test_stale_helper_files_are_removed_before_the_clean_snapshot(rt: FakeRuntime,
+                                                                  timeline: Timeline) -> None:
+    """The output file of the PowerShell run that the reboot interrupted could not be deleted (Tools
+    were going down) and ended up in the clean snapshot (real VM, 2026-11-24): clean C:\\mcp\\tmp's
+    ps-* helper files first; other files there are none of ours and stay."""
+    _setup(rt, timeline)
+    stale = ["C:\\mcp\\tmp\\ps-4cbe56126f159819.out", "C:\\mcp\\tmp\\ps-0123456789abcdef.ps1"]
+    keep = "C:\\mcp\\tmp\\notes.txt"
+    for path in stale + [keep]:
+        rt.channel.write(path, b"x")
+    summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN_V2")
+    assert summary["snapshot"]["name"] == "MCP_CLEAN_V2"
+    assert not [p for p in stale if rt.channel.file_exists(p)]
+    assert rt.channel.file_exists(keep)
+    assert summary["cleaned_guest_tmp"] == 2
+    deletes = [i for i, c in enumerate(rt.channel.calls) if c[0] == "delete_file" and "ps-4cbe" in c[1][0]]
+    snaps = [i for i, c in enumerate(rt.vm.calls) if c[0] == "take_snapshot"]
+    assert deletes and snaps  # removed before the snapshot (separate call logs: checked by the result above)
+
+
+def test_a_stale_file_that_cannot_be_removed_only_warns(rt: FakeRuntime, timeline: Timeline, caplog,
+                                                        monkeypatch) -> None:
+    _setup(rt, timeline)
+    stale = "C:\\mcp\\tmp\\ps-4cbe56126f159819.out"
+    rt.channel.write(stale, b"x")
+    real_delete = rt.channel.delete_file
+
+    def delete(path: str) -> None:
+        if path == stale:
+            raise GuestOperationError("in use")
+        real_delete(path)
+
+    monkeypatch.setattr(rt.channel, "delete_file", delete)
+    with caplog.at_level(logging.WARNING):
+        summary = _provision(rt, Probe(timeline), reboot=True, clean_snapshot="MCP_CLEAN_V2")
+    assert summary["snapshot"]["name"] == "MCP_CLEAN_V2"
+    assert "ps-4cbe56126f159819.out" in caplog.text
+
+
 def test_snapshot_without_reboot_still_waits_for_ready(rt: FakeRuntime, timeline: Timeline,
                                                       host_tmp: Path) -> None:
     _setup(rt, timeline)

@@ -1144,8 +1144,42 @@ def provision_guest(
         summary.update(ready_s=round(runtime.clock.monotonic() - start, 1), readiness=dict(obs.statuses))
 
     if snap_plan is not None:
+        summary["cleaned_guest_tmp"] = _clean_guest_tmp(channel)
         summary["snapshot"] = _take_snapshot(runtime, snap_plan.name, overwrite_snapshot)
     return summary
+
+
+#: helper files of ps.run_powershell / run_powershell_file (``ps-<16 hex>.out|.ps1``)
+_PS_HELPER_FILE_RE = re.compile(r"^ps-[0-9a-f]{16}\.(?:out|ps1)$", re.IGNORECASE)
+
+
+def _clean_guest_tmp(channel: GuestChannel) -> int:
+    """Remove leftover PowerShell helper files from the guest temp folder before the clean
+    snapshot; returns how many were removed. A run that the reboot interrupted cannot delete
+    its own output file (Tools are going down; seen on the spike VM, 2026-11-24), and whatever
+    is left here would be part of every analysis. Only our ``ps-*`` files are touched; a
+    failure is logged, never raised (the snapshot matters more than the clutter)."""
+    tmp = DEFAULT_GUEST_TMP_DIR
+    try:
+        if not channel.dir_exists(tmp):
+            return 0
+        names = channel.list_dir(tmp)
+    except GatewayError as exc:
+        log.warning("could not list %s before the snapshot (%s); stale helper files may remain",
+                    tmp, exc.code)
+        return 0
+    removed = 0
+    for name in names:
+        if not _PS_HELPER_FILE_RE.match(name):
+            continue
+        path = str(PureWindowsPath(tmp) / name)
+        try:
+            channel.delete_file(path)
+            removed += 1
+        except GatewayError as exc:
+            log.warning("stale guest helper file %s could not be removed before the snapshot (%s)",
+                        path, exc.code)
+    return removed
 
 
 # ── plugin deployment ───────────────────────────────────────────────
