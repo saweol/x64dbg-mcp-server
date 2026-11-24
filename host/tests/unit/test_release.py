@@ -192,10 +192,12 @@ def test_build_release_writes_the_release_folder(tmp_path):
     assert "build -Doptimize=ReleaseSafe --prefix" in (tmp_path / "zig.log").read_text(encoding="utf-8")
 
     release = repo / "release"
-    wheel_name = f"{PACKAGE}-0.1.0-py3-none-any.whl"
+    gw_version = _pyproject()["project"]["version"]
+    wheel_name = f"{PACKAGE}-{gw_version}-py3-none-any.whl"
+    sdist_name = f"{PACKAGE}-{gw_version}.tar.gz"
     plugin_zip = f"x64dbg-mcp-plugin-{version}.zip"
     assert sorted(p.name for p in release.iterdir()) == sorted(
-        [wheel_name, f"{PACKAGE}-0.1.0.tar.gz", plugin_zip, "SHA256SUMS"])
+        [wheel_name, sdist_name, plugin_zip, "SHA256SUMS"])
 
     with zipfile.ZipFile(release / plugin_zip) as zf:
         assert set(zf.namelist()) == PLUGIN_ENTRIES
@@ -211,7 +213,7 @@ def test_build_release_writes_the_release_folder(tmp_path):
     for line in sums:
         digest, name = line.split("  ", 1)
         listed[name] = digest
-    assert set(listed) == {wheel_name, f"{PACKAGE}-0.1.0.tar.gz", plugin_zip}
+    assert set(listed) == {wheel_name, sdist_name, plugin_zip}
     for name, digest in listed.items():
         assert hashlib.sha256((release / name).read_bytes()).hexdigest() == digest
 
@@ -270,3 +272,56 @@ def test_release_workflow_builds_and_uploads_the_release_folder(workflow):
     assert "scripts/build-release.sh" in workflow
     assert re.search(r"files:\s*[\"']?release/\*", workflow)
     assert re.search(r"(?m)^\s*contents:\s*write\s*$", workflow)
+
+
+def test_shell_scripts_keep_lf_line_endings_in_every_checkout():
+    """A CRLF checkout (core.autocrlf on Windows, then Git Bash or WSL) breaks bash scripts."""
+    lines = (REPO / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    assert any(re.fullmatch(r"\*\.sh\s+text\s+eol=lf", line.strip()) for line in lines)
+
+
+
+FAILING_ZIG = """#!/usr/bin/env bash
+if [ "${1:-}" = "version" ]; then echo 0.14.0; exit 0; fi
+echo "error: compilation failed" >&2
+exit 1
+"""
+
+
+@needs_bash
+def test_a_failed_build_leaves_no_release_and_no_bundle_behind(tmp_path):
+    repo = _copy_project(tmp_path / "repo", with_script=True)
+    (repo / "release").mkdir()
+    (repo / "release" / "old.whl").write_text("old", encoding="utf-8")
+    bundle = repo / "host" / "src" / PACKAGE / "data" / "plugin" / "x64"
+    bundle.mkdir(parents=True, exist_ok=True)
+    (bundle / "x64dbg-MCP-Server.dp64").write_bytes(b"old")
+    zig = tmp_path / "failing-zig"
+    zig.write_text(FAILING_ZIG, encoding="utf-8")
+    zig.chmod(0o755)
+    res = _run_script(repo, repo, tmp_path, zig=str(zig))
+    assert res.returncode != 0
+    assert not (repo / "release").exists()
+    assert not bundle.exists()
+
+
+@needs_uv
+@needs_bash
+def test_build_release_takes_a_relative_zig_path(tmp_path):
+    repo = _copy_project(tmp_path / "repo", with_script=True)
+    _run_script(repo, tmp_path, tmp_path, zig=str(tmp_path / "unused"))  # creates the stub in tmp/bin
+    res = _run_script(repo, tmp_path, tmp_path, zig="bin/zig")  # relative to the caller's directory
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert (repo / "release" / "SHA256SUMS").is_file()
+
+
+def test_release_workflow_tests_before_it_publishes(workflow):
+    steps = workflow.index("run: scripts/build-release.sh")
+    assert "zig build test" in workflow[:steps]
+    assert "uv run pytest" in workflow[:steps]
+
+
+def test_release_workflow_builds_without_caches_and_with_a_pinned_uv(workflow):
+    assert re.search(r"use-cache:\s*false", workflow)
+    setup_uv = workflow[workflow.index("astral-sh/setup-uv"):]
+    assert re.search(r"version:\s*[\"']?\d+\.\d+\.\d+", setup_uv.split("- name:")[0])

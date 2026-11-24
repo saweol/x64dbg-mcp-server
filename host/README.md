@@ -123,7 +123,9 @@ host-only.
    VM instance, job roots), installs the bundled plugin (`--dist DIR` for another build), runs
    `provision` with `--snapshot` (default: the profile's `clean_snapshot`), checks again and prints
    the `claude mcp add` command. `--skip-plugin` and `--skip-provision` run parts of it. It never
-   replaces an existing snapshot: use `--snapshot NEW_NAME` and point `clean_snapshot` at it.
+   replaces an existing snapshot: use `--snapshot NEW_NAME`, then set `clean_snapshot` (and
+   `protected_snapshots`) in the config to it yourself. Without auto-logon someone has to log on in
+   the VM after the reboot, within `--wait-ready` seconds.
    `setup` and the bundled-plugin install are covered by unit tests only; the real-VM runs used
    steps 3 to 5, which are the same work one command at a time.
 3. Copy the plugin into the guest (the bundled build, or `--dist DIR` holding `x64/plugins` and

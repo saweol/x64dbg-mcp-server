@@ -1,0 +1,2 @@
+# bash scripts must keep LF line endings, also in a Windows checkout with core.autocrlf
+*.sh text eol=lf

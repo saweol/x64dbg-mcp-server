@@ -103,7 +103,8 @@ x64dbg-vm-gateway setup             # (설정이 없으면 init) → doctor → 
 - 설정 파일이 없으면 `init` 마법사를 실행합니다. `--non-interactive --vmx ... --guest-user ... --x64dbg-root ...`도 받습니다.
 - doctor에서 setup이 고칠 수 없는 항목(vmrun, .vmx, VM 전원, VMware Tools, 게스트 계정, 게스트 IP, 격리, VM 중복 실행, job 폴더)이 실패하면 힌트를 보여 주고 멈춥니다.
 - 번들 플러그인을 설치하고(다른 빌드는 `--dist DIR`), `provision --snapshot`(기본값: 프로필의 `clean_snapshot`)을 실행합니다. 이어서 doctor로 다시 점검하고 Claude Code 등록 명령(§7)을 출력합니다.
-- `--skip-plugin`, `--skip-provision`으로 일부만 실행합니다. 이미 있는 스냅샷은 바꾸지 않습니다. `--snapshot 새이름`으로 찍고 `clean_snapshot`을 그 이름으로 바꿉니다.
+- `--skip-plugin`, `--skip-provision`으로 일부만 실행합니다. 이미 있는 스냅샷은 바꾸지 않습니다. `--snapshot 새이름`으로 찍은 뒤 설정 파일의 `clean_snapshot`(과 `protected_snapshots`)을 직접 그 이름으로 바꿉니다.
+- `--no-autologon`이면 재부팅 뒤 누군가 `--wait-ready`초 안에 VM에 로그온해야 합니다(디버거는 로그온 때 시작됩니다).
 - `setup`과 번들 플러그인 설치는 단위 테스트로만 검증했고, 실제 VM에서는 아직 돌려 보지 않았습니다. 실 VM에서 검증한 절차는 아래 단계별 명령입니다.
 
 한 단계씩 하려면:

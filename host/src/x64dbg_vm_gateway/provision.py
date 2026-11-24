@@ -120,6 +120,7 @@ __all__ = [
     "InfoProbe",
     "LocalIpFor",
     "RuntimeLike",
+    "check_provision_arguments",
     "default_http_probe",
     "default_info_probe",
     "default_local_ip_for",
@@ -315,6 +316,14 @@ def _safe_probe(probe: HttpProbe, ip: str, port: int, timeout: float) -> int | N
 def packaged_provision_script() -> Traversable:
     """The provision.ps1 shipped inside the package (identical to guest/provision.ps1)."""
     return resources.files(__package__).joinpath("data").joinpath("guest").joinpath("provision.ps1")
+
+
+def check_provision_arguments(*, user: object, bind: object, backends: Mapping[str, BackendConfig]) -> None:
+    """The argument checks :func:`provision_guest` makes before it touches the guest, for a caller
+    that changes the guest earlier (``setup`` installs the plugin first). Raises ConfigError."""
+    _check_user(user)
+    _check_bind(bind)
+    _ports_by_arch(backends)
 
 
 def _clip(text: str, limit: int = _TEXT_LIMIT) -> str:

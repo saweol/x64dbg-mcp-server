@@ -58,9 +58,11 @@ def test_bundle_without_version_file(tmp_path):
     assert bundle is not None and bundle.version is None
 
 
-def test_a_bogus_version_file_is_ignored(tmp_path):
+@pytest.mark.parametrize("text", ["1.10.0\x1b[2J and more\n" * 50, "1.0\x1b[2J\n", "1.0 beta\n", "\n",
+                                  "-1\n"])
+def test_a_bogus_version_file_is_ignored(tmp_path, text):
     root = make_bundle(tmp_path / "b")
-    (root / plugin_bundle.VERSION_FILE).write_text("1.10.0\x1b[2J and more\n" * 50, encoding="utf-8")
+    (root / plugin_bundle.VERSION_FILE).write_text(text, encoding="utf-8")
     bundle = plugin_bundle.find_bundle(root)
     assert bundle is not None and bundle.version is None
 

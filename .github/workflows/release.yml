@@ -3,6 +3,8 @@ name: Release
 # On a version tag: build the plugin and the host gateway wheel with the plugin bundled
 # (scripts/build-release.sh) and attach release/* (wheel, sdist, plugin zip, SHA256SUMS)
 # to the GitHub release of that tag. Ordinary pushes and pull requests do not run this.
+# The tag names the release; the assets keep their own versions (the wheel: host/pyproject.toml,
+# the plugin zip: build.zig.zon). Both test suites run before anything is built or published.
 on:
   push:
     tags:
@@ -24,9 +26,23 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.14.0
+          use-cache: false # a release build does not reuse caches written by other runs
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.26"
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Plugin unit tests
+        run: zig build test --summary all
+
+      - name: Host unit tests
+        working-directory: host
+        run: |
+          uv sync --locked
+          uv run pytest -q
 
       - name: Build plugin, wheel, sdist, plugin zip and SHA256SUMS
         run: scripts/build-release.sh

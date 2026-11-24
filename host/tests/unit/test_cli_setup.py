@@ -6,7 +6,6 @@ are replaced in ``sys.modules`` so nothing reaches a VM."""
 from __future__ import annotations
 
 import json
-import shlex
 import sys
 import types
 from pathlib import Path
@@ -19,6 +18,7 @@ from tests.unit.test_cli import _fake_bundle, run, write_config
 from x64dbg_vm_gateway import config as gw_config
 from x64dbg_vm_gateway import platform as gw_platform
 from x64dbg_vm_gateway import plugin_bundle
+from x64dbg_vm_gateway import provision as real_provision
 from x64dbg_vm_gateway.contracts import Secret
 from x64dbg_vm_gateway.errors import GuestOperationError, LockTimeout
 from x64dbg_vm_gateway.frontends import cli
@@ -93,6 +93,7 @@ def provision(monkeypatch) -> types.SimpleNamespace:
     mod = types.SimpleNamespace(
         provision_guest=lambda runtime, **kw: answer("provision_guest", runtime, kw),
         install_plugin=lambda runtime, **kw: answer("install_plugin", runtime, kw),
+        check_provision_arguments=real_provision.check_provision_arguments,
         calls=calls, results=results)
     monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.provision", mod)
     return mod
@@ -207,8 +208,8 @@ def test_setup_json_report(cfg_path, capsys):
     assert steps["install-plugin"]["result"]["plugin"] == {"source": "bundled", "version": "1.10.0"}
     assert steps["provision"]["status"] == "done" and steps["provision"]["result"]["rebooted"] is True
     assert steps["doctor"]["status"] == "done" and steps["doctor"]["result"]["ok"] is True
-    assert data["register"] == {"command": cli.shell_join(register_argv(cfg_path)),
-                                "argv": register_argv(cfg_path)}
+    assert data["register"]["command"] == cli.shell_join(register_argv(cfg_path))
+    assert data["register"]["argv"] == register_argv(cfg_path)
     assert data["static_tools"] == STATIC_LINE
 
 
@@ -284,6 +285,26 @@ def test_setup_skip_provision_relaunches_the_debuggers(cfg_path, provision, fake
     assert calls_named(provision, "provision_guest") == []
     assert fake.called("vm_snapshots_list") == []
     assert steps_of(data)["provision"]["status"] == "skipped"
+
+
+@pytest.mark.usefixtures("wiring", "bundle")
+def test_setup_skip_provision_cannot_fix_a_rejected_token(cfg_path, provision, fake, capsys):
+    """Provisioning rewrites the token configs; reinstalling the plugin does not."""
+    rejected = {"name": "backend:x64:token", "ok": False, "hint": "run: x64dbg-vm-gateway provision",
+                "detail": "BACKEND_AUTH: backend x64 rejects the token"}
+    fake.results["doctor"] = {"ok": False, "checks": [FRESH_GUEST["checks"][2], rejected]}
+    rc, data = json_run(["--config", str(cfg_path), "--json", "setup", "--skip-provision"], capsys)
+    assert rc == 1 and provision.calls == []
+    assert steps_of(data)["precheck"]["blockers"] == ["backend:x64:token"]
+
+
+@pytest.mark.usefixtures("wiring", "ready")
+def test_setup_provisioning_fixes_a_rejected_token(cfg_path, provision, fake, capsys):
+    rejected = {"name": "backend:x64:token", "ok": False, "detail": "BACKEND_AUTH: rejected", "hint": None}
+    answers = iter([{"ok": False, "checks": [rejected]}, ALL_GREEN])
+    fake.results["doctor"] = lambda **kw: next(answers)
+    assert run(["--config", str(cfg_path), "setup"]) == 0, capsys.readouterr()
+    assert len(calls_named(provision, "provision_guest")) == 1
 
 
 @pytest.mark.usefixtures("wiring", "bundle")
@@ -456,13 +477,20 @@ def test_setup_new_config_takes_the_profile_and_snapshot_names(tmp_path, provisi
 
 
 @pytest.mark.usefixtures("bundle", "vmrun_found")
-def test_setup_writes_the_config_then_stops_for_the_password(tmp_path, wiring, monkeypatch, capsys):
+def test_setup_writes_no_config_while_the_plan_has_a_problem(tmp_path, wiring, monkeypatch, capsys):
     monkeypatch.delenv(PW_ENV, raising=False)
     path = tmp_path / "config.toml"
     assert run(["--config", str(path), "setup", *INIT_FLAGS]) == 1
-    assert path.is_file()  # the next setup run uses it
+    assert not path.exists()  # the same command runs again once the password is exported
     assert PW_ENV in capsys.readouterr().err
     assert wiring.calls == []
+
+
+@pytest.mark.usefixtures("ready", "vmrun_found")
+def test_setup_usage_error_in_the_guest_options_writes_no_config(tmp_path, wiring):
+    path = tmp_path / "config.toml"
+    assert run(["--config", str(path), "setup", *INIT_FLAGS, "--wait-ready", "0"]) == 2
+    assert not path.exists() and wiring.calls == []
 
 
 @pytest.mark.usefixtures("ready", "vmrun_found")
@@ -536,9 +564,23 @@ def test_setup_dry_run_json_plan(cfg_path, capsys):
     assert rc == 0 and data["dry_run"] is True and data["problems"] == []
     assert all(s["status"] in ("planned", "skipped") for s in data["steps"])
     steps = steps_of(data)
-    assert f"install-plugin --x64dbg-root '{ROOT}' --no-relaunch" in steps["install-plugin"]["command"]
-    assert f"provision --x64dbg-root '{ROOT}' --snapshot MCP_CLEAN" in steps["provision"]["command"]
-    assert steps["provision"]["command"].endswith(f" --config {shlex.quote(str(cfg_path))}")
+    # quoted for the host's shell, like the registration command
+    install = cli.shell_join(["x64dbg-vm-gateway", "install-plugin", "--x64dbg-root", ROOT, "--no-relaunch"])
+    assert steps["install-plugin"]["command"].startswith(install)
+    provision = cli.shell_join(["x64dbg-vm-gateway", "provision", "--x64dbg-root", ROOT,
+                                "--snapshot", "MCP_CLEAN"])
+    assert steps["provision"]["command"].startswith(provision)
+    assert steps["provision"]["command"].endswith(" " + cli.shell_join(["--config", str(cfg_path)]))
+    if sys.platform != "win32":
+        assert f"install-plugin --x64dbg-root '{ROOT}' --no-relaunch" in steps["install-plugin"]["command"]
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_dry_run_commands_use_windows_quoting_on_windows(cfg_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_windows_host", lambda: True)
+    _, data = json_run(["--config", str(cfg_path), "--json", "setup", "--dry-run"], capsys)
+    assert f"--x64dbg-root {ROOT} --no-relaunch" in steps_of(data)["install-plugin"]["command"]
+    assert "'" not in steps_of(data)["provision"]["command"]
 
 
 @pytest.mark.usefixtures("provision", "ready", "vmrun_found")
@@ -567,3 +609,76 @@ def test_setup_dry_run_human_problems(cfg_path, capsys):
     assert run(["--config", str(cfg_path), "setup", "--dry-run"]) == 1
     out = capsys.readouterr().out
     assert "problem [TRANSFER_FAILED]" in out and "scripts/build-release.sh" in out
+
+
+# ── review findings: checks before the guest changes ────────────────
+@pytest.mark.parametrize("bad", [["--bind", "not-an-ip"], ["--bind", "::1"], ["--user", "bad/user"]])
+@pytest.mark.usefixtures("ready")
+def test_setup_checks_the_provision_arguments_before_changing_the_guest(cfg_path, wiring, provision, capsys,
+                                                                        bad):
+    rc, data = json_run(["--config", str(cfg_path), "--json", "setup", *bad], capsys)
+    assert rc == 1 and data["error"]["code"] == "CONFIG_INVALID"
+    assert provision.calls == [] and wiring.calls == []
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_dry_run_lists_bad_provision_arguments(cfg_path, capsys):
+    rc, data = json_run(["--config", str(cfg_path), "--json", "setup", "--dry-run", "--bind", "nope"], capsys)
+    assert rc == 1 and [p["code"] for p in data["problems"]] == ["CONFIG_INVALID"]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1"])
+@pytest.mark.usefixtures("ready")
+def test_setup_wait_ready_must_be_a_positive_finite_number(cfg_path, wiring, value):
+    assert run(["--config", str(cfg_path), "setup", "--wait-ready", value]) == 2
+    assert wiring.calls == []
+
+
+@pytest.mark.usefixtures("ready")
+def test_setup_dist_without_the_build_fails_before_the_vm(cfg_path, wiring, provision, tmp_path, capsys):
+    (tmp_path / "empty").mkdir()
+    argv = ["--config", str(cfg_path), "--json", "setup", "--dist", str(tmp_path / "empty")]
+    rc, data = json_run(argv, capsys)
+    assert rc == 1 and data["error"]["code"] == "TRANSFER_FAILED"
+    assert wiring.calls == [] and provision.calls == []
+
+
+@pytest.mark.usefixtures("wiring", "provision", "bundle")
+def test_setup_without_autologon_says_someone_must_log_on(cfg_path, capsys):
+    _, data = json_run(["--config", str(cfg_path), "--json", "setup", "--dry-run", "--no-autologon"], capsys)
+    assert any("log on" in n and "analyst" in n and "300" in n for n in data["notes"]), data["notes"]
+
+
+@pytest.mark.usefixtures("ready", "vmrun_found")
+def test_setup_profile_and_profile_name_must_agree_for_a_new_config(tmp_path, wiring):
+    path = tmp_path / "config.toml"
+    rc = run(["--config", str(path), "--profile", "a", "setup", *INIT_FLAGS, "--profile-name", "b"])
+    assert rc == 2 and not path.exists() and wiring.calls == []
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_notes_an_x64dbg_root_the_profile_does_not_use(cfg_path, capsys):
+    argv = ["--config", str(cfg_path), "--json", "setup", "--dry-run", "--x64dbg-root", "D:\\dbg"]
+    _, data = json_run(argv, capsys)
+    assert any("D:\\dbg" in n and ROOT in n for n in data["notes"]), data["notes"]
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_registration_says_where_serve_gets_the_guest_password(cfg_path, capsys):
+    _, data = json_run(["--config", str(cfg_path), "--json", "setup"], capsys)
+    note = data["register"]["note"]
+    assert PW_ENV in note and "env_file" in note and "-e" in note
+
+
+def test_every_check_the_real_doctor_emits_is_classified_by_setup(tmp_path):
+    """A check added to Gateway.doctor must be sorted into blocking / fixable on purpose."""
+    from tests.fakes.fake_runtime import make_lab
+
+    lab = make_lab(tmp_path / "lab")
+    try:
+        names = [c["name"] for c in lab.gateway().doctor()["checks"]]
+    finally:
+        lab.close()
+    assert "vm_power" in names and any(n.startswith("backend:") for n in names)
+    assert [n for n in names if cli.setup_check_kind(n) == "unknown"] == []
+    assert cli.setup_check_kind("runtime") == "blocking"  # emitted only when the runtime cannot be built

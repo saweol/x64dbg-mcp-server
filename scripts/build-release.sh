@@ -10,7 +10,8 @@
 #
 # Needs Zig 0.14 ($ZIG, else zig on PATH, else ~/.local/share/zig/zig-linux-x86_64-0.14.0/zig)
 # and uv on PATH. <version> is the plugin version in build.zig.zon. Every run starts over:
-# release/ and the bundled copy in host/src/x64dbg_vm_gateway/data/plugin/ are replaced.
+# release/ and the bundled copy in host/src/x64dbg_vm_gateway/data/plugin/ are removed first,
+# so a failed run leaves neither behind; release/ only appears complete.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,10 +25,18 @@ X32_PLUGIN="x32/plugins/x64dbg-MCP-Server.dp32"
 log() { echo "build-release: $*" >&2; }
 die() { echo "build-release: error: $*" >&2; exit 1; }
 
-find_zig() {
+find_zig() {  # an absolute path: the build runs from the repository root
     if [ -n "${ZIG:-}" ]; then
-        command -v "$ZIG" >/dev/null 2>&1 || die "ZIG=$ZIG is not an executable"
-        command -v "$ZIG"
+        case "$ZIG" in
+            */*)
+                [ -f "$ZIG" ] && [ -x "$ZIG" ] || die "ZIG=$ZIG is not an executable"
+                echo "$(cd "$(dirname "$ZIG")" && pwd)/$(basename "$ZIG")"
+                ;;
+            *)
+                command -v "$ZIG" >/dev/null 2>&1 || die "ZIG=$ZIG is not an executable"
+                command -v "$ZIG"
+                ;;
+        esac
         return
     fi
     if command -v zig >/dev/null 2>&1; then
@@ -55,6 +64,11 @@ case "$ZIG_VERSION" in
     *) log "warning: Zig $ZIG_VERSION; the plugin is built and tested with 0.14.0" ;;
 esac
 
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+STAGE="$TMP/release"
+rm -rf "$RELEASE" "$BUNDLE"
+
 log "plugin $VERSION: zig build -Doptimize=ReleaseSafe --prefix dist (Zig $ZIG_VERSION)"
 (cd "$ROOT" && "$ZIG_BIN" build -Doptimize=ReleaseSafe --prefix "$DIST")
 for f in "$X64_PLUGIN" "$X32_PLUGIN"; do
@@ -62,32 +76,28 @@ for f in "$X64_PLUGIN" "$X32_PLUGIN"; do
 done
 
 log "bundling the plugin into the package"
-rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/x64" "$BUNDLE/x32"
 cp "$DIST/$X64_PLUGIN" "$BUNDLE/x64/"
 cp "$DIST/$X32_PLUGIN" "$BUNDLE/x32/"
 printf '%s\n' "$VERSION" > "$BUNDLE/VERSION"
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 log "uv build (sdist, then the wheel from it)"
 (cd "$HOST" && uv build --out-dir "$TMP/out")
 
-rm -rf "$RELEASE"
-mkdir -p "$RELEASE"
+mkdir -p "$STAGE"
 shopt -s nullglob
 wheels=("$TMP"/out/*.whl)
 sdists=("$TMP"/out/*.tar.gz)
 shopt -u nullglob
 [ "${#wheels[@]}" -eq 1 ] || die "expected one wheel from uv build, got ${#wheels[@]}"
-cp "${wheels[0]}" "$RELEASE/"
+cp "${wheels[0]}" "$STAGE/"
 if [ "${#sdists[@]}" -gt 0 ]; then
-    cp "${sdists[@]}" "$RELEASE/"
+    cp "${sdists[@]}" "$STAGE/"
 fi
 
 # The plugin zip (fixed timestamps: the same build gives the same zip), a check that the
 # wheel really carries the plugin, and SHA256SUMS over everything in release/.
-"${PYTHON[@]}" -I - "$DIST" "$RELEASE" "$VERSION" "$X64_PLUGIN" "$X32_PLUGIN" <<'PY'
+"${PYTHON[@]}" -I - "$DIST" "$STAGE" "$VERSION" "$X64_PLUGIN" "$X32_PLUGIN" <<'PY'
 import hashlib
 import sys
 import zipfile
@@ -115,6 +125,7 @@ lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
          for p in sorted(release.iterdir()) if p.is_file() and p.name != "SHA256SUMS"]
 (release / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
 PY
+mv "$STAGE" "$RELEASE"
 
 log "release/ written:"
 (cd "$RELEASE" && cat SHA256SUMS) >&2
