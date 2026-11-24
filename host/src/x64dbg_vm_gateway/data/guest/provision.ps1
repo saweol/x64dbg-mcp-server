@@ -35,7 +35,7 @@
   debugger's ini file next to its exe (x64dbg.ini / x32dbg.ini), creating the
   file, section or key as needed and keeping every other line, so databases
   saved to x64dbg's default location are plain JSON (the gateway's
-  ida_export_annotations cannot read LZ4-compressed ones). The other lines are
+  static_export_annotations cannot read LZ4-compressed ones). The other lines are
   kept byte for byte (any encoding) and the file is replaced in one step. The
   summary's db_compression is read back from the file: 'disabled', or
   'unverified' when the value did not stick.
@@ -338,7 +338,7 @@ try {
 
         # x64dbg reads its settings from <exe dir>\<exe name>.ini (x64dbg.ini, x32dbg.ini).
         # Engine/DisableDatabaseCompression=1 keeps databases saved to x64dbg's default
-        # location plain JSON instead of LZ4 (ida_export_annotations parses them).
+        # location plain JSON instead of LZ4 (static_export_annotations parses them).
         # ASSUMPTION, to be verified on the real VM: the ini file name (taken from the exe
         # name, as x64dbg's bridge does) and the section/key names (x64dbg database.cpp).
         # A debugger running now may write its own settings back when it exits; the reboot

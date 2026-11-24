@@ -6,34 +6,35 @@ each run). IDA analyses it at the **IDB image base**. Both agree on
 
 ```
 runtime = module_base_runtime + rva          (x64dbg, from ListModules)
-ida     = ida_imagebase      + rva           (IDA, idaapi.get_imagebase())
+ida     = IDB image base     + rva           (IDA, idaapi.get_imagebase())
 ```
 
 There are two parts:
 
 | Part | Where | What it does |
 |---|---|---|
-| `x64dbg_vm_gateway.ida_sync` | host gateway (`host/src/…/ida_sync.py`) | Parses `ListModules` into a module map, rebases addresses, parses x64dbg databases (`.dd64`/`.dd32`), builds export documents and import plans. It is a pure library; the gateway exposes it as the MCP tools `ida_rebase`, `ida_export_annotations` and `ida_import_annotations` (`app.Gateway`). |
-| `static/ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Menu actions to import an export document into the IDB, and to export the IDB's names/comments for x64dbg. |
+| `x64dbg_vm_gateway.ida_sync` | host gateway (`host/src/…/ida_sync.py`) | Parses `ListModules` into a module map, rebases addresses, parses x64dbg databases (`.dd64`/`.dd32`), builds export documents and import plans. It is a pure library; the gateway exposes it as the MCP tools `static_rebase`, `static_export_annotations` and `static_import_annotations` (`app.Gateway`; the same tools serve Ghidra, radare2 and Cutter, see [../README.md](../README.md)). |
+| `static/ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Menu actions to import an export document into the IDB, and to export the IDB's names/comments for x64dbg. An installed gateway carries a copy: `x64dbg-vm-gateway static-scripts` prints where. |
 
 ## Using it with ida-multi-mcp (AI workflow)
 
 The AI talks to two MCP servers: the gateway (x64dbg in the VM) and
 ida-multi-mcp (IDA on the host). The gateway converts the addresses, and
-ida-multi-mcp edits the IDB.
+ida-multi-mcp edits the IDB. `x64dbg-vm-gateway mcp-config` prints the
+`claude mcp add` commands for both (ida-multi-mcp: `python3 -m ida_multi_mcp`, stdio).
 
 **Dynamic finding → IDA** (for example a decryption routine found at a breakpoint):
 
-1. Gateway: `ida_rebase(address="0x7FF6A1231234", direction="runtime_to_ida", ida_imagebase="0x140000000")`.
+1. Gateway: `static_rebase(address="0x7FF6A1231234", direction="runtime_to_static", imagebase="0x140000000")`.
    The module is found in the job's module map, and the result is
-   `{"module": "sample.exe", "rva": "0x1234", "ida": "0x140001234", "module_map_source": "live", ...}`.
+   `{"module": "sample.exe", "rva": "0x1234", "static": "0x140001234", "module_map_source": "live", ...}`.
    The map is a live `ListModules` of the job's debugger while the sample is loaded
    (a direct read-only call: a dead debugger is never restarted for a rebase), else the
    map `analysis_collect` recorded in the job manifest (`"manifest"`).
-   `ida_imagebase` is the IDB's image base, `idaapi.get_imagebase()` in IDA. If it is
+   `imagebase` is the IDB's image base, `idaapi.get_imagebase()` in IDA. If it is
    omitted, the module's preferred (PE) image base is used, but only when the gateway
    knows it: it does for the sample (read from its PE header on the host). Without that,
-   the call fails and asks for it. `rva_to_runtime` / `ida_to_runtime` default `module`
+   the call fails and asks for it. `rva_to_runtime` / `static_to_runtime` default `module`
    to the sample (its guest name, `<sha12>.exe`).
 2. ida-multi-mcp: call `rename` / `set_comments` (or `decompile`) at `0x140001234` on the
    instance that holds `sample.exe`, then `idb_save`.
@@ -42,7 +43,7 @@ ida-multi-mcp edits the IDB.
 
 1. Collect `{rva | ida_address, name?, comment?}` items, either from ida-multi-mcp
    output or from the *Export* action below (its `items` can be passed as-is).
-2. Gateway: `ida_import_annotations(items, module="sample.exe", ida_imagebase="0x140000000")`.
+2. Gateway: `static_import_annotations(items, module="sample.exe", imagebase="0x140000000")`.
    It needs the job's live debugger (the sample loaded): the items are rebased onto the
    module's current runtime base, labels and comments are made x64dbg-safe, and each one
    is set through the plugin tool `CommentOrLabelAtAddress(address, value, mode="Label" |
@@ -56,11 +57,11 @@ ida-multi-mcp edits the IDB.
 
 **x64dbg database → IDA** (all labels, comments, bookmarks and breakpoints of a session):
 
-1. Gateway: `ida_export_annotations()`. It calls `SaveDatabase` (plugin v1.10: into the job
-   out directory with `filePath`, which x64dbg writes **uncompressed**; older plugins:
+1. Gateway: `static_export_annotations()`. It calls `SaveDatabase` (plugin v1.10: into the
+   job out directory with `filePath`, which x64dbg writes **uncompressed**; older plugins:
    x64dbg's default `<x64dbg>\db\<file>.dd64`), copies the file to
-   `<job host dir>/artifacts/ida_sync.dd64` and writes the `x64dbg-ida-sync/1` document to
-   `<job host dir>/artifacts/ida_sync.json` (0600). Without a debug session it uses the
+   `<job host dir>/artifacts/static_sync.dd64` and writes the `x64dbg-ida-sync/1` document to
+   `<job host dir>/artifacts/static_sync.json` (0600). Without a debug session it uses the
    database `analysis_collect` brought to the host. The default database location is
    LZ4-compressed unless `[Engine] DisableDatabaseCompression=1` is set in the debugger's
    ini file (`x64dbg-vm-gateway provision` sets it); a compressed file is refused with
@@ -68,17 +69,21 @@ ida-multi-mcp edits the IDB.
    has no labels, comments, bookmarks, breakpoints or functions; the export is then an empty
    document with `database.source = "not_written"` and a warning.
 2. Open the document in IDA with the *Import* action, or let the AI apply the items through
-   ida-multi-mcp (`rename` / `set_comments` at `ida_imagebase + rva`).
+   ida-multi-mcp (`rename` / `set_comments` at the IDB image base + `rva`).
 
-Rebase directions (`ida_rebase` / `ida_sync.rebase`):
+The former tool names `ida_rebase`, `ida_export_annotations` and `ida_import_annotations`
+(and the arguments `ida_imagebase`, `runtime_to_ida`, `ida_to_runtime`) still work as hidden
+aliases.
+
+Rebase directions (`static_rebase`; the library `ida_sync.rebase` uses the older names in
+brackets):
 
 | direction | input | needs | notes |
 |---|---|---|---|
 | `runtime_to_rva` | runtime address | module map | The module is found by `base <= addr < base+size`. If the size is unknown, the nearest lower base is used and `approximate: true` is set. |
 | `rva_to_runtime` | RVA | `module` | The RVA is bounds-checked against the module size. |
-| `runtime_to_ida` | runtime address | `ida_imagebase` or a known preferred base | |
-| `ida_to_runtime` | IDA address | `module` and `ida_imagebase` | There is no default, because a rebased IDB would silently give wrong addresses. |
-
+| `runtime_to_static` (`runtime_to_ida`) | runtime address | `imagebase` or a known preferred base | |
+| `static_to_runtime` (`ida_to_runtime`) | IDA address | `module` and `imagebase` | There is no default, because a rebased IDB would silently give wrong addresses. |
 Module names are matched case-insensitively. They can be given as a file name, a path or
 a name without extension (`sample`). If the same DLL is loaded twice, each copy is keyed
 as `name@0x<base>`, and the bare name is rejected as ambiguous.
@@ -185,7 +190,7 @@ untrusted:
   `xmm0`, …) and flags (`_zf`). This order is assumed from x64dbg's `valfromstring` as
   recalled; it was not re-checked against an x64dbg build. A name with no safe character
   becomes `IDA name: …` at the front of the comment, never a placeholder label.
-* **Rejected batches.** `ida_import_annotations` rejects the whole batch at the first
+* **Rejected batches.** `static_import_annotations` rejects the whole batch at the first
   invalid item and names it (`items[3]: …`). `plan_import_report(..., on_error="skip")`
   skips and lists invalid items instead.
 

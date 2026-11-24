@@ -51,7 +51,7 @@ program's file name (case-insensitive, then a unique match without extension:
   section table (`iSj`), so the PE header (below the first section) counts as unmapped there.
 
 **Export** (tool → document) writes RVAs relative to the tool's image base, ready for the
-gateway's `ida_import_annotations` / `plan_import` (items `{rva, name?, comment?}`; the
+gateway's `static_import_annotations` / `plan_import` (items `{rva, name?, comment?}`; the
 module entry carries the image base as `ida_imagebase`, the field name the schema uses for
 the static tool's image base):
 
@@ -165,17 +165,22 @@ embedded Python still runs, and the script works there. The Qt5 AppImage and Cut
 ## MCP servers per tool
 
 Each static tool's own MCP server is registered next to the gateway. The gateway converts
-addresses (`ida_rebase`, the export/import tools), and the tool's server reads and edits the
-database at `image base + rva`. These are the servers this directory was checked against.
-All are stdio servers. Replace `<...>` with your paths.
+addresses (`static_rebase`, `static_export_annotations` / `static_import_annotations`), and
+the tool's server reads and edits the database at `image base + rva`. These are the servers
+this directory was checked against. All are stdio servers. Replace `<...>` with your paths.
+
+`x64dbg-vm-gateway mcp-config` prints the `claude mcp add` command of every tool listed in
+the gateway config's `[static] tools`, with the `<...>` placeholders still to fill in, the
+tool's sync script inside the installation and these notes. Values from
+`[static.servers.<id>]` (`command`, `args`, `env`, `url`, `name`) replace the defaults below.
 
 | Tool | MCP server | Register (Claude Code) | rename | comment | decompile |
 |---|---|---|---|---|---|
-| IDA | ida-multi-mcp | see [ida/README.md](ida/README.md) | `rename` | `set_comments` | `decompile` |
-| Ghidra (headless) | [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp) 0.3.0 (`pip install pyghidra-mcp`) | `claude mcp add pyghidra -e GHIDRA_INSTALL_DIR=<ghidra> -e JAVA_HOME=<jdk25> -- <venv>/bin/pyghidra-mcp --transport stdio --project-path <projects_dir> --project-name <name> --wait-for-analysis <sample.exe>` | `rename_function(binary_name, name_or_address, new_name)` (functions only) | `set_comment(binary_name, target, comment, comment_type=eol\|pre\|post\|plate\|repeatable\|decompiler)` | `decompile_function(binary_name, name_or_address)` |
-| Ghidra (headless or GUI) | [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) 2.0 (release wheel `ghidra_mcp-2.0.0[headless]` + the extension's `GhidraMCP.jar`) | headless: `claude mcp add ghidra -e GHIDRA_INSTALL_DIR=<ghidra> -e JAVA_HOME=<jdk25> -- <venv>/bin/ghidra-mcp --headless --binary <sample.exe> --project <project_dir> --extension-jar <GhidraMCP.jar>`; GUI: `... ghidra-mcp --ghidra-server http://127.0.0.1:8080/` with the extension enabled in Ghidra | `rename_function_by_address(function_address, new_name)`, `rename_function(old_name, new_name)`, `rename_data(address, new_name)` | `set_disassembly_comment(address, comment)` (EOL), `set_decompiler_comment(address, comment)` (PRE) | `decompile_function_by_address(address)` |
-| radare2 | [r2mcp](https://github.com/radareorg/radare2-mcp) 1.9.0 (`r2pm -ci r2mcp`) | `claude mcp add radare2 -- r2pm -r r2mcp` (`r2pm` and `radare2` on `PATH`) | `rename_function(address, name)` (needs a function: call `analyze` first), `rename_flag(address, name, new_name)` | `set_comment(address, message)` | `decompile_function(address)` (r2's `pdc` by default) |
-| Cutter (rizin) | [CutterMCP](https://github.com/ap425q/CutterMCP) 2.0: Cutter Python plugin + `bridge_mcp_cutter.py` | `claude mcp add cutter -- <venv>/bin/python <CutterMCP>/bridge_mcp_cutter.py` (Cutter must be running with the plugin) | `rename_function_by_address(function_address, new_name)` | `set_decompiler_comment(address, comment)`: **broken in 2.0** (the bridge posts to `/set_decompiler_comment`, the plugin serves `/setDecompilerComment`; the call returns an `Error 404` text) | `decompile_function_by_address(address)` (rz-ghidra `pdg`) |
+| IDA | ida-multi-mcp | `claude mcp add ida-multi-mcp -- python3 -m ida_multi_mcp` (default; see [ida/README.md](ida/README.md)) | `rename` | `set_comments` | `decompile` |
+| Ghidra (headless) | [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp) 0.3.0 (`pip install pyghidra-mcp`) | `claude mcp add ghidra -e GHIDRA_INSTALL_DIR=<ghidra-install-dir> -e JAVA_HOME=<jdk25-home> -- pyghidra-mcp --transport stdio --project-path <project-dir> --project-name <project-name> --wait-for-analysis <binary>` (default) | `rename_function(binary_name, name_or_address, new_name)` (functions only) | `set_comment(binary_name, target, comment, comment_type=eol\|pre\|post\|plate\|repeatable\|decompiler)` | `decompile_function(binary_name, name_or_address)` |
+| Ghidra (headless; GUI not verified) | [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) 2.0 (release wheel `ghidra_mcp-2.0.0[headless]` + the extension's `GhidraMCP.jar`) | alternative: `claude mcp add ghidra -e GHIDRA_INSTALL_DIR=<ghidra-install-dir> -e JAVA_HOME=<jdk25-home> -- ghidra-mcp --headless --binary <binary> --project <project-dir> --extension-jar <GhidraMCP.jar>` (`[static.servers.ghidra] command`); GUI mode (`ghidra-mcp --ghidra-server http://127.0.0.1:8080/` with the extension enabled in Ghidra) was not verified | `rename_function_by_address(function_address, new_name)`, `rename_function(old_name, new_name)`, `rename_data(address, new_name)` | `set_disassembly_comment(address, comment)` (EOL), `set_decompiler_comment(address, comment)` (PRE) | `decompile_function_by_address(address)` |
+| radare2 | [r2mcp](https://github.com/radareorg/radare2-mcp) 1.9.0 (`r2pm -ci r2mcp`) | `claude mcp add radare2 -- r2pm -r r2mcp` (default; `r2pm` and `radare2` on `PATH`) | `rename_function(address, name)` (needs a function: call `analyze` first), `rename_flag(address, name, new_name)` | `set_comment(address, message)` | `decompile_function(address)` (r2's `pdc` by default) |
+| Cutter (rizin) | [CutterMCP](https://github.com/ap425q/CutterMCP) 2.0: Cutter Python plugin + `bridge_mcp_cutter.py` | **not registered by default** (unsafe as shipped, see below); only after patching the plugin to bind `127.0.0.1`: `[static.servers.cutter] command = ["<venv-python>", "<CutterMCP-dir>/bridge_mcp_cutter.py"]` (Cutter must be running with the plugin) | `rename_function_by_address(function_address, new_name)` | `set_decompiler_comment(address, comment)`: **broken in 2.0** (the bridge posts to `/set_decompiler_comment`, the plugin serves `/setDecompilerComment`; the call returns an `Error 404` text with `isError` false) | `decompile_function_by_address(address)` (rz-ghidra `pdg`) |
 
 Notes:
 
@@ -197,7 +202,9 @@ Notes:
   interfaces (`('', 8000)`) without authentication. It also passes request parameters
   unescaped into `cutter.cmd` (`afn {new_name} @ {address}`, `CCu {comment} @ {address}`,
   `afs ...`, `afl~...`). Anyone who can reach port 8000 can run rizin commands, including
-  `!` shell commands. Before using it, change the bind address to `127.0.0.1`. The plugin
+  `!` shell commands. The gateway therefore registers no MCP server for Cutter by default:
+  use `x64dbg_sync_r2.py` inside Cutter, or radare2's r2mcp on the same binary. If you use
+  CutterMCP anyway, change the bind address to `127.0.0.1` first. The plugin
   imports PySide6, so it needs a Qt6 Cutter that loads Python plugins: Cutter 2.4.1 works,
   the 2.5.0 Qt6 AppImage does not (#3659), and the Qt5 AppImages have only PySide2. Its
   requirements pin `mcp==1.5.0`, which fails to import with a current pydantic

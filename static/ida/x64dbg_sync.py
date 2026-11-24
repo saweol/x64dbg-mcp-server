@@ -10,7 +10,7 @@ Two actions:
 - "Export IDA names/comments for x64dbg (x64dbg-ida-sync JSON)"
   (File > Produce file): writes the IDB's non-dummy names and comments as
   RVAs relative to the IDB image base, ready for the gateway's
-  ``plan_import`` (AI: ``ida_import_annotations``).
+  ``plan_import`` (AI: ``static_import_annotations``).
 
 Install: copy this file into IDA's ``plugins`` directory (menu entries appear
 at start-up), or run it once with File > Script file... (Alt+F7), which

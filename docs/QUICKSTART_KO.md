@@ -125,7 +125,7 @@ x64dbg-vm-gateway provision --x64dbg-root 'C:\x64dbg\release' --snapshot MCP_CLE
 - 플러그인 설정을 씁니다.
   - 외부 바인드에 필요한 `AllowExternal`, `AllowedClients=host IP`(자동 감지)를 넣습니다.
   - 손상된 토큰을 복구합니다.
-- `C:\mcp\jobs`를 만들고, x64dbg DB 압축을 끕니다(IDA 연동용).
+- `C:\mcp\jobs`를 만들고, x64dbg DB 압축을 끕니다(정적 분석 도구 연동용).
 
 프로비저닝은 재부팅을 게스트 부팅 시각으로 확인한 뒤 플러그인 응답을 기다리고 스냅샷을 찍습니다(실측: 준비 39초, 전체 3분 14초). 스냅샷은 메모리 포함 켜짐 상태입니다. 복원하면 x64dbg가 떠 있는 상태 그대로 11~14초 만에 돌아옵니다.
 
@@ -143,6 +143,8 @@ claude mcp add x64dbg-vm -- x64dbg-vm-gateway serve
 # 설정 파일이 기본 위치가 아니면:
 claude mcp add x64dbg-vm -e X64DBG_VM_GATEWAY_CONFIG=/path/config.toml -- x64dbg-vm-gateway serve
 ```
+
+`x64dbg-vm-gateway mcp-config`가 현재 설정에 맞는 등록 명령(정적 분석 도구 포함, 9절)을 출력합니다.
 
 사용 예시(대화):
 
@@ -177,15 +179,35 @@ admin = "GW_TOKEN_ADMIN"      # 스냅샷 복원·삭제, 전원, 파일 다운�
 
 `x64dbg-vm-gateway serve --transport http`로 띄웁니다. 클라이언트는 `https://<host>:9100/mcp`에 `Authorization: Bearer <token>`으로 접속합니다. 비루프백 주소에 바인드하면서 TLS가 없으면 시작을 거부합니다. 모든 호출은 `<jobs_root>/_audit/`에 감사 로그로 남습니다.
 
-## 9. IDA 연동 (ida-multi-mcp와 함께)
+## 9. 정적 분석 도구 연동 (IDA, Ghidra, radare2, Cutter)
+
+게이트웨이는 정적 분석 도구를 직접 실행하지 않습니다. 각 도구의 MCP 서버를 게이트웨이 옆에 따로 등록하고, 게이트웨이는 x64dbg 런타임 주소와 도구의 `이미지 베이스 + RVA`를 서로 변환합니다.
 
 | 툴 | 하는 일 |
 |---|---|
-| `static_rebase` | x64dbg 런타임 주소(ASLR)와 IDA 주소·RVA를 서로 변환합니다. |
+| `static_rebase` | x64dbg 런타임 주소(ASLR), RVA, 정적 도구 주소(이미지 베이스 + RVA)를 서로 변환합니다. |
 | `static_export_annotations` | x64dbg DB(라벨·주석·북마크·BP)를 `artifacts/static_sync.json`으로 내보냅니다. |
-| `static_import_annotations` | IDA 쪽 이름과 주석을 x64dbg에 적용합니다. |
+| `static_import_annotations` | 정적 도구 쪽 이름과 주석을 x64dbg에 적용합니다. |
 
-IDA 안에서는 `static/ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 있습니다. 자세한 내용은 `static/ida/README.md`에 있습니다.
+설정 파일의 `[static] tools`에 쓰는 도구를 적습니다(기본 `["ida"]`, 첫 번째가 기본 도구). 등록 명령은 다음으로 확인합니다.
+
+```console
+x64dbg-vm-gateway mcp-config      # 게이트웨이와 각 도구의 claude mcp add 명령
+x64dbg-vm-gateway static-scripts  # 설치된 동기화 스크립트 위치 (--dest DIR 이면 복사)
+```
+
+`<...>`로 남은 값(프로젝트 경로, 바이너리 등)은 직접 채웁니다. `[static.servers.<id>]`의 `args`·`env`에 적어 두면 mcp-config가 그 값으로 출력합니다.
+
+| 도구 | MCP 서버(기본 등록) | 확인한 버전 |
+|---|---|---|
+| IDA | ida-multi-mcp (`python3 -m ida_multi_mcp`) | IDA 9.2 헤드리스에서 동기화 스크립트 import·export |
+| Ghidra | pyghidra-mcp 0.3.0 헤드리스. `GHIDRA_INSTALL_DIR`, `JAVA_HOME` 필요 | Ghidra 12.2 + JDK 25. 스크립트는 `pyghidraRun -H`로 실행 |
+| radare2 | r2mcp 1.9.0 (`r2pm -r r2mcp`). 프로젝트 저장 툴이 없어 종료하면 변경이 사라짐 | radare2 6.2.6 |
+| Cutter | 기본 등록 없음 | 동기화 스크립트를 Cutter 2.5.0·2.4.1의 Python 콘솔에서 실행 |
+
+**CutterMCP 주의:** CutterMCP 2.0 플러그인은 인증 없이 모든 인터페이스(포트 8000)에서 요청을 받고, 요청 값을 그대로 `cutter.cmd`(rizin 명령, `!` 셸 명령 포함)에 넣습니다. 그래서 기본으로 등록하지 않습니다. Cutter에서는 동기화 스크립트를 쓰거나 같은 바이너리를 radare2의 r2mcp로 엽니다. 그래도 쓰려면 플러그인이 `127.0.0.1`에만 바인드하도록 고친 뒤 `[static.servers.cutter] command`로 등록합니다.
+
+자세한 내용은 `static/README.md`, IDA는 `static/ida/README.md`에 있습니다.
 
 ## 10. 안전 수칙
 
@@ -203,7 +225,7 @@ IDA 안에서는 `static/ida/x64dbg_sync.py`로 JSON을 가져오거나 내보�
 | `BackendAuthError` + provision 안내 | 게스트 `mcp_config.json`이 손상됨(0으로 채워진 사례 있음). `provision`을 다시 실행한다. |
 | `provision`이 `--user is required` | 구버전 CLI가 `guest_user_env`/`env_file`을 읽지 않던 결함(수정됨). 지금은 env 파일 값으로 동작한다. |
 | `GetDebugState`가 `status: LOCKED` | 이전 플러그인 빌드. 정지 상태(PAUSED)와 같다. 플러그인을 다시 설치하면 PAUSED로 나온다. |
-| `ida_export_annotations`가 빈 문서(`database.source = "not_written"`)와 경고를 돌려줌 | 세션에 라벨·주석·북마크·BP·함수가 하나도 없으면 x64dbg는 DB 파일을 쓰지 않는다. 플러그인(2026-11-24 빌드)은 이를 `No database file written`으로 알린다. 주석을 단 뒤 다시 export한다. 이전 빌드는 저장을 큐에 넣기만 하고 항상 "저장됨"이라고 답하므로, 게이트웨이가 빈 세션과 저장 실패를 구별하지 못한다는 경고를 붙인다. |
+| `static_export_annotations`가 빈 문서(`database.source = "not_written"`)와 경고를 돌려줌 | 세션에 라벨·주석·북마크·BP·함수가 하나도 없으면 x64dbg는 DB 파일을 쓰지 않는다. 플러그인(2026-11-24 빌드)은 이를 `No database file written`으로 알린다. 주석을 단 뒤 다시 export한다. 이전 빌드는 저장을 큐에 넣기만 하고 항상 "저장됨"이라고 답하므로, 게이트웨이가 빈 세션과 저장 실패를 구별하지 못한다는 경고를 붙인다. |
 | 게스트 명령 인자 깨짐 | vmrun은 인자마다 따옴표를 씌우고 이스케이프하지 않는다. 게이트웨이가 미리 이스케이프한다. 직접 vmrun을 쓸 때는 PowerShell `-EncodedCommand`나 `-File`을 쓰고, cmd.exe는 쓰지 않는다. |
 | 게스트 PowerShell 스크립트가 "인수 형식이 일치하지 않습니다" | Windows PowerShell 5.1의 `ConvertTo-Json @($List[object])` 문제. 게이트웨이 스크립트는 `.ToArray()`를 쓴다. |
 

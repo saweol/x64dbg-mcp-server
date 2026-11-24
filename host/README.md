@@ -169,6 +169,10 @@ claude mcp add x64dbg-vm -- x64dbg-vm-gateway serve
 # another profile:  claude mcp add x64dbg-lab -- x64dbg-vm-gateway serve --profile lab
 ```
 
+`x64dbg-vm-gateway mcp-config` prints this command for your config (with
+`-e X64DBG_VM_GATEWAY_CONFIG=<path>` when the config is not at the default location), followed by
+the commands for the static-analysis tools ([below](#static-analysis-tools)).
+
 Start Claude Code from a shell where the password variable is exported (avoid `claude mcp add -e`,
 which writes the value into Claude's config file). Run only one gateway per jobs root at a time;
 remote users connect to the same gateway over HTTP instead of starting a second one.
@@ -221,10 +225,10 @@ Further behaviour worth knowing:
 - `static_rebase`, `static_export_annotations` (writes `<job>/artifacts/static_sync.json`) and
   `static_import_annotations` connect the session to the static-analysis tool (IDA, Ghidra,
   radare2/rizin or Cutter, configured under `[static]`; addresses are static image base + RVA);
-  see `static/ida/README.md`. The former names `ida_rebase`, `ida_export_annotations` and
-  `ida_import_annotations` still work but are not listed. When the debugger
-  should still hold the sample but its live module map is unavailable, the map recorded by
-  `analysis_collect` is used and `warnings` says so.
+  see [Static analysis tools](#static-analysis-tools). The former names `ida_rebase`,
+  `ida_export_annotations` and `ida_import_annotations` still work but are not listed. When the
+  debugger should still hold the sample but its live module map is unavailable, the map recorded
+  by `analysis_collect` is used and `warnings` says so.
 - x64dbg writes no database file while a session has no labels, comments, bookmarks, breakpoints or
   functions (and deletes an existing one). The plugin's `SaveDatabase` with `filePath` (builds
   from 2026-11-24) watches the file for up to 10 s and answers `Database saved to "..."`,
@@ -241,6 +245,73 @@ Further behaviour worth knowing:
   `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
   after a plugin install. A job whose debugger held the sample is marked `flags.debuggee_lost`
   (the CLI names it), and the next gateway's recovery hint says the sample is no longer loaded.
+
+## Static analysis tools
+
+The gateway does not run IDA, Ghidra or radare2. Each tool's own MCP server is registered in the
+MCP client next to the gateway, and the gateway converts between x64dbg runtime addresses and the
+tool's `image base + RVA`: `static_rebase`, `static_export_annotations` and
+`static_import_annotations` (tool-neutral document `x64dbg-ida-sync/1`, keyed by module + RVA).
+List the tools you use; the first one is the default the gateway names in its instructions:
+
+```toml
+[static]
+tools = ["ida", "ghidra", "radare2"]   # default ["ida"]; ids: ida, ghidra, radare2, cutter
+
+[static.servers.ghidra]                 # optional: fills in or replaces the default recipe
+args = ["--transport", "stdio", "--project-path", "/path/to/ghidra-projects", "--project-name", "lab",
+        "--wait-for-analysis", "/path/to/sample.exe"]
+env = { GHIDRA_INSTALL_DIR = "/path/to/ghidra_12.2_PUBLIC", JAVA_HOME = "/path/to/jdk-25" }
+```
+
+`[static.servers.<id>]` takes `command` (program and arguments; the program is an absolute path or a
+bare name found on `PATH`), `args` (arguments for the default program), `url` with `transport`
+(`http` or `sse`), `env` (environment of a stdio server; names containing TOKEN, KEY, SECRET or PASS
+are refused, because `mcp-config` prints the values) and `name` (the MCP server name; not
+`x64dbg-vm`, which is the gateway's).
+
+Register them:
+
+```console
+x64dbg-vm-gateway mcp-config          # `claude mcp add` for the gateway and every [static] tool
+x64dbg-vm-gateway mcp-config --json   # the same as a list
+```
+
+User-specific parts stay as `<...>` placeholders and are listed under `fill in`. Each tool's entry
+also names its install command, its sync script in this installation and its caveats; `setup` ends
+with the same block.
+
+| Tool | MCP server (default registration) | Verified with | Sync script (`static-scripts`) |
+|---|---|---|---|
+| IDA Pro | ida-multi-mcp: `python3 -m ida_multi_mcp` (tools `rename`, `set_comments`, `decompile`, `idb_save`) | ida-multi-mcp | `ida/x64dbg_sync.py`: IDA menu actions or File > Script file |
+| Ghidra | pyghidra-mcp 0.3.0, headless (`pip install pyghidra-mcp`): `pyghidra-mcp --transport stdio --project-path <project-dir> --project-name <project-name> --wait-for-analysis <binary>` with `GHIDRA_INSTALL_DIR` and `JAVA_HOME` | Ghidra 12.2 with JDK 25 | `ghidra/x64dbg_sync_ghidra.py`: `support/pyghidraRun -H` (plain `analyzeHeadless` cannot run Python scripts) or the Script Manager of a Ghidra started with `pyghidraRun` |
+| radare2 | r2mcp 1.9.0 (`r2pm -ci r2mcp`): `r2pm -r r2mcp`. It has no project-save tool: changes made through it are lost when it exits | radare2 6.2.6 | `radare2/x64dbg_sync_r2.py` (radare2 and rizin; `--project` keeps the changes) |
+| Cutter | none by default (see the warning) | sync script in Cutter 2.5.0 and 2.4.1 | `radare2/x64dbg_sync_r2.py` in Cutter's Python console |
+
+pyghidra-mcp answers the client's first `initialize` only after Ghidra's analysis when
+`--wait-for-analysis` is given: raise the client's start-up timeout (Claude Code: `MCP_TIMEOUT`) or
+drop the option. Its `rename_function` renames functions only, `save` writes the project, and
+`binary_name` comes from `list_project_binaries`. Alternative for Ghidra: LaurieWired GhidraMCP 2.0
+headless (`ghidra_mcp-2.0.0[headless]` wheel and `GhidraMCP.jar` from its release zip), registered
+with `[static.servers.ghidra] command = ["ghidra-mcp", "--headless", "--binary", ...,
+"--extension-jar", ...]` and the same two variables; its GUI mode was not verified.
+
+> **CutterMCP is unsafe as shipped.** CutterMCP 2.0's Cutter plugin listens on all interfaces
+> (port 8000) without authentication and pastes request parameters unescaped into `cutter.cmd`, so
+> anyone who reaches the port runs rizin commands, including `!` shell commands. Its
+> `set_decompiler_comment` is broken as well. The gateway therefore registers no MCP server for
+> Cutter: use the sync script inside Cutter, or radare2's r2mcp on the same binary. If you still
+> use CutterMCP, patch its plugin to bind `127.0.0.1` first, then set `[static.servers.cutter]
+> command`. (Cutter 2.5.0's Qt6 AppImage cannot load Python plugins at all, rizinorg/cutter#3659.)
+
+The wheel carries the sync scripts (byte copies of [`../static/`](../static/README.md)):
+`x64dbg-vm-gateway static-scripts` prints where they are installed, and
+`x64dbg-vm-gateway static-scripts --dest DIR` copies them with their layout (it refuses to
+overwrite files unless `--force` is given). How to run each one: [`../static/README.md`](../static/README.md)
+and, for IDA, [`../static/ida/README.md`](../static/ida/README.md). `doctor` (and the MCP tool
+`gateway_doctor`) reports in its `static_tools` check whether each tool and its MCP server's
+program are found; it only warns, and it shows the program's name and the number of arguments,
+never the command line.
 
 ## Remote access (M3)
 
@@ -310,7 +381,9 @@ export NODE_EXTRA_CA_CERTS=/path/to/gw.crt     # Node-based clients and a self-s
 | `discard JOB_ID [--yes]` | human-only: mark a job DISCARDED so it may be reverted without collection |
 | `provision --x64dbg-root PATH ...` | prepare the guest (see above) |
 | `install-plugin [--dist DIR] ...` | copy a plugin build (default: the bundled one) into the guest |
-| `setup [--dry-run] ...` | init (no config yet), doctor, install-plugin, provision, doctor, registration command |
+| `setup [--dry-run] ...` | init (no config yet), doctor, install-plugin, provision, doctor, registration commands |
+| `mcp-config [--client claude]` | `claude mcp add` commands for the gateway and the configured static tools |
+| `static-scripts [--dest DIR] [--force]` | where the static-tool sync scripts are installed, or a copy of them |
 
 Global options, before or after the command: `--config PATH`, `--profile NAME`, `--json`
 (machine-readable stdout), `-v`. Exit codes: 0 success, 1 failure (prints `error [CODE]: message`
@@ -366,7 +439,10 @@ uv run ruff check src tests
 ### Testing
 
 `uv run pytest` runs the unit tests only (`-m 'not vm'` is the default): the VM, the guest and
-the plugin are fakes (`tests/fakes/`), and the plugin speaks real HTTP on loopback.
+the plugin are fakes (`tests/fakes/`), and the plugin speaks real HTTP on loopback. It also runs
+the sync-script suites `../static/tests` and `../static/ida/tests` (no IDA, Ghidra or radare2
+needed) in a subprocess, and checks that the packaged copies in `src/x64dbg_vm_gateway/data/static/`
+are byte-identical to `../static/`.
 
 The real-VM end-to-end suite `tests/vm/test_e2e_spike.py` (marker `vm`) drives a real VMware VM
 through the gateway. **It changes that VM**: it reverts it to the profile's clean snapshot,
