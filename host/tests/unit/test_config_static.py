@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
@@ -222,3 +223,73 @@ def test_the_gateway_name_constant_is_the_registration_name():
     from x64dbg_vm_gateway import static_tools
 
     assert all(t.mcp.name != cfgmod.GATEWAY_MCP_NAME for t in static_tools.TOOLS.values())
+
+
+# ── secrets: mcp-config prints command, args, url and env values verbatim ──
+def _refused_as_secret(tmp_path, body: str, key: str, value: str = "s3cr3t") -> None:
+    err = expect_error(tmp_path, BASE + "\n[static.servers.ghidra]\n" + body, key)
+    assert "secret" in err.message and value not in err.message
+    assert err.hint and "own configuration" in err.hint and "never in the gateway config" in err.hint
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:s3cr3t@10.0.0.5:8443/mcp",
+    "https://s3cr3t@10.0.0.5:8443/mcp",  # a token as the user name
+    "http://127.0.0.1:8089/sse?token=s3cr3t",
+    "http://127.0.0.1:8089/sse?x=1&API_KEY=s3cr3t",
+])
+def test_a_url_carrying_credentials_is_refused(tmp_path, url):
+    _refused_as_secret(tmp_path, f'url = "{url}"\n', "static.servers.ghidra.url")
+
+
+@pytest.mark.parametrize(("args", "index"), [
+    (["--api-key", "s3cr3t"], 0),
+    (["--transport", "stdio", "--token=s3cr3t"], 2),
+    (["--apiKey", "s3cr3t"], 0),
+    (["--password", "s3cr3t"], 0),
+    (["--private-key", "s3cr3t"], 0),
+    (["--credentials", "s3cr3t"], 0),
+    (["--auth-header", "s3cr3t"], 0),
+    (["--cookie=s3cr3t"], 0),
+    (["API_KEY=s3cr3t"], 0),
+    (["-H", "Authorization: Bearer s3cr3t"], 1),
+    (["--header", "Cookie: session=s3cr3t"], 1),
+    (["Bearer s3cr3t"], 0),
+    (["--url", "https://user:s3cr3t@h/mcp"], 1),
+    (["-Djavax.net.ssl.keyStorePassword=s3cr3t"], 0),
+])
+def test_args_carrying_a_secret_are_refused(tmp_path, args, index):
+    body = "args = [" + ", ".join(json.dumps(a) for a in args) + "]\n"
+    _refused_as_secret(tmp_path, body, f"static.servers.ghidra.args[{index}]")
+
+
+def test_a_command_carrying_a_secret_is_refused(tmp_path):
+    body = 'command = ["/opt/ghidra-mcp/run", "--headless", "--secret", "s3cr3t"]\n'
+    _refused_as_secret(tmp_path, body, "static.servers.ghidra.command[2]")
+
+
+@pytest.mark.parametrize("name", ["API_KEY", "GH_TOKEN", "DB_PASS", "AUTH_HEADER", "PRIVATE_KEY", "COOKIE",
+                                  "AWS_CREDENTIALS", "BEARER"])
+def test_env_names_with_a_secret_segment_are_refused(tmp_path, name):
+    _refused_as_secret(tmp_path, f'env = {{ {name} = "s3cr3t" }}\n', f"static.servers.ghidra.env.{name}")
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("HTTPS_PROXY", "http://user:s3cr3t@proxy:3128"),
+    ("JAVA_TOOL_OPTIONS", "-Xmx2g -Djavax.net.ssl.trustStorePassword=s3cr3t"),
+])
+def test_env_values_carrying_a_secret_are_refused(tmp_path, name, value):
+    _refused_as_secret(tmp_path, f'env = {{ {name} = "{value}" }}\n', f"static.servers.ghidra.env.{name}")
+
+
+def test_names_that_only_contain_a_secret_word_are_accepted(tmp_path):
+    """Segment matching: KEYBOARD, COMPASS and BYPASS are not KEY, PASS or a secret."""
+    text = BASE + (
+        '\n[static.servers.ghidra]\n'
+        'command = ["/opt/token-mcp/run", "--keyboard", "--compass", "--bypass", "--token-file", "/run/t",'
+        ' "MONKEY=1", "--project-path", "/srv/pass word", "http://127.0.0.1:1/sse?verbose=1"]\n'
+        'env = { KEYBOARD = "us", COMPASS = "n", BYPASS = "1", HTTPS_PROXY = "http://proxy:3128" }\n'
+    )
+    s = load_text(tmp_path, text).static.servers["ghidra"]
+    assert s.command is not None and s.command[1:4] == ("--keyboard", "--compass", "--bypass")
+    assert set(s.env) == {"KEYBOARD", "COMPASS", "BYPASS", "HTTPS_PROXY"}
