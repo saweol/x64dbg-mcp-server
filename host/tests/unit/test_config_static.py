@@ -341,3 +341,25 @@ def test_a_drive_relative_windows_program_is_refused(tmp_path, program):
     err = expect_error(tmp_path, BASE + f"\n[static.servers.ghidra]\ncommand = ['{program}']\n",
                        "static.servers.ghidra.command[0]")
     assert "drive" in err.message
+
+
+PROFILE_WITH = '''
+[profiles.{name}]
+vmx = "/vm/x.vmx"
+guest_user = "mcp"
+guest_password_env = {password_env}
+
+[profiles.{name}.backends.{backend}]
+arch = "x64"
+port = 9094
+'''
+
+
+@pytest.mark.parametrize(("name", "password_env", "backend", "key"), [
+    ('"p\\n"', '"GW_GUEST_PW"', "x64", "profiles.p\n"),
+    ("p", '"GW_GUEST_PW\\n"', "x64", "profiles.p.guest_password_env"),
+    ("p", '"GW_GUEST_PW"', '"x64\\n"', "profiles.p.backends.x64\n"),
+])
+def test_names_with_a_trailing_newline_are_refused(tmp_path, name, password_env, backend, key):
+    """A regex ending in $ also matches before a final newline: names are matched in full."""
+    expect_error(tmp_path, PROFILE_WITH.format(name=name, password_env=password_env, backend=backend), key)
