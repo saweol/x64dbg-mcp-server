@@ -12,7 +12,7 @@ a primary USER_DEFINED label (other labels at the address stay as secondary
 labels); comments are merged into the EOL comment (``--comment=pre``: the pre
 comment), never overwritten, and re-importing the same document changes
 nothing; bookmarks/breakpoints become ``[x64dbg: ...]`` tags in the comment,
-like ida/x64dbg_sync.py does in IDA.
+like static/ida/x64dbg_sync.py does in IDA.
 
 ``export``: writes the USER_DEFINED label and function names and the comments
 of the program's memory as RVAs relative to the program's image base, ready for

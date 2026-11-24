@@ -1,8 +1,8 @@
-# x64dbg ⇄ static tools sync (Ghidra, radare2, rizin, Cutter)
+# x64dbg ⇄ static tools sync (IDA, Ghidra, radare2, rizin, Cutter)
 
 The gateway exchanges annotations between x64dbg (dynamic, runtime addresses) and a
 static tool (image base addresses) through one tool-neutral JSON document, schema
-`x64dbg-ida-sync/1`, keyed by **module + RVA** (see [ida/README.md](../ida/README.md)
+`x64dbg-ida-sync/1`, keyed by **module + RVA** (see [ida/README.md](ida/README.md)
 for the schema and the IDA side):
 
 ```
@@ -10,17 +10,18 @@ runtime = module_base_runtime + rva          (x64dbg, ListModules)
 static  = image base of the static tool + rva   (Ghidra: program image base, r2/rizin: baddr)
 ```
 
-This directory holds the per-tool sync scripts for the other supported static tools,
-and the shared core they are built on:
+This directory holds the per-tool sync scripts of the supported static tools, and the
+shared core the Ghidra and radare2 scripts are built on:
 
 | File | Runs in | What it does |
 |---|---|---|
+| `ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Import / export menu actions in IDA; see [ida/README.md](ida/README.md). It is self-contained (no core). |
 | `common/x64dbg_sync_core.py` | plain Python 3.9+ | Loads/validates a document, matches the module by file name, builds the import plan for an image base, holds the name/comment rules per tool, applies a plan through a small tool adapter (merge-not-overwrite comments, counters), builds export documents. Mirrors the rules of `ida/x64dbg_sync.py` (parity tests). No tool module is imported. |
 | `ghidra/x64dbg_sync_ghidra.py` | Ghidra ≥ 11.3 with PyGhidra (Python 3) | Import / export, from the Script Manager or headless. |
 | `radare2/x64dbg_sync_r2.py` | radare2 (r2pipe), rizin (rzpipe), Cutter (`cutter.cmd`) | One script for all three through a command adapter. Import / export, from the command line, from inside a session (`#!pipe`), or from Cutter's Python console. |
 
-Both scripts find `x64dbg_sync_core.py` at run time: next to the script first, then in
-`../common/`. Keep the directory layout, or copy the core next to the script.
+The Ghidra and radare2 scripts find `x64dbg_sync_core.py` at run time: next to the script
+first, then in `../common/`. Keep the directory layout, or copy the core next to the script.
 
 ## What import and export do
 
@@ -163,7 +164,7 @@ All are stdio servers. Replace `<...>` with your paths.
 
 | Tool | MCP server | Register (Claude Code) | rename | comment | decompile |
 |---|---|---|---|---|---|
-| IDA | ida-multi-mcp | see [ida/README.md](../ida/README.md) | `rename` | `set_comments` | `decompile` |
+| IDA | ida-multi-mcp | see [ida/README.md](ida/README.md) | `rename` | `set_comments` | `decompile` |
 | Ghidra (headless) | [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp) 0.3.0 (`pip install pyghidra-mcp`) | `claude mcp add pyghidra -e GHIDRA_INSTALL_DIR=<ghidra> -e JAVA_HOME=<jdk25> -- <venv>/bin/pyghidra-mcp --transport stdio --project-path <projects_dir> --project-name <name> --wait-for-analysis <sample.exe>` | `rename_function(binary_name, name_or_address, new_name)` (functions only) | `set_comment(binary_name, target, comment, comment_type=eol\|pre\|post\|plate\|repeatable\|decompiler)` | `decompile_function(binary_name, name_or_address)` |
 | Ghidra (headless or GUI) | [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) 2.0 (release wheel `ghidra_mcp-2.0.0[headless]` + the extension's `GhidraMCP.jar`) | headless: `claude mcp add ghidra -e GHIDRA_INSTALL_DIR=<ghidra> -e JAVA_HOME=<jdk25> -- <venv>/bin/ghidra-mcp --headless --binary <sample.exe> --project <project_dir> --extension-jar <GhidraMCP.jar>`; GUI: `... ghidra-mcp --ghidra-server http://127.0.0.1:8080/` with the extension enabled in Ghidra | `rename_function_by_address(function_address, new_name)`, `rename_function(old_name, new_name)`, `rename_data(address, new_name)` | `set_disassembly_comment(address, comment)` (EOL), `set_decompiler_comment(address, comment)` (PRE) | `decompile_function_by_address(address)` |
 | radare2 | [r2mcp](https://github.com/radareorg/radare2-mcp) 1.9.0 (`r2pm -ci r2mcp`) | `claude mcp add radare2 -- r2pm -r r2mcp` (`r2pm` and `radare2` on `PATH`) | `rename_function(address, name)` (needs a function: call `analyze` first), `rename_flag(address, name, new_name)` | `set_comment(address, message)` | `decompile_function(address)` (r2's `pdc` by default) |
@@ -221,7 +222,10 @@ driven from a plugin module).
 cd host
 uv run pytest ../static/tests -q      # core (with parity checks against ida/x64dbg_sync.py),
                                       # the r2/rizin/Cutter adapter (fake pipe), the Ghidra script (fakes)
+uv run pytest ../static/ida/tests -q  # the IDA script against stub ida_* modules
 ```
 
 The tests need no reverse-engineering tool and run on Python 3.9 and newer. `static/tests`
-sits outside the host project's `testpaths`, so run it explicitly, as with `ida/tests`.
+and `static/ida/tests` sit outside the host project's `testpaths`; the host suite runs both
+in a subprocess (`tests/unit/test_static_scripts.py`, `tests/unit/test_ida_sync.py`), so a
+plain `uv run pytest` in `host/` covers them.

@@ -217,7 +217,7 @@ Further behaviour worth knowing:
 - `static_rebase`, `static_export_annotations` (writes `<job>/artifacts/static_sync.json`) and
   `static_import_annotations` connect the session to the static-analysis tool (IDA, Ghidra,
   radare2/rizin or Cutter, configured under `[static]`; addresses are static image base + RVA);
-  see `ida/README.md`. The former names `ida_rebase`, `ida_export_annotations` and
+  see `static/ida/README.md`. The former names `ida_rebase`, `ida_export_annotations` and
   `ida_import_annotations` still work but are not listed. When the debugger
   should still hold the sample but its live module map is unavailable, the map recorded by
   `analysis_collect` is used and `warnings` says so.

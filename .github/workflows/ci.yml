@@ -67,7 +67,7 @@ jobs:
       - name: Install dependencies (uv sync, lock must be current)
         run: uv sync --locked
 
-      - name: Run tests (includes ida/tests through a subprocess test)
+      - name: Run tests (includes static/tests and static/ida/tests through subprocess tests)
         run: uv run pytest -q
 
       - name: Lint

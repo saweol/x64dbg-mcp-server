@@ -5,7 +5,7 @@ the MCP client NEXT TO the gateway (for example ``claude mcp add ghidra -- pyghi
 and the gateway only offers the tool-neutral side: address rebasing between x64dbg runtime
 addresses and ``static image base + RVA`` (``static_rebase``) and the module + RVA
 annotation document ``x64dbg-ida-sync/1`` (``static_export_annotations`` /
-``static_import_annotations``, see ``ida_sync`` and ``ida/README.md``).
+``static_import_annotations``, see ``ida_sync`` and ``static/ida/README.md``).
 
 This module is DATA ONLY: one :class:`StaticTool` per supported tool with
 

@@ -16,7 +16,7 @@ validating a document, module matching, the import plan for an image base, the
 name/comment rules of each target tool, applying a plan through a small tool
 adapter, and building an export document.
 
-It mirrors the rules of ``ida/x64dbg_sync.py`` (it does not import it; the
+It mirrors the rules of ``static/ida/x64dbg_sync.py`` (it does not import it; the
 parity tests in static/tests run both on the same inputs). Pure Python 3.9+,
 standard library only, no tool module is imported. Input documents are
 untrusted (they derive from a malware analysis VM): sizes and counts are capped
@@ -112,7 +112,7 @@ def _replace_runs(text: str, keep: Callable[[str], bool]) -> str:
 # ── name rules per target tool ──────────────────────────────────────
 _IDA_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$?@")
 # IDA refuses user names that look like its own dummy names ("sub_401000"); same list as
-# ida/x64dbg_sync.py (IDA's "Names representation" help).
+# static/ida/x64dbg_sync.py (IDA's "Names representation" help).
 _IDA_DUMMY_RE = re.compile(
     r"(?:sub|locret|loc|off|seg|asc|byte|word|dword|qword|byte3|xmmword|ymmword|zmmword|packreal"
     r"|flt|dbl|tbyte|stru|custdata|algn|unk)_[0-9A-Fa-f]+",
@@ -121,7 +121,7 @@ _IDA_DUMMY_RE = re.compile(
 
 
 def _ida_core(text: str, max_len: int) -> str:
-    """Exactly ``_name_core`` of ida/x64dbg_sync.py: ``[A-Za-z0-9_$?@]``, no leading
+    """Exactly ``_name_core`` of static/ida/x64dbg_sync.py: ``[A-Za-z0-9_$?@]``, no leading
     digit, no IDA dummy name; ``""`` when no IDA-safe character is left."""
     normalized = unicodedata.normalize("NFKC", text[: max_len * 4]).strip()
     name = _replace_runs(normalized, lambda ch: ch in _IDA_NAME_CHARS)

@@ -14,7 +14,7 @@ There are two parts:
 | Part | Where | What it does |
 |---|---|---|
 | `x64dbg_vm_gateway.ida_sync` | host gateway (`host/src/…/ida_sync.py`) | Parses `ListModules` into a module map, rebases addresses, parses x64dbg databases (`.dd64`/`.dd32`), builds export documents and import plans. It is a pure library; the gateway exposes it as the MCP tools `ida_rebase`, `ida_export_annotations` and `ida_import_annotations` (`app.Gateway`). |
-| `ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Menu actions to import an export document into the IDB, and to export the IDB's names/comments for x64dbg. |
+| `static/ida/x64dbg_sync.py` | IDA Pro 8.4 / 9.x | Menu actions to import an export document into the IDB, and to export the IDB's names/comments for x64dbg. |
 
 ## Using it with ida-multi-mcp (AI workflow)
 
@@ -202,11 +202,11 @@ Not handled:
 ```sh
 cd host
 uv run pytest tests/unit/test_ida_sync.py -q   # gateway library, cross-checks with the script,
-                                               # and the ida/tests suite in a subprocess
-uv run pytest ../ida/tests -q                  # IDA script against stub ida_* modules only
+                                               # and the static/ida/tests suite in a subprocess
+uv run pytest ../static/ida/tests -q           # IDA script against stub ida_* modules only
 ```
 
-`ida/tests` sits outside the host project's `testpaths`, so `test_ida_sync.py` runs it in a
+`static/ida/tests` sits outside the host project's `testpaths`, so `test_ida_sync.py` runs it in a
 subprocess. That way the default `uv run pytest` covers the script too.
 
 The fixtures (`host/tests/fixtures/ida/`) are synthetic. They follow the plugin's

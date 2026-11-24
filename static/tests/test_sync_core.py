@@ -2,9 +2,9 @@
 
 From host/:  uv run pytest ../static/tests -q
 
-The core is loaded by path (like ida/tests does with the IDA script), so neither
+The core is loaded by path (like static/ida/tests does with the IDA script), so neither
 ``sys.path`` nor a conftest.py is needed. The parity tests at the end load
-ida/x64dbg_sync.py the same way and check that the rules meant to be shared give
+static/ida/x64dbg_sync.py the same way and check that the rules meant to be shared give
 identical results.
 """
 
@@ -20,9 +20,8 @@ from pathlib import Path
 import pytest
 
 STATIC_DIR = Path(__file__).resolve().parent.parent
-REPO_DIR = STATIC_DIR.parent
 CORE_PATH = STATIC_DIR / "common" / "x64dbg_sync_core.py"
-IDA_SCRIPT = REPO_DIR / "ida" / "x64dbg_sync.py"
+IDA_SCRIPT = STATIC_DIR / "ida" / "x64dbg_sync.py"
 
 
 def _load(path: Path, name: str) -> types.ModuleType:
@@ -615,7 +614,7 @@ def test_write_json_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
 
 
-# ── parity with ida/x64dbg_sync.py ──────────────────────────────────
+# ── parity with static/ida/x64dbg_sync.py ───────────────────────────
 @pytest.fixture(scope="module")
 def ida_script() -> types.ModuleType:
     assert IDA_SCRIPT.is_file(), f"{IDA_SCRIPT} is missing"

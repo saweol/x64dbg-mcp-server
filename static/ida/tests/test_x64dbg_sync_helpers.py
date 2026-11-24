@@ -1,6 +1,6 @@
-"""Tests for ida/x64dbg_sync.py, run with plain Python (no IDA).
+"""Tests for static/ida/x64dbg_sync.py, run with plain Python (no IDA).
 
-From host/:  uv run pytest ../ida/tests -q
+From host/:  uv run pytest ../static/ida/tests -q
 
 Pure helpers are called directly; the IDA-facing functions run against the
 stub ``idaapi`` / ``ida_*`` / ``idautils`` modules that the ``fake_ida``
@@ -32,7 +32,7 @@ IDA_SCRIPT = IDA_DIR / "x64dbg_sync.py"
 
 
 def _load_script() -> types.ModuleType:
-    """Load ida/x64dbg_sync.py by path (it imports no ida_* module at import time)."""
+    """Load static/ida/x64dbg_sync.py by path (it imports no ida_* module at import time)."""
     spec = importlib.util.spec_from_file_location("x64dbg_sync", IDA_SCRIPT)
     assert spec is not None and spec.loader is not None, f"cannot load {IDA_SCRIPT}"
     module = importlib.util.module_from_spec(spec)

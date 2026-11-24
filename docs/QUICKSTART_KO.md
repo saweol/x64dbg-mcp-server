@@ -185,7 +185,7 @@ admin = "GW_TOKEN_ADMIN"      # 스냅샷 복원·삭제, 전원, 파일 다운�
 | `static_export_annotations` | x64dbg DB(라벨·주석·북마크·BP)를 `artifacts/static_sync.json`으로 내보냅니다. |
 | `static_import_annotations` | IDA 쪽 이름과 주석을 x64dbg에 적용합니다. |
 
-IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 있습니다. 자세한 내용은 `ida/README.md`에 있습니다.
+IDA 안에서는 `static/ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 있습니다. 자세한 내용은 `static/ida/README.md`에 있습니다.
 
 ## 10. 안전 수칙
 
@@ -225,7 +225,7 @@ IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 �
     - 실제 Claude Code가 host-only 주소의 TLS 게이트웨이로 루프 전체를 돌렸습니다(122초).
     - `read` 토큰은 툴 45개만 보이고 변경 툴은 거부됐습니다. 토큰이 없거나 틀리면 401이었습니다.
   - `in_progress`: `max_call_s`를 15로 낮춘 설정에서 시작·수집·복원이 모두 `in_progress`를 돌려줬고, 클라이언트가 `session_status`로 기다렸습니다.
-  - IDA 9.2(헤드리스)에서 `ida/x64dbg_sync.py` import·export가 동작했습니다.
+  - IDA 9.2(헤드리스)에서 `static/ida/x64dbg_sync.py` import·export가 동작했습니다.
   - `run`/step 직후 `GetDebugState`: 실행 중 `RUNNING`, 정지 후 `PAUSED`.
   - `LogRedirect`, `LoadBinary`의 인자와 작업 폴더가 동작했습니다. x64dbg를 죽이면 디버기도 함께 종료됩니다.
   - 빈 세션의 `SaveDatabase`·export·수집이 정상 처리됩니다(이번에 고친 결함).

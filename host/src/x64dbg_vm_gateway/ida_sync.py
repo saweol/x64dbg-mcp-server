@@ -13,7 +13,7 @@ tool-neutral ``static_*`` tools use this module for all of them
 - :func:`rebase` converts one address between runtime, RVA and IDA addresses.
 - :func:`parse_x64dbg_db` reads an x64dbg user database (``.dd64``/``.dd32``)
   into :class:`Annotations`; :func:`export_for_ida` turns those into the
-  ``x64dbg-ida-sync/1`` JSON document consumed by ``ida/x64dbg_sync.py``.
+  ``x64dbg-ida-sync/1`` JSON document consumed by ``static/ida/x64dbg_sync.py``.
 - :func:`plan_import` turns IDA-side items (RVA or IDA address + name/comment)
   into runtime addresses with x64dbg-safe labels/comments, ready for the
   ``CommentOrLabelAtAddress`` tool; :func:`plan_import_report` is the same with

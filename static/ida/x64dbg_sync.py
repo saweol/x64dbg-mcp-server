@@ -19,7 +19,7 @@ registers the actions and asks what to do now.
 Design: all logic that does not need IDA (JSON validation, rebasing,
 sanitising, module matching, report text) lives in plain functions; IDA
 modules are imported lazily inside the functions that talk to IDA, so the
-file imports and tests under plain Python (ida/tests). Keep it compatible with
+file imports and tests under plain Python (static/ida/tests). Keep it compatible with
 Python 3.8 (IDA 8.4 may run on it): no ``match``, no runtime ``X | Y`` types.
 Input files are untrusted (they derive from a malware VM): sizes and counts
 are capped and every string is cleaned of control/bidi characters.
@@ -696,7 +696,7 @@ def PLUGIN_ENTRY() -> Any:  # noqa: N802 - name required by IDA
         # code (its value 2 would mean PLUGIN_DRAW here). 0: loaded per database.
         flags = 0
         comment = "Exchange names/comments with x64dbg (x64dbg-ida-sync JSON)"
-        help = "File > Load file / Produce file > x64dbg-ida-sync JSON; see ida/README.md"
+        help = "File > Load file / Produce file > x64dbg-ida-sync JSON; see static/ida/README.md"
         wanted_name = "x64dbg sync"
         wanted_hotkey = ""
 

@@ -48,7 +48,7 @@ from x64dbg_vm_gateway.ida_sync import (
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "ida"
 HOST_DIR = Path(__file__).resolve().parents[2]
-IDA_DIR = HOST_DIR.parent / "ida"
+IDA_DIR = HOST_DIR.parent / "static" / "ida"
 IDA_SCRIPT = IDA_DIR / "x64dbg_sync.py"
 LABEL_CHARSET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_@?$.:<>~")
 # Tokens x64dbg's expression evaluator resolves before labels (see ida_sync._is_reserved_label).
@@ -79,7 +79,7 @@ def modmap() -> dict[str, ModuleInfo]:
 
 @pytest.fixture(scope="module")
 def ida_script() -> ModuleType:
-    """ida/x64dbg_sync.py loaded by path (it imports no ida_* module at import time)."""
+    """static/ida/x64dbg_sync.py loaded by path (it imports no ida_* module at import time)."""
     assert IDA_SCRIPT.is_file(), f"{IDA_SCRIPT} is missing"
     spec = importlib.util.spec_from_file_location("x64dbg_sync_under_test", IDA_SCRIPT)
     assert spec is not None and spec.loader is not None
@@ -108,7 +108,7 @@ def test_wrapper_tags_match_the_proxy() -> None:
     assert ida_sync.UNTRUSTED_CLOSE == proxy.UNTRUSTED_CLOSE
 
 
-# ── cross-check with ida/x64dbg_sync.py (schema drift guard) ────────
+# ── cross-check with static/ida/x64dbg_sync.py (schema drift guard) ─
 def test_gateway_export_is_accepted_by_the_script(ida_script: ModuleType) -> None:
     db = {
         "labels": [
@@ -163,7 +163,8 @@ def test_script_export_with_an_item_past_the_image_end(ida_script: ModuleType) -
 
 
 def test_ida_script_suite_passes() -> None:
-    """ida/tests sits outside this project's testpaths; run it here so the default run covers it."""
+    """static/ida/tests sits outside this project's testpaths; run it here so the default run
+    covers it."""
     env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
     out = subprocess.run(
         [sys.executable, "-m", "pytest", str(IDA_DIR / "tests"), "-q", "-p", "no:cacheprovider"],
