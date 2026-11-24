@@ -157,9 +157,9 @@ admin = "GW_TOKEN_ADMIN"      # 스냅샷 복원·삭제, 전원, 파일 다운�
 
 | 툴 | 하는 일 |
 |---|---|
-| `ida_rebase` | x64dbg 런타임 주소(ASLR)와 IDA 주소·RVA를 서로 변환합니다. |
-| `ida_export_annotations` | x64dbg DB(라벨·주석·북마크·BP)를 `artifacts/ida_sync.json`으로 내보냅니다. |
-| `ida_import_annotations` | IDA 쪽 이름과 주석을 x64dbg에 적용합니다. |
+| `static_rebase` | x64dbg 런타임 주소(ASLR)와 IDA 주소·RVA를 서로 변환합니다. |
+| `static_export_annotations` | x64dbg DB(라벨·주석·북마크·BP)를 `artifacts/static_sync.json`으로 내보냅니다. |
+| `static_import_annotations` | IDA 쪽 이름과 주석을 x64dbg에 적용합니다. |
 
 IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 있습니다. 자세한 내용은 `ida/README.md`에 있습니다.
 

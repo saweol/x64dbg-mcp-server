@@ -169,8 +169,8 @@ guard for all of them.
 
 | Tier | Gateway tools |
 |---|---|
-| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `ida_rebase`, `jobs_list`, `jobs_show` |
-| guest-mutating | `file_upload`, `debugger_select`, `debugger_restart`, `debugger_call`, `analysis_start`, `analysis_collect`, `ida_export_annotations`, `ida_import_annotations` |
+| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `static_rebase`, `jobs_list`, `jobs_show` |
+| guest-mutating | `file_upload`, `debugger_select`, `debugger_restart`, `debugger_call`, `analysis_start`, `analysis_collect`, `static_export_annotations`, `static_import_annotations` |
 | host/VM-destructive | `vm_snapshot_take`, `vm_snapshot_revert`, `vm_snapshot_delete`, `vm_power`, `file_download`, `analysis_finish` |
 
 Errors come back as `isError` results with
@@ -188,14 +188,17 @@ Further behaviour worth knowing:
   `session_status`, and it is never restarted for that.
 - With `analysis_start(reload_on_restart=true)` a relaunched debugger gets the sample again before
   `BACKEND_RESTARTED` is reported; `details.reloaded` says whether it is loaded.
-- `ida_rebase`, `ida_export_annotations` (writes `<job>/artifacts/ida_sync.json`) and
-  `ida_import_annotations` connect the session to IDA; see `ida/README.md`. When the debugger
+- `static_rebase`, `static_export_annotations` (writes `<job>/artifacts/static_sync.json`) and
+  `static_import_annotations` connect the session to the static-analysis tool (IDA, Ghidra,
+  radare2/rizin or Cutter, configured under `[static]`; addresses are static image base + RVA);
+  see `ida/README.md`. The former names `ida_rebase`, `ida_export_annotations` and
+  `ida_import_annotations` still work but are not listed. When the debugger
   should still hold the sample but its live module map is unavailable, the map recorded by
   `analysis_collect` is used and `warnings` says so.
 - x64dbg writes no database file while a session has no labels, comments, bookmarks, breakpoints or
   functions (and deletes an existing one). The plugin's `SaveDatabase` with `filePath` (builds
   from 2026-11-24) watches the file for up to 10 s and answers `Database saved to "..."`,
-  `No database file written to "..."` or an error (including a directory it cannot write to). After the second, `ida_export_annotations` returns an empty document with
+  `No database file written to "..."` or an error (including a directory it cannot write to). After the second, `static_export_annotations` returns an empty document with
   `database.source = "not_written"` and a warning, and `analysis_collect` succeeds without a
   database. Older builds only queue the save and answer "Database saved" either way: the gateway
   waits up to 5 s for the file and, if it does not appear, says in `warnings` that an empty session
@@ -361,7 +364,7 @@ smoke test starts its own `serve`). The suite covers:
 | Test | What it checks |
 |---|---|
 | `test_a_doctor_...` | `doctor` is all green, including `single_vm_instance` |
-| `test_b_full_loop_x64`, `test_c_full_loop_x32` | `analysis_start` (polling `session_status` while `in_progress`), `GetServerInfo`, `ListModules`, `SetBreakpoint kernel32.Sleep`, `run` until paused there, `GetCallStack`, `DumpMemory` to a relative `filePath`, `analysis_collect` (the dump and the `.dd64`/`.dd32` are collected), `ida_export_annotations`, `analysis_finish(revert)` |
+| `test_b_full_loop_x64`, `test_c_full_loop_x32` | `analysis_start` (polling `session_status` while `in_progress`), `GetServerInfo`, `ListModules`, `SetBreakpoint kernel32.Sleep`, `run` until paused there, `GetCallStack`, `DumpMemory` to a relative `filePath`, `analysis_collect` (the dump and the `.dd64`/`.dd32` are collected), `static_export_annotations`, `analysis_finish(revert)` |
 | `test_d_killed_debugger_...` | x64dbg killed in the guest while ANALYZING: the next mutating call answers `BACKEND_RESTARTED`, `session_status` acknowledges, `LoadBinary` works again |
 | `test_e_mcp_stdio_smoke` | `serve` over stdio with the `mcp` SDK client: the first `tools/list` has the v1.10 tools (`GetServerInfo`, `SetArtifactDir`, `ProbeFile`), `session_status` answers |
 
