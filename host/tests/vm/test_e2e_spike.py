@@ -165,14 +165,20 @@ def _finish_leftover_job(gw: Any) -> bool:
     if not job or job["state"] in ("DONE", "FAILED"):
         return False
     job_id = job["job_id"]
-    try:
-        if job["state"] not in ("COLLECTED", "DISCARDED", "REVERTING"):
-            finished(gw, gw.analysis_collect(job_id))
-        finished(gw, gw.analysis_finish(job_id, revert=True))
-    except (GatewayError, pytest.fail.Exception):
-        gw.discard_job(job_id, actor="e2e-teardown")
-        finished(gw, gw.analysis_finish(job_id, revert=True))
-    return True
+    # Discarding is human-only (CLI), so the teardown never discards: it collects again (a debugger
+    # relaunched meanwhile has no session, so nothing is lost) and leaves anything else to the operator.
+    last: BaseException | None = None
+    for _ in range(2):
+        try:
+            state = (gw.session_status().get("job") or {}).get("state", job["state"])
+            if state not in ("COLLECTED", "DISCARDED", "REVERTING"):
+                finished(gw, gw.analysis_collect(job_id))
+            finished(gw, gw.analysis_finish(job_id, revert=True))
+            return True
+        except (GatewayError, pytest.fail.Exception) as e:
+            last = e
+    pytest.fail(f"teardown could not collect and revert job {job_id} ({last}); it blocks the VM until a "
+                f"human decides, e.g. `x64dbg-vm-gateway discard {job_id}` and then analysis_finish")
 
 
 def start_analysis(gw: Any, vmx: str, arch: str) -> dict[str, Any]:
@@ -266,6 +272,9 @@ def test_c_full_loop_x32(gw, vmx):
 
 
 # ── (d) chaos: the debugger dies while ANALYZING ────────────────────
+# analysis_start (~15 s) + the kill through vmrun (~6 s) + the connect budget (10 s) + the relaunch
+# (~20 s on the spike VM): the default 60 s left no margin (59.8 s on 2026-11-24).
+@pytest.mark.timeout(180)
 def test_d_killed_debugger_is_relaunched_and_reported(gw, vmx):
     res = start_analysis(gw, vmx, "x64")
     bid = res["backend_id"]
