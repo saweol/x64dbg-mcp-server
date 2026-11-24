@@ -23,6 +23,13 @@ shared core the Ghidra and radare2 scripts are built on:
 The Ghidra and radare2 scripts find `x64dbg_sync_core.py` at run time: next to the script
 first, then in `../common/`. Keep the directory layout, or copy the core next to the script.
 
+An installed gateway carries byte-identical copies of these scripts (the wheel's
+`x64dbg_vm_gateway/data/static/`, same layout): `x64dbg-vm-gateway static-scripts` prints
+where they are, and `x64dbg-vm-gateway static-scripts --dest DIR` copies them (it refuses to
+overwrite files unless `--force` is given). After changing a script here, copy it to
+`host/src/x64dbg_vm_gateway/data/static/` too; the host tests and `scripts/build-release.sh`
+fail while the two differ.
+
 ## What import and export do
 
 **Import** (document → tool), at `image base + rva` of the module that matches the

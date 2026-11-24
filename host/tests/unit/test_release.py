@@ -30,7 +30,9 @@ SCRIPT = REPO / "scripts" / "build-release.sh"
 WORKFLOW = REPO / ".github" / "workflows" / "release.yml"
 PLUGIN_ENTRIES = {"x64/plugins/x64dbg-MCP-Server.dp64", "x32/plugins/x64dbg-MCP-Server.dp32"}
 BUNDLE_FILES = ("data/plugin/x64/x64dbg-MCP-Server.dp64", "data/plugin/x32/x64dbg-MCP-Server.dp32")
-DATA_FILES = ("data/guest/provision.ps1", "data/tools-v1.10.json")
+STATIC_FILES = ("data/static/common/x64dbg_sync_core.py", "data/static/ida/x64dbg_sync.py",
+                "data/static/ghidra/x64dbg_sync_ghidra.py", "data/static/radare2/x64dbg_sync_r2.py")
+DATA_FILES = ("data/guest/provision.ps1", "data/tools-v1.10.json", *STATIC_FILES)
 UV = shutil.which("uv")
 BASH = shutil.which("bash")
 needs_uv = pytest.mark.skipif(UV is None, reason="uv is not on PATH")
@@ -63,6 +65,8 @@ def _copy_project(dst: Path, *, with_script: bool = False) -> Path:
         (dst / "scripts").mkdir()
         shutil.copy2(SCRIPT, dst / "scripts" / SCRIPT.name)
         shutil.copyfile(REPO / "build.zig.zon", dst / "build.zig.zon")
+        shutil.copytree(REPO / "static", dst / "static",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     return dst
 
 
@@ -233,6 +237,26 @@ def test_build_release_fails_clearly_without_zig(tmp_path):
     assert res.returncode != 0
     assert "zig" in (res.stdout + res.stderr).lower()
     assert not (repo / "release").exists()
+
+
+@pytest.mark.parametrize("damage", ["edit", "missing", "extra"])
+@needs_bash
+def test_build_release_refuses_packaged_static_scripts_that_differ_from_static(tmp_path, damage):
+    repo = _copy_project(tmp_path / "repo", with_script=True)
+    packaged = repo / "host" / "src" / PACKAGE / "data" / "static"
+    if damage == "edit":
+        with (packaged / "radare2" / "x64dbg_sync_r2.py").open("a", encoding="utf-8") as f:
+            f.write("# stale\n")
+    elif damage == "missing":
+        (packaged / "ida" / "x64dbg_sync.py").unlink()
+    else:
+        (repo / "static" / "ghidra" / "x64dbg_sync_extra.py").write_text("# new\n", encoding="utf-8")
+    res = _run_script(repo, repo, tmp_path)
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "static" in out and ("differs" in out or "lists differ" in out), out
+    assert not (repo / "release").exists()
+    assert not (tmp_path / "zig.log").exists(), "the check runs before the Zig build"
 
 
 # ── .github/workflows/release.yml ───────────────────────────────────

@@ -12,6 +12,7 @@ Commands::
     install-plugin [--dist DIR] ...     copy a plugin build (default: the bundled one) into the guest
     setup [--dry-run] ...               init (no config yet), doctor, install-plugin, provision,
                                         doctor, then print the ``claude mcp add`` command
+    static-scripts [--dest DIR]         where the packaged static-tool sync scripts are, or a copy
 
 Global options (before or after the command): ``--config PATH``, ``--profile NAME``,
 ``--json`` (machine-readable stdout), ``-v/--verbose``.
@@ -72,7 +73,7 @@ from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, TextIO
 
 from .. import config as gw_config
-from .. import envfile, plugin_bundle
+from .. import envfile, plugin_bundle, static_scripts, static_tools
 from .. import platform as gw_platform
 from ..errors import (
     ConfigError,
@@ -1383,6 +1384,40 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
     return EXIT_OK if ok else EXIT_FAILURE
 
 
+# ── static-scripts ──────────────────────────────────────────────────
+def _format_static_scripts(result: Mapping[str, Any]) -> str:
+    if "dest" in result:
+        return "\n".join([f"copied {len(result['copied'])} files to {result['dest']}",
+                          *(f"  {rel}" for rel in result["copied"])])
+    root = result["root"]
+    lines = [f"static sync scripts in this installation: {root}" if root else
+             "static sync scripts: inside a zipped installation (copy them out with --dest DIR)"]
+    tools = result["tools"]
+    width = max(len(t) for t in [*tools, "common"])
+    lines.extend(f"  {tool_id:<{width}}  {rel}" for tool_id, rel in tools.items())
+    lines.append(f"  {'common':<{width}}  common/x64dbg_sync_core.py (the ghidra and radare2 scripts load it "
+                 "from ../common/)")
+    lines.append(f"copy them elsewhere: {PROG} static-scripts --dest DIR")
+    return "\n".join(lines)
+
+
+def cmd_static_scripts(args: argparse.Namespace, out: _Output) -> int:
+    """Where the packaged sync scripts are, or (``--dest``) a copy of them; needs no config."""
+    if args.force and not args.dest:
+        raise UsageError("--force only applies together with --dest")
+    if args.dest:
+        dest = Path(args.dest).expanduser()
+        copied = static_scripts.copy_to(dest, force=args.force)
+        out.data({"ok": True, "dest": str(dest), "copied": copied}, _format_static_scripts)
+        return EXIT_OK
+    root = static_scripts.installed_root()
+    tools = {tid: static_scripts.relative_path(static_tools.get_tool(tid).sync_script)
+             for tid in static_tools.TOOL_IDS}
+    out.data({"ok": True, "root": str(root) if root is not None else None,
+              "files": list(static_scripts.SCRIPT_FILES), "tools": tools}, _format_static_scripts)
+    return EXIT_OK
+
+
 # ── parser ──────────────────────────────────────────────────────────
 def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     def default(value: Any) -> Any:
@@ -1495,6 +1530,12 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--wait-ready", type=float, default=DEFAULT_WAIT_READY_S, metavar="SECONDS",
                        help="how long to wait for the plugins after the reboot "
                             f"(default: {DEFAULT_WAIT_READY_S:g})")
+
+    p = command("static-scripts", cmd_static_scripts,
+                "show where the static-tool sync scripts (IDA, Ghidra, radare2/rizin/Cutter) are installed, "
+                "or copy them")
+    p.add_argument("--dest", metavar="DIR", help="copy the scripts into DIR (keeps their layout)")
+    p.add_argument("--force", action="store_true", help="with --dest: replace files that already exist")
     return parser
 
 

@@ -42,9 +42,16 @@ def _locked_versions() -> dict[str, str]:
     return {canonicalize_name(p["name"]): p["version"] for p in _lock()["package"] if "version" in p}
 
 
+#: package data: the static-tool scripts (data/static) run inside IDA / Ghidra / r2 and import their
+#: modules (idaapi, r2pipe, ...); the gateway never imports them
+DATA = SRC / "data"
+
+
 def _third_party_imports() -> set[str]:
     names: set[str] = set()
     for path in SRC.rglob("*.py"):
+        if DATA in path.parents:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -62,6 +69,28 @@ def test_every_direct_import_is_a_declared_dependency():
     declared = set(_requirements())
     missing = {DISTRIBUTION_OF[m] for m in imported} - declared
     assert not missing, f"imported but not declared in [project].dependencies: {sorted(missing)}"
+
+
+def test_the_gateway_never_imports_the_packaged_static_scripts():
+    """Control for the exclusion above: the scripts do import tool modules, and no gateway
+    module imports a module from data/."""
+    tool_modules = {"idaapi", "r2pipe", "rzpipe", "cutter"}
+    found: set[str] = set()
+    for path in DATA.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            if isinstance(node, ast.Import):
+                found.update(a.name.split(".")[0] for a in node.names)
+    assert tool_modules & found, "the exclusion would hide nothing"
+    for path in SRC.rglob("*.py"):
+        if DATA not in path.parents:
+            assert "data.static" not in path.read_text(encoding="utf-8"), path
+
+
+def test_ruff_skips_the_packaged_static_scripts():
+    """They are byte copies of static/ (linted, or not, at their source and kept Python 3.8 / 3.9
+    compatible for the tools), so the host lint settings do not apply to them."""
+    excluded = _pyproject()["tool"]["ruff"].get("extend-exclude", [])
+    assert "src/x64dbg_vm_gateway/data" in excluded
 
 
 def test_mcp_is_pinned_to_the_2x_series():

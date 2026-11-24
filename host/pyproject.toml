@@ -51,6 +51,9 @@ markers = [
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+# data/static holds byte copies of the repository's static/ scripts (they run inside IDA,
+# Ghidra and radare2, on older Pythons); they are not gateway code
+extend-exclude = ["src/x64dbg_vm_gateway/data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "I", "UP", "S"]
