@@ -192,6 +192,15 @@ Further behaviour worth knowing:
   `ida_import_annotations` connect the session to IDA; see `ida/README.md`. When the debugger
   should still hold the sample but its live module map is unavailable, the map recorded by
   `analysis_collect` is used and `warnings` says so.
+- x64dbg writes no database file while a session has no labels, comments, bookmarks, breakpoints or
+  functions (and deletes an existing one). The plugin's `SaveDatabase` with `filePath` (builds
+  from 2026-11-24) watches the file for up to 10 s and answers `Database saved to "..."`,
+  `No database file written to "..."` or an error (including a directory it cannot write to). After the second, `ida_export_annotations` returns an empty document with
+  `database.source = "not_written"` and a warning, and `analysis_collect` succeeds without a
+  database. Older builds only queue the save and answer "Database saved" either way: the gateway
+  waits up to 5 s for the file and, if it does not appear, says in `warnings` that an empty session
+  cannot be told from a failed save (export: empty document; collection: complete with plugin
+  v1.10, partial with older plugins, whose default database file stays expected).
 - `jobs_list` / `jobs_show` list the jobs of the serving gateway (a second process cannot open
   its job store).
 - While a gateway serves a jobs root, CLI commands that need it (`discard`, `status`, `doctor`,
@@ -365,5 +374,5 @@ changing the VM's power state or snapshots: program arguments round-trip through
 (quotes, trailing backslashes, empty strings, Unicode), a PowerShell `-Command` one-liner,
 `instance_report()`, and the guest boot time used for reboot detection.
 
-Last full run on the spike VM (2026-11-24): 10 passed in 3 min 43 s; see
+Last full run on the spike VM (2026-11-24, clean snapshot `MCP_CLEAN_V110E`): 10 passed in 3 min 32 s; see
 `docs/PHASE0_RESULTS.md` for the timings and the defects this suite found.

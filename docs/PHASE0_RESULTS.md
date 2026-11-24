@@ -131,3 +131,89 @@
 - `LogRedirect` 명령의 실제 동작(V5 일부).
 - vmrun 동시 호출(V7), Claude Code 실제 클라이언트의 장시간 호출 timeout(V8), vmtoolsd 강제 종료(V9).
 - Windows/macOS host(V11, 범위 밖).
+
+## 남은 항목 실 VM 검증과 수정 (2026-11-24 오전)
+
+- **대상:** 스파이크 VM, 클린 스냅샷 `MCP_CLEAN_V110E`(아래 플러그인 수정의 최종 빌드 + provision으로 새로 만든 것)
+- **실 VM 스위트:** `pytest -m vm tests/vm` 결과는 아래 "최종 실행"에 적었다.
+
+### 확인한 것
+
+- **`run`/step 직후 `GetDebugState`**
+  - `StepOver` 5회, 매번 직후 3회 조회: 모두 `PAUSED`.
+  - `run`(BP에서 다음 BP까지) 중 30 ms 간격 조회: `PAUSED` → `RUNNING`(0.03 s) → `PAUSED`(0.52 s). 실행 중 `RUNNING` 15회, 그 밖의 상태는 나오지 않았다.
+- **V5 (x64dbg 명령)**
+  - `LogRedirect "<out>\x64dbg_redirect.log"` → `log` → `LogRedirectStop`: 로그 파일에 마커가 기록되고 수집으로 회수됐다.
+  - `init` 3인자(`LoadBinary`의 `arguments`, `workingDir`): PEB의 명령줄이 `"...\24db8e22265a.exe" alpha "b c" d`, 현재 폴더가 job `out\`였다. 샘플이 그 폴더에 쓴 `e2e_sample_output.txt`도 회수됐다. 끝이 `\`인 인자는 플러그인이 거부한다(x64dbg가 인용할 수 없는 형태, 의도된 제한).
+  - `dbsave`: 세션에 주석이 없으면 파일을 쓰지 않는다. 아래 결함으로 이어졌다.
+- **V14 (x64dbg 강제 종료 시 디버기)**: x64dbg를 죽이면 디버기 프로세스도 1초 안에 사라졌다. 다음 호출은 `BACKEND_RESTARTED`였고 디버거는 재기동됐다.
+- **V9 (부분)**
+  - 사용자 세션의 `vmtoolsd.exe`를 종료한 뒤에도 업로드, 디버거 호출, 수집, 복원이 정상이었다.
+  - SYSTEM 서비스 `vmtoolsd.exe`는 분석 계정 권한으로 종료할 수 없었다(`GUEST_AUTH`). 서비스가 죽은 경우는 확인하지 못했다.
+- **`in_progress` 경로 (실제 Claude Code)**
+  - `max_call_s = 15`(대기 상한 5 s)로 낮춘 설정에서 확인했다. 기본 110 s를 넘기는 작업을 만들기 어려워서, 같은 코드 경로를 낮은 한도로 태웠다.
+  - 헤드리스 Claude Code가 아래 원격 HTTPS로 접속했다. `analysis_start`, `analysis_collect`, `analysis_finish`가 각각 `in_progress`를 받았고, 클라이언트가 `session_status`를 폴링해 완료를 기다린 뒤 다음 단계로 갔다. 전체 122 s, job DONE, 복원됨.
+- **원격 HTTPS (M3)**
+  - 게이트웨이를 host-only 어댑터 주소에 TLS(자체 서명)로 바인드하고, 허용 목록은 host 자신(`/32`)만 두었다. 다른 PC 대신 같은 host에서 비루프백 주소로 접속했다.
+  - 토큰 없음·틀린 토큰은 401이었다. 신뢰하지 않는 인증서와 평문 HTTP는 연결되지 않았다.
+  - `read` 토큰: 툴 45개(변경 툴 없음). `vm_power`는 `FORBIDDEN`이었다. 다른 범위의 토큰으로 같은 세션을 쓰면 404였다.
+  - `admin` 토큰: 툴 104개.
+  - 감사 로그에 토큰 값은 없었다. 거부 기록은 같은 클라이언트·결과마다 묶여(`suppressed` 횟수) 기록된다.
+- **IDA 9.2 (idalib, 헤드리스)**: 스크래치 폴더에 복사한 샘플로 `ida/x64dbg_sync.py`를 실행했다.
+  - import: 이름 변경(`start` → `gw_probe_entry`), 기존 주석을 보존한 주석 병합, 북마크 태그
+  - 같은 문서를 다시 import하면 주석이 바뀌지 않았다(멱등).
+  - export: 문서에 해당 항목이 들어 있었다. 메뉴 등록도 성공했다.
+- **수정한 `SaveDatabase` (실제 x64dbg, 각 0.3~0.5 s)**
+
+  | 경우 | 응답 |
+  |---|---|
+  | 빈 세션, 새 파일 | `No database file written` (자리표시 파일을 x64dbg가 지움) |
+  | 없는 폴더 | 오류: `cannot create ... (Win32 error 3)` |
+  | BP 있음, 새 파일 / 기존 파일 다시 저장 | `Database saved to` |
+  | BP를 모두 지운 뒤 기존 파일 | `No database file written` (x64dbg가 기존 파일을 지움) |
+  | `ida_export_annotations` 빈 세션 / BP 있음 | `not_written`, 항목 0 / `saved`, 항목 1 |
+  | `analysis_collect` 빈 세션 | `COLLECTED`, DB 없음 |
+
+### 이 검증에서 찾아 고친 결함
+
+| 결함 | 원인 | 조치 |
+|---|---|---|
+| 주석이 없는 세션에서 `ida_export_annotations`가 `GUEST_OP_FAILED`(파일 없음). 플러그인 v1.9 경로에서는 수집도 partial | x64dbg는 세션에 라벨·주석·북마크·BP·함수가 없으면 DB 파일을 쓰지 않고 기존 파일을 지운다. `dbsave`는 항상 성공을 반환하고 파일을 만들지 못해도 로그만 남긴다. 플러그인은 명령을 큐에 넣고 "Database saved to"라고 답했다. | 플러그인(`src/mcp/dbsave.zig`): 대상에 파일이 없으면 0바이트 자리표시 파일을 만들고(못 만들면 오류), `dbsave`를 큐에 넣은 뒤 최대 10 s 파일을 본다. 지워짐 = 빈 세션, 바뀐 뒤 안정 = 저장(0바이트로 남으면 쓰기 실패), 그대로 = 오류("큐에 남아 나중에 실행될 수 있으니 다시 호출" 안내). 관찰 중 폴더가 사라진 경우는 빈 세션으로 보지 않는다. 게이트웨이는 그 표시를 믿고 빈 문서와 경고를 돌려준다. 이전 빌드면 5 s 기다린 뒤 "빈 세션과 저장 실패를 구별할 수 없다"는 경고를 붙인다. v1.9의 기본 경로 DB가 없으면 예전처럼 partial이다. |
+| (중간 시도) BP 목록으로 빈 세션을 확인하는 방식이 실 VM에서 빈 세션을 "BP 있음"으로 오판 | x64dbg가 자동으로 거는 일회성 BP(엔트리·TLS)가 `ListBreakpoints`에 나오고, 플러그인 출력은 일회성 여부를 담지 않는다. 이런 BP는 DB에 저장되지 않는다. | 폐기하고 위의 파일 관찰 방식으로 바꿨다. |
+| (리뷰) 동기 실행(`DbgCmdExecDirect`)으로 바꾸면 플러그인 연결 스레드가 GUI 스레드를 기다린다 | `DbSave`가 GUI에서 디버기 노트를 동기로 받는다(x64dbg 원본). | `dbsave`는 큐로 보내고 파일을 관찰한다. |
+| x64dbg 강제 종료 직후 첫 호출이 `connect()`에서 60 s 넘게 대기(`test_d` 시간 초과) | 게스트가 닫힌 포트로 온 SYN에 응답하지 않아 연결이 끝나지 않았다. 연결 대기 한도가 호출 전체 한도와 같았다. | 연결 단계 한도 10 s(주소 후보가 나눠 씀). 넘으면 `BackendUnavailable`(`not_sent`)로 보고하고 바로 복구(health check, 재기동)로 넘긴다. 읽기 전용 재시도는 생략하고, 재시도는 남은 예산으로 줄인다. |
+| E2E teardown이 사람 전용 `discard`를 시도해 실패하고, VM에 partial job이 남음 | 테스트 결함 | 수집과 복원을 한 번 더 시도하고, 안 되면 사람이 결정하라는 안내와 함께 실패한다. |
+| 플러그인 `cmdExec`/`cmdExecDirect`가 C++ `bool` 반환값을 마스킹하지 않음 | 다른 브리지 함수와 달리 `& 0xFF`가 빠져 있었다. | 마스킹했다. |
+
+다른 모델 리뷰: Sonnet 2회, Mythos 3회(3차는 x64dbg 원본 `database.cpp`·`cmd-user-database.cpp` 대조). 리뷰가 지적한 것 중 반영한 것은 다음과 같다.
+- 연결 한도가 주소마다 누적되던 문제
+- v1.9 수집의 fail-open 확대
+- 폐기한 방식을 서술하던 문서
+- "없음"과 "확인 불가"의 혼동
+- 미전송 호출을 "결과 불명"으로 보고하던 문제
+- 동기 실행의 GUI 대기
+- 쓰기 실패를 빈 세션으로 오판하던 문제
+- 0바이트로 잘린 파일
+- 부동소수 비교에 기대던 연결 한도 판정
+
+반영하지 않은 것과 그 이유는 다음과 같다.
+- **잘린 JSON(디스크가 쓰는 도중 가득 참):** 플러그인은 "저장됨"으로 본다. export는 파싱 오류로 fail-closed이지만, 수집은 그 파일을 그대로 담는다. 좁은 경로라 기록만 했다.
+- **v1.9 기본 경로에 이전 세션의 DB가 남아 있는 경우:** 원래 있던 문제다.
+- **주소가 6개를 넘을 때 연결 한도가 소진된 뒤의 후보:** 시도하지 않는다. 엔드포인트는 보통 IP 리터럴이라 실무 영향이 작다.
+
+### 아직 확인하지 않은 것
+
+- Windows·macOS host
+- SYSTEM 서비스 `vmtoolsd`가 죽은 경우(V9 나머지)
+- vmrun 동시 호출(V7). 게이트웨이가 VM별 락으로 직렬화하므로 실제로 동시에 부르지 않는다.
+- 실제로 다른 PC에서의 원격 접속(같은 host의 비루프백 주소로 대신 확인)
+- 기본 한도(110 s)를 실제로 넘기는 호출(낮춘 한도로 같은 경로만 확인)
+- x64dbg 명령 큐가 긴 명령으로 막혀 `SaveDatabase`의 10 s 관찰이 부족한 경우(그때는 오류로 보고되고 수집은 partial)
+- 이전 플러그인 빌드와 게이트웨이의 실 VM 조합(단위 테스트만)
+
+### 최종 실행 (클린 스냅샷 `MCP_CLEAN_V110E`)
+
+- `pytest -m vm tests/vm`: **10건 모두 통과**(3분 32초). VM 작업마다 같은 .vmx의 `vmware-vmx` 프로세스가 정확히 1개였다.
+- 위 `SaveDatabase` 표의 7가지 경우를 최종 빌드로 다시 돌려 같은 결과를 얻었다.
+- `test_d`(x64dbg 강제 종료)는 69 s 걸렸다. 내역은 `analysis_start` 약 15 s, vmrun 종료 약 6 s, 연결 한도 10 s, 재기동 약 20 s다. 테스트 기본 한도 60 s로는 여유가 없어 이 테스트만 180 s로 올렸다.
+- 단위 테스트 2,952개 통과(5개 건너뜀), `zig build test` 통과, ruff 통과.

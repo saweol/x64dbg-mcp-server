@@ -198,15 +198,21 @@ IDA 쪽 MCP 서버(예: ida-multi-mcp)와 함께 쓰는 것을 전제로 합니�
   - 툴 104개가 보였습니다.
   - BP → `run` → 스택 → 덤프 → 회수 → 복원까지 분석 루프 전체가 68초에 끝났습니다.
 - 클린 스냅샷 복원 후 x64dbg가 응답하기까지 11~14초가 걸렸습니다.
+- 원격 HTTPS
+  - 실제 Claude Code가 비루프백 주소의 TLS 게이트웨이로 분석 루프 전체를 돌렸습니다.
+  - 범위별 토큰 권한, 401·403, 감사 로그도 확인했습니다.
+- `in_progress` 경로: 호출 한도를 낮춘 설정에서 실제 Claude Code가 `in_progress`를 받고 `session_status`로 기다렸다가 이어 갔습니다.
+- 실제 IDA 9.2(헤드리스)에서 `ida/x64dbg_sync.py`의 import·export·메뉴 등록이 동작했습니다.
+- `run`/step 직후 `GetDebugState`는 실행 중 `RUNNING`, 멈춘 뒤 `PAUSED`로 일관됐습니다.
+- `LogRedirect`, `LoadBinary`의 인자·작업 폴더가 동작했습니다. x64dbg를 죽이면 디버기도 함께 종료됩니다.
 
 **아직 확인하지 않은 것**
 
 - Windows·macOS host
-- 다른 PC에서 실제로 원격 HTTPS 접속(단위 테스트만 함)
+- 실제로 다른 PC에서 원격 접속(같은 host의 비루프백 주소로 대신 확인)
+- 기본 한도(110초)를 실제로 넘기는 호출(낮춘 한도로 같은 경로만 확인)
 - VM 없이 고정 주소의 플러그인에 붙는 `endpoint` 프로필의 실환경 사용
-- 110초를 넘는 장시간 호출이 실제 Claude Code에서 `in_progress` 경로를 타는지
-- 실제 IDA에서 `ida/x64dbg_sync.py` 실행
-- `run`/step 직후 과도 상태의 `GetDebugState`
+- 게스트의 SYSTEM 서비스 `vmtoolsd`가 죽은 경우
 
 ## 개발 방식과 테스트
 

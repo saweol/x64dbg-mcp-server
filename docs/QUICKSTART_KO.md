@@ -179,6 +179,7 @@ IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 �
 | `BackendAuthError` + provision 안내 | 게스트 `mcp_config.json`이 손상됨(0으로 채워진 사례 있음). `provision`을 다시 실행한다. |
 | `provision`이 `--user is required` | 구버전 CLI가 `guest_user_env`/`env_file`을 읽지 않던 결함(수정됨). 지금은 env 파일 값으로 동작한다. |
 | `GetDebugState`가 `status: LOCKED` | 이전 플러그인 빌드. 정지 상태(PAUSED)와 같다. 플러그인을 다시 설치하면 PAUSED로 나온다. |
+| `ida_export_annotations`가 빈 문서(`database.source = "not_written"`)와 경고를 돌려줌 | 세션에 라벨·주석·북마크·BP·함수가 하나도 없으면 x64dbg는 DB 파일을 쓰지 않는다. 플러그인(2026-11-24 빌드)은 이를 `No database file written`으로 알린다. 주석을 단 뒤 다시 export한다. 이전 빌드는 저장을 큐에 넣기만 하고 항상 "저장됨"이라고 답하므로, 게이트웨이가 빈 세션과 저장 실패를 구별하지 못한다는 경고를 붙인다. |
 | 게스트 명령 인자 깨짐 | vmrun은 인자마다 따옴표를 씌우고 이스케이프하지 않는다. 게이트웨이가 미리 이스케이프한다. 직접 vmrun을 쓸 때는 PowerShell `-EncodedCommand`나 `-File`을 쓰고, cmd.exe는 쓰지 않는다. |
 | 게스트 PowerShell 스크립트가 "인수 형식이 일치하지 않습니다" | Windows PowerShell 5.1의 `ConvertTo-Json @($List[object])` 문제. 게이트웨이 스크립트는 `.ToArray()`를 쓴다. |
 
@@ -195,9 +196,17 @@ IDA 안에서는 `ida/x64dbg_sync.py`로 JSON을 가져오거나 내보낼 수 �
     - 툴 104개가 보이고 `session_status`, `GetServerInfo`(v1.10)가 호출됩니다.
     - 분석 루프 전체가 68초에 끝났습니다. `analysis_start` → BP `kernel32.Sleep` → `run` 2회 → PAUSED → 스택 → 덤프 → 수집(`.dd64` + 덤프) → 복원.
     - `run`의 `timeoutMs`가 호출 예산(`max_call_s`)에 맞게 줄어드는 것도 확인했습니다.
+- **추가 검증(2026-11-24 오전, 클린 스냅샷 `MCP_CLEAN_V110E`)**
+  - 원격 HTTPS
+    - 실제 Claude Code가 host-only 주소의 TLS 게이트웨이로 루프 전체를 돌렸습니다(122초).
+    - `read` 토큰은 툴 45개만 보이고 변경 툴은 거부됐습니다. 토큰이 없거나 틀리면 401이었습니다.
+  - `in_progress`: `max_call_s`를 15로 낮춘 설정에서 시작·수집·복원이 모두 `in_progress`를 돌려줬고, 클라이언트가 `session_status`로 기다렸습니다.
+  - IDA 9.2(헤드리스)에서 `ida/x64dbg_sync.py` import·export가 동작했습니다.
+  - `run`/step 직후 `GetDebugState`: 실행 중 `RUNNING`, 정지 후 `PAUSED`.
+  - `LogRedirect`, `LoadBinary`의 인자와 작업 폴더가 동작했습니다. x64dbg를 죽이면 디버기도 함께 종료됩니다.
+  - 빈 세션의 `SaveDatabase`·export·수집이 정상 처리됩니다(이번에 고친 결함).
 - **미검증**
   - Windows/macOS host
-  - 실제 Claude Code에서 110초를 넘기는 장시간 호출(`in_progress` 응답 경로)
-  - 실제 IDA에서의 스크립트 실행
-  - 원격 HTTP/TLS 모드의 실제 다른 PC 접속(단위 테스트만)
-  - `run`/step 직후 과도 상태의 `GetDebugState`
+  - 실제 다른 PC에서의 원격 접속(같은 host의 비루프백 주소로 대신 확인)
+  - 기본 한도(110초)를 실제로 넘기는 호출
+  - 게스트의 SYSTEM 서비스 `vmtoolsd`가 죽은 경우
