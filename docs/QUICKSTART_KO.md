@@ -27,13 +27,20 @@ Claude Code ──stdio(또는 HTTPS)──► x64dbg-vm-gateway (host)
 
 ## 3. 설치
 
-```bash
-# 플러그인 빌드 (dist/x64/plugins/*.dp64, dist/x32/plugins/*.dp32)
-zig build -Doptimize=ReleaseSafe --prefix dist
+릴리스 wheel에는 미리 빌드한 플러그인이 들어 있어 Zig가 필요 없습니다. GitHub 릴리스에서 `x64dbg_vm_gateway-<버전>-py3-none-any.whl`을 받아 설치합니다.
 
-# 게이트웨이 설치 (x64dbg-vm-gateway 명령이 생깁니다)
-uv tool install ./host
+```bash
+uv tool install ./x64dbg_vm_gateway-0.1.0-py3-none-any.whl   # x64dbg-vm-gateway 명령이 생깁니다
 ```
+
+직접 빌드하려면 저장소에서 `scripts/build-release.sh`를 실행합니다(Zig 0.14.0과 uv 필요, 어느 디렉터리에서나 실행 가능). 플러그인을 빌드해 패키지에 넣고, `release/`에 wheel, sdist, `x64dbg-mcp-plugin-<버전>.zip`(`x64/plugins`, `x32/plugins`), `SHA256SUMS`를 만듭니다. `v*` 태그를 push하면 GitHub Actions가 같은 스크립트를 돌려 `release/*`를 릴리스에 첨부합니다.
+
+```bash
+scripts/build-release.sh
+uv tool install --force release/x64dbg_vm_gateway-*.whl
+```
+
+`uv tool install ./host`도 됩니다. 다만 스크립트를 먼저 돌리지 않았다면 플러그인이 들어 있지 않으므로 `install-plugin --dist dist`가 필요합니다(`zig build -Doptimize=ReleaseSafe --prefix dist`로 빌드).
 
 ## 4. 설정
 
@@ -86,8 +93,25 @@ launch_task = "MCP-x32dbg"
 
 ## 5. 게스트 준비 (한 번만)
 
+VM을 켜고 게스트 암호 환경 변수를 export한 뒤 한 번에 실행할 수 있습니다.
+
+```bash
+x64dbg-vm-gateway setup --dry-run   # 계획만 출력합니다(아무것도 접속·변경하지 않음)
+x64dbg-vm-gateway setup             # (설정이 없으면 init) → doctor → install-plugin → provision → doctor
+```
+
+- 설정 파일이 없으면 `init` 마법사를 실행합니다. `--non-interactive --vmx ... --guest-user ... --x64dbg-root ...`도 받습니다.
+- doctor에서 setup이 고칠 수 없는 항목(vmrun, .vmx, VM 전원, VMware Tools, 게스트 계정, 게스트 IP, 격리, VM 중복 실행, job 폴더)이 실패하면 힌트를 보여 주고 멈춥니다.
+- 번들 플러그인을 설치하고(다른 빌드는 `--dist DIR`), `provision --snapshot`(기본값: 프로필의 `clean_snapshot`)을 실행합니다. 이어서 doctor로 다시 점검하고 Claude Code 등록 명령(§7)을 출력합니다.
+- `--skip-plugin`, `--skip-provision`으로 일부만 실행합니다. 이미 있는 스냅샷은 바꾸지 않습니다. `--snapshot 새이름`으로 찍은 뒤 설정 파일의 `clean_snapshot`(과 `protected_snapshots`)을 직접 그 이름으로 바꿉니다.
+- `--no-autologon`이면 재부팅 뒤 누군가 `--wait-ready`초 안에 VM에 로그온해야 합니다(디버거는 로그온 때 시작됩니다).
+- `setup`과 번들 플러그인 설치는 단위 테스트로만 검증했고, 실제 VM에서는 아직 돌려 보지 않았습니다. 실 VM에서 검증한 절차는 아래 단계별 명령입니다.
+
+한 단계씩 하려면:
+
 ```bash
 # 1) 플러그인 배포: 디버거 종료 → 기존 플러그인을 plugins_backup\에 백업 → 복사 → 재기동 (실측 17~25초)
+#    --dist를 빼면 번들 빌드를 씁니다. 프로비저닝 전의 게스트에는 --no-relaunch를 붙입니다.
 x64dbg-vm-gateway install-plugin --dist dist --x64dbg-root 'C:\x64dbg\release'
 
 # 2) 프로비저닝 → 재부팅 → 클린 스냅샷

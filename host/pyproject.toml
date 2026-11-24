@@ -32,6 +32,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# The plugin build bundled by scripts/build-release.sh (data/plugin/<arch>/*.dp64|.dp32 and
+# VERSION) is gitignored; artifacts put it into the sdist and the wheel when it is present.
+artifacts = ["src/x64dbg_vm_gateway/data/plugin/**"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/x64dbg_vm_gateway"]
 

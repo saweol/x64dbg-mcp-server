@@ -406,18 +406,111 @@ def test_provision_requires_x64dbg_root(cfg_path, wiring, provision):
 
 
 def test_install_plugin(cfg_path, wiring, provision, fake, tmp_path, capsys):
-    dist = tmp_path / "dist"
-    dist.mkdir()
+    dist = _fake_dist(tmp_path / "dist")
     assert run(["--config", str(cfg_path), "--json", "install-plugin", "--dist", str(dist)]) == 0
     name, runtime, kw = provision.calls[0]
     assert name == "install_plugin" and runtime is fake.runtimes[0]
-    assert Path(kw["dist_dir"]) == dist and kw["x64dbg_root"] is None and kw["relaunch"] is True
-    assert json.loads(capsys.readouterr().out)["ok"] is True
+    # the root comes from the profile's backends (<root>\x64\mcp_config.json)
+    assert Path(kw["dist_dir"]) == dist and kw["x64dbg_root"] == "C:\\x64dbg\\release"
+    assert kw["relaunch"] is True
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] is True and data["plugin"] == {"source": "dist", "path": str(dist)}
+
+
+def _fake_dist(root: Path) -> Path:
+    """A folder laid out like ``zig build --prefix``."""
+    for arch, name in (("x64", "x64dbg-MCP-Server.dp64"), ("x32", "x64dbg-MCP-Server.dp32")):
+        (root / arch / "plugins").mkdir(parents=True, exist_ok=True)
+        (root / arch / "plugins" / name).write_bytes(b"MZ-" + arch.encode())
+    return root
 
 
 def test_install_plugin_missing_dist_is_usage_error(cfg_path, wiring, provision, tmp_path):
     assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(tmp_path / "nope")]) == 2
     assert provision.calls == []
+
+
+def test_install_plugin_dist_without_the_build_fails_before_the_vm(cfg_path, wiring, provision, tmp_path,
+                                                                  capsys):
+    dist = tmp_path / "dist"
+    (dist / "x64" / "plugins").mkdir(parents=True)
+    (dist / "x64" / "plugins" / "x64dbg-MCP-Server.dp64").write_bytes(b"MZ")
+    assert run(["--config", str(cfg_path), "--json", "install-plugin", "--dist", str(dist)]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "TRANSFER_FAILED"
+    assert error["details"]["missing"] == ["x32/plugins/x64dbg-MCP-Server.dp32"]
+    assert provision.calls == [] and wiring.calls == []
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0"])
+def test_provision_wait_ready_must_be_a_positive_finite_number(cfg_path, wiring, provision, value):
+    assert run(["--config", str(cfg_path), *PROVISION_ARGS, "--wait-ready", value]) == 2
+    assert provision.calls == []
+
+
+def test_install_plugin_explicit_root_wins(cfg_path, wiring, provision, tmp_path):
+    dist = _fake_dist(tmp_path / "dist")
+    assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist),
+                "--x64dbg-root", "D:/tools/x64dbg"]) == 0
+    assert provision.calls[0][2]["x64dbg_root"] == "D:\\tools\\x64dbg"
+
+
+def test_install_plugin_root_not_derivable_is_usage_error(tmp_path, wiring, provision, capsys):
+    path = write_config(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "config = 'C:\\x64dbg\\release\\x64\\mcp_config.json'", "config = 'C:\\elsewhere\\mcp_config.json'"),
+        encoding="utf-8")
+    dist = _fake_dist(tmp_path / "dist")
+    assert run(["--config", str(path), "install-plugin", "--dist", str(dist)]) == 2
+    assert "--x64dbg-root" in capsys.readouterr().err
+    assert provision.calls == [] and wiring.calls == []
+
+
+def _fake_bundle(root: Path, version: str = "1.10.0") -> Path:
+    for arch, name in (("x64", "x64dbg-MCP-Server.dp64"), ("x32", "x64dbg-MCP-Server.dp32")):
+        (root / arch).mkdir(parents=True, exist_ok=True)
+        (root / arch / name).write_bytes(b"MZ-" + arch.encode())
+    (root / "VERSION").write_text(version + "\n", encoding="utf-8")
+    return root
+
+
+def test_install_plugin_without_dist_uses_the_bundled_build(cfg_path, wiring, provision, fake, tmp_path,
+                                                            monkeypatch, capsys):
+    from x64dbg_vm_gateway import plugin_bundle
+
+    bundle = _fake_bundle(tmp_path / "bundle")
+    monkeypatch.setattr(plugin_bundle, "bundle_root", lambda: bundle)
+    seen: dict[str, Any] = {}
+
+    def install_plugin(runtime: Any, **kw: Any) -> dict[str, Any]:
+        dist = Path(kw["dist_dir"])
+        seen.update(dist=dist, x64=(dist / "x64" / "plugins" / "x64dbg-MCP-Server.dp64").read_bytes(),
+                    x32=(dist / "x32" / "plugins" / "x64dbg-MCP-Server.dp32").read_bytes(), kw=kw)
+        return {"ok": True, "installed": {"x64": {}, "x32": {}}}
+
+    provision.install_plugin = install_plugin
+    assert run(["--config", str(cfg_path), "--json", "install-plugin"]) == 0, capsys.readouterr()
+    assert seen["x64"] == b"MZ-x64" and seen["x32"] == b"MZ-x32"
+    assert not seen["dist"].exists()  # the temporary copy is gone
+    assert seen["kw"]["relaunch"] is True and seen["kw"]["x64dbg_root"] == "C:\\x64dbg\\release"
+    data = json.loads(capsys.readouterr().out)
+    assert data["plugin"] == {"source": "bundled", "version": "1.10.0"}
+
+
+def test_install_plugin_without_dist_or_bundle_fails_with_a_hint(cfg_path, wiring, provision, tmp_path,
+                                                                 monkeypatch, capsys):
+    from x64dbg_vm_gateway import plugin_bundle
+
+    monkeypatch.setattr(plugin_bundle, "bundle_root", lambda: tmp_path / "no-bundle")
+    assert run(["--config", str(cfg_path), "install-plugin"]) == 1
+    err = capsys.readouterr().err
+    assert "bundled" in err and "scripts/build-release.sh" in err and "--dist" in err
+    assert provision.calls == [] and wiring.calls == []  # nothing was built or touched
+
+    assert run(["--config", str(cfg_path), "--json", "install-plugin"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "TRANSFER_FAILED" and "--dist" in error["hint"]
+    assert error["details"]["missing"] == ["x64/x64dbg-MCP-Server.dp64", "x32/x64dbg-MCP-Server.dp32"]
 
 
 # ── provisioning holds the VM (J-integ) ─────────────────────────────
@@ -444,8 +537,7 @@ def test_provision_with_a_reboot_starts_new_epochs(cfg_path, wiring, provision, 
 
 
 def test_install_plugin_bumps_the_backend_epochs_after_success(cfg_path, wiring, provision, fake, tmp_path):
-    dist = tmp_path / "dist"
-    dist.mkdir()
+    dist = _fake_dist(tmp_path / "dist")
     assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist)]) == 0
     rt = fake.runtimes[0]
     assert rt.log == ["supervisor.pause", "lock.write", "install_plugin", "bump:x64", "bump:x32",
@@ -470,8 +562,7 @@ def test_provision_without_a_reboot_records_nothing(cfg_path, wiring, provision,
 def test_install_plugin_names_the_jobs_that_lost_their_debuggee(cfg_path, wiring, provision, fake, tmp_path,
                                                                 capsys):
     fake.results["note_debuggers_restarted"] = [JOB_ID]
-    dist = tmp_path / "dist"
-    dist.mkdir()
+    dist = _fake_dist(tmp_path / "dist")
     assert run(["--config", str(cfg_path), "--json", "install-plugin", "--dist", str(dist)]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["debuggee_lost_jobs"] == [JOB_ID]
@@ -483,8 +574,7 @@ def test_failed_install_plugin_keeps_the_epochs_and_releases_everything(
     from x64dbg_vm_gateway.errors import GuestOperationError
 
     provision.results["install_plugin"] = GuestOperationError("schtasks /run failed")
-    dist = tmp_path / "dist"
-    dist.mkdir()
+    dist = _fake_dist(tmp_path / "dist")
     assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist)]) == 1
     assert "GUEST_OP_FAILED" in capsys.readouterr().err
     assert fake.runtimes[0].log == ["supervisor.pause", "lock.write", "install_plugin", "lock.release",
@@ -509,8 +599,7 @@ def test_provision_with_the_real_runtime_runs_paused_and_locked(tmp_path, cfg_pa
             return {"ok": True}
 
         provision.install_plugin = install_plugin
-        dist = tmp_path / "dist"
-        dist.mkdir()
+        dist = _fake_dist(tmp_path / "dist")
         assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist)]) == 0
         assert seen == {"writer": True, "paused": True, "same": True}
         assert rt.supervisor.epoch("x64") == 1
@@ -529,8 +618,7 @@ def test_install_plugin_marks_the_live_job_in_the_real_store(tmp_path, cfg_path,
         monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.wiring",
                             types.SimpleNamespace(build_app=lambda *a, **kw: gw))
         provision.install_plugin = lambda runtime, **kw: {"ok": True}
-        dist = tmp_path / "dist"
-        dist.mkdir()
+        dist = _fake_dist(tmp_path / "dist")
         assert run(["--config", str(cfg_path), "install-plugin", "--dist", str(dist)]) == 0
         later = lab.gateway()  # the CLI closed its gateway; the next process reads the record
         flags = later.get_job(job_id)["flags"]
