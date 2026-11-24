@@ -45,6 +45,23 @@ def test_the_ida_script_lives_with_the_other_static_scripts() -> None:
     assert not (REPO / "ida").exists(), "the IDA script moved to static/ida"
 
 
+def _markdown_files() -> list[Path]:
+    return sorted([*STATIC_DIR.rglob("*.md"), *(REPO / "docs").glob("*.md"), REPO / "README.md",
+                   HOST_DIR / "README.md"])
+
+
+def test_markdown_tables_end_with_a_blank_line() -> None:
+    """A line right after a table renders as one more table row."""
+    for path in _markdown_files():
+        fenced = False
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for number, (line, following) in enumerate(zip(lines, lines[1:], strict=False), start=2):
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+            elif not fenced and line.startswith("|") and following.strip() and not following.startswith("|"):
+                raise AssertionError(f"{path.relative_to(REPO)}:{number}: add a blank line after the table")
+
+
 # ── packaged copies (data/static) ───────────────────────────────────
 def _repo_scripts() -> set[str]:
     return {p.relative_to(STATIC_DIR).as_posix() for p in STATIC_DIR.glob("*/*.py")
