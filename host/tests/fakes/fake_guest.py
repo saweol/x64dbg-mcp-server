@@ -21,6 +21,10 @@ def _norm(p: str) -> str:
     return str(PureWindowsPath(p)).rstrip("\\").lower()
 
 
+#: the key the fake guest file system uses for a guest path (case-insensitive, like Windows)
+norm_path = _norm
+
+
 class FakeGuest:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}  # normalized path -> content

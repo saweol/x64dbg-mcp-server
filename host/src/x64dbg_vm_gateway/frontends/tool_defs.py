@@ -407,7 +407,11 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "breakpoints into an x64dbg-ida-sync/1 document keyed by module + RVA at "
         "<job host dir>/artifacts/ida_sync.json, for ida/x64dbg_sync.py (Import) or for ida-multi-mcp "
         "(rename / set_comments at ida_imagebase + rva). Without a debug session the database collected by "
-        "analysis_collect is used. Returns host_path, item counts and the database used. An LZ4-compressed "
+        "analysis_collect is used. Returns host_path, item counts and the database used. x64dbg writes no "
+        "database file while the session has no labels, comments, bookmarks, breakpoints or functions: then "
+        "database.source is 'not_written', database.host_path is null, the document is empty and warnings "
+        "says so (with older plugin builds, that an empty session cannot be told from a failed save). An "
+        "LZ4-compressed "
         "database is refused with DATABASE_FORMAT (the hint says how to turn compression off). Side effects: "
         "saves the debugger database in the guest and writes files under the host job directory. Returns "
         "state='in_progress' if it takes longer than the call budget.",

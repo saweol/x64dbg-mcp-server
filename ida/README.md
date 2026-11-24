@@ -64,7 +64,9 @@ ida-multi-mcp edits the IDB.
    database `analysis_collect` brought to the host. The default database location is
    LZ4-compressed unless `[Engine] DisableDatabaseCompression=1` is set in the debugger's
    ini file (`x64dbg-vm-gateway provision` sets it); a compressed file is refused with
-   `DATABASE_FORMAT` and a hint saying so.
+   `DATABASE_FORMAT` and a hint saying so. x64dbg writes no database file while the session
+   has no labels, comments, bookmarks, breakpoints or functions; the export is then an empty
+   document with `database.source = "not_written"` and a warning.
 2. Open the document in IDA with the *Import* action, or let the AI apply the items through
    ida-multi-mcp (`rename` / `set_comments` at `ida_imagebase + rva`).
 

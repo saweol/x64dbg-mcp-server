@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from tests.fakes.fake_guest import FakeGuest
+from tests.fakes.fake_guest import norm_path as fake_guest_norm
 from tests.fakes.fake_plugin_server import FakePluginServer
 from tests.fakes.fake_powershell import GuestPowerShell, is_powershell
 from tests.fakes.fake_vm import FakeClock, FakeVm
@@ -107,8 +108,13 @@ class FakeLab:
     gateways: list[Gateway] = field(default_factory=list)
     runtimes: list[Runtime] = field(default_factory=list)
     vmrun_path: str = "/usr/bin/vmrun"
-    #: what the fake SaveDatabase writes (tests put an x64dbg JSON database here)
-    db_content: bytes = b"x64dbg database"
+    #: what the fake SaveDatabase writes (tests put an x64dbg JSON database here). None models
+    #: a session without annotations: real x64dbg then writes no file (and deletes an old one)
+    #: while the plugin still answers "Database saved to ..." (measured on the spike VM).
+    db_content: bytes | None = b"x64dbg database"
+    #: True models plugin builds before 2026-11-24: "Database saved to ..." even when x64dbg wrote
+    #: nothing. False: the rebuilt plugin's "No database file written ..." (filePath saves only).
+    legacy_dbsave_reply: bool = False
 
     @property
     def profile(self) -> ProfileConfig:
@@ -262,12 +268,21 @@ def _install_debugger_behaviour(lab: FakeLab, backend_id: str) -> None:
         return f"Loaded {loaded['path']}"
 
     def save(args: dict[str, Any]) -> str:
+        """Synchronous model: the file exists when the reply is sent (older plugins only queue
+        dbsave; tests that need the delay wrap the guest's file_exists)."""
         path = str(args.get("filePath") or "")
+        given = bool(path)
         if not path:
             name = loaded.get("path", "unknown").rsplit("\\", 1)[-1]
             path = f"{EXE[backend_id].rsplit(chr(92), 1)[0]}\\db\\{name}.{ext}"
-        lab.guest.write(path, lab.db_content)
-        return f"Database saved to {path}"
+        if lab.db_content is None:
+            lab.guest.files.pop(fake_guest_norm(path), None)
+            if given and not lab.legacy_dbsave_reply:
+                return (f'No database file written to "{path}": x64dbg writes none while the session has '
+                        "no labels, comments, bookmarks, breakpoints or functions.")
+        else:
+            lab.guest.write(path, lab.db_content)
+        return f'Database saved to "{path}".' if given else "Database saved."
 
     def modules(args: dict[str, Any]) -> str:
         name = loaded.get("path", "").rsplit("\\", 1)[-1] or "sample.exe"

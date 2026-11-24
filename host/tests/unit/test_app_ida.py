@@ -18,9 +18,12 @@ from tests.fakes.fake_runtime import EXE, GUEST_ROOT, NTDLL_BASE, SAMPLE_BASE, m
 from x64dbg_vm_gateway import ida_sync
 from x64dbg_vm_gateway.contracts import JobState
 from x64dbg_vm_gateway.errors import (
+    BackendError,
     BackendRestarted,
     DatabaseFormatError,
+    GatewayError,
     InvalidArgument,
+    LockTimeout,
     StateViolation,
 )
 
@@ -223,6 +226,129 @@ def test_export_without_a_debug_session_uses_the_collected_database(lab):
     assert out["database"]["source"] == "collected" and out["module_map_source"] == "manifest"
     assert len(lab.servers["x64"].tool_calls("SaveDatabase")) == saves
     assert out["items"] == 4
+
+
+# x64dbg writes no database file while the session has no labels, comments, bookmarks,
+# breakpoints or functions (and deletes an old one), and DbgCmdExec only queues dbsave (measured on
+# the spike VM, 2026-11-24). Rebuilt plugins (src/mcp/dbsave.zig) save synchronously and answer
+# "No database file written ..."; older builds answer "Database saved ..." either way.
+SAVE_CASES = [  # (plugin_version, legacy_dbsave_reply, the gateway can tell an empty session)
+    ("1.10", False, True),
+    ("1.10", True, False),
+    ("1.9", False, False),
+]
+
+
+@pytest.mark.parametrize(("plugin_version", "legacy", "confirmed"), SAVE_CASES)
+def test_export_of_a_session_without_annotations_is_empty_not_a_guest_error(
+        tmp_path, plugin_version, legacy, confirmed):
+    lab = make_lab(tmp_path, plugin_version=plugin_version)
+    try:
+        lab.legacy_dbsave_reply = legacy
+        gw, res, _ = start(lab)
+        lab.db_content = None
+        out = gw.ida_export_annotations()
+        assert out["items"] == 0 and out["modules"] == 0
+        assert out["counts"]["labels"] == 0 and out["counts"]["breakpoints"] == 0
+        db = out["database"]
+        assert db["source"] == "not_written" and db["host_path"] is None and db["size"] == 0
+        assert db["guest_path"]
+        text = " ".join(out["warnings"])
+        assert "no database file" in text.lower()
+        if confirmed:
+            assert "no labels, comments, bookmarks, breakpoints or functions" in text
+            assert "cannot tell" not in text
+        else:  # an older plugin: empty session or failed save, say both
+            assert "cannot tell" in text and "or the save failed" in text
+        target = Path(lab.config.jobs_root) / res["job_id"] / "artifacts" / "ida_sync.json"
+        doc = json.loads(target.read_text(encoding="utf-8"))
+        assert doc["schema"] == ida_sync.SCHEMA and doc["modules"] == {}
+        # the session gets a breakpoint: the next export reads the file x64dbg now writes
+        lab.db_content = x64dbg_db(PureWindowsPath(res["sample"]["guest_path"]).name.lower())
+        again = gw.ida_export_annotations()
+        assert again["database"]["source"] == "saved" and again["items"] == 4
+    finally:
+        lab.close()
+
+
+@pytest.mark.parametrize(("plugin_version", "legacy", "confirmed"), SAVE_CASES)
+def test_collect_of_a_session_without_annotations_succeeds_without_a_database(
+        tmp_path, plugin_version, legacy, confirmed):
+    lab = make_lab(tmp_path, plugin_version=plugin_version)
+    try:
+        lab.legacy_dbsave_reply = legacy
+        gw, _, _ = start(lab)
+        lab.db_content = None
+        out = gw.analysis_collect()
+        step = next(s for s in out["steps"] if s["name"] == "save_database")
+        assert step["ok"] and "no database file" in step["detail"].lower(), step
+        hedged = [w for w in out["warnings"] if "cannot tell" in w]
+        assert bool(hedged) is (not confirmed), out["warnings"]
+        if plugin_version == "1.9":
+            # x64dbg's default database stays an expected file: a missing one keeps the revert blocked
+            assert out["state"] == "COLLECTED_PARTIAL", out
+        else:
+            assert out["state"] == "COLLECTED" and out["partial"] is False, out
+            assert not [f for f in out["files"] if str(f).lower().endswith((".dd64", ".dd32"))], out["files"]
+    finally:
+        lab.close()
+
+
+def test_a_failed_save_makes_the_collection_partial_and_the_export_an_error(tmp_path):
+    """A rebuilt plugin reports a dbsave that failed as an error: fail closed."""
+    lab = make_lab(tmp_path, plugin_version="1.10")
+    try:
+        gw, _, _ = start(lab)
+        lab.servers["x64"].on_tool("SaveDatabase", {
+            "content": [{"type": "text", "text": "Error: x64dbg could not save the database to C:\\x.dd64."}],
+            "isError": True})
+        with pytest.raises(BackendError) as ei:
+            gw.ida_export_annotations()
+        assert ei.value.message == "SaveDatabase failed"
+        out = gw.analysis_collect()
+        assert out["state"] == "COLLECTED_PARTIAL", out
+        assert [e for e in out["errors"] if e.get("step") == "save_database"], out["errors"]
+    finally:
+        lab.close()
+
+
+def test_a_database_written_after_the_save_returned_is_awaited(lab, monkeypatch):
+    """Older plugins only queue x64dbg's dbsave: the file can appear after the reply."""
+    gw, res, name = start(lab)
+    lab.db_content = None  # the save writes nothing now ...
+    content = x64dbg_db(name)
+    real = lab.guest.file_exists
+    calls = []
+
+    def late(path):
+        calls.append(path)
+        if len(calls) == 3:  # ... and dbsave finishes while the gateway polls
+            lab.guest.write(path, content)
+        return real(path)
+
+    monkeypatch.setattr(lab.guest, "file_exists", late)
+    out = gw.ida_export_annotations()
+    assert out["database"]["source"] == "saved" and out["items"] == 4, out
+    assert len(calls) >= 3
+
+
+def test_a_lock_timeout_during_the_check_is_raised_not_waited_out_twice(lab):
+    gw, _, _ = start(lab)
+    lab.db_content = None
+    lab.guest.fail_next("file_exists", LockTimeout("the VM lock is held by a revert"))
+    before = len(lab.guest.calls)
+    with pytest.raises(LockTimeout):
+        gw.ida_export_annotations()
+    assert not [c for c in lab.guest.calls[before:] if c[0] == "copy_from_guest"]
+
+
+def test_a_failed_existence_check_keeps_the_old_fail_closed_behaviour(lab):
+    gw, _, _ = start(lab)
+    lab.db_content = None
+    lab.guest.fail_next("file_exists", GatewayError("vmrun fileExistsInGuest failed"))
+    with pytest.raises(GatewayError) as ei:  # the copy of the missing file fails as before
+        gw.ida_export_annotations()
+    assert "not found" in ei.value.message
 
 
 def test_export_without_any_database(lab):

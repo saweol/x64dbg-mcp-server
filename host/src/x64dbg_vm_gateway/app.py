@@ -133,6 +133,7 @@ from .errors import (
     GatewayError,
     GuestOperationError,
     InvalidArgument,
+    LockTimeout,
     PathNotAllowed,
     ProtectedSnapshotError,
     StateViolation,
@@ -179,6 +180,15 @@ same as PAUSED: inspect it or continue with run/step as usual."""
 
 # ── tunables ────────────────────────────────────────────────────────
 DEFAULT_WAIT_CAP_S = 100.0
+#: x64dbg writes no database file while a session has no labels, comments, bookmarks, breakpoints or
+#: functions. Rebuilt plugins (src/mcp/dbsave.zig) watch the file after dbsave and say so with this.
+NO_DATABASE_MARKER = "No database file written"
+EMPTY_DATABASE_NOTE = ("no database file written: the session has no labels, comments, bookmarks, "
+                       "breakpoints or functions")
+LEGACY_NOT_WRITTEN_NOTE = "x64dbg wrote no database file (empty session or failed save)"
+#: older plugins only queue x64dbg's dbsave command: how long to wait for the file to appear
+DB_WRITE_WAIT_S = 5.0
+DB_WRITE_POLL_S = 0.5
 VM_START_JOIN_S = 30.0  # `vmrun start` may block for minutes although the VM already runs
 VM_START_TIMEOUT_S = 300.0
 TOOLS_TIMEOUT_S = 300.0
@@ -366,6 +376,13 @@ class _Steps:
         finally:
             rec.pop("_soft_failed", None)
             rec["ms"] = round((self._clock.monotonic() - t0) * 1000.0, 1)
+
+
+def _legacy_not_written_warning(guest_db: str) -> str:
+    return (f"x64dbg wrote no database file at {guest_db}. Either the session has no labels, comments, "
+            "bookmarks, breakpoints or functions (x64dbg then writes none) or the save failed: this plugin "
+            "build cannot tell which (rebuilt plugins answer 'No database file written'). If the session has "
+            "annotations, check the x64dbg log and that the debugger can write there before reverting.")
 
 
 def _collection_owned_extras(art: Path) -> set[str]:
@@ -2406,7 +2423,16 @@ class Gateway(GatewayApp):
             bid = job.backend_id if job.backend_id in rt.backends else None
             if bid is not None:
                 with steps.step("save_database", soft=True) as st:
-                    detail, extra, _saved = self._save_database(rt, bid, job)
+                    detail, extra, saved, not_written = self._save_database(rt, bid, job)
+                    if not_written:
+                        detail = f"{EMPTY_DATABASE_NOTE}; nothing to collect"
+                        extra = None
+                    elif saved is not None and self._database_written(rt, saved) is False:
+                        steps.warnings.append(_legacy_not_written_warning(saved))
+                        if extra is None:  # saved into the out dir: the zip simply has no database
+                            detail = f"saved; {LEGACY_NOT_WRITTEN_NOTE}, nothing to collect"
+                        else:  # v1.9: the default database stays expected, so the collection is partial
+                            detail = f"saved; {LEGACY_NOT_WRITTEN_NOTE}; still expected (fail closed)"
                     st["detail"] = detail
                     if extra:
                         db_extras.append(extra)
@@ -2528,9 +2554,10 @@ class Gateway(GatewayApp):
 
     def _save_database(
         self, rt: Runtime, bid: str, job: Job, *, stage: str = "collect"
-    ) -> tuple[str, str | None, str | None]:
+    ) -> tuple[str, str | None, str | None, bool]:
         """SaveDatabase. Returns (detail, extra guest path to collect or None, guest path of
-        the saved database file or None).
+        the saved database file or None, True if the plugin reported that x64dbg wrote no
+        file because the session is empty; see NO_DATABASE_MARKER).
 
         v1.10 (``filePath`` in the schema) saves into the job out dir; older plugins
         save to x64dbg's default ``<exe dir>\\db\\<debuggee file name>.dd64``, which is
@@ -2555,7 +2582,7 @@ class Gateway(GatewayApp):
             target = extra
             saved = f"saved; collecting {extra}" if extra else "saved"
         if _no_session(res):
-            return "no debug session: nothing to save", None, None
+            return "no debug session: nothing to save", None, None, False
         if res.is_error:
             again = "analysis_collect" if stage == "collect" else stage
             raise BackendError(
@@ -2564,7 +2591,10 @@ class Gateway(GatewayApp):
                 details={"texts": [_clip(t) for t in res.texts[:2]]},
                 hint=f"check the debugger with GetDebugState, then call {again} again",
             )
-        return saved, extra, target
+        # the proxy wraps the reply in <untrusted_guest_output>: match the marker at a line start
+        if any(re.search(rf"(?m)^\s*{re.escape(NO_DATABASE_MARKER)}\b", t) for t in res.texts):
+            return EMPTY_DATABASE_NOTE, None, target, True
+        return saved, extra, target, False
 
     def analysis_finish(
         self,
@@ -2880,28 +2910,45 @@ class Gateway(GatewayApp):
         bid = job.backend_id if job.backend_id in rt.backends else None
         if bid is not None and rt.channel is not None and JobState(job.state) in IDA_LIVE_STATES:
             with steps.step("save_database") as st:
-                detail, _extra, guest_db = self._save_database(rt, bid, job, stage="ida_export_annotations")
+                detail, _extra, guest_db, not_written = self._save_database(rt, bid, job,
+                                                                            stage="ida_export_annotations")
                 st["detail"] = detail
             if guest_db is not None:
                 with steps.step("fetch_database") as st:
-                    database = self._fetch_database(rt, job, guest_db, art)
-                    st["detail"] = f"{database['size']} bytes"
+                    if not_written or self._database_written(rt, guest_db) is False:
+                        database = {"source": "not_written", "guest_path": guest_db,
+                                    "original_path": guest_db, "host_path": None, "size": 0, "sha256": None}
+                        if not_written:
+                            st["detail"] = EMPTY_DATABASE_NOTE
+                            steps.warnings.append(
+                                f"x64dbg wrote no database file at {guest_db}: the session has no labels, "
+                                "comments, bookmarks, breakpoints or functions, so the export is empty")
+                        else:
+                            st["detail"] = LEGACY_NOT_WRITTEN_NOTE
+                            steps.warnings.append(_legacy_not_written_warning(guest_db))
+                    else:
+                        database = self._fetch_database(rt, job, guest_db, art)
+                        st["detail"] = f"{database['size']} bytes"
         if database is None:
             with steps.step("collected_database") as st:
                 database = self._collected_database(job, art)
                 st["detail"] = str(database["original_path"])
-        db_path = Path(database["host_path"])
         with steps.step("parse") as st:
-            if db_path.stat().st_size > ida_sync.MAX_DB_BYTES:
-                raise DatabaseFormatError(
-                    f"the database is larger than {ida_sync.MAX_DB_BYTES} bytes",
-                    stage="ida_export_annotations", details={"host_path": str(db_path)},
-                )
-            try:
-                ann = ida_sync.parse_x64dbg_db(db_path.read_bytes())
-            except ValueError as e:
-                raise self._database_format_error(e, database) from None
-            st["detail"] = f"{len(ann.labels)} labels, {len(ann.comments)} comments"
+            if database["source"] == "not_written":
+                ann = ida_sync.parse_x64dbg_db(b"{}")
+                st["detail"] = "empty database"
+            else:
+                db_path = Path(database["host_path"])
+                if db_path.stat().st_size > ida_sync.MAX_DB_BYTES:
+                    raise DatabaseFormatError(
+                        f"the database is larger than {ida_sync.MAX_DB_BYTES} bytes",
+                        stage="ida_export_annotations", details={"host_path": str(db_path)},
+                    )
+                try:
+                    ann = ida_sync.parse_x64dbg_db(db_path.read_bytes())
+                except ValueError as e:
+                    raise self._database_format_error(e, database) from None
+                st["detail"] = f"{len(ann.labels)} labels, {len(ann.comments)} comments"
         modules: dict[str, Any] | None = None
         source: str | None = None
         try:
@@ -2934,6 +2981,27 @@ class Gateway(GatewayApp):
             "warnings": list(ann.warnings) + list(doc["warnings"]) + steps.warnings,
             "steps": steps.items,
         }
+
+    def _database_written(self, rt: Runtime, guest_db: str) -> bool | None:
+        """Whether the guest file exists, waiting up to DB_WRITE_WAIT_S for a queued dbsave
+        (plugins before src/mcp/dbsave.zig); None if that cannot be checked. A lock timeout is
+        raised, so the caller does not wait for the lock a second time."""
+        if rt.channel is None:
+            return None
+        deadline = self._clock.monotonic() + DB_WRITE_WAIT_S
+        for _ in range(int(DB_WRITE_WAIT_S / DB_WRITE_POLL_S) + 2):
+            try:
+                with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
+                    if rt.channel.file_exists(guest_db):
+                        return True
+            except LockTimeout:
+                raise
+            except (GatewayError, OSError):
+                return None
+            if self._clock.monotonic() >= deadline:
+                break
+            self._clock.sleep(DB_WRITE_POLL_S)
+        return False
 
     def _fetch_database(self, rt: Runtime, job: Job, guest_db: str, art: Path) -> dict[str, Any]:
         """Copy the saved database from the guest to ``artifacts/ida_sync.<dd64|dd32>`` (0600)."""

@@ -111,8 +111,12 @@ class GatewayApp(Protocol):
     def ida_export_annotations(self, job_id: str | None = None) -> JSON:
         """SaveDatabase, copy it to the host, write ``<job>/artifacts/ida_sync.json``
         (x64dbg-ida-sync/1). {"host_path", "modules", "items", "counts", "database",
-        "module_map_source", "skipped", "warnings", "steps"}. DatabaseFormatError for an
-        unreadable (e.g. LZ4-compressed) database. Long operation (may answer in_progress)."""
+        "module_map_source", "skipped", "warnings", "steps"}. ``database.source`` is "saved",
+        "collected" or "not_written" (x64dbg wrote no file; ``host_path`` is None and the
+        document is empty; ``warnings`` says whether the plugin reported an empty session or,
+        for older plugin builds, that it cannot be told from a failed save). DatabaseFormatError
+        for an unreadable (e.g. LZ4-compressed) database; BackendError when SaveDatabase reports
+        a failure. Long operation (may answer in_progress)."""
         ...
 
     def ida_import_annotations(self, items: Sequence[Mapping[str, Any]], *, module: str,
