@@ -483,8 +483,12 @@ def _jobs_report(args: argparse.Namespace, out: _Output, root: Path) -> int:
     if args.out:
         target = Path(args.out).expanduser()
         text = result["report"] if fmt == "markdown" else _dumps(result["report"]) + "\n"
+        if not args.force and (target.exists() or target.is_symlink()):
+            raise GatewayError(f"{target} already exists; refusing to overwrite it", stage="cli",
+                               hint="pass --force to replace it, or choose another --out FILE",
+                               details={"path": str(target)})
         try:
-            _write_private(target, text, replace=True)
+            _write_private(target, text, replace=bool(args.force))  # without --force: O_EXCL
         except OSError as e:
             raise GatewayError(f"cannot write the report to {target}: {e.strerror or type(e).__name__}",
                                stage="cli", details={"path": str(target)}) from None
@@ -503,8 +507,10 @@ def _jobs_report(args: argparse.Namespace, out: _Output, root: Path) -> int:
 def cmd_jobs(args: argparse.Namespace, out: _Output) -> int:
     config = _load_config(args)
     root = config.jobs_root_path
-    if args.action != "report" and (args.out or args.format):
-        raise UsageError("--out and --format only apply to `jobs report JOB_ID`")
+    if args.action != "report" and (args.out or args.format or args.force):
+        raise UsageError("--out, --format and --force only apply to `jobs report JOB_ID`")
+    if args.force and not args.out:
+        raise UsageError("--force only applies together with --out")
     if args.action == "report":
         return _jobs_report(args, out, root)
     if args.action == "show":
@@ -2102,6 +2108,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="report: write it to FILE (0600) instead of printing it, e.g. "
                         "<jobs_root>/<JOB_ID>/artifacts/report.md")
     p.add_argument("--format", choices=("markdown", "json"), help="report: markdown (default) or json")
+    p.add_argument("--force", action="store_true", help="report --out: replace a file that exists")
 
     p = command("discard", cmd_discard, "mark a job DISCARDED (human-only) so the VM may be reverted")
     p.add_argument("job_id", metavar="JOB_ID")

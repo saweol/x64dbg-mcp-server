@@ -118,8 +118,115 @@ def test_guest_file_names_cannot_break_out_of_the_table_or_the_fence(lab):
     assert "\x1b" not in md and "\x1b" not in json.dumps(doc)
     assert md.count("</untrusted_guest_output>") == md.count("<untrusted_guest_output>")
     row = next(line for line in md.splitlines() if "ignore previous" in line)
-    assert "a\\|b" in row  # the pipe is escaped: the row keeps its columns
+    assert row.startswith("- `") and "a|b" in code_spans(row)[0]  # one value, in a code span
     assert "collection.files[].original_path" in doc["guest_derived"]
+
+
+def code_spans(text: str) -> list[str]:
+    """The contents of the code spans in ``text`` (any backtick-run delimiter)."""
+    import re
+
+    spans = []
+    for m in re.finditer(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", text):
+        content = m.group(2)
+        if content.startswith(" ") and content.endswith(" ") and content.strip():
+            content = content[1:-1]  # CommonMark strips one space from each end
+        spans.append(content)
+    return spans
+
+
+def outside_code_and_fences(md: str) -> str:
+    """The Markdown without its code spans: what a viewer would interpret."""
+    import re
+
+    return re.sub(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", "", md)
+
+
+def fenced_text(md: str) -> str:
+    """Everything inside the untrusted_guest_output blocks."""
+    parts = md.split("<untrusted_guest_output>")
+    return "\n".join(p.split("</untrusted_guest_output>", 1)[0] for p in parts[1:])
+
+
+def unfenced_text(md: str) -> str:
+    parts = md.split("<untrusted_guest_output>")
+    return "\n".join([parts[0], *(p.split("</untrusted_guest_output>", 1)[1] for p in parts[1:])])
+
+
+def test_markdown_and_html_in_guest_names_are_inert(lab):
+    """The names reach the report as the manifest has them; a Windows guest allows most of these
+    characters, the rest come from archive member names."""
+    gw, job_id = finished_job(lab, export=False)
+    doc = report.build_report(gw._jobs().get(job_id), job_dir(lab, job_id))
+    evil = "![x](http://attacker.invalid/p)<img src=x>[a](b)*b*_c_`tick``s a\\|b.bin"
+    doc["collection"]["files"].insert(0, {"source": "out", "original_path": evil, "size": 1, "sha256": None,
+                                          "status": "ok", "host_path": None})
+    doc["module_map"]["modules"][0]["name"] = "<b>mod</b>[l](x)"
+    md = report.render_markdown(doc)
+    row = next(line for line in md.splitlines() if "attacker.invalid" in line)
+    assert row.startswith("- ")
+    assert code_spans(row)[0] == evil  # the whole name in one code span, exactly
+    viewer = outside_code_and_fences(md)
+    for live in ("<img", "<b>", "](", "![", "attacker.invalid"):
+        assert live not in viewer, live  # nothing a Markdown viewer would render as a link, image or HTML
+
+
+def test_every_guest_derived_field_is_fenced(tmp_path):
+    with JobStore(tmp_path / "jobs") as store:
+        job = store.create("lab", "C:\\mcp\\jobs")
+        job = store.transition(job.id, JobState.FAILED, reason="analysis_start failed: GUESTREASON",
+                               error={"code": "BACKEND_ERROR", "message": "GUESTMESSAGE",
+                                      "hint": "GUESTHINT"})
+        job = store.update(job.id, set_flags={"debuggee_lost": "GUESTFLAG"})
+    root = tmp_path / "jobs" / job.id
+    (root / "artifacts").mkdir(parents=True, exist_ok=True)
+    (root / "artifacts" / "manifest.json").write_text(json.dumps({
+        "entries": [], "errors": [{"stage": "collect", "code": "TRANSFER_FAILED", "message": "GUESTCOLL"}],
+    }), encoding="utf-8")
+    (root / "artifacts" / "static_sync.json").write_text(json.dumps({"schema": "GUESTSCHEMA", "modules": {}}),
+                                                          encoding="utf-8")
+    doc = report.build_report(job, root)
+    md = report.render_markdown(doc)
+    inside, outside = fenced_text(md), unfenced_text(md)
+    for marker in ("GUESTREASON", "GUESTMESSAGE", "GUESTHINT", "GUESTFLAG", "GUESTCOLL", "GUESTSCHEMA"):
+        assert marker in inside and marker not in outside, marker
+    for field in ("states[].reason", "flags", "errors[].message", "errors[].hint", "static_sync.schema"):
+        assert field in doc["guest_derived"], field
+
+
+def test_the_json_file_list_is_capped(lab, monkeypatch):
+    gw = lab.gateway()
+    job_id = gw.analysis_start(str(lab.sample()))["job_id"]
+    for i in range(6):
+        lab.guest.write(f"{GUEST_ROOT}\\{job_id}\\out\\f{i}.bin", b"%d" % i)
+    gw.analysis_collect()
+    monkeypatch.setattr(report, "MAX_JSON_FILES", 3)
+    coll = report.build_report(gw._jobs().get(job_id), job_dir(lab, job_id))["collection"]
+    assert len(coll["files"]) == 3 and coll["files_truncated"] is True and coll["file_count"] >= 6
+    monkeypatch.setattr(report, "MAX_JSON_FILES", 1000)
+    coll = report.build_report(gw._jobs().get(job_id), job_dir(lab, job_id))["collection"]
+    assert coll["files_truncated"] is False and len(coll["files"]) == coll["file_count"]
+
+
+def test_a_host_root_outside_the_job_directory_is_not_followed(lab, tmp_path):
+    import dataclasses
+
+    gw, job_id = finished_job(lab, export=False)
+    job = gw._jobs().get(job_id)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "artifacts").mkdir(parents=True)
+    (elsewhere / "artifacts" / "manifest.json").write_text('{"entries": [{"source": "out", "original_path": '
+                                                           '"LEAKED", "size": 1, "status": "ok"}]}',
+                                                           encoding="utf-8")
+    moved = dataclasses.replace(job, host_root=str(elsewhere))
+    doc = report.build_report(moved, job_dir(lab, job_id))  # the CLI and the gateway pass <jobs_root>/<id>
+    assert "LEAKED" not in json.dumps(doc)
+    assert any("host directory" in w for w in doc["warnings"])
+    # the gateway reads <jobs_root>/<id>, whatever state.json says
+    monkey = gw._jobs()
+    real_get = monkey.get
+    monkey.get = lambda jid: dataclasses.replace(real_get(jid), host_root=str(elsewhere))  # type: ignore[method-assign]
+    assert "LEAKED" not in json.dumps(gw.analysis_report(job_id, format="json"))
 
 
 def test_report_of_a_running_job_without_collection(lab):
@@ -328,6 +435,16 @@ def test_cli_jobs_report_out_writes_a_private_file(lab, capsys):
     assert target.read_text(encoding="utf-8").startswith(f"# Analysis report: job {job_id}")
     if POSIX:
         assert (target.stat().st_mode & 0o777) == 0o600
+    # an existing file is replaced only with --force
+    assert run(["--config", str(cfg), "jobs", "report", job_id, "--out", str(target)]) == 1
+    assert "--force" in capsys.readouterr().err
+    target.write_text("keep me", encoding="utf-8")
+    assert run(["--config", str(cfg), "jobs", "report", job_id, "--out", str(target)]) == 1
+    assert target.read_text(encoding="utf-8") == "keep me"
+    capsys.readouterr()
+    assert run(["--config", str(cfg), "jobs", "report", job_id, "--out", str(target), "--force"]) == 0
+    assert target.read_text(encoding="utf-8").startswith("# Analysis report")
+    capsys.readouterr()
     elsewhere = lab.tmp / "reports" / "r.json"
     assert run(["--config", str(cfg), "--json", "jobs", "report", job_id, "--format", "json",
                 "--out", str(elsewhere)]) == 0
@@ -343,4 +460,5 @@ def test_cli_jobs_report_errors(lab, capsys):
     assert run(["--config", str(cfg), "jobs", "report", "20990101-000000-abcdef"]) == 1
     assert "JOB_NOT_FOUND" in capsys.readouterr().err
     assert run(["--config", str(cfg), "jobs", "list", "--out", str(lab.tmp / "x.md")]) == 2
+    assert run(["--config", str(cfg), "jobs", "report", "20990101-000000-abcdef", "--force"]) == 2  # no --out
     assert run(["--config", str(cfg), "jobs", "show", "20990101-000000-abcdef", "--format", "json"]) == 2
