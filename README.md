@@ -300,7 +300,7 @@ AI는 대략 다음 순서로 툴을 호출합니다.
 ### 구성 요소와 연결
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph HOST["host (Linux에서 실검증)"]
         CC["MCP 클라이언트<br/>Claude Code 등"]
         subgraph GW["x64dbg-vm-gateway"]
