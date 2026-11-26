@@ -7,6 +7,14 @@ threaded fake plugin servers, wired together by the REAL ``wiring.build_runtime`
     lab.kill_debugger("x64")                 # x64dbg dies: HTTP refused, process gone
     lab.close()
 
+Several VMs behind one gateway (one config, one jobs root, one ``Gateway``):
+
+    labs = make_labs(tmp_path)               # profiles "lab" and "lab2", one FakeLab each
+    gw = labs.gateway()
+    gw.analysis_start(str(labs["lab2"].sample()), profile="lab2")
+    labs["lab"].vm.calls                     # what the first VM saw
+    labs.close()
+
 Guest-side programs are dispatched by executable:
 
 - ``powershell.exe`` -> :class:`tests.fakes.fake_powershell.GuestPowerShell`;
@@ -23,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
@@ -115,21 +124,23 @@ class FakeLab:
     #: True models plugin builds before 2026-11-24: "Database saved to ..." even when x64dbg wrote
     #: nothing. False: the rebuilt plugin's "No database file written ..." (filePath saves only).
     legacy_dbsave_reply: bool = False
+    #: the gateway profile this lab's VM is configured as
+    name: str = PROFILE
 
     @property
     def profile(self) -> ProfileConfig:
-        return self.config.profile(PROFILE)
+        return self.config.profile(self.name)
 
     def set_profile(self, **changes: Any) -> None:
         prof = replace(self.profile, **changes)
-        self.config = replace(self.config, profiles={PROFILE: prof})
+        self.config = replace(self.config, profiles={**self.config.profiles, self.name: prof})
 
     def set_config(self, **changes: Any) -> None:
         self.config = replace(self.config, **changes)
 
     # ── wiring ──────────────────────────────────────────────────────
     def runtime(self) -> Runtime:
-        rt = build_runtime(self.config, PROFILE, environ=self.environ, clock=self.clock, vm=self.vm,
+        rt = build_runtime(self.config, self.name, environ=self.environ, clock=self.clock, vm=self.vm,
                            channel=self.guest, cache_dir=self.tmp / "cache")
         self.runtimes.append(rt)
         return rt
@@ -138,7 +149,7 @@ class FakeLab:
         rt = self.runtime()
 
         def factory(name: str) -> Runtime:
-            assert name == PROFILE, name
+            assert name == self.name, name
             return rt
 
         kwargs.setdefault("host_system", "Linux")
@@ -198,9 +209,12 @@ def make_lab(
     backends: tuple[str, ...] = ("x64",),
     plugin_version: str = "1.9",
     token_source: str = "guest-config",  # noqa: S107 - token source kind, not a secret
+    name: str = PROFILE,
+    clock: FakeClock | None = None,
+    jobs_root: Path | None = None,
     **profile_changes: Any,
 ) -> FakeLab:
-    clock = FakeClock()
+    clock = clock if clock is not None else FakeClock()
     vm = FakeVm()
     vm.ip = "127.0.0.1"
     vm.snapshots = [Snapshot("MCP_CLEAN"), Snapshot("BASE")]
@@ -213,13 +227,13 @@ def make_lab(
     environ = {PW_ENV: "guest-pw"}
     if token_source == "env":
         environ.update({TOKEN_ENV[b]: token_for(b) for b in backends})
-    vmx = tmp_path / "vm" / "lab.vmx"
+    vmx = tmp_path / "vm" / f"{name}.vmx"
     vmx.parent.mkdir(parents=True, exist_ok=True)
-    vmx.write_text('displayName = "lab"\n', encoding="utf-8")
+    vmx.write_text(f'displayName = "{name}"\n', encoding="utf-8")
     samples = tmp_path / "samples"
     samples.mkdir()
     profile = ProfileConfig(
-        name=PROFILE,
+        name=name,
         mode="vmware",
         vmx=str(vmx),
         clean_snapshot="MCP_CLEAN",
@@ -236,10 +250,10 @@ def make_lab(
             for b in backends),
     )
     profile = replace(profile, **profile_changes)
-    config = GatewayConfig(jobs_root=str(tmp_path / "jobs"), default_profile=PROFILE, max_call_s=110.0,
-                           profiles={PROFILE: profile}, upload_roots=(str(samples),))
+    config = GatewayConfig(jobs_root=str(jobs_root or tmp_path / "jobs"), default_profile=name,
+                           max_call_s=110.0, profiles={name: profile}, upload_roots=(str(samples),))
     lab = FakeLab(tmp=tmp_path, clock=clock, vm=vm, guest=guest, ps=ps, servers=servers, config=config,
-                  environ=environ, samples=samples)
+                  environ=environ, samples=samples, name=name)
     guest.on_run_program = lab.dispatch
     guest.mkdir(GUEST_ROOT)
     for b in backends:
@@ -247,6 +261,83 @@ def make_lab(
         guest.add_process(f'"{EXE[b]}"')
         _install_debugger_behaviour(lab, b)
     return lab
+
+
+@dataclass
+class FakeLabs:
+    """Several FakeLabs (one VM, guest and set of plugin servers each) configured as the
+    profiles of ONE gateway: one config, one jobs root, one clock. ``gateway()`` builds each
+    profile's runtime from its own lab, like ``wiring.build_app`` does from the config."""
+
+    tmp: Path
+    clock: FakeClock
+    labs: dict[str, FakeLab]
+    config: GatewayConfig
+    gateways: list[Gateway] = field(default_factory=list)
+    runtimes: dict[str, list[Runtime]] = field(default_factory=dict)
+    vmrun_path: str = "/usr/bin/vmrun"
+
+    def __getitem__(self, name: str) -> FakeLab:
+        return self.labs[name]
+
+    @property
+    def environ(self) -> dict[str, str]:
+        env: dict[str, str] = {}
+        for lab in self.labs.values():
+            env.update(lab.environ)
+        return env
+
+    def set_profile(self, name: str, **changes: Any) -> None:
+        prof = replace(self.config.profile(name), **changes)
+        self.config = replace(self.config, profiles={**self.config.profiles, name: prof})
+
+    def set_config(self, **changes: Any) -> None:
+        self.config = replace(self.config, **changes)
+
+    def runtime(self, name: str) -> Runtime:
+        lab = self.labs[name]
+        rt = build_runtime(self.config, name, environ=self.environ, clock=self.clock, vm=lab.vm,
+                           channel=lab.guest, cache_dir=self.tmp / "cache")
+        self.runtimes.setdefault(name, []).append(rt)
+        return rt
+
+    def gateway(self, **kwargs: Any) -> Gateway:
+        kwargs.setdefault("host_system", "Linux")
+        kwargs.setdefault("find_vmrun", lambda configured="auto", **_kw: self.vmrun_path)
+        kwargs.setdefault("vmrun_version", lambda path: "1.17.0 build-24583834")
+        gw = Gateway(self.config, runtime_factory=self.runtime, clock=self.clock, **kwargs)
+        self.gateways.append(gw)
+        return gw
+
+    def close(self) -> None:
+        for gw in self.gateways:
+            gw.close()
+        for lab in self.labs.values():
+            lab.close()
+
+
+def make_labs(
+    tmp_path: Path,
+    names: Sequence[str] = (PROFILE, "lab2"),
+    *,
+    default_profile: str | None = None,
+    overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    **lab_kwargs: Any,
+) -> FakeLabs:
+    """One FakeLab per profile name (``make_lab`` arguments apply to each, ``overrides[name]``
+    to that one only), configured together.
+
+    ``default_profile`` is the config's ``gateway.default_profile`` (None: no default, so the
+    gateway has to be told which VM a call is for)."""
+    clock = FakeClock()
+    labs = {n: make_lab(tmp_path / n, name=n, clock=clock, jobs_root=tmp_path / "jobs",
+                        **{**lab_kwargs, **(overrides or {}).get(n, {})})
+            for n in names}
+    config = GatewayConfig(
+        jobs_root=str(tmp_path / "jobs"), default_profile=default_profile, max_call_s=110.0,
+        profiles={n: lab.profile for n, lab in labs.items()},
+        upload_roots=tuple(str(lab.samples) for lab in labs.values()))
+    return FakeLabs(tmp=tmp_path, clock=clock, labs=labs, config=config)
 
 
 #: Runtime bases the fake debugger reports in ListModules (the sample, then ntdll.dll).

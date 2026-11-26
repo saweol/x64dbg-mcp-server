@@ -833,7 +833,7 @@ def build_runtime(
         hang_hook=hang_hook,
         **sup_opts,
     )
-    proxy = Proxy(catalog, clients, supervisor, max_call_s=config.max_call_s, clock=clk)
+    proxy = Proxy(catalog, clients, supervisor, max_call_s=config.max_call_s, clock=clk, profile=prof.name)
     rt = Runtime(
         profile=prof,
         vm=vm,
