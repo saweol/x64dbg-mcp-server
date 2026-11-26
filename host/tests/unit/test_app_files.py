@@ -68,6 +68,18 @@ def test_upload_outside_the_allowed_roots_names_the_roots_and_the_setting(lab, t
     assert err.details["allowed_roots"] == [str(lab.samples.resolve())]
 
 
+def test_upload_root_refusal_does_not_tell_the_client_how_to_widen_the_roots(lab, tmp_path):
+    """Review finding: guest output may carry a prompt injection, and an MCP client that can edit
+    files could follow a hint to widen gateway.upload_roots. The hint sends that to a human."""
+    secret = tmp_path / "notes.txt"
+    secret.write_bytes(b"x")
+    with pytest.raises(PathNotAllowed) as ei:
+        lab.gateway().file_upload(str(secret), guest_dir="C:\\Tools")
+    hint = ei.value.hint or ""
+    assert "operator" in hint and "human" in hint
+    assert "restart" not in hint and "add its folder" not in hint and "config file" not in hint
+
+
 @pytest.mark.skipif(not POSIX, reason="symlinks")
 def test_upload_symlink_escaping_the_root_is_refused(lab, tmp_path):
     secret = tmp_path / "secret.txt"

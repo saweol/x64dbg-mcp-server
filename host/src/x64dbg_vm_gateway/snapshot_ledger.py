@@ -11,7 +11,7 @@ snapshot VMware lists but this file does not name is somebody else's and is neve
 Format: ``{"version": 1, "snapshots": [{"profile", "vmx", "name", "recorded_at", "source",
 "was_clean"}]}`` in the order taken (a name taken again moves to the end: it is a new snapshot).
 Names compare case-insensitively (like the gateway's snapshot checks), .vmx paths after
-``normcase``/``abspath``. A file that cannot be read counts as empty and is never overwritten
+``normcase``/``realpath``. A file that cannot be read counts as empty and is never overwritten
 (a warning is logged), so a damaged file cannot make prune forget what it lists by being
 rewritten. Writes are atomic (temp file + rename, 0600).
 
@@ -57,8 +57,8 @@ def path_for(jobs_root: Path | str) -> Path:
 
 
 def _same_vm(a: str, b: str) -> bool:
-    def norm(p: str) -> str:
-        return os.path.normcase(os.path.abspath(os.path.expanduser(p)))
+    def norm(p: str) -> str:  # a symlink and its target are the same VM
+        return os.path.normcase(os.path.realpath(os.path.expanduser(p)))
 
     return norm(a) == norm(b)
 

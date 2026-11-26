@@ -92,3 +92,26 @@ def test_find_vms_reads_the_inventory_and_vmrun(tmp_path):
     found = vm_inventory.find_vms(runner, files=[inv, tmp_path / "missing.vmls"])
     assert [(Path(x.vmx), x.name, x.running) for x in found] == [(vmx, "lab", False)]
     assert vm_inventory.find_vms(None, files=[]) == []
+
+
+def test_parse_inventory_skips_an_absurd_entry_index():
+    """Review finding: int() of a 5000-digit index raised ValueError and stopped setup."""
+    text = "vmlist" + "9" * 5000 + '.config = "/v/x.vmx"\nvmlist1.config = "/v/a.vmx"\n'
+    assert vm_inventory.parse_inventory(text) == [("/v/a.vmx", None)]
+
+
+def test_an_oversized_inventory_file_is_skipped(tmp_path, monkeypatch):
+    vmx = tmp_path / "a.vmx"
+    vmx.write_text("", encoding="utf-8")
+    inv = tmp_path / "inventory.vmls"
+    inv.write_text(f'vmlist1.config = "{vmx.as_posix()}"\n' + "#" * 200, encoding="utf-8")
+    monkeypatch.setattr(vm_inventory, "MAX_INVENTORY_BYTES", 100)
+    assert vm_inventory.find_vms(None, files=[inv]) == []
+    monkeypatch.setattr(vm_inventory, "MAX_INVENTORY_BYTES", 10_000)
+    assert [Path(c.vmx) for c in vm_inventory.find_vms(None, files=[inv])] == [vmx]
+
+
+def test_parse_vmrun_list_takes_only_vmx_lines():
+    text = ("Total running VMs: 1\nWarning: the libaio package is outdated\n/vms/a/a.VMX\n"
+            "Error: something\n")
+    assert vm_inventory.parse_vmrun_list(text) == ["/vms/a/a.VMX"]

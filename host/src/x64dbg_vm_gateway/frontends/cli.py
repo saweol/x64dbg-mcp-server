@@ -117,6 +117,7 @@ from ..errors import (
     GuestAuthFailed,
     JobNotFound,
     LockTimeout,
+    PathNotAllowed,
     StateViolation,
     TransferError,
     VmrunNotFound,
@@ -322,7 +323,13 @@ def _report_lost(result: Any, lost: list[str], out: _Output) -> Any:
 
 
 def _explain(err: GatewayError, command: str) -> GatewayError:
-    """A jobs root held by a serving gateway: say which process and what to do instead."""
+    """A jobs root held by a serving gateway: say which process and what to do instead. A host
+    path outside the upload roots: tell the human at the CLI how the roots are widened (the MCP
+    client's hint only says to ask the operator)."""
+    if isinstance(err, PathNotAllowed) and "allowed_roots" in err.details:
+        err.hint = ((err.hint + "; " if err.hint else "") + "the operator adds the folder to "
+                    "gateway.upload_roots in the gateway config and restarts the gateway")
+        return err
     if not isinstance(err, LockTimeout) or "owner_pid" not in err.details:
         return err
     pid, host = err.details.get("owner_pid"), err.details.get("owner_host")
@@ -1074,6 +1081,17 @@ class _InitPlan:
     config: gw_config.GatewayConfig
     text: str
     vmrun_path: str | None
+    #: setup with a password file: the text written first, without gateway.env_file (``text``
+    #: replaces it once the password file exists)
+    first_text: str | None = None
+
+
+def _config_text(doc: Mapping[str, Any]) -> str:
+    text = to_toml(doc, header=f"x64dbg-vm-gateway configuration (written by `{PROG} init`).\n"
+                               "Secrets are never stored here: *_env keys name environment variables.")
+    if tomllib.loads(text) != json.loads(json.dumps(doc)):  # belt and braces for the TOML writer
+        raise InternalError("generated TOML does not round-trip", stage="init")
+    return text + _HTTP_EXAMPLE
 
 
 def _plan_init(args: argparse.Namespace, out: _Output, path: Path) -> _InitPlan:
@@ -1082,11 +1100,7 @@ def _plan_init(args: argparse.Namespace, out: _Output, path: Path) -> _InitPlan:
     vmrun_value, vmrun_path = _discover_vmrun(answers, out)
     doc = _init_document(answers, vmrun_value)
     config = gw_config.config_from_dict(doc, source=str(path))  # same validation as load_config
-    text = to_toml(doc, header=f"x64dbg-vm-gateway configuration (written by `{PROG} init`).\n"
-                               "Secrets are never stored here: *_env keys name environment variables.")
-    if tomllib.loads(text) != json.loads(json.dumps(doc)):  # belt and braces for the TOML writer
-        raise InternalError("generated TOML does not round-trip", stage="init")
-    return _InitPlan(answers, doc, config, text + _HTTP_EXAMPLE, vmrun_path)
+    return _InitPlan(answers, doc, config, _config_text(doc), vmrun_path)
 
 
 def cmd_init(args: argparse.Namespace, out: _Output) -> int:
@@ -1288,6 +1302,12 @@ def _setup_config(args: argparse.Namespace, out: _Output, path: Path, report: _S
         return config, None
     _check_profile_names(args)
     plan = _plan_init(_setup_init_args(args, session), out, path)
+    if session.password_file is not None:
+        # gateway.env_file goes in only once the password file exists: a config naming a file that
+        # was never written (the guest refused the password) would stop doctor and serve
+        first = json.loads(json.dumps(plan.document))
+        first["gateway"].pop("env_file", None)
+        plan = dataclasses.replace(plan, first_text=_config_text(first))
     report.set("init", "planned", f"write {path} (profile {plan.answers['profile_name']!r})",
                document=plan.document)
     return plan.config, plan
@@ -1295,7 +1315,7 @@ def _setup_config(args: argparse.Namespace, out: _Output, path: Path, report: _S
 
 def _write_setup_config(path: Path, init: _InitPlan, report: _SetupReport,
                         out: _Output) -> gw_config.GatewayConfig:
-    _write_private(path, init.text, replace=False)
+    _write_private(path, init.first_text or init.text, replace=False)
     report.data["config"]["created"] = True
     out.note(f"setup: wrote {path}")
     step = report.step("init")
@@ -1474,7 +1494,7 @@ def _run_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: 
         _claim_jobs_root(app)
         out.note("setup: checking the configuration, the VM and the guest (doctor) ...")
         before = app.doctor(args.profile)
-        _save_password_file_after_precheck(session.password_file, before, args, prof, report, out)
+        _save_password_file_after_precheck(session, before, args, prof, report, out)
         _refused_password_note(before, session, config, prof, report)
         blockers, fixable, unknown = _classify_precheck(before, plan)
         found = {"result": before, "blockers": blockers, "fixable": fixable, "unknown": unknown}
@@ -1695,6 +1715,8 @@ class _SetupSession:
     asked_user: str | None = None  # the guest user typed for an existing config
     save: bool = False  # the user said yes to saving the credentials
     password_file: _PasswordFile | None = None
+    #: a config this run created without gateway.env_file: (path, its text, the text with it)
+    new_config: tuple[Path, str, str] | None = None
 
     def pending(self, config: gw_config.GatewayConfig) -> bool:
         """gateway.env_file is the password file this run has not written (yet, or at all)."""
@@ -1797,7 +1819,8 @@ def _ask_vm(vmrun: str | None, out: _Output) -> str:
     def check(value: str) -> str | None:
         if _NUMBER_RE.fullmatch(value):
             if found and 1 <= int(value) <= len(found):
-                return None
+                chosen = Path(found[int(value) - 1].vmx).expanduser()
+                return None if chosen.is_file() else f"no such file: {chosen}"
             if found:
                 return f"choose 1 to {len(found)}, or type a path"
             return "type the path of the VM's .vmx file"
@@ -2049,27 +2072,79 @@ def _updated_env_text(old: str, values: Sequence[tuple[str, str]]) -> str:
     return "".join(out)
 
 
-def _write_in_place(path: Path, text: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0))
+def _write_fd(fd: int, data: bytes) -> None:
+    """Write all of ``data`` to ``fd`` and fsync it (tests replace it to simulate a full disk)."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    os.fsync(fd)
+
+
+def _not_restricted(path: Path) -> ConfigError:
+    return ConfigError(f"{path} could not be restricted to your account, so the password was not written to "
+                       "it", stage="setup", details={"path": str(path)},
+                       hint="the file system must allow chmod 0600 (on Windows icacls must be able to change "
+                            "the file's permissions); or export the password where the MCP client starts "
+                            "serve instead")
+
+
+def _create_secret_file(path: Path, data: bytes) -> None:
+    """A new file holding ``data``: created empty (0600, O_EXCL), restricted to its owner, then
+    filled. On any failure after it was created it is removed again (no empty file stays)."""
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):  # the file's own restriction below is what counts
+            gw_platform.secure_dir(parent)
     try:
-        view = memoryview(text.encode("utf-8"))
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except FileExistsError:
+        raise ConfigError(f"{path} exists already; setup does not overwrite it", stage="setup",
+                          hint="pass --force to update it", details={"path": str(path)}) from None
+    try:
         os.close(fd)
+        if not gw_platform.restrict_to_owner(path):
+            raise _not_restricted(path)
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0))
+        try:
+            _write_fd(fd, data)
+        finally:
+            os.close(fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+
+
+def _replace_secret_file(path: Path, data: bytes) -> None:
+    """Replace ``path`` atomically: a temp file in the same folder (0600) is restricted to its
+    owner, filled and renamed over ``path``; on any failure the old file stays as it was and the
+    temp file is removed."""
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temp = Path(name)
+    try:
+        try:
+            if not gw_platform.restrict_to_owner(temp):
+                raise _not_restricted(path)
+            _write_fd(fd, data)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+        raise
 
 
 def write_password_file(path: Path, values: Sequence[tuple[str, str]], *, profile: str, force: bool,
                         comments: Sequence[str] = ()) -> None:
-    """Write ``values`` to the env file ``path``, readable by its owner only. The file is created
-    empty (0600, parent 0700), restricted (``platform.restrict_to_owner``: chmod 0600, on Windows
-    icacls) and only then filled, so the secret never sits in a file others may read; when the
-    restriction fails nothing is written (a new file is removed) and ConfigError is raised. An
-    existing file is only changed with ``force``: the lines of these variables are replaced, every
-    other line is kept (it must be UTF-8)."""
+    """Write ``values`` to the env file ``path``, readable by its owner only: the secret never sits
+    in a file others may read (``platform.restrict_to_owner``: chmod 0600, on Windows icacls, is
+    applied before anything is written), and a failure leaves no file behind (a new one) or the
+    old one unchanged (an update). A refused restriction raises ConfigError, other failures their
+    OSError. An existing file is only changed with ``force``: the lines of these variables are
+    replaced, every other line is kept (it must be UTF-8)."""
     lines = [_env_line(k, v) for k, v in values]  # refuses unstorable values before anything is written
-    created = False
     if path.exists():
         if not path.is_file():
             raise ConfigError(f"{path} is not a file", stage="setup", details={"path": str(path)})
@@ -2081,24 +2156,14 @@ def write_password_file(path: Path, values: Sequence[tuple[str, str]], *, profil
         except UnicodeDecodeError:
             raise ConfigError(f"{path} is not valid UTF-8, so setup does not change it", stage="setup",
                               details={"path": str(path)}) from None
-    else:
-        header = [f"# x64dbg-vm-gateway: guest credentials of profile {profile!r} (written by "
-                  f"`{PROG} setup`).",
-                  "# The config's gateway.env_file names this file; keep it readable only by you.",
-                  "# Lab-only password: Windows auto-logon stores it in the guest registry and in every "
-                  "snapshot.", *(f"# {c}" for c in comments)]
-        text = "\n".join(header + lines) + "\n"
-        _write_private(path, "", replace=False)
-        created = True
-    if not gw_platform.restrict_to_owner(path):
-        if created:
-            with contextlib.suppress(OSError):
-                path.unlink()
-        raise ConfigError(f"{path} could not be restricted to your account, so the password was not written "
-                          "to it", stage="setup", details={"path": str(path)},
-                          hint="on Windows icacls must be able to change the file's permissions; or export "
-                               "the password where the MCP client starts serve instead")
-    _write_in_place(path, text)
+        _replace_secret_file(path, text.encode("utf-8"))
+        return
+    header = [f"# x64dbg-vm-gateway: guest credentials of profile {profile!r} (written by `{PROG} setup`).",
+              "# The config's gateway.env_file names this file; keep it readable only by you.",
+              "# Lab-only password: Windows auto-logon stores it in the guest registry and in every "
+              "snapshot.", *(f"# {c}" for c in comments)]
+    _create_secret_file(path, ("\n".join(header + lines) + "\n").encode("utf-8"))
+
 
 
 def _record_not_saved(pf: _PasswordFile, why: str, report: _SetupReport) -> None:
@@ -2108,11 +2173,13 @@ def _record_not_saved(pf: _PasswordFile, why: str, report: _SetupReport) -> None
                 "the password and offers to save it)")
 
 
-def _save_password_file_after_precheck(pf: _PasswordFile | None, precheck: Any, args: argparse.Namespace,
+def _save_password_file_after_precheck(session: _SetupSession, precheck: Any, args: argparse.Namespace,
                                        prof: gw_config.ProfileConfig, report: _SetupReport,
                                        out: _Output) -> None:
     """Write the planned password file once the precheck's guest_credentials check passed: a
-    password the guest refused, or could not check (VM not running), is not saved."""
+    password the guest refused, or could not check (VM not running), is not saved. A config this
+    run created gets gateway.env_file then."""
+    pf = session.password_file
     if pf is None or pf.status != "planned":
         return
     raw = precheck.get("checks") if isinstance(precheck, Mapping) else None
@@ -2131,15 +2198,36 @@ def _save_password_file_after_precheck(pf: _PasswordFile | None, precheck: Any, 
     try:
         write_password_file(pf.path, pf.values, profile=prof.name, force=bool(args.force),
                             comments=pf.comments)
-    except ConfigError as e:
-        pf.status, pf.reason = "not_written", e.message
+    except (ConfigError, OSError) as e:
+        why = e.message if isinstance(e, ConfigError) else (
+            f"writing {pf.path} failed ({e.strerror or type(e).__name__})")
+        pf.status, pf.reason = "not_written", why
         report.data["password_file"] = pf.public()
         report.data.setdefault("warnings", []).append(
-            f"{e.message} (not saved): export {pf.values[-1][0]} where the MCP client starts serve instead")
+            f"{why} (not saved): export {pf.values[-1][0]} where the MCP client starts serve instead")
         return
     pf.status = "written"
     report.data["password_file"] = pf.public()
     out.note(f"setup: wrote {pf.path}")
+    if session.new_config is not None:
+        _add_env_file_to_new_config(session.new_config, pf, report, out)
+
+
+def _add_env_file_to_new_config(new_config: tuple[Path, str, str], pf: _PasswordFile, report: _SetupReport,
+                                out: _Output) -> None:
+    """Give the config this run created its gateway.env_file line (only while it is exactly what
+    this run wrote; otherwise the line is printed)."""
+    path, written, full = new_config
+    line = f"env_file = {_toml_str(str(pf.path))}"
+    try:
+        if path.read_text(encoding="utf-8") != written:
+            raise OSError("the config changed since setup wrote it")
+        _write_private(path, full, replace=True)
+    except OSError:
+        report.note(f"add this line to the [gateway] table of {path} so serve finds the password file: "
+                    f"{line}")
+        return
+    out.note(f"setup: added gateway.env_file to {path}")
 
 
 def _refused_password_note(precheck: Any, session: _SetupSession, config: gw_config.GatewayConfig,
@@ -2234,6 +2322,8 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
     elif init is not None:  # the config first: the password file is written once the guest accepted it
         config = _write_setup_config(path, init, report, out)
         prof = config.profile(args.profile)
+        if init.first_text is not None:
+            session.new_config = (path, init.first_text, init.text)
     error: GatewayError | None = None
     if args.dry_run:
         ok = not report.data["problems"]
@@ -2289,8 +2379,8 @@ def _same_vm_profiles(config: gw_config.GatewayConfig,
                       prof: gw_config.ProfileConfig) -> list[gw_config.ProfileConfig]:
     """``prof`` first, then every other vmware profile of the config on the same .vmx: snapshots
     and the guest belong to the VM, not to one profile."""
-    def norm(path: str) -> str:
-        return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+    def norm(path: str) -> str:  # a symlink and its target are the same VM
+        return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
 
     if not prof.vmx:
         return [prof]
@@ -2468,6 +2558,24 @@ def _format_refresh(result: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _forget_stale(config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig, names: Sequence[str],
+                  out: _Output) -> list[str]:
+    """Drop the ledger entries of snapshots VMware no longer lists (deleted by hand): a snapshot
+    made later under the same name is somebody else's, not the gateway's old one. Returns them."""
+    from .. import snapshot_ledger
+
+    vmx = prof.vmx
+    if not vmx:
+        return []
+    present = {_fold(n) for n in names}
+    stale = [e.name for e in snapshot_ledger.entries(config.jobs_root_path, profile=prof.name, vmx=vmx)
+             if _fold(e.name) not in present]
+    if stale:
+        _ledger_write(config, ", ".join(stale), out, lambda root: snapshot_ledger.forget(
+            root, profile=prof.name, vmx=vmx, names=stale))
+    return stale
+
+
 def cmd_snapshot_refresh(args: argparse.Namespace, out: _Output) -> int:
     config = _load_config(args)
     prof = config.profile(args.profile)
@@ -2512,16 +2620,18 @@ def cmd_snapshot_refresh(args: argparse.Namespace, out: _Output) -> int:
                  "snapshot takes a few minutes) ...")
         with _holding_vm(runtime):
             result = provision.take_clean_snapshot(runtime, name, wait_ready_s=float(args.wait_ready))
-    protected, unprotected = _clean_snapshot_change(prof, name)
-    path = _config_target(args)
-    lines = [f"clean_snapshot = {_toml_str(name)}", f"protected_snapshots = {_toml_value(protected)}"]
-    reason = (_edit_clean_snapshot(path, prof.name, name, protected) if args.set_clean
-              else "--set-clean not given")
-    # the ledger prune reads: the replaced clean snapshot has been the clean one; the new one is
-    # the clean one only once the config says so
-    if prof.clean_snapshot and any(_fold(n) == _fold(prof.clean_snapshot) for n in existing):
-        _record_was_clean(config, prof, prof.clean_snapshot, out)
-    _record_taken(config, prof, name, "refresh", clean=reason is None, out=out)
+        protected, unprotected = _clean_snapshot_change(prof, name)
+        path = _config_target(args)
+        lines = [f"clean_snapshot = {_toml_str(name)}", f"protected_snapshots = {_toml_value(protected)}"]
+        reason = (_edit_clean_snapshot(path, prof.name, name, protected) if args.set_clean
+                  else "--set-clean not given")
+        # the ledger prune reads, still holding the jobs root: entries VMware no longer lists go;
+        # the replaced clean snapshot has been the clean one; the new one is the clean one only once
+        # the config says so
+        _forget_stale(config, prof, existing, out)
+        if prof.clean_snapshot and any(_fold(n) == _fold(prof.clean_snapshot) for n in existing):
+            _record_was_clean(config, prof, prof.clean_snapshot, out)
+        _record_taken(config, prof, name, "refresh", clean=reason is None, out=out)
     conf: dict[str, Any] = {"path": str(path), "updated": reason is None, "set_clean": bool(args.set_clean),
                             "lines": lines, "unprotected": unprotected}
     if reason is not None:
@@ -2538,6 +2648,14 @@ class _PruneRow:
     reason: str
 
 
+def _duplicates(names: Sequence[str]) -> set[str]:
+    """Folded names VMware lists more than once (a delete by name removes whichever it picks)."""
+    counts: dict[str, int] = {}
+    for n in names:
+        counts[_fold(n)] = counts.get(_fold(n), 0) + 1
+    return {f for f, c in counts.items() if c > 1}
+
+
 def _prune_plan(names: Sequence[str], profiles: Sequence[gw_config.ProfileConfig],
                 recorded: Sequence[tuple[str, bool]], keep: int,
                 unfinished_ids: Sequence[str]) -> tuple[list[_PruneRow], int]:
@@ -2545,10 +2663,12 @@ def _prune_plan(names: Sequence[str], profiles: Sequence[gw_config.ProfileConfig
     (``policy.retention_plan``: the newest ``keep`` job snapshots stay, so do those of unfinished
     jobs and gw-* names that are not job snapshots); the recorded ``(name, was_clean)`` snapshots
     of its ledger that were the clean snapshot once (the newest ``keep`` stay) and the ones that
-    never were (kept); the clean and protected snapshots of every profile on the VM (always kept).
-    ``untouched`` counts every other snapshot."""
+    never were (kept); snapshots whose name is not unique (kept); the clean and protected
+    snapshots of every profile on the VM (always kept). ``untouched`` counts every other entry of
+    the listing."""
     prof = profiles[0]
     protection = _protection(profiles)
+    duplicates = _duplicates(names)
     rows: dict[str, _PruneRow] = {}
 
     def owned(name: str) -> bool:
@@ -2556,9 +2676,10 @@ def _prune_plan(names: Sequence[str], profiles: Sequence[gw_config.ProfileConfig
             gw_policy.check_snapshot_delete(name, prof)
         except GatewayError:
             return False
-        return _fold(name) not in protection
+        return _fold(name) not in protection and _fold(name) not in duplicates
 
-    gateway = [n for n in names if owned(n)]
+    unique = list(dict.fromkeys(names))
+    gateway = [n for n in unique if owned(n)]
     excluded = [j for j in unfinished_ids if isinstance(j, str) and JOB_ID_RE.fullmatch(j)]
     retention = gw_config.RetentionConfig(max_gateway_snapshots=keep, max_age_days=_NO_AGE_LIMIT_DAYS)
     doomed = set(gw_policy.retention_plan(gateway, prof.snapshot_prefix, retention, datetime.now(UTC),
@@ -2575,9 +2696,10 @@ def _prune_plan(names: Sequence[str], profiles: Sequence[gw_config.ProfileConfig
             rows[name] = _PruneRow(name, "keep", f"snapshot of the unfinished job {m.group(1)}")
         else:
             rows[name] = _PruneRow(name, "keep", f"gateway snapshot, among the newest {keep}")
-    present = {_fold(n): n for n in names}
+    present = {_fold(n): n for n in unique}
     candidates = [(present[_fold(n)], was_clean) for n, was_clean in recorded
-                  if _fold(n) in present and _fold(n) not in protection and present[_fold(n)] not in rows]
+                  if _fold(n) in present and _fold(n) not in protection and _fold(n) not in duplicates
+                  and present[_fold(n)] not in rows]
     old = [n for n, was_clean in candidates if was_clean]
     kept_old = set(old[len(old) - keep:]) if keep else set()
     for name in old:
@@ -2589,11 +2711,17 @@ def _prune_plan(names: Sequence[str], profiles: Sequence[gw_config.ProfileConfig
         if not was_clean:
             rows[name] = _PruneRow(name, "keep", "taken by the gateway but never the clean snapshot (make it "
                                                  "clean_snapshot, or delete it in VMware)")
-    for name in names:
+    gateway_named = {_fold(n) for n, _ in recorded}
+    gateway_named |= {_fold(n) for n in unique if prof.snapshot_prefix and n.startswith(prof.snapshot_prefix)}
+    for name in unique:
         if _fold(name) in protection:
             rows[name] = _PruneRow(name, "keep", protection[_fold(name)])
-    ordered = [rows[n] for n in names if n in rows]
-    return ordered, len(names) - len(ordered)
+        elif _fold(name) in duplicates and _fold(name) in gateway_named:
+            rows[name] = _PruneRow(name, "keep", "duplicate name: VMware lists more than one snapshot of "
+                                                 "this name, so a delete could remove either; rename one "
+                                                 "in VMware")
+    ordered = [rows[n] for n in unique if n in rows]
+    return ordered, sum(1 for n in names if n not in rows)
 
 
 def _format_prune(result: Mapping[str, Any]) -> str:
@@ -2607,6 +2735,9 @@ def _format_prune(result: Mapping[str, Any]) -> str:
         lines.append("  (no gateway or clean snapshot)")
     if result["untouched"]:
         lines.append(f"{result['untouched']} other snapshot(s) are not the gateway's and are not touched")
+    if result.get("forgotten"):
+        lines.append(f"forgot {len(result['forgotten'])} recorded snapshot(s) VMware no longer lists: "
+                     + ", ".join(_safe(n) for n in result["forgotten"]))
     for failure in result["failed"]:
         lines.append(f"failed: {_safe(failure['name'])} ({failure['error']['code']}: "
                      f"{_safe(failure['error']['message'])})")
@@ -2631,21 +2762,25 @@ def cmd_snapshot_prune(args: argparse.Namespace, out: _Output) -> int:
     assert vmx is not None
     profiles = _same_vm_profiles(config, prof)
     protection = _protection(profiles)
-    recorded = [(e.name, e.was_clean)
-                for e in snapshot_ledger.entries(config.jobs_root_path, profile=prof.name, vmx=vmx)]
     deleted: list[str] = []
     failed: list[dict[str, Any]] = []
-    with _app(args, config) as app:
+    with _app(args, config) as app:  # every ledger read and write happens while the jobs root is held
         _claim_jobs_root(app)
         unfinished = [str(j["job_id"]) for j in _unfinished_jobs(app, profiles) if j.get("job_id")]
         names = _snapshot_listing(app, args.profile)
+        forgotten = _forget_stale(config, prof, names, out)
+        recorded = [(e.name, e.was_clean)
+                    for e in snapshot_ledger.entries(config.jobs_root_path, profile=prof.name, vmx=vmx)
+                    if e.name not in forgotten]
         rows, untouched = _prune_plan(names, profiles, recorded, args.keep, unfinished)
         doomed = [r.name for r in rows if r.action == "delete"]
+        duplicates = _duplicates(names)
         if args.yes and doomed:
             runtime = _runtime(app, args.profile)
             with _holding_vm(runtime):
                 for name in doomed:
-                    if _fold(name) in protection:  # never, whatever the plan says
+                    # never, whatever the plan says
+                    if _fold(name) in protection or _fold(name) in duplicates:
                         continue
                     try:
                         runtime.vm.delete_snapshot(name)
@@ -2653,15 +2788,14 @@ def cmd_snapshot_prune(args: argparse.Namespace, out: _Output) -> int:
                         failed.append({"name": name, "error": e.to_dict()})
                     else:
                         deleted.append(name)
-    if deleted:
-        _ledger_write(config, ", ".join(deleted), out, lambda root: snapshot_ledger.forget(
-            root, profile=prof.name, vmx=vmx, names=deleted))
+        if deleted:
+            _ledger_write(config, ", ".join(deleted), out, lambda root: snapshot_ledger.forget(
+                root, profile=prof.name, vmx=vmx, names=deleted))
     result = {"ok": not failed, "profile": prof.name, "dry_run": not args.yes, "keep": args.keep,
               "snapshots": [dataclasses.asdict(r) for r in rows], "untouched": untouched, "delete": doomed,
-              "deleted": deleted, "failed": failed}
+              "deleted": deleted, "failed": failed, "forgotten": forgotten}
     out.data(result, _format_prune)
     return EXIT_OK if not failed else EXIT_FAILURE
-
 
 
 def cmd_snapshot(args: argparse.Namespace, out: _Output) -> int:

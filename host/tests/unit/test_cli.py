@@ -1029,3 +1029,15 @@ def test_doctor_help_says_what_it_checks_and_its_exit_codes(capsys):
     assert "0 every check passed" in out and "1 a check failed" in out and "2 usage error" in out
     assert "LOCK_TIMEOUT" in out and "gateway_doctor" in out and "session_status" in out
     assert "serve" in out
+
+
+def test_cli_output_of_an_upload_root_refusal_says_how_the_operator_widens_the_roots():
+    """The MCP-facing hint only says to ask the operator; the CLI (a human reads it) adds how."""
+    from x64dbg_vm_gateway.errors import PathNotAllowed
+
+    err = PathNotAllowed("host path is outside the allowed upload roots (gateway.upload_roots: /s)",
+                         hint="ask the operator", details={"allowed_roots": ["/s"]})
+    hint = cli._explain(err, "demo").hint or ""
+    assert hint.startswith("ask the operator") and "gateway.upload_roots" in hint and "restart" in hint
+    other = PathNotAllowed("guest path has a NUL byte", hint="fix it")
+    assert cli._explain(other, "demo").hint == "fix it"
