@@ -989,3 +989,43 @@ def test_doctor_text_shows_a_warning_check_as_warn_with_its_hint():
     assert lines[1].startswith("[WARN] static_tools")
     assert lines[2].strip() == "hint: install Ghidra or set [static.servers.ghidra]"
     assert lines[-1] == "doctor: all checks passed (1 warning)"
+
+
+# ── help texts (first-time usability) ───────────────────────────────
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _subparser(name: str) -> Any:
+    import argparse
+
+    parser = cli.build_parser()
+    (sub,) = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    return sub.choices[name]
+
+
+def _option_help(command: str, option: str) -> str:
+    (action,) = [a for a in _subparser(command)._actions if option in a.option_strings]
+    return _flat(action.help or "")
+
+
+def test_top_level_help_says_how_to_get_started(capsys):
+    assert run(["--help"]) == 0
+    out = capsys.readouterr().out
+    assert "Getting started:" in out
+    lines = [line.strip() for line in out.splitlines()]
+    assert any(line.startswith("1) x64dbg-vm-gateway setup") for line in lines), out
+    assert any(line.startswith("2) x64dbg-vm-gateway mcp-config") for line in lines), out
+    assert any(line.startswith("3) claude mcp add") for line in lines), out
+    assert "serve is started by the MCP client, not by hand" in _flat(out)
+
+
+def test_doctor_help_says_what_it_checks_and_its_exit_codes(capsys):
+    assert run(["doctor", "--help"]) == 0
+    out = _flat(capsys.readouterr().out)
+    for words in ("vmrun", "VMware Tools", "single running instance", "guest credentials", "clean snapshot",
+                  "backend", "the VM must be running"):
+        assert words in out, words
+    assert "0 every check passed" in out and "1 a check failed" in out and "2 usage error" in out
+    assert "LOCK_TIMEOUT" in out and "gateway_doctor" in out and "session_status" in out
+    assert "serve" in out

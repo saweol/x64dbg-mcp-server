@@ -803,3 +803,43 @@ def test_the_static_tools_check_is_advisory_and_never_stops_setup():
     """static_tools only reports which static tools and MCP servers are found (WARN, never FAIL)."""
     assert cli.setup_check_kind("static_tools") == "advisory"
     assert "static_tools" not in cli.SETUP_BLOCKING_CHECKS
+
+
+# ── help texts (first-time usability) ───────────────────────────────
+def _setup_parser() -> Any:
+    from tests.unit.test_cli import _subparser
+
+    return _subparser("setup")
+
+
+def test_setup_help_shows_a_first_run_example(capsys):
+    assert run(["setup", "--help"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    (i,) = [n for n, line in enumerate(lines) if line.strip().startswith("x64dbg-vm-gateway setup --vmx")]
+    example = " ".join(lines[i:i + 2])
+    assert "--guest-user" in example and "--x64dbg-root" in example
+    flat = " ".join(out.split())
+    assert "three values" in flat and "--dry-run" in flat and "--non-interactive" in flat
+
+
+def test_setup_help_groups_have_short_titles(capsys):
+    assert run(["setup", "--help"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    groups = {g.title: g for g in _setup_parser()._action_groups if g._group_actions}
+    assert {"config creation", "plugin", "provisioning"} <= set(groups), groups
+    assert all(len(t or "") <= 30 for t in groups), list(groups)
+    assert all(f"{t}:" in out for t in groups)  # each title stands on its own line
+    assert "no config file" in (groups["config creation"].description or "")
+
+
+@pytest.mark.parametrize(("option", "other"), [
+    ("--user", "--guest-user"), ("--guest-user", "--user"),
+    ("--snapshot", "--clean-snapshot"), ("--clean-snapshot", "--snapshot"),
+    ("--profile-name", "--profile"), ("--profile", "--profile-name"),
+])
+def test_setup_help_tells_the_option_pairs_apart(option, other):
+    from tests.unit.test_cli import _option_help
+
+    words = _option_help("setup", option).replace(",", " ").replace(")", " ").replace("(", " ").split()
+    assert other in words, (option, words)

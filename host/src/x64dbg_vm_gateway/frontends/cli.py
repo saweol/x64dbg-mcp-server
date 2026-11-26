@@ -68,6 +68,7 @@ import re
 import shlex
 import sys
 import tempfile
+import textwrap
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PureWindowsPath
@@ -1567,30 +1568,56 @@ def cmd_static_scripts(args: argparse.Namespace, out: _Output) -> int:
 
 
 # ── parser ──────────────────────────────────────────────────────────
-def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+_PROFILE_HELP = "profile to use (default: gateway.default_profile)"
+
+
+def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool,
+                        profile_help: str = _PROFILE_HELP) -> None:
     def default(value: Any) -> Any:
         return argparse.SUPPRESS if suppress else value
 
     group = parser.add_argument_group("global options")
     group.add_argument("--config", metavar="PATH", default=default(None),
                        help=f"config file (default: ${gw_config.ENV_CONFIG_PATH} or the per-user location)")
-    group.add_argument("--profile", metavar="NAME", default=default(None),
-                       help="profile to use (default: gateway.default_profile)")
+    group.add_argument("--profile", metavar="NAME", default=default(None), help=profile_help)
     group.add_argument("--json", action="store_true", default=default(False), help="machine-readable output")
     group.add_argument("-v", "--verbose", action="store_true", default=default(False),
                        help="debug logging on stderr")
 
 
-def _add_init_options(p: Any, *,
-                      x64dbg_root_help: str = "guest directory containing x64\\ and x32\\") -> None:
-    """The config values ``init`` asks for (``setup`` passes them through to it)."""
-    p.add_argument("--non-interactive", action="store_true", help="take every value from flags")
-    p.add_argument("--profile-name", metavar="NAME")
-    p.add_argument("--vmx", metavar="PATH", help="host path of the VM's .vmx file")
-    p.add_argument("--clean-snapshot", metavar="NAME", help=f"default: {DEFAULT_CLEAN_SNAPSHOT}")
-    p.add_argument("--guest-user", metavar="USER")
-    p.add_argument("--guest-password-env", metavar="VAR", help=f"default: {DEFAULT_PASSWORD_ENV}")
-    p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help=x64dbg_root_help)
+def _add_init_options(p: Any, *, setup: bool = False) -> None:
+    """The config values ``init`` asks for (``setup`` uses them when it creates the config)."""
+    if setup:
+        helps = {
+            "--non-interactive": "never ask: take every value from the flags and the environment (also what "
+                                 "happens when stdin is not a terminal)",
+            "--profile-name": "name of the profile in a new config (default: the global --profile, else "
+                              f"{DEFAULT_PROFILE_NAME})",
+            "--vmx": "host path of the VM's .vmx file, written to a new config",
+            "--clean-snapshot": "clean_snapshot written to a new config: the snapshot analyses revert to "
+                                f"(default: --snapshot, else {DEFAULT_CLEAN_SNAPSHOT})",
+            "--guest-user": "guest account written to a new config as guest_user; provisioning also uses it "
+                            "unless --user names another one",
+            "--x64dbg-root": "x64dbg release folder in the guest, holding x64\\ and x32\\ (default: derived "
+                             "from the profile's backends); a new config takes the backend paths from it",
+        }
+    else:
+        helps = {
+            "--non-interactive": "take every value from flags",
+            "--profile-name": f"name of the new profile (default: {DEFAULT_PROFILE_NAME})",
+            "--vmx": "host path of the VM's .vmx file",
+            "--clean-snapshot": f"the snapshot analyses revert to (default: {DEFAULT_CLEAN_SNAPSHOT})",
+            "--guest-user": "guest account that logs on and runs the debuggers",
+            "--x64dbg-root": "guest directory containing x64\\ and x32\\",
+        }
+    p.add_argument("--non-interactive", action="store_true", help=helps["--non-interactive"])
+    p.add_argument("--profile-name", metavar="NAME", help=helps["--profile-name"])
+    p.add_argument("--vmx", metavar="PATH", help=helps["--vmx"])
+    p.add_argument("--clean-snapshot", metavar="NAME", help=helps["--clean-snapshot"])
+    p.add_argument("--guest-user", metavar="USER", help=helps["--guest-user"])
+    p.add_argument("--guest-password-env", metavar="VAR",
+                   help=f"environment variable holding the guest password (default: {DEFAULT_PASSWORD_ENV})")
+    p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help=helps["--x64dbg-root"])
     p.add_argument("--jobs-root", metavar="DIR", help="host directory for job artifacts")
     p.add_argument("--vmrun", metavar="PATH", help="vmrun executable (default: auto-detect)")
     p.add_argument("--upload-root", metavar="DIR", action="append", dest="upload_roots",
@@ -1598,23 +1625,80 @@ def _add_init_options(p: Any, *,
                         "(repeatable; default: ~, the home folder)")
 
 
+_TOP_EPILOG = f"""\
+Getting started:
+  1) {PROG} setup
+       create the config, install the plugin, prepare the guest and take the
+       clean snapshot (on a terminal it asks for what it needs; try --dry-run)
+  2) {PROG} mcp-config
+       print the MCP client registration commands
+  3) claude mcp add {MCP_SERVER_NAME} -- {PROG} serve
+       register the gateway with Claude Code (setup and mcp-config print the
+       exact command for your config)
+serve is started by the MCP client, not by hand.
+"""
+
+_DOCTOR_DESCRIPTION = """\
+Check the configuration and the environment, one line per check, with a hint
+for each failure: vmrun, the .vmx file, the VM (power, a single running
+instance, VMware Tools, guest IP, isolation), the guest credentials, the guest
+and host job folders, the clean snapshot, every backend (reachable, token, tool
+catalog) and the static tools. For a vmware profile the VM must be running:
+most checks look inside the guest.
+"""
+
+_DOCTOR_EPILOG = """\
+Exit codes: 0 every check passed (warnings included), 1 a check failed,
+2 usage error.
+
+While an MCP client runs the gateway (serve), that process holds the jobs
+folder: the CLI commands doctor, status and provision then stop with
+LOCK_TIMEOUT. Use the gateway_doctor and session_status tools from the MCP
+client instead, or close the client first.
+"""
+
+_SETUP_EPILOG = f"""\
+Example, first run (no config yet, the VM is running):
+  {PROG} setup --vmx ~/vmware/win10/win10.vmx --guest-user analyst \\
+      --x64dbg-root 'C:\\x64dbg\\release'
+
+These are the three values a first run needs: the VM's .vmx file, the Windows
+account in the guest that logs on and runs the debuggers, and the x64dbg
+release folder in the guest (it holds x64\\ and x32\\). On a terminal setup asks
+for whichever is missing, and for the guest password unless the variable
+{DEFAULT_PASSWORD_ENV} (--guest-password-env) holds it; --non-interactive
+asks nothing. Try --dry-run first: it prints the plan and changes nothing.
+"""
+
+
+def _wrap(text: str, width: int = 78) -> str:
+    """Pre-wrapped text for a raw help section (a raw formatter keeps descriptions as given)."""
+    return "\n".join(textwrap.wrap(text, width))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Host-side MCP gateway for x64dbg-MCP inside VMware guests.")
+        prog=PROG, description="Host-side MCP gateway for x64dbg-MCP inside VMware guests.",
+        epilog=_TOP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_global_options(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    def command(name: str, handler: Callable[[argparse.Namespace, _Output], int], help_text: str
-                ) -> argparse.ArgumentParser:
-        p = sub.add_parser(name, help=help_text, description=help_text)
-        _add_global_options(p, suppress=True)
+    def command(name: str, handler: Callable[[argparse.Namespace, _Output], int], help_text: str, *,
+                description: str | None = None, epilog: str | None = None,
+                profile_help: str = _PROFILE_HELP) -> argparse.ArgumentParser:
+        raw = description is not None or epilog is not None
+        p = sub.add_parser(name, help=help_text, description=description or help_text, epilog=epilog,
+                           formatter_class=argparse.RawDescriptionHelpFormatter if raw
+                           else argparse.HelpFormatter)
+        _add_global_options(p, suppress=True, profile_help=profile_help)
         p.set_defaults(handler=handler)
         return p
 
     p = command("serve", cmd_serve, "run the MCP server (stdio for Claude Code, http for remote clients)")
     p.add_argument("--transport", choices=("stdio", "http"), default="stdio")
 
-    command("doctor", cmd_doctor, "check configuration, VM, guest and backends")
+    command("doctor", cmd_doctor, "check configuration, VM, guest and backends",
+            description=_DOCTOR_DESCRIPTION, epilog=_DOCTOR_EPILOG)
     command("status", cmd_status, "show VM, backend and job status")
 
     p = command("init", cmd_init, "create a config file (interactive unless --non-interactive)")
@@ -1655,26 +1739,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help="default: derived from the profile's backends")
     p.add_argument("--no-relaunch", action="store_true", help="do not restart the debuggers")
 
-    p = command("setup", cmd_setup,
-                "one-shot setup: init (if there is no config), doctor, install-plugin, provision, doctor, "
-                "and the MCP client registration command")
+    setup_help = ("one-shot setup: init (if there is no config), doctor, install-plugin, provision, doctor, "
+                  "and the MCP client registration command")
+    p = command("setup", cmd_setup, setup_help, description=_wrap(setup_help + "."), epilog=_SETUP_EPILOG,
+                profile_help="profile to use (default: gateway.default_profile); a new config also takes it "
+                             "as its profile name, like --profile-name")
     p.add_argument("--dry-run", action="store_true", help="print the plan; change and contact nothing")
     p.add_argument("--skip-plugin", action="store_true", help="do not install the plugin")
     p.add_argument("--skip-provision", action="store_true",
                    help="do not provision (the debuggers are then relaunched after the plugin install)")
-    group = p.add_argument_group("config creation (used only when there is no config file, see init; "
-                                 "--x64dbg-root also feeds install-plugin and provision)")
-    _add_init_options(group, x64dbg_root_help="guest directory containing x64\\ and x32\\ "
-                                              "(default: derived from the profile's backends)")
+    group = p.add_argument_group(
+        "config creation", _wrap("Used only when there is no config file yet (see init); --x64dbg-root also "
+                                 "feeds install-plugin and provision.", 76))
+    _add_init_options(group, setup=True)
     group = p.add_argument_group("plugin")
     group.add_argument("--dist", metavar="DIR",
                        help="host folder holding x64/plugins and x32/plugins (default: the bundled build)")
-    group = p.add_argument_group("provisioning (see provision)")
+    group = p.add_argument_group("provisioning", "See provision. These apply to this run only.")
     group.add_argument("--snapshot", metavar="NAME",
-                       help="clean snapshot to take (default: the profile's clean_snapshot, "
-                            f"{DEFAULT_CLEAN_SNAPSHOT})")
+                       help="snapshot provisioning takes now (default: the profile's clean_snapshot, else "
+                            f"{DEFAULT_CLEAN_SNAPSHOT}); a new config also makes it its clean_snapshot "
+                            "unless --clean-snapshot names another one")
     group.add_argument("--user", metavar="USER",
-                       help="interactive guest user (default: the profile's guest_user)")
+                       help="guest account provisioning sets up for auto-logon and the debuggers' logon "
+                            "tasks, for this run (default: the profile's guest_user); --guest-user instead "
+                            "writes the account into a new config")
     group.add_argument("--no-autologon", action="store_true", help="do not configure Windows auto-logon")
     group.add_argument("--bind", metavar="ADDR", default=DEFAULT_PLUGIN_BIND,
                        help=f"plugin bind address in the guest (default: {DEFAULT_PLUGIN_BIND})")
