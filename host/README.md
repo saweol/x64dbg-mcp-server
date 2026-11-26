@@ -21,20 +21,35 @@ Design and rationale: [`../docs/VM_ORCHESTRATION_PLAN.md`](../docs/VM_ORCHESTRAT
 - A Windows 10/11 guest with VMware Tools, x64dbg (both `x64\` and `x32\`) and the x64dbg-MCP
   plugin (`x64dbg-MCP-Server.dp64` / `.dp32`). Plugin v1.3 and later work; the gateway detects
   features (for example `GetServerInfo`, `SetArtifactDir`) from the plugin's tool list.
-- A host-only network for the guest and shared folders disabled (see [Safety](#safety)).
+- A host-only network for the guest and shared folders disabled (see [Safety](#safety)). Host-only
+  is required, not just allowed: the gateway reaches the plugins in the guest over HTTP, so an
+  adapter that is not connected passes the isolation check but the guest cannot be driven. Keys the check reads
+  in the `.vmx`: every present, connected `ethernetN.connectionType` must be `"hostonly"` (a missing
+  `connectionType` means bridged; VMware's "Custom" choice writes `"custom"`), and shared folders
+  count as off with `isolation.tools.hgfs.disable = "TRUE"` or no enabled `sharedFolderN` entry.
+- A guest password used nowhere else: Windows auto-logon (set up by `provision`) stores it in the
+  guest registry (`Winlogon\DefaultPassword`), so it is in every snapshot and readable by malware
+  in the guest.
 
 ## Install
 
-A release wheel carries a prebuilt plugin, so no Zig is needed. Download
-`x64dbg_vm_gateway-<version>-py3-none-any.whl` from a GitHub release (or build it, below) and:
+Releases will be published at <https://github.com/saweol/x64dbg-mcp-server/releases>; there is
+no release yet, so for now build the wheel from a checkout (Zig 0.14 and uv):
 
 ```console
-uv tool install ./x64dbg_vm_gateway-0.1.0-py3-none-any.whl   # puts x64dbg-vm-gateway on PATH
+scripts/build-release.sh
+(cd release && sha256sum -c SHA256SUMS)
+uv tool install release/x64dbg_vm_gateway-*.whl      # puts x64dbg-vm-gateway on PATH (--force to reinstall)
 x64dbg-vm-gateway --help
 ```
 
-`scripts/build-release.sh` (Zig 0.14 and uv; runs from any directory) builds the plugin, bundles
-it into the package and writes `release/`: the wheel, the sdist,
+A release wheel will carry the prebuilt plugin, so no Zig is needed then: download the wheel and
+`SHA256SUMS`, run `sha256sum -c --ignore-missing SHA256SUMS`, then
+`uv tool install ./x64dbg_vm_gateway-<version>-py3-none-any.whl`. If the shell does not find
+`x64dbg-vm-gateway` afterwards, run `uv tool update-shell` and open a new shell.
+
+`scripts/build-release.sh` (Zig 0.14 and uv; runs from any directory) builds the plugin and the
+benign demo samples, bundles them into the package and writes `release/`: the wheel, the sdist,
 `x64dbg-mcp-plugin-<version>.zip` (`x64/plugins`, `x32/plugins`) and `SHA256SUMS`. The wheel
 also carries the static-tool sync scripts ([Static analysis tools](#static-analysis-tools)).
 Pushing a `v*` tag runs it in GitHub Actions and attaches `release/*` to the release. The tag
@@ -113,7 +128,9 @@ The gateway expects the clean-snapshot contract of plan section 5.7: a powered-o
 plugin listening, `C:\mcp\jobs` exists and is empty, shared folders are off and the network is
 host-only.
 
-1. In the guest: install VMware Tools, unpack x64dbg, create the analysis user (with a password).
+1. Clone the VM first if it is an analysis VM you already use: setup changes the guest and every
+   analysis reverts it. In the guest: install VMware Tools, unpack x64dbg, create a local analysis
+   user with a lab-only password (see [Requirements](#requirements)).
 2. On the host, with the VM running and the guest password exported, run everything at once:
 
    ```console
@@ -130,8 +147,10 @@ host-only.
    replaces an existing snapshot: use `--snapshot NEW_NAME`, then set `clean_snapshot` (and
    `protected_snapshots`) in the config to it yourself. Without auto-logon someone has to log on in
    the VM after the reboot, within `--wait-ready` seconds.
-   `setup` and the bundled-plugin install are covered by unit tests only; the real-VM runs used
-   steps 3 to 5, which are the same work one command at a time.
+   `setup` with its values given as flags ran on the real VM (248 s from the precheck to the
+   registration commands); its terminal questions and `--save-password-file` are covered by unit
+   tests only. What is verified where is listed in one place, the
+   [verification status of the Korean README](../README.md#검증-현황).
 3. Copy the plugin into the guest (the bundled build, or `--dist DIR` holding `x64/plugins` and
    `x32/plugins`; `--x64dbg-root` defaults to the profile's backend paths). On a guest that is not
    provisioned yet add `--no-relaunch`: the logon tasks that relaunch the debuggers come with step 4.
@@ -177,9 +196,9 @@ Start Claude Code from a shell where the password variable is exported (avoid `c
 which writes the value into Claude's config file). Run only one gateway per jobs root at a time;
 remote users connect to the same gateway over HTTP instead of starting a second one.
 
-The gateway lists all tools at session start: its own tools plus the plugin's x64dbg tools under
-their original names (`SetBreakpoint`, `run`, `DumpMemory`, ...). `debugger_call` reaches any
-backend tool that is not listed.
+The gateway lists all tools at session start: its own 22 tools plus the plugin's x64dbg tools
+under their original names (`SetBreakpoint`, `run`, `DumpMemory`, ...; 83 with plugin v1.10, so 105
+in all). `debugger_call` reaches any backend tool that is not listed.
 
 ### The analysis loop
 
@@ -254,7 +273,11 @@ Further behaviour worth knowing:
   `arch`), `trace-api` (`sample_path`, `api` such as `kernel32.CreateFileW`), `find-oep`
   (`sample_path`), `static-dynamic` (`sample_path`, `static_address`, `imagebase`, `module`) and
   `report` (`job_id`). Each is a step-by-step plan with the real tool names and the safety rules;
-  bad arguments answer `INVALID_PARAMS`.
+  bad arguments answer `INVALID_PARAMS`. Claude Code lists them as commands such as
+  `/x64dbg-vm:analyze-sample (MCP)` and runs `/mcp__x64dbg-vm__analyze-sample /path/to/sample.exe`
+  (the middle part is the server name given to `claude mcp add`; arguments are split on
+  whitespace, in the order above). The prompts are covered by unit tests; the Claude Code naming is
+  taken from Claude Code's documentation.
 - While a gateway serves a jobs root, CLI commands that need it (`discard`, `status`, `doctor`,
   `provision`, `install-plugin`) stop with `LOCK_TIMEOUT` naming the gateway's pid. `provision` and
   `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
@@ -498,7 +521,8 @@ missing samples (with how to build them). It reverts the VM to the clean snapsho
 - **Guest output is untrusted.** Text from the guest is stripped of control characters and
   wrapped in `<untrusted_guest_output>`; the model is told never to follow instructions inside
   it. Collected files and downloads are untrusted data: never execute them on the host. On
-  Windows hosts artifacts are kept in an encrypted zip by default.
+  Windows hosts `analysis_collect` keeps the archive `artifacts/raw/out.zip` without extracting it
+  by default (`extract=true` extracts it).
 - **Destructive tools.** Reverts, power changes, snapshot deletion and `analysis_finish` cannot be
   undone. The gateway enforces its own rules (protected snapshots, no revert before collection,
   only `gw-*` snapshots deletable, no `force` flag), but you should still require human approval
@@ -523,10 +547,27 @@ missing samples (with how to build them). It reverts the VM to the clean snapsho
 - **The plugins do not answer after a revert or reboot.** They start through the `AtLogOn` tasks,
   so auto-logon must work; after a reboot they answered within about 45 s on the reference VM.
   `vm_screenshot` shows a stuck logon screen or a modal dialog.
-- **`LOCK_TIMEOUT` on the jobs root.** Another gateway process owns it. Stop it, or use `jobs`
-  (read-only) instead.
+- **`LOCK_TIMEOUT` on the jobs root.** Another gateway process owns it, usually the `serve` that
+  Claude Code started. Close the client, or use the MCP tools
+  `gateway_doctor` / `session_status`, or `jobs` (read-only) instead. A second Claude Code window
+  cannot start its own gateway on the same jobs root for the same reason.
+- **`x64dbg-vm-gateway: command not found` after `uv tool install`.** Run `uv tool update-shell` and
+  open a new shell (`uv tool dir --bin` shows the directory).
+- **The MCP server shows as failed in Claude Code** (`/mcp`, `claude mcp list`). Re-register with
+  the command `mcp-config --tool gateway` prints (it names the executable by absolute path, which
+  changes when you reinstall elsewhere); make sure no other gateway holds the jobs root; `claude mcp
+  add` registers for the current directory unless `--scope user` is given. Slow servers such as
+  pyghidra-mcp with `--wait-for-analysis` need a longer start-up timeout: `MCP_TIMEOUT=120000 claude`
+  (milliseconds).
+- **`ISOLATION_REQUIRED`.** Power the VM off and fix the `.vmx` keys listed under
+  [Requirements](#requirements).
+- **`TARGET_AMBIGUOUS`.** Live jobs on several VMs and no target for this client session: call
+  `debugger_select(profile=...)` or pass `profile` / `job_id` (see [Several VMs](#several-vms)).
 - **`serve --transport http` refuses to start.** The error names the missing piece: `http.enabled`,
   an unset token variable, a token shorter than 16 characters, or TLS for a non-loopback bind.
+
+The Korean README has a troubleshooting table by symptom and an index of every error code:
+[문제 해결](../README.md#문제-해결).
 
 ## Development
 
@@ -586,4 +627,6 @@ changing the VM's power state or snapshots: program arguments round-trip through
 `instance_report()`, and the guest boot time used for reboot detection.
 
 Last full run on the spike VM (2026-11-24, clean snapshot `MCP_CLEAN_V110E`): 10 passed in 3 min 32 s; see
-`docs/PHASE0_RESULTS.md` for the timings and the defects this suite found.
+[`docs/PHASE0_RESULTS.md`](../docs/PHASE0_RESULTS.md) for the timings and the defects this suite
+found, and the [verification status](../README.md#검증-현황) for what is verified on the real VM and
+what only by unit tests.
