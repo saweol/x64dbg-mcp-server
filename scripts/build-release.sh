@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build a release into release/ at the repository root:
 #
-#   x64dbg_vm_gateway-<gw-version>-py3-none-any.whl   host gateway with the plugin and the static-tool
-#                                                     sync scripts bundled
+#   x64dbg_vm_gateway-<gw-version>-py3-none-any.whl   host gateway with the plugin, the static-tool
+#                                                     sync scripts and the demo samples bundled
 #   x64dbg_vm_gateway-<gw-version>.tar.gz             its sdist (same content)
 #   x64dbg-mcp-plugin-<version>.zip                   x64/plugins/*.dp64 and x32/plugins/*.dp32
 #   SHA256SUMS
@@ -11,9 +11,12 @@
 #
 # Needs Zig 0.14 ($ZIG, else zig on PATH, else ~/.local/share/zig/zig-linux-x86_64-0.14.0/zig)
 # and uv on PATH. <gw-version> is host/pyproject.toml's version, <version> the plugin version in
-# build.zig.zon. Every run starts over: release/ and the bundled copy in
-# host/src/x64dbg_vm_gateway/data/plugin/ are removed first, so a failed run leaves neither
-# behind; release/ only appears complete. The sync scripts under static/<tool>/ are packaged
+# build.zig.zon. Every run starts over: release/ and the bundled copies in
+# host/src/x64dbg_vm_gateway/data/plugin/ and data/samples/ are removed first, so a failed run leaves
+# none of them behind; release/ only appears complete. The demo samples (`x64dbg-vm-gateway demo`)
+# are the benign E2E programs of host/tests/vm/samples/hello.zig, built for x86_64 and x86 Windows
+# by host/tests/vm/samples/build.sh; only the two .exe files are bundled. The sync scripts under
+# static/<tool>/ are packaged
 # from their committed copies in host/src/x64dbg_vm_gateway/data/static/; the run stops before
 # building anything when a copy differs from static/ (copy the files again).
 set -euo pipefail
@@ -23,6 +26,9 @@ HOST="$ROOT/host"
 DIST="$ROOT/dist"
 BUNDLE="$HOST/src/x64dbg_vm_gateway/data/plugin"
 STATIC_COPY="$HOST/src/x64dbg_vm_gateway/data/static"
+SAMPLES="$HOST/src/x64dbg_vm_gateway/data/samples"
+SAMPLE_BUILD="$HOST/tests/vm/samples/build.sh"
+SAMPLE_FILES=(e2e_sample_x86_64.exe e2e_sample_x86.exe)
 RELEASE="$ROOT/release"
 X64_PLUGIN="x64/plugins/x64dbg-MCP-Server.dp64"
 X32_PLUGIN="x32/plugins/x64dbg-MCP-Server.dp32"
@@ -72,7 +78,7 @@ esac
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 STAGE="$TMP/release"
-rm -rf "$RELEASE" "$BUNDLE"
+rm -rf "$RELEASE" "$BUNDLE" "$SAMPLES"
 
 log "checking the packaged static-tool scripts against static/"
 "${PYTHON[@]}" -I - "$ROOT/static" "$STATIC_COPY" <<'PY'
@@ -105,6 +111,18 @@ cp "$DIST/$X64_PLUGIN" "$BUNDLE/x64/"
 cp "$DIST/$X32_PLUGIN" "$BUNDLE/x32/"
 printf '%s\n' "$VERSION" > "$BUNDLE/VERSION"
 
+log "demo samples: $SAMPLE_BUILD (x86_64, x86)"
+[ -f "$SAMPLE_BUILD" ] || die "$SAMPLE_BUILD not found"
+mkdir -p "$TMP/samples"
+# Zig leaves .pdb and .obj files next to the executables: build elsewhere, bundle the .exe files only
+(cd "$TMP" && ZIG="$ZIG_BIN" bash "$SAMPLE_BUILD" "$TMP/samples" >&2) \
+    || { rm -rf "$BUNDLE"; die "the demo sample build failed (host/tests/vm/samples/build.sh)"; }
+mkdir -p "$SAMPLES"
+for f in "${SAMPLE_FILES[@]}"; do
+    [ -s "$TMP/samples/$f" ] || { rm -rf "$BUNDLE" "$SAMPLES"; die "the sample build did not produce $f"; }
+    cp "$TMP/samples/$f" "$SAMPLES/"
+done
+
 log "uv build (sdist, then the wheel from it)"
 (cd "$HOST" && uv build --out-dir "$TMP/out")
 
@@ -120,15 +138,18 @@ if [ "${#sdists[@]}" -gt 0 ]; then
 fi
 
 # The plugin zip (fixed timestamps: the same build gives the same zip), a check that the
-# wheel really carries the plugin and the static scripts, and SHA256SUMS over everything in release/.
-"${PYTHON[@]}" -I - "$DIST" "$STAGE" "$VERSION" "$STATIC_COPY" "$X64_PLUGIN" "$X32_PLUGIN" <<'PY'
+# wheel really carries the plugin, the static scripts and the demo samples, and SHA256SUMS over
+# everything in release/.
+"${PYTHON[@]}" -I - "$DIST" "$STAGE" "$VERSION" "$STATIC_COPY" "${SAMPLE_FILES[*]}" "$X64_PLUGIN" \
+    "$X32_PLUGIN" <<'PY'
 import hashlib
 import sys
 import zipfile
 from pathlib import Path
 
 dist, release, version, static_copy = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
-entries = sys.argv[5:]
+samples = sys.argv[5].split()
+entries = sys.argv[6:]
 with zipfile.ZipFile(release / f"x64dbg-mcp-plugin-{version}.zip", "w") as zf:
     for name in entries:
         info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
@@ -150,6 +171,10 @@ for script in sorted(static_copy.rglob("*.py")):
     inside = f"x64dbg_vm_gateway/data/static/{script.relative_to(static_copy).as_posix()}"
     if inside not in names:
         sys.exit(f"build-release: error: {wheel.name} lacks {inside}")
+for sample in samples:
+    inside = f"x64dbg_vm_gateway/data/samples/{sample}"
+    if inside not in names:
+        sys.exit(f"build-release: error: {wheel.name} lacks {inside} (check [tool.hatch.build] artifacts)")
 
 lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
          for p in sorted(release.iterdir()) if p.is_file() and p.name != "SHA256SUMS"]

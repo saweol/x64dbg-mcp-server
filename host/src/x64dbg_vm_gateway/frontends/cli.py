@@ -15,6 +15,8 @@ Commands::
                                         doctor, then print the ``claude mcp add`` commands
     mcp-config [--client claude]        the ``claude mcp add`` commands for the gateway and the
                                         configured static tools (placeholders as <...>)
+    demo [--arch x64|x32|both]          installation self-test: the bundled benign sample through
+                                        the whole analysis loop on the VM (reverts it)
     static-scripts [--dest DIR]         where the packaged static-tool sync scripts are, or a copy
 
 Global options (before or after the command): ``--config PATH``, ``--profile NAME``,
@@ -121,6 +123,8 @@ _SERVING_ADVICE = {
     "install-plugin": "stop that gateway first: installing the plugin kills and relaunches the debuggers",
     "setup": "stop that gateway first: setup installs the plugin and reboots the guest",
     "serve": "a gateway is already serving this jobs root: connect to it, or stop it first",
+    "demo": "stop that gateway first (the demo reverts the VM), or run the same loop through its MCP tools "
+            "(the analyze-sample prompt)",
 }
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:\\")
@@ -504,6 +508,50 @@ def cmd_jobs(args: argparse.Namespace, out: _Output) -> int:
         raise UsageError("jobs list takes no JOB_ID (did you mean `jobs show JOB_ID`?)")
     out.data(_scan_jobs(root, args.profile), _format_jobs)
     return EXIT_OK
+
+
+# ── demo ────────────────────────────────────────────────────────────
+def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
+    """The installation self-test (``frontends/demo.py``): the bundled benign sample through the
+    analysis loop, with its own gateway whose upload_roots hold only the demo's private copy."""
+    from . import demo
+
+    config = _load_config(args)
+    prof = config.profile(args.profile)
+    if prof.mode != "vmware":
+        raise ConfigError(f"profile {prof.name} is an endpoint profile: the demo needs a vmware profile (it "
+                          "reverts the VM)", stage="demo", hint="pass --profile NAME of a vmware profile")
+    archs = demo.demo_archs(prof, args.arch)
+    streamed = not out.json_mode
+
+    def show(step: Mapping[str, Any]) -> None:
+        _emit(sys.stdout, demo.format_step(step))
+        sys.stdout.flush()
+
+    results: list[dict[str, Any]] = []
+    with demo.staged_samples(archs) as (folder, samples):
+        # this process only: the config file (and every MCP client's upload roots) stays as it is
+        demo_config = dataclasses.replace(config, upload_roots=(str(folder),))
+        with _app(args, demo_config) as app:
+            _claim_jobs_root(app)  # LOCK_TIMEOUT while another gateway serves this jobs root
+            demo.check_idle(app, args.profile)
+            runner = demo.DemoRun(app, on_step=show if streamed else None)
+            for arch in archs:
+                if streamed:
+                    _emit(sys.stdout, f"demo {arch}: {samples[arch].name} (bundled benign sample) on profile "
+                                      f"{prof.name}")
+                res = runner.run(arch, samples[arch])
+                results.append(res)
+                if streamed:
+                    _emit(sys.stdout, demo.format_arch(res))
+                if not res["ok"] and res["job_id"] and res["steps"] and not res["steps"][-1]["ok"] \
+                        and res["steps"][-1].get("cleanup"):
+                    out.note(f"demo: stopping: job {res['job_id']} could not be cleaned up")
+                    break
+    doc = {"ok": bool(results) and all(r["ok"] for r in results) and len(results) == len(archs),
+           "profile": prof.name, "archs": archs, "results": results}
+    out.data(doc, lambda d: demo.format_result(d, streamed=True))
+    return EXIT_OK if doc["ok"] else EXIT_FAILURE
 
 
 # ── provision / install-plugin ──────────────────────────────────────
@@ -1711,6 +1759,13 @@ def build_parser() -> argparse.ArgumentParser:
                 "print the MCP client registration commands for the gateway and the configured static "
                 "tools (IDA, Ghidra, radare2, Cutter)")
     p.add_argument("--client", choices=MCP_CLIENTS, default="claude", help="MCP client (default: claude)")
+
+    p = command("demo", cmd_demo,
+                "installation self-test: analyse the bundled benign sample on the VM (analysis_start, a "
+                "breakpoint on kernel32.Sleep, run, GetCallStack, analysis_collect, analysis_finish); "
+                "reverts the VM to the clean snapshot")
+    p.add_argument("--arch", choices=("x64", "x32", "both"),
+                   help="which debugger to test (default: every architecture the profile has a backend for)")
 
     p = command("static-scripts", cmd_static_scripts,
                 "show where the static-tool sync scripts (IDA, Ghidra, radare2/rizin/Cutter) are installed, "

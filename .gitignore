@@ -21,7 +21,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Release builds (scripts/build-release.sh): the release folder and the plugin
-# build it bundles into the package
+# Release builds (scripts/build-release.sh): the release folder, and the plugin build
+# and the demo samples it bundles into the package
 release/
 host/src/x64dbg_vm_gateway/data/plugin/
+host/src/x64dbg_vm_gateway/data/samples/
