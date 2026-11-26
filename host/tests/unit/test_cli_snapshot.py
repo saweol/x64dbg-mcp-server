@@ -569,6 +569,96 @@ def test_lab_prune_spares_the_live_jobs_snapshots(lab, tmp_path, capsys):
     assert data["deleted"] == [f"gw-job-{JOB_A}"] and f"gw-job-{job_id}" in snapshot_names(lab)
 
 
+def test_lab_prune_forgets_a_snapshot_deleted_by_hand_and_spares_a_namesake_made_later(lab, tmp_path, capsys):
+    """Review finding: an old clean snapshot deleted in VMware and later re-made by hand under the
+    same name is somebody else's snapshot, not the gateway's old one."""
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE")  # C1 was deleted in VMware by hand
+    _ledger(lab, path, "C1", "MCP_CLEAN")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0"], capsys)
+    assert rc == 0 and data["forgotten"] == ["C1"]
+    conf = gw_config.load_config(path, environ={})
+    kw = {"profile": PROFILE, "vmx": lab.profile.vmx}
+    assert [e.name for e in snapshot_ledger.entries(conf.jobs_root_path, **kw)] == ["MCP_CLEAN"]
+    lab.vm.snapshots.append(Snapshot("C1"))  # made by hand later
+    lab.gw = lab.gateway()
+    sys.modules["x64dbg_vm_gateway.wiring"] = types.SimpleNamespace(build_app=lambda *a, **kw: lab.gw)
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0 and data["deleted"] == [] and "C1" in snapshot_names(lab)
+
+
+def test_lab_refresh_forgets_stale_ledger_entries_too(lab, tmp_path, capsys):
+    path = lab_config(lab, tmp_path)
+    _ledger(lab, path, "GONE")
+    assert run(["--config", str(path), "snapshot", "refresh", "--name", "C2"]) == 0, capsys.readouterr()
+    conf = gw_config.load_config(path, environ={})
+    kw = {"profile": PROFILE, "vmx": lab.profile.vmx}
+    names = [e.name for e in snapshot_ledger.entries(conf.jobs_root_path, **kw)]
+    assert "GONE" not in names and "C2" in names
+
+
+def test_lab_prune_keeps_snapshots_whose_name_is_not_unique(lab, tmp_path, capsys):
+    """Review finding: vmrun deleteSnapshot NAME removes whichever of two namesakes VMware picks."""
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE", "C0", "c0", f"gw-job-{JOB_A}", f"gw-job-{JOB_A}",
+                   f"gw-job-{JOB_B}")
+    _ledger(lab, path, "C0", "MCP_CLEAN")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0, data
+    assert data["deleted"] == [f"gw-job-{JOB_B}"]
+    reasons = {s["name"]: s["reason"] for s in data["snapshots"]}
+    assert "duplicate name" in reasons["C0"] and "duplicate name" in reasons[f"gw-job-{JOB_A}"]
+    assert [s["name"] for s in data["snapshots"]].count(f"gw-job-{JOB_A}") == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_lab_prune_sees_the_same_vm_through_a_symlink(lab, tmp_path, capsys):
+    """Review finding: a profile that names the .vmx through a symlink is on the same VM."""
+    link = tmp_path / "link.vmx"
+    link.symlink_to(lab.profile.vmx)
+    path = lab_config(lab, tmp_path, other={"vmx": str(link), "clean_snapshot": "OTHER_CLEAN"})
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE", "OTHER_CLEAN")
+    _ledger(lab, path, "OTHER_CLEAN", "MCP_CLEAN")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0 and data["deleted"] == [] and "OTHER_CLEAN" in snapshot_names(lab)
+
+
+def test_ledger_matches_a_vm_through_a_symlink(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("symlinks")
+    real = tmp_path / "vm" / "a.vmx"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    link = tmp_path / "link.vmx"
+    link.symlink_to(real)
+    root = tmp_path / "jobs"
+    snapshot_ledger.mark_clean(root, profile="p", vmx=str(link), name="C1")
+    assert [e.name for e in snapshot_ledger.entries(root, profile="p", vmx=str(real))] == ["C1"]
+
+
+def test_the_ledger_is_written_while_the_jobs_root_is_held(cfg_path, wiring, provision, fake, monkeypatch,
+                                                         capsys):
+    """Review finding: ledger writes happen inside the jobs-root lock (before the gateway closes)."""
+    seen: list[tuple[str, bool]] = []
+    for name in ("record_taken", "mark_clean", "forget"):
+        real = getattr(snapshot_ledger, name)
+
+        def spy(*a: Any, _real: Any = real, _name: str = name, **kw: Any) -> Any:
+            seen.append((_name, fake.closed))
+            return _real(*a, **kw)
+
+        monkeypatch.setattr(snapshot_ledger, name, spy)
+    assert run(["--config", str(cfg_path), "snapshot", "refresh", "--name", "C2"]) == 0, capsys.readouterr()
+    fake.closed = False
+    fake.results["vm_snapshots_list"] = {"snapshots": [{"name": "MCP_CLEAN"}]}  # C2 gone: forgotten
+    assert run(["--config", str(cfg_path), "snapshot", "prune", "--keep", "0"]) == 0, capsys.readouterr()
+    assert {n for n, _ in seen} >= {"record_taken", "mark_clean", "forget"}
+    assert all(closed is False for _, closed in seen), seen
+
+
 def test_lab_prune_human_output(lab, tmp_path, capsys):
     path = lab_config(lab, tmp_path)
     _lab_snapshots(lab, "MCP_CLEAN", "BASE", f"gw-job-{JOB_A}")

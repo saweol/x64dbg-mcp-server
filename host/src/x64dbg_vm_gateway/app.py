@@ -2300,8 +2300,10 @@ class Gateway(GatewayApp):
             listed = ", ".join(str(r) for r in e.details["allowed_roots"]) or "none"
             e.message = f"host path is outside the allowed upload roots (gateway.upload_roots: {listed})"
             e.args = (e.message,)
-            e.hint = ("copy the file into one of those folders, or add its folder to gateway.upload_roots in "
-                      "the gateway config (then restart the gateway)")
+            # the client only learns the roots: widening them is the operator's decision (guest output
+            # may carry a prompt injection, and a client that edits files could follow a how-to)
+            e.hint = ("use a file inside one of those folders, or ask the operator (a human) to change "
+                      "gateway.upload_roots")
             raise
         roots = [r for r in (_resolved(x) for x in self.config.upload_roots) if r is not None]
         containing = [r for r in roots if src.is_relative_to(r)]

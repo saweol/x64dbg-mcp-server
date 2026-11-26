@@ -32,9 +32,12 @@ from .vmrun import parse_vmx
 __all__ = ["VmCandidate", "candidates", "find_vms", "inventory_files", "parse_inventory", "parse_vmrun_list",
            "running_vms"]
 
-_ENTRY_RE = re.compile(r"^vmlist(\d+)\.(config|displayname)$")
+# a bounded index: int() of thousands of digits raises (the file is not ours to trust)
+_ENTRY_RE = re.compile(r"^vmlist(\d{1,9})\.(config|displayname)$")
 _RUNNING_HEADER_RE = re.compile(r"^Total running VMs:\s*\d+\s*$", re.IGNORECASE)
 _LIST_TIMEOUT_S = 30.0
+#: a VM library larger than this is not read (it lists VMs, a few hundred bytes each)
+MAX_INVENTORY_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -73,9 +76,9 @@ def parse_inventory(text: str) -> list[tuple[str, str | None]]:
 
 
 def parse_vmrun_list(text: str) -> list[str]:
-    """The ``.vmx`` paths of ``vmrun list`` output."""
+    """The ``.vmx`` paths of ``vmrun list`` output (warnings and other lines are dropped)."""
     lines = (line.strip() for line in text.splitlines())
-    return [line for line in lines if line and not _RUNNING_HEADER_RE.match(line)]
+    return [line for line in lines if line.lower().endswith(".vmx") and not _RUNNING_HEADER_RE.match(line)]
 
 
 def running_vms(runner: VmrunRunner) -> list[str]:
@@ -121,8 +124,11 @@ def find_vms(runner: VmrunRunner | None, *, files: Sequence[Path] | None = None,
     inventory: list[tuple[str, str | None]] = []
     for path in inventory_files(system=system, environ=environ) if files is None else files:
         try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
+            with open(path, "rb") as f:
+                data = f.read(MAX_INVENTORY_BYTES + 1)
         except OSError:
             continue
-        inventory.extend(parse_inventory(text))
+        if len(data) > MAX_INVENTORY_BYTES:
+            continue
+        inventory.extend(parse_inventory(data.decode("utf-8", errors="replace")))
     return candidates(running=running, inventory=inventory)

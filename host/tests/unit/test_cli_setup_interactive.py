@@ -593,16 +593,112 @@ def test_a_password_the_guest_refuses_is_not_saved_and_is_asked_again(
     assert not target.exists()  # the precheck refused it before anything was saved
     assert "not saved" in captured.out and "refused" in captured.out
     assert "wrong" not in captured.out + captured.err
-    assert Path(gw_config.load_config(path, environ={}).env_file) == target  # the config names the file
+    # review finding: no config pointing at a password file that was never written (doctor and
+    # serve would fail with "env file not found"); env_file goes in only with the file
+    conf = gw_config.load_config(path, environ={})
+    assert conf.env_file is None and PW_ENV not in envfile.resolve_environ(conf, {})
     assert called(provision, "provision_guest") == []
-    # the next run asks again (the file is missing) and saves it there once the guest accepts it
+    # the next run asks again and saves it once the guest accepts it; the config (existing now)
+    # is not edited: setup prints the line
     fake.results["doctor"] = ALL_GREEN
     terminal.passwords = [PASSWORD]
     terminal.answers = [""]
+    before = path.read_text(encoding="utf-8")
     rc = run(["--config", str(path), "setup"])
-    assert rc == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert rc == 0, out
     assert env_values(target) == {PW_ENV: PASSWORD}  # the config names the user (guest_user)
-    assert envfile.resolve_environ(gw_config.load_config(path, environ={}), {})[PW_ENV] == PASSWORD
+    assert path.read_text(encoding="utf-8") == before and f"env_file = '{target}'" in out
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_new_config_gets_env_file_only_once_the_password_file_is_written(
+        tmp_path, environment, wiring, provision, vm_file, monkeypatch, capsys):
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+    seen: list[str | None] = []
+    real_build = wiring.build_app
+
+    def build_app(config: Any, profile: str | None = None, environ: Any = None) -> Any:
+        seen.append(gw_config.load_config(tmp_path / "config.toml", environ={}).env_file)  # on disk, now
+        return real_build(config, profile, environ)
+
+    monkeypatch.setattr(wiring, "build_app", build_app)
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file"])
+    assert rc == 0, capsys.readouterr()
+    assert seen == [None]  # while the guest had not accepted the password yet
+    conf = gw_config.load_config(tmp_path / "config.toml", environ={})
+    assert Path(conf.env_file) == environment / "win10.env"
+    assert envfile.resolve_environ(conf, {})[PW_ENV] == PASSWORD
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_failing_password_file_write_leaves_no_file_and_setup_goes_on(
+        tmp_path, environment, wiring, provision, vm_file, monkeypatch, capsys):
+    """Review finding: an OSError while writing (a volume without chmod, a full disk) is reported
+    like a refused restriction; no empty file stays behind."""
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+
+    def full(fd: int, data: bytes) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "_write_fd", full)
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert not (environment / "win10.env").exists()
+    assert "warning:" in out and "not saved" in out
+    assert gw_config.load_config(tmp_path / "config.toml", environ={}).env_file is None
+
+
+def test_restrict_to_owner_never_raises(tmp_path):
+    def no_chmod(path: Any, mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    assert gw_platform.restrict_to_owner(tmp_path / "x.env", system="Linux", chmod=no_chmod) is False
+
+
+def test_a_forced_update_that_fails_keeps_the_old_file(tmp_path, monkeypatch):
+    """Review finding: --force replaces the file atomically (temp file, restricted, renamed)."""
+    target = tmp_path / "x.env"
+    target.write_text("GW_ADMIN=keep-me\nX64DBG_GW_GUEST_PW='old'\n", encoding="utf-8")
+    target.chmod(0o600)
+
+    def full(fd: int, data: bytes) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "_write_fd", full)
+    with pytest.raises(OSError):
+        cli.write_password_file(target, [(PW_ENV, PASSWORD)], profile="win10", force=True)
+    assert target.read_text(encoding="utf-8") == "GW_ADMIN=keep-me\nX64DBG_GW_GUEST_PW='old'\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["x.env"]  # no temp file left
+
+
+def test_a_forced_update_restricts_the_replacement_before_it_holds_the_secret(tmp_path, monkeypatch):
+    target = tmp_path / "x.env"
+    target.write_text("A=1\n", encoding="utf-8")
+    target.chmod(0o600)
+    seen: list[tuple[str, bytes]] = []
+
+    def refuse(path: Path, **kw: Any) -> bool:
+        seen.append((Path(path).name, Path(path).read_bytes()))
+        return False
+
+    monkeypatch.setattr(gw_platform, "restrict_to_owner", refuse)
+    with pytest.raises(cli.ConfigError):
+        cli.write_password_file(target, [(PW_ENV, PASSWORD)], profile="win10", force=True)
+    assert [data for _name, data in seen] == [b""] and seen[0][0] != "x.env"
+    assert target.read_text(encoding="utf-8") == "A=1\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["x.env"]
+
+
+def test_a_numbered_vm_whose_file_is_gone_is_asked_again(tmp_path, terminal, wiring, vm_file, monkeypatch,
+                                                         capsys):
+    monkeypatch.setattr(vm_inventory, "running_vms", lambda runner: [str(tmp_path / "gone" / "gone.vmx")])
+    terminal.answers = ["1"]  # then end of input
+    assert run(["--config", str(tmp_path / "config.toml"), "setup"]) == 2
+    assert "no such file" in capsys.readouterr().err
 
 
 @pytest.mark.usefixtures("bundle")

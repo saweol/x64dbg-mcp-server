@@ -226,10 +226,13 @@ def restrict_to_owner(path: Path | str, *, system: str | None = None,
     """Make a secret file readable by its owner only: chmod 0600 on POSIX hosts; on Windows
     ``icacls <path> /inheritance:r /grant:r <DOMAIN>\\<user>:F`` (the inherited entries, such as
     the Users group of a folder outside the profile, are dropped; only the current user keeps
-    access). Returns False when that could not be done (no user name, icacls failed); never
-    raises for it."""
+    access). Returns False when that could not be done (chmod refused, e.g. on a FAT/exFAT
+    volume; no user name; icacls failed); never raises for it."""
     if host_system(system) != "Windows":
-        chmod(path, 0o600)
+        try:
+            chmod(path, 0o600)
+        except OSError:
+            return False
         return True
     env = os.environ if environ is None else environ
     user = env.get("USERNAME")
