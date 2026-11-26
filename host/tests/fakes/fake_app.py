@@ -189,16 +189,19 @@ class FakeApp:
                             job_id=job_id)
 
     # ── debugger ────────────────────────────────────────────────────
-    def debugger_select(self, backend_id: str) -> JSON:
-        return self._record("debugger_select", {"active": backend_id}, backend_id=backend_id)
+    def debugger_select(self, backend_id: str | None = None, profile: str | None = None) -> JSON:
+        return self._record("debugger_select", {"active": backend_id, "profile": profile},
+                            backend_id=backend_id, profile=profile)
 
-    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested") -> JSON:
-        return self._record("debugger_restart", {"epoch": 2}, backend_id=backend_id, reason=reason)
+    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested",
+                         profile: str | None = None) -> JSON:
+        return self._record("debugger_restart", {"epoch": 2}, backend_id=backend_id, reason=reason,
+                            profile=profile)
 
     def debugger_call(self, tool: str, arguments: Mapping[str, Any] | None = None,
-                      backend_id: str | None = None) -> JSON:
+                      backend_id: str | None = None, profile: str | None = None) -> JSON:
         return self._record("debugger_call", _texts_result(tool),
-                            tool=tool, arguments=arguments, backend_id=backend_id)
+                            tool=tool, arguments=arguments, backend_id=backend_id, profile=profile)
 
     def call_mirrored(self, tool: str, arguments: Mapping[str, Any] | None = None) -> JSON:
         return self._record("call_mirrored", _texts_result(tool),

@@ -50,6 +50,14 @@ both ``tools/list`` and ``tools/call`` to the scope's risk tiers:
 
 A denied call returns code ``FORBIDDEN`` and never reaches the app.
 
+Client sessions (several VMs): every ``tools/call`` reaches the app inside
+``app_api.client_session(key)``, so the app keeps a current target VM per client
+session. The key is the streamable-HTTP session (``mcp-session-id``, which the session
+manager has already validated for this scope) together with the scope; HTTP requests
+without a session (the stateless 2026 protocol) share one key per scope; stdio and
+in-memory clients use ``None`` (one client per process). It never comes from the tool
+arguments, so a client cannot act in another client's session.
+
 Thread-safety / state: the server holds no global state; one ``Server`` per
 ``build_server`` call.
 """
@@ -73,7 +81,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from .. import __version__
-from ..app_api import GatewayApp
+from ..app_api import GatewayApp, client_session
 from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
@@ -181,6 +189,26 @@ def _client_host(request: Any) -> str | None:
 
 def _log_name(name: str) -> str:
     return repr(name[:_LOG_NAME_CHARS])
+
+
+_SESSION_ID_CHARS = 128
+
+
+def session_key(scope: str | None, ctx: Any) -> str | None:
+    """The client session of a ``tools/call`` (module docstring, "Client sessions"): ``http:<scope>:<id>``
+    for a streamable-HTTP session, ``http:<scope>`` for an HTTP request without one, None without an
+    HTTP request (stdio, in memory)."""
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return None
+    try:
+        sid = request.headers.get("mcp-session-id")
+    except Exception:  # noqa: BLE001 - not a Starlette request: no session to tell apart
+        sid = None
+    label = f"http:{scope or 'all'}"
+    if isinstance(sid, str) and sid:
+        return f"{label}:{sid[:_SESSION_ID_CHARS]}"
+    return label
 
 
 # ── tool listing ────────────────────────────────────────────────────
@@ -319,10 +347,12 @@ class _Handlers:
         arguments = params.arguments
         try:
             spec = CALLABLE_TOOLS.get(name)
-            if spec is not None:
-                result = await self._call_gateway(spec, arguments)
-            else:
-                result = await self._call_mirrored(name, arguments)
+            # the worker thread of the app call inherits the client session (anyio copies the context)
+            with client_session(session_key(self.scope, ctx)):
+                if spec is not None:
+                    result = await self._call_gateway(spec, arguments)
+                else:
+                    result = await self._call_mirrored(name, arguments)
             outcome = "TOOL_ERROR" if result.is_error else "OK"
         except GatewayError as err:
             result, outcome = _error_result(err), err.code

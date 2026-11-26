@@ -178,10 +178,20 @@ def _address(description: str) -> dict[str, Any]:
     return {"type": ["string", "integer"], "description": description}
 
 
-_PROFILE = _str("Gateway profile (VM) to act on. Omit to use the configured default profile.")
-_JOB_ID = _str("Job id (YYYYMMDD-HHMMSS-xxxxxx). Omit to use the active job.")
-_BACKEND_ID = _str("Debugger backend: 'x64' (x64dbg) or 'x32' (x32dbg), or a custom backend id from the "
-                   "profile.")
+_PROFILE = _str("Gateway profile (VM) to act on. Omit for this session's target VM (set by analysis_start "
+                "or debugger_select), else the VM with the only live job, else the default profile.")
+_TARGET_PROFILE = _str("Gateway profile (VM) for this call only. Omit for this session's target VM (set by "
+                       "analysis_start or debugger_select), else the VM with the only live job, else the "
+                       "default profile.")
+_STATUS_PROFILE = _str("Only this gateway profile (VM), in full detail. Omit for every configured profile "
+                       "(a compact entry per VM when there are several).")
+_DOCTOR_PROFILE = _str("Gateway profile (VM) to check. Omit to use the configured default profile.")
+_START_PROFILE = _str("Gateway profile (VM) to analyse in; it becomes this session's target VM. Omit for "
+                      "this session's target VM, else the default profile (required when several VMs are "
+                      "configured and neither is set).")
+_JOB_ID = _str("Job id (YYYYMMDD-HHMMSS-xxxxxx); the job decides the VM. Omit to use the active job of "
+               "this session's target VM (or the only live job; with live jobs on several VMs and no "
+               "target the call is refused).")
 
 
 MAX_WAIT_S = 3600.0
@@ -224,8 +234,11 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "state='in_progress', and after any BACKEND_RESTARTED error: calling it acknowledges the restart so "
         "mutating debugger tools are accepted again (re-check addresses afterwards). The acknowledgement is "
         "gateway-wide: a call from any client session, read-scope HTTP clients included, clears the restart "
-        "guard for every session. Read-only apart from that acknowledgement.",
-        _obj({"profile": _PROFILE}),
+        "guard for every session. With several VMs (profiles) and no profile it reports every VM compactly "
+        "(VM, backends, live job, running operation), acknowledges each, and says which VM this session's "
+        "calls without a profile go to (target, routing, active_jobs). Read-only apart from that "
+        "acknowledgement.",
+        _obj({"profile": _STATUS_PROFILE}),
     ),
     _def(
         "gateway_doctor", "Gateway doctor",
@@ -235,7 +248,7 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "Ghidra, radare2, Cutter) are on PATH and which MCP server recipe is registered for them (it only "
         "warns, level 'warn'). Returns {ok, checks: [{name, ok, detail, hint}]}. Use it before the "
         "first analysis and whenever a tool fails in a way the error hint does not explain. Read-only.",
-        _obj({"profile": _PROFILE}), method="doctor",
+        _obj({"profile": _DOCTOR_PROFILE}), method="doctor",
     ),
     _def(
         "vm_snapshots_list", "List VM snapshots",
@@ -333,12 +346,20 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
     ),
     # debugger
     _def(
-        "debugger_select", "Select debugger backend",
-        "Route the mirrored x64dbg tools (SetBreakpoint, run, ...) to another backend: 'x64' (x64dbg) or "
-        "'x32' (x32dbg). analysis_start already selects the backend matching the sample's architecture, so "
-        "use this only to inspect the other debugger. Side effects: changes where later mirrored calls go; "
-        "the debuggers themselves are not touched.",
-        _obj({"backend_id": _BACKEND_ID}, ("backend_id",)),
+        "debugger_select", "Select target VM and debugger",
+        "Choose where this client session's mirrored x64dbg tools (SetBreakpoint, run, ...), debugger_call, "
+        "debugger_restart and vm_* tools without a profile, and job tools without job_id go: profile picks "
+        "the VM (gateway profile) when several are configured, backend_id the debugger in it ('x64' = "
+        "x64dbg, 'x32' = x32dbg). Pass at least one. analysis_start already targets its VM and the "
+        "backend matching the sample's architecture, so use this to switch to another VM or to inspect the "
+        "other debugger; while a job is live its backend keeps receiving the mirrored calls. With live jobs "
+        "on several VMs and no target, calls without a profile are refused (TARGET_AMBIGUOUS) until this is "
+        "called. Side effects: changes where later calls of this session go; VMs and debuggers are not "
+        "touched.",
+        _obj({"backend_id": _str("Debugger backend in the target VM: 'x64' (x64dbg) or 'x32' (x32dbg), or a "
+                                 "custom backend id from the profile. Omit for the live job's backend, "
+                                 "else the first."),
+              "profile": _str("Gateway profile (VM) to target. Omit to keep the current target VM.")}),
         idempotent=True,
     ),
     _def(
@@ -346,19 +367,23 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "Kill and relaunch the debugger (x64dbg/x32dbg) in the guest, e.g. when it hangs or a modal dialog "
         "blocks it. Side effects: the debuggee and all runtime debugger state (breakpoints, patches, "
         "memory edits) are lost and the backend epoch increases; the sample is reloaded only if the job was "
-        "started with reload_on_restart=true. Re-check addresses afterwards (call session_status).",
+        "started with reload_on_restart=true. Re-check addresses afterwards (call session_status). Other "
+        "VMs are not touched.",
         _obj({"backend_id": _str("Backend to restart. Omit for the active backend."),
-              "reason": _str("Short reason recorded in the job history.")}),
+              "reason": _str("Short reason recorded in the job history."),
+              "profile": _TARGET_PROFILE}),
     ),
     _def(
         "debugger_call", "Call any debugger tool",
         "Call any x64dbg-MCP backend tool by its original name with the given arguments, including tools "
         "that are missing from tools/list (for example ones added by a newer plugin). Prefer the mirrored "
-        "tools when they are listed. Side effects: exactly those of the called backend tool (it may run the "
+        "tools when they are listed. The result ends with a [gateway] line naming the epoch, backend and "
+        "profile (VM) that answered. Side effects: exactly those of the called backend tool (it may run the "
         "debuggee, write guest memory, etc.). " + _UNTRUSTED,
         _obj({"tool": _str("Backend tool name, e.g. 'GetServerInfo'."),
               "arguments": {"type": "object", "description": "Arguments for the backend tool."},
-              "backend_id": _str("Backend to call. Omit for the active backend.")}, ("tool",)),
+              "backend_id": _str("Backend to call. Omit for the active backend."),
+              "profile": _TARGET_PROFILE}, ("tool",)),
         returns_texts=True,
     ),
     # analysis loop
@@ -368,12 +393,13 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "(revert=true), upload the sample with hash verification, start the debugger matching its "
         "architecture and load it paused at the system breakpoint. It never runs the sample; use the "
         "mirrored tools (SetBreakpoint, run, ...) afterwards. Returns {job_id, arch, sha256, steps, ...}, or "
-        "state='in_progress' after wait_s (poll session_status). Only one live job per profile. Side "
-        "effects: with revert=true the current guest state is discarded; the sample is copied into the "
-        "guest.",
+        "state='in_progress' after wait_s (poll session_status). Only one live job per profile (VM); with "
+        "several VMs configured each may run its own job at the same time, and the started VM becomes this "
+        "session's target for the mirrored tools. Side effects: with revert=true the current guest state "
+        "of that VM is discarded (other VMs are not touched); the sample is copied into the guest.",
         _obj({
             "sample_path": _str("Absolute host path of the sample (inside the allowed host roots)."),
-            "profile": _PROFILE,
+            "profile": _START_PROFILE,
             "snapshot": _str("Snapshot to start from. Omit for the profile's clean snapshot."),
             "arch": {"type": "string", "enum": ["auto", "x64", "x32"],
                      "description": "Debugger architecture; 'auto' reads the PE header."},

@@ -17,6 +17,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from tests.fakes.fake_app import FakeApp
+from x64dbg_vm_gateway.app_api import CLIENT_SESSION
 from x64dbg_vm_gateway.config import HttpServerConfig
 from x64dbg_vm_gateway.errors import ConfigError
 from x64dbg_vm_gateway.frontends import http_server
@@ -309,6 +310,31 @@ def test_analyze_token_scope(app, tmp_path):
         assert res["result"]["isError"] is False
         res = rpc(c, ANALYZE_TOKEN, sid, "tools/call", {"name": "analysis_finish", "arguments": {}})
         assert json.loads(res["result"]["content"][0]["text"])["code"] == "FORBIDDEN"
+
+
+def test_every_http_session_is_its_own_client_session(app, tmp_path):
+    """Several VMs: each MCP session has its own current target, so the app learns which session a
+    call comes from (app_api.CLIENT_SESSION): stable within a session, different across sessions
+    and scopes, never taken from the tool arguments."""
+    seen: list[Any] = []
+
+    def record(**_kwargs: Any) -> Any:
+        seen.append(CLIENT_SESSION.get())
+        return {"texts": ["ok"], "is_error": False}
+
+    app.results["call_mirrored"] = record
+    with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
+        one = open_session(c, ANALYZE_TOKEN)
+        two = open_session(c, ANALYZE_TOKEN)
+        admin = open_session(c, ADMIN_TOKEN)
+        order = ((ANALYZE_TOKEN, one), (ANALYZE_TOKEN, two), (ANALYZE_TOKEN, one), (ADMIN_TOKEN, admin))
+        for token, sid in order:
+            res = rpc(c, token, sid, "tools/call", {"name": "SetBreakpoint", "arguments": {"address": "0x1"}})
+            assert res["result"]["isError"] is False
+    assert all(isinstance(k, str) and k for k in seen), seen
+    assert seen[0] == seen[2] and len({seen[0], seen[1], seen[3]}) == 3
+    assert one in seen[0] and "analyze" in seen[0] and "admin" in seen[3]
+    assert CLIENT_SESSION.get() is None
 
 
 def test_session_cannot_be_reused_with_a_lower_scope_token(app, tmp_path):

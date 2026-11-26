@@ -119,6 +119,14 @@ class JobNotFound(StateViolation):
     code = "JOB_NOT_FOUND"
 
 
+class TargetAmbiguous(StateViolation):
+    """A call names no VM (profile) and the gateway cannot tell which one it is for: live jobs
+    on several profiles and no target selected for the client session, or several profiles
+    and neither a selection nor a default profile. Nothing was sent anywhere."""
+
+    code = "TARGET_AMBIGUOUS"
+
+
 class IsolationRequired(GatewayError):
     code = "ISOLATION_REQUIRED"
 

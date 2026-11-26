@@ -13,16 +13,41 @@ seconds the call returns ``{"state": "in_progress", "op_id": ..., "stage": ...,
 the final outcome are reported by ``session_status()["operation"]``. Calling the
 same operation again with identical arguments while it runs returns the same
 in-progress record (idempotent) instead of starting a second one.
+
+Several VMs: one app serves every configured profile. Calls that name no profile
+(the mirrored tools, ``debugger_*`` without ``profile``, tools without ``job_id``) go to
+the *current target* of the client session they come from. A front-end that serves
+several clients says which session a call belongs to by running the app call inside
+``client_session(key)`` (``CLIENT_SESSION``); calls outside one share the session
+``None`` (stdio, the CLI: one client per process). ``analysis_start`` and
+``debugger_select(profile=...)`` set the target of their session.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import contextlib
+from collections.abc import Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from typing import Any, Protocol, runtime_checkable
 
 from .contracts import ToolInfo
 
 JSON = dict[str, Any]
+
+CLIENT_SESSION: ContextVar[str | None] = ContextVar("x64dbg_vm_gateway_client_session", default=None)
+"""Key of the client session the current app call comes from (see the module docstring).
+Never part of a tool's arguments: a client cannot name another client's session."""
+
+
+@contextlib.contextmanager
+def client_session(key: str | None) -> Iterator[None]:
+    """Run the app calls inside the ``with`` block on behalf of client session ``key``.
+    Context variables follow ``anyio.to_thread.run_sync`` into its worker thread."""
+    token = CLIENT_SESSION.set(key)
+    try:
+        yield
+    finally:
+        CLIENT_SESSION.reset(token)
 
 
 @runtime_checkable
@@ -71,17 +96,24 @@ class GatewayApp(Protocol):
     def file_download(self, guest_path: str, job_id: str | None = None) -> JSON: ...
 
     # ── debugger ──────────────────────────────────────────────────────
-    def debugger_select(self, backend_id: str) -> JSON: ...
-    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested") -> JSON: ...
+    def debugger_select(self, backend_id: str | None = None, profile: str | None = None) -> JSON:
+        """Make ``profile`` (and/or ``backend_id`` within it) the current target of the
+        calling client session; at least one of them is required."""
+        ...
+
+    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested",
+                         profile: str | None = None) -> JSON: ...
     def debugger_call(self, tool: str, arguments: Mapping[str, Any] | None = None,
-                      backend_id: str | None = None) -> JSON:
+                      backend_id: str | None = None, profile: str | None = None) -> JSON:
         """Generic escape hatch: call any backend tool by name (also ones the client
-        never saw in tools/list). Result: {"texts": [...], "is_error": bool}."""
+        never saw in tools/list). Result: {"texts": [...], "is_error": bool, "epoch",
+        "backend_id", "profile"}. ``profile`` overrides the session target for this call."""
         ...
 
     def call_mirrored(self, tool: str, arguments: Mapping[str, Any] | None = None) -> JSON:
-        """Route a mirrored backend tool to the active backend. Same result shape as
-        debugger_call. Texts are already sanitised/wrapped as untrusted output."""
+        """Route a mirrored backend tool to the session's current target (see the module
+        docstring). Same result shape as debugger_call. Texts are already sanitised/wrapped
+        as untrusted output."""
         ...
 
     # ── analysis loop ────────────────────────────────────────────────
