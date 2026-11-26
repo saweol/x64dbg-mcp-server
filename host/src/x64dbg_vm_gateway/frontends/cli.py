@@ -540,7 +540,7 @@ def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
         demo_config = dataclasses.replace(config, upload_roots=(str(folder),))
         with _app(args, demo_config) as app:
             _claim_jobs_root(app)  # LOCK_TIMEOUT while another gateway serves this jobs root
-            demo.check_idle(app, args.profile)
+            demo.check_idle(app, prof.name)  # this profile's VM only (another profile is another VM)
             runner = demo.DemoRun(app, on_step=show if streamed else None)
             for arch in archs:
                 if streamed:

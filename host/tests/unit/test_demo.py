@@ -238,6 +238,14 @@ def test_demo_refuses_while_a_job_is_live(dlab64, capsys):
     assert not dlab64.lab.servers["x64"].tool_calls("LoadBinary")
 
 
+def test_a_live_job_of_another_profile_does_not_block_the_demo(dlab64, capsys):
+    with JobStore(Path(dlab64.lab.config.jobs_root)) as store:
+        other = store.create("other-vm", "C:\\mcp\\jobs")  # another profile: another VM
+    assert run(["demo", "--arch", "x64"]) == 0
+    states = {j.id: j.state for j in dlab64.jobs()}
+    assert states[other.id] == JobState.CREATED  # untouched
+
+
 def test_demo_refuses_while_another_gateway_serves_the_jobs_root(dlab64, capsys):
     with JobStore(Path(dlab64.lab.config.jobs_root)):  # stands in for a serving gateway (this pid)
         rc = run(["demo", "--arch", "x64"])
