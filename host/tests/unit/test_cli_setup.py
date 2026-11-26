@@ -543,6 +543,21 @@ def test_setup_creates_the_config_first(tmp_path, wiring, provision, capsys):
     assert wiring.calls[0]["config"].profile().vmx == "/vms/w10/w10.vmx"
 
 
+@pytest.mark.usefixtures("wiring", "provision", "ready", "vmrun_found")
+def test_setup_new_config_takes_the_upload_roots(tmp_path, capsys):
+    path = tmp_path / "config.toml"
+    samples = tmp_path / "samples"
+    assert run(["--config", str(path), "setup", *INIT_FLAGS, "--upload-root", str(samples)]) == 0, \
+        capsys.readouterr()
+    assert gw_config.load_config(path, environ={}).upload_roots == (str(samples),)
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_upload_root_with_an_existing_config_is_not_used(cfg_path, capsys):
+    _, data = json_run(["--config", str(cfg_path), "--json", "setup", "--upload-root", "/x"], capsys)
+    assert any("--upload-root" in n and "not used" in n for n in data["notes"]), data["notes"]
+
+
 @pytest.mark.usefixtures("wiring", "ready", "vmrun_found")
 def test_setup_new_config_takes_the_profile_and_snapshot_names(tmp_path, provision, capsys):
     path = tmp_path / "config.toml"

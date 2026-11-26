@@ -778,6 +778,7 @@ def _init_answers(args: argparse.Namespace) -> dict[str, Any]:
         "vmrun": args.vmrun,
         "x64_url": args.x64_url, "x64_token_env": args.x64_token_env,
         "x32_url": args.x32_url, "x32_token_env": args.x32_token_env,
+        "upload_roots": _upload_roots(getattr(args, "upload_roots", None)),
     }
     if args.non_interactive:
         if a["mode"] == "vmware":
@@ -821,6 +822,12 @@ def _init_answers(args: argparse.Namespace) -> dict[str, Any]:
     return a
 
 
+def _upload_roots(values: Sequence[str] | None) -> list[str]:
+    """``--upload-root`` values for gateway.upload_roots: ``~`` paths stay as given (the gateway
+    expands them), a relative path becomes absolute (relative to the current directory)."""
+    return [v if v.startswith("~") else str(Path(v).absolute()) for v in values or ()]
+
+
 def _init_document(a: Mapping[str, Any], vmrun_value: str) -> dict[str, Any]:
     name = a["profile_name"]
     if a["mode"] == "vmware":
@@ -847,7 +854,10 @@ def _init_document(a: Mapping[str, Any], vmrun_value: str) -> dict[str, Any]:
             arch: {"url": a[f"{arch}_url"], "token_env": a[f"{arch}_token_env"]}
             for arch in ("x64", "x32") if a[f"{arch}_url"]
         }}
-    return {"gateway": {"jobs_root": a["jobs_root"], "default_profile": name}, "profiles": {name: profile}}
+    gateway: dict[str, Any] = {"jobs_root": a["jobs_root"], "default_profile": name}
+    if a.get("upload_roots"):
+        gateway["upload_roots"] = list(a["upload_roots"])
+    return {"gateway": gateway, "profiles": {name: profile}}
 
 
 def _discover_vmrun(a: Mapping[str, Any], out: _Output) -> tuple[str, str | None]:
@@ -979,7 +989,8 @@ SETUP_BLOCKING_CHECKS = frozenset({
 SETUP_ADVISORY_CHECKS = frozenset({"static_tools"})
 #: init options that only matter while setup creates the config (--x64dbg-root also feeds the guest steps)
 _SETUP_INIT_ONLY = ("profile_name", "vmx", "clean_snapshot", "guest_user", "guest_password_env", "jobs_root",
-                    "vmrun", "non_interactive")
+                    "vmrun", "upload_roots", "non_interactive")
+_INIT_FLAG_NAMES = {"upload_roots": "--upload-root"}
 _ENDPOINT_INIT_DEFAULTS = {"mode": None, "force": False, "x64_url": None, "x64_token_env": None,
                            "x32_url": None, "x32_token_env": None}
 
@@ -1079,7 +1090,8 @@ def _setup_config(args: argparse.Namespace, out: _Output, path: Path,
     if path.exists():
         config = gw_config.load_config(path, environ=os.environ)
         report.set("init", "skipped", f"using the existing config {path}")
-        given = [f"--{k.replace('_', '-')}" for k in _SETUP_INIT_ONLY if getattr(args, k, None)]
+        given = [_INIT_FLAG_NAMES.get(k, f"--{k.replace('_', '-')}") for k in _SETUP_INIT_ONLY
+                 if getattr(args, k, None)]
         if given:
             report.note(f"the config exists, so {', '.join(given)} were not used (edit {path}, or run "
                         f"`{PROG} init --force`)")
@@ -1581,6 +1593,9 @@ def _add_init_options(p: Any, *,
     p.add_argument("--x64dbg-root", metavar="GUEST_PATH", help=x64dbg_root_help)
     p.add_argument("--jobs-root", metavar="DIR", help="host directory for job artifacts")
     p.add_argument("--vmrun", metavar="PATH", help="vmrun executable (default: auto-detect)")
+    p.add_argument("--upload-root", metavar="DIR", action="append", dest="upload_roots",
+                   help="host folder samples and uploads may be read from, written to gateway.upload_roots "
+                        "(repeatable; default: ~, the home folder)")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -718,6 +718,29 @@ def test_init_custom_values(tmp_path, vmrun_found):
     assert prof.clean_snapshot == "CLEAN \"2\"" and prof.guest_password_env == "MY_PW"
 
 
+def test_init_upload_roots_default_to_the_home_directory(tmp_path, vmrun_found):
+    path = tmp_path / "c.toml"
+    assert run(["--config", str(path), *INIT_ARGS]) == 0
+    assert gw_config.load_config(path, environ={}).upload_roots == ("~",)
+
+
+def test_init_upload_root_is_written_to_gateway_upload_roots(tmp_path, vmrun_found):
+    path = tmp_path / "c.toml"
+    samples, more = tmp_path / "samples", tmp_path / "more"
+    assert run(["--config", str(path), *INIT_ARGS, "--upload-root", str(samples),
+                "--upload-root", "~/malware"]) == 0
+    assert gw_config.load_config(path, environ={}).upload_roots == (str(samples), "~/malware")
+    assert run(["--config", str(path), *INIT_ARGS, "--force", "--upload-root", str(more)]) == 0
+    assert gw_config.load_config(path, environ={}).upload_roots == (str(more),)
+
+
+def test_init_relative_upload_root_is_made_absolute(tmp_path, vmrun_found, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "c.toml"
+    assert run(["--config", str(path), *INIT_ARGS, "--upload-root", "samples"]) == 0
+    assert gw_config.load_config(path, environ={}).upload_roots == (str(tmp_path / "samples"),)
+
+
 def test_init_refuses_to_overwrite_without_force(tmp_path, vmrun_found, capsys):
     path = tmp_path / "config.toml"
     path.write_text("# mine\n", encoding="utf-8")
