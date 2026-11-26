@@ -203,7 +203,7 @@ guard for all of them.
 
 | Tier | Gateway tools |
 |---|---|
-| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `static_rebase`, `jobs_list`, `jobs_show` |
+| observe (read-only) | `session_status`, `gateway_doctor`, `vm_snapshots_list`, `vm_screenshot`, `static_rebase`, `jobs_list`, `jobs_show`, `analysis_report` |
 | guest-mutating | `file_upload`, `debugger_select`, `debugger_restart`, `debugger_call`, `analysis_start`, `analysis_collect`, `static_export_annotations`, `static_import_annotations` |
 | host/VM-destructive | `vm_snapshot_take`, `vm_snapshot_revert`, `vm_snapshot_delete`, `vm_power`, `file_download`, `analysis_finish` |
 
@@ -240,6 +240,18 @@ Further behaviour worth knowing:
   v1.10, partial with older plugins, whose default database file stays expected).
 - `jobs_list` / `jobs_show` list the jobs of the serving gateway (a second process cannot open
   its job store).
+- `analysis_report(job_id?, format="markdown"|"json")` summarises a job from its host job
+  directory: states with timestamps, the sample (name, size, sha256, arch), epoch and debugger
+  restarts, the collected files (original guest path, size, sha256, host path), the module map,
+  screenshots, downloads, the static export and warnings / errors. Default job: the active one,
+  else the newest. Guest-derived names and messages stay inside `<untrusted_guest_output>` blocks
+  (JSON: listed under `guest_derived`). It only returns text; `x64dbg-vm-gateway jobs report
+  JOB_ID --out FILE` writes it (0600), also while a gateway serves.
+- MCP prompts (`prompts/list`, `prompts/get`, every HTTP scope): `analyze-sample` (`sample_path`,
+  `arch`), `trace-api` (`sample_path`, `api` such as `kernel32.CreateFileW`), `find-oep`
+  (`sample_path`), `static-dynamic` (`sample_path`, `static_address`, `imagebase`, `module`) and
+  `report` (`job_id`). Each is a step-by-step plan with the real tool names and the safety rules;
+  bad arguments answer `INVALID_PARAMS`.
 - While a gateway serves a jobs root, CLI commands that need it (`discard`, `status`, `doctor`,
   `provision`, `install-plugin`) stop with `LOCK_TIMEOUT` naming the gateway's pid. `provision` and
   `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
@@ -281,7 +293,23 @@ Register them:
 ```console
 x64dbg-vm-gateway mcp-config          # `claude mcp add` for the gateway and every [static] tool
 x64dbg-vm-gateway mcp-config --json   # the same as a list
+x64dbg-vm-gateway mcp-config --client json      # an mcpServers document (Claude Desktop, Cursor, VS Code)
+x64dbg-vm-gateway mcp-config --tool ghidra --set binary=/srv/a.exe --set project-dir=/srv/ghidra ...
+x64dbg-vm-gateway mcp-config --apply  # run the commands that need nothing filled in (asks; --yes)
+x64dbg-vm-gateway mcp-config --permissions      # Claude Code settings.json permissions snippet
 ```
+
+The gateway's command names this installation's executable by its absolute path when it can be
+resolved (the running `x64dbg-vm-gateway`, else the one on PATH). `--tool ID` limits the output to
+`gateway` or one static tool; `--set NAME=VALUE` fills the `<NAME>` placeholder (refused: control
+characters and values that look like a secret, as in the config). `--apply` runs `claude mcp add`
+only for registrations without placeholders, after a y/N question on a terminal or with `--yes`,
+never with an argument that looks like a secret (and, with an npm `claude.cmd` on Windows, never
+with an argument cmd.exe would misread), and reports each command and its output.
+`--permissions` prints `{"permissions": {"allow": [...], "ask": [...]}}` for the gateway's server
+name: every observe and guest-mutating gateway tool and every plugin tool of the builtin lists by
+exact name (`mcp__x64dbg-vm__<tool>`) under `allow`, the host/VM-destructive gateway tools under
+`ask`; merge it into `.claude/settings.json` or `~/.claude/settings.json`.
 
 On Windows the printed commands are for PowerShell (every argument that is not a plain word is
 single-quoted, including `'--'`); elsewhere they are for a POSIX shell.
@@ -387,16 +415,29 @@ export NODE_EXTRA_CA_CERTS=/path/to/gw.crt     # Node-based clients and a self-s
 | `status` | session status (VM, backends, job) |
 | `init` | write the config file |
 | `jobs [list \| show JOB_ID]` | read-only view of the job directories (works while a gateway runs) |
+| `jobs report JOB_ID [--out FILE] [--format markdown\|json]` | the job's report (see `analysis_report`), printed or written to FILE |
+| `demo [--arch x64\|x32\|both]` | installation self-test on the VM with the bundled benign sample (see below) |
 | `discard JOB_ID [--yes]` | human-only: mark a job DISCARDED so it may be reverted without collection |
 | `provision --x64dbg-root PATH ...` | prepare the guest (see above) |
 | `install-plugin [--dist DIR] ...` | copy a plugin build (default: the bundled one) into the guest |
 | `setup [--dry-run] ...` | init (no config yet), doctor, install-plugin, provision, doctor, registration commands |
-| `mcp-config [--client claude]` | `claude mcp add` commands for the gateway and the configured static tools |
+| `mcp-config [--client claude\|json] [--tool ID] [--set NAME=VALUE] [--apply [--yes]] [--permissions]` | registration commands (or mcpServers JSON) for the gateway and the configured static tools; `--apply` runs them, `--permissions` prints Claude Code permissions |
 | `static-scripts [--dest DIR] [--force]` | where the static-tool sync scripts are installed, or a copy of them |
 
 Global options, before or after the command: `--config PATH`, `--profile NAME`, `--json`
 (machine-readable stdout), `-v`. Exit codes: 0 success, 1 failure (prints `error [CODE]: message`
 and a hint), 2 usage error.
+
+`demo` analyses the benign E2E sample bundled with release wheels (`data/samples/`, built from
+`tests/vm/samples/hello.zig` by `scripts/build-release.sh`) for each architecture the profile has a
+backend for (or `--arch`): `analysis_start`, `SetBreakpoint kernel32.Sleep`, `run` until it stops in
+kernel32 (at most 4 times), `GetCallStack`, `analysis_collect`, `analysis_finish(revert=true)`. It
+prints every step with its time, then `PASS` or `FAIL` with hints (exit 0 / 1; `--json` for one
+document). The sample is copied to a private directory below `~/.cache/x64dbg-vm-gateway/demo`, which
+is the only upload root of the demo's own gateway (the config file is not changed). A failed step
+cleans up the demo's job (collect, discard if still partial, finish with revert). It refuses next to
+a serving gateway (`LOCK_TIMEOUT`), a live or unreadable job, an endpoint profile and missing samples
+(with how to build them). It reverts the VM to the clean snapshot.
 
 ## Safety
 
