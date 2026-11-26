@@ -54,6 +54,15 @@ Prompts (``prompts/list``, ``prompts/get``): the analysis plans of ``prompts`` (
 trace-api, find-oep, static-dynamic, report). They only return text and never reach the app, so
 every scope may read them; bad arguments or an unknown name answer JSON-RPC INVALID_PARAMS.
 
+Client sessions (several VMs): every ``tools/call`` and ``tools/list`` reaches the app
+inside ``app_api.client_session(key)`` (``session_key``), so the app keeps a current target
+VM per client session. The key is the streamable-HTTP session of a handshake-era protocol
+(``mcp-session-id``, which the session manager has already validated for this scope)
+together with the scope; any other HTTP request (the stateless 2026 protocol, whose
+session header nothing validates) gets ``app_api.STATELESS_SESSION`` and keeps no target;
+stdio and in-memory clients use ``None`` (one client per process). It never comes from the
+tool arguments, so a client cannot act in another client's session.
+
 Thread-safety / state: the server holds no global state; one ``Server`` per
 ``build_server`` call.
 """
@@ -73,11 +82,12 @@ import anyio
 import anyio.to_thread
 from anyio.lowlevel import RunVar
 from mcp import MCPError, types
+from mcp.server import streamable_http_manager as _session_manager
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from .. import __version__
-from ..app_api import GatewayApp
+from ..app_api import STATELESS_SESSION, GatewayApp, client_session
 from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
@@ -186,6 +196,36 @@ def _client_host(request: Any) -> str | None:
 
 def _log_name(name: str) -> str:
     return repr(name[:_LOG_NAME_CHARS])
+
+
+_SESSION_ID_CHARS = 128
+#: The protocol versions the SDK's session manager serves through its sessions (validating the
+#: ``mcp-session-id``); it hands every other version to its stateless path. Read from the module
+#: that makes that decision; an SDK without it trusts no session header (fail closed).
+_HANDSHAKE_VERSIONS: tuple[str, ...] = tuple(getattr(_session_manager, "HANDSHAKE_PROTOCOL_VERSIONS", ()))
+
+
+def session_key(scope: str | None, ctx: Any) -> str | None:
+    """The client session of a request (module docstring, "Client sessions").
+
+    ``http:<scope>:<id>`` for a streamable-HTTP session of a handshake-era protocol, whose
+    ``mcp-session-id`` the SDK's session manager has validated for this scope (an unknown id
+    gets 404 before the server sees it). ``app_api.STATELESS_SESSION`` for any other HTTP
+    request: the 2026 protocol has no sessions and its ``mcp-session-id`` header is the
+    client's own word, so such calls keep no target. None without an HTTP request (stdio,
+    in memory: one client)."""
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return None
+    if getattr(ctx, "protocol_version", None) not in _HANDSHAKE_VERSIONS:
+        return STATELESS_SESSION
+    try:
+        sid = request.headers.get("mcp-session-id")
+    except Exception:  # noqa: BLE001 - not a Starlette request: no session to tell apart
+        sid = None
+    if isinstance(sid, str) and sid:
+        return f"http:{scope or 'all'}:{sid[:_SESSION_ID_CHARS]}"
+    return STATELESS_SESSION
 
 
 # ── tool listing ────────────────────────────────────────────────────
@@ -309,7 +349,9 @@ class _Handlers:
     async def list_tools(self, ctx: Any, params: Any) -> types.ListToolsResult:
         tools = [_gateway_tool(t, self.static_note) for t in GATEWAY_TOOLS if t.tier in self.tiers]
         try:
-            mirrored = await anyio.to_thread.run_sync(self.mirrors.fetch, limiter=self.pools.get(status=True))
+            with client_session(session_key(self.scope, ctx)):  # the session's selected backend
+                mirrored = await anyio.to_thread.run_sync(self.mirrors.fetch,
+                                                          limiter=self.pools.get(status=True))
         except Exception:
             # Keep session_status / gateway_doctor reachable so the problem can be diagnosed.
             log.exception("listing mirrored backend tools failed; offering gateway tools only")
@@ -334,10 +376,12 @@ class _Handlers:
         arguments = params.arguments
         try:
             spec = CALLABLE_TOOLS.get(name)
-            if spec is not None:
-                result = await self._call_gateway(spec, arguments)
-            else:
-                result = await self._call_mirrored(name, arguments)
+            # the worker thread of the app call inherits the client session (anyio copies the context)
+            with client_session(session_key(self.scope, ctx)):
+                if spec is not None:
+                    result = await self._call_gateway(spec, arguments)
+                else:
+                    result = await self._call_mirrored(name, arguments)
             outcome = "TOOL_ERROR" if result.is_error else "OK"
         except GatewayError as err:
             result, outcome = _error_result(err), err.code

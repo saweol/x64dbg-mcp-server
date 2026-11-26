@@ -43,9 +43,11 @@ Rules applied to every ``Proxy.call``:
     between the gate and the send is reported as BACKEND_RESTARTED.
 (f) Every guest-provided text item is sanitised and wrapped in
     ``<untrusted_guest_output>`` and a final ``[gateway] epoch=N backend=ID
-    retried=true|false`` line is appended. ``ToolCallResult.raw`` of the returned
-    result holds gateway metadata only (``{"gateway": {backend, epoch, retried}}``),
-    never the unsanitised backend payload.
+    [profile=NAME] retried=true|false`` line is appended (``profile`` when the proxy
+    was built for a profile, as ``wiring.build_runtime`` does: one gateway may serve
+    several VMs). ``ToolCallResult.raw`` of the returned result holds gateway metadata
+    only (``{"gateway": {backend, epoch, retried[, profile]}}``), never the
+    unsanitised backend payload.
 
 Supervisor surface used (``SupervisorLike``): ``check`` and ``ensure_alive`` (both
 with the ``max_wait_s`` extension: recovery gives them what is left of the call
@@ -227,10 +229,12 @@ _RECOVERABLE = (BackendUnavailable, BackendTimeout, CancelledByVmOp)
 class Proxy:
     def __init__(self, catalog: ToolCatalog, clients: Mapping[str, BackendClient], supervisor: SupervisorLike,
                  *, max_call_s: float, default_timeout_s: float = 30.0, clock: Clock | None = None,
-                 lock_timeout_s: float | None = None, max_text_len: int = DEFAULT_MAX_TEXT) -> None:
+                 lock_timeout_s: float | None = None, max_text_len: int = DEFAULT_MAX_TEXT,
+                 profile: str | None = None) -> None:
         """``clients`` is read on every call (not copied) so it may be shared with the
         supervisor's token refresher. ``lock_timeout_s`` overrides how long a mutating
-        call waits for the per-backend lock (default: what remains of the budget)."""
+        call waits for the per-backend lock (default: what remains of the budget).
+        ``profile`` names the gateway profile (VM) in every result trailer."""
         if max_call_s <= 0 or default_timeout_s <= 0:
             raise ConfigError("max_call_s and default_timeout_s must be positive")
         self._catalog = catalog
@@ -241,6 +245,7 @@ class Proxy:
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._lock_timeout_s = lock_timeout_s
         self._max_text = max_text_len
+        self._profile = profile
         self._lock = threading.Lock()
         self._backend_locks: dict[str, threading.Lock] = {}
         self._acked: dict[str, int] = {b: supervisor.epoch(b) for b in clients}
@@ -379,9 +384,13 @@ class Proxy:
                 "running, call WaitForPause to keep waiting."
             )
         epoch = self._sup.epoch(backend_id)
-        texts.append(f"[gateway] epoch={epoch} backend={backend_id} retried={'true' if retried else 'false'}")
-        meta = {"gateway": {"backend": backend_id, "epoch": epoch, "retried": retried}}
-        return ToolCallResult(texts=texts, is_error=result.is_error, raw=meta)
+        where = f" profile={self._profile}" if self._profile else ""
+        texts.append(f"[gateway] epoch={epoch} backend={backend_id}{where} "
+                     f"retried={'true' if retried else 'false'}")
+        gateway: dict[str, Any] = {"backend": backend_id, "epoch": epoch, "retried": retried}
+        if self._profile:
+            gateway["profile"] = self._profile
+        return ToolCallResult(texts=texts, is_error=result.is_error, raw={"gateway": gateway})
 
     def _recover(self, backend_id: str, tool: str, retryable: bool, exc: GatewayError, epoch_before: int,
                  job_id: str | None, deadline: float) -> GatewayError:

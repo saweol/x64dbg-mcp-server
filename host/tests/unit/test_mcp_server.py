@@ -18,7 +18,7 @@ import pytest
 from mcp import Client
 
 from tests.fakes.fake_app import FakeApp, blocking_result
-from x64dbg_vm_gateway.app_api import GatewayApp
+from x64dbg_vm_gateway.app_api import CLIENT_SESSION, GatewayApp
 from x64dbg_vm_gateway.contracts import ToolInfo
 from x64dbg_vm_gateway.errors import BackendRestarted, StateViolation
 from x64dbg_vm_gateway.frontends import mcp_server
@@ -304,7 +304,44 @@ def test_debugger_call_returns_one_text_content_per_text(app):
     assert texts(res) == ["<untrusted_guest_output>GetServerInfo</untrusted_guest_output>",
                           "[gateway] epoch=1 backend=x64 retried=false"]
     assert app.called("debugger_call") == [
-        {"tool": "GetServerInfo", "arguments": {"x": 1}, "backend_id": None}]
+        {"tool": "GetServerInfo", "arguments": {"x": 1}, "backend_id": None, "profile": None}]
+
+
+def test_debugger_tools_take_a_profile(app):
+    async def calls(c: Client) -> None:
+        await c.call_tool("debugger_call", {"tool": "GetDebugState", "profile": "lab2"})
+        await c.call_tool("debugger_select", {"profile": "lab2"})
+        await c.call_tool("debugger_restart", {"profile": "lab2"})
+
+    drive(mcp_server.build_server(app), calls)
+    assert app.called("debugger_call")[0]["profile"] == "lab2"
+    assert app.called("debugger_select") == [{"backend_id": None, "profile": "lab2"}]
+    assert app.called("debugger_restart")[0]["profile"] == "lab2"
+
+
+def session_recorder(seen: list[Any], value: Any) -> Callable[..., Any]:
+    """A FakeApp result that records the client session the app call ran in."""
+    def _res(**_kwargs: Any) -> Any:
+        seen.append(CLIENT_SESSION.get())
+        return value
+    return _res
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_in_process_calls_run_in_the_one_client_session(app, mode):
+    """stdio (in memory here) serves one client: its calls share the session None, the same one
+    the CLI and direct app calls use."""
+    seen: list[Any] = []
+    app.results["call_mirrored"] = session_recorder(seen, {"texts": ["ok"], "is_error": False})
+    app.results["debugger_select"] = session_recorder(seen, {"selected": "x64"})
+
+    async def calls(c: Client) -> None:
+        await c.call_tool("debugger_select", {"profile": "lab2"})
+        await c.call_tool("SetBreakpoint", {"address": "0x1"})
+
+    drive(mcp_server.build_server(app), calls, mode)
+    assert seen == [None, None]
+    assert CLIENT_SESSION.get() is None
 
 
 def test_debugger_call_backend_error_flag_is_propagated(app):

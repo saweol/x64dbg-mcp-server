@@ -203,6 +203,14 @@ def test_success_wraps_every_text_and_appends_trailer(proxy, client):
     assert res.is_error is False
 
 
+def test_trailer_names_the_profile_when_the_proxy_knows_it(catalog, client, sup):
+    """Several VMs behind one gateway: every result says which profile (VM) answered."""
+    proxy = make_proxy(catalog, client, sup, profile="lab2")
+    res = proxy.call("x64", "GetAllRegisters", {})
+    assert trailer(res) == "[gateway] epoch=0 backend=x64 profile=lab2 retried=false"
+    assert res.raw == {"gateway": {"backend": "x64", "epoch": 0, "retried": False, "profile": "lab2"}}
+
+
 def test_raw_backend_result_is_not_exposed(proxy, client):
     """Only sanitised, wrapped texts leave the proxy; ``raw`` carries gateway metadata only."""
     client.queue("GetAllRegisters", ToolCallResult(texts=["rax=1"], raw={"content": [

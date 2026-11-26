@@ -13,10 +13,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import mcp.shared.inbound as inbound
 import pytest
 from starlette.testclient import TestClient
 
 from tests.fakes.fake_app import FakeApp
+from x64dbg_vm_gateway.app_api import CLIENT_SESSION, STATELESS_SESSION
 from x64dbg_vm_gateway.config import HttpServerConfig
 from x64dbg_vm_gateway.errors import ConfigError
 from x64dbg_vm_gateway.frontends import http_server
@@ -309,6 +311,64 @@ def test_analyze_token_scope(app, tmp_path):
         assert res["result"]["isError"] is False
         res = rpc(c, ANALYZE_TOKEN, sid, "tools/call", {"name": "analysis_finish", "arguments": {}})
         assert json.loads(res["result"]["content"][0]["text"])["code"] == "FORBIDDEN"
+
+
+def test_every_http_session_is_its_own_client_session(app, tmp_path):
+    """Several VMs: each MCP session has its own current target, so the app learns which session a
+    call comes from (app_api.CLIENT_SESSION): stable within a session, different across sessions
+    and scopes, never taken from the tool arguments."""
+    seen: list[Any] = []
+
+    def record(**_kwargs: Any) -> Any:
+        seen.append(CLIENT_SESSION.get())
+        return {"texts": ["ok"], "is_error": False}
+
+    app.results["call_mirrored"] = record
+    with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
+        one = open_session(c, ANALYZE_TOKEN)
+        two = open_session(c, ANALYZE_TOKEN)
+        admin = open_session(c, ADMIN_TOKEN)
+        order = ((ANALYZE_TOKEN, one), (ANALYZE_TOKEN, two), (ANALYZE_TOKEN, one), (ADMIN_TOKEN, admin))
+        for token, sid in order:
+            res = rpc(c, token, sid, "tools/call", {"name": "SetBreakpoint", "arguments": {"address": "0x1"}})
+            assert res["result"]["isError"] is False
+    assert all(isinstance(k, str) and k for k in seen), seen
+    assert seen[0] == seen[2] and len({seen[0], seen[1], seen[3]}) == 3
+    assert one in seen[0] and "analyze" in seen[0] and "admin" in seen[3]
+    assert CLIENT_SESSION.get() is None
+
+
+def modern_call(client: TestClient, token: str, sid: str | None) -> int:
+    """One tools/call in the stateless 2026 protocol (per-request envelope, no handshake)."""
+    h = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
+         "Authorization": f"Bearer {token}", "mcp-protocol-version": "2026-07-28",
+         "Mcp-Method": "tools/call", "Mcp-Name": "SetBreakpoint"}
+    if sid is not None:
+        h["mcp-session-id"] = sid
+    meta = {inbound.PROTOCOL_VERSION_META_KEY: "2026-07-28", inbound.CLIENT_CAPABILITIES_META_KEY: {},
+            inbound.CLIENT_INFO_META_KEY: {"name": "t", "version": "1"}}
+    r = client.post("/mcp", headers=h, json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "SetBreakpoint", "arguments": {"address": "0x1"}, "_meta": meta}})
+    return r.status_code
+
+
+def test_a_stateless_request_never_borrows_a_session_by_its_header(app, tmp_path):
+    """Nothing validates mcp-session-id in the 2026 protocol: such calls keep no target, even when
+    they name a real session's id (it would act in that client's session)."""
+    seen: list[Any] = []
+
+    def record(**_kwargs: Any) -> Any:
+        seen.append(CLIENT_SESSION.get())
+        return {"texts": ["ok"], "is_error": False}
+
+    app.results["call_mirrored"] = record
+    with TestClient(build(app, tmp_path), base_url=BASE, client=LOCAL) as c:
+        real = open_session(c, ANALYZE_TOKEN)
+        rpc(c, ANALYZE_TOKEN, real, "tools/call", {"name": "SetBreakpoint", "arguments": {"address": "0x1"}})
+        for sid in (None, "made-up-by-client", real):
+            assert modern_call(c, ANALYZE_TOKEN, sid) == 200
+    assert len(seen) == 4 and real in seen[0]
+    assert seen[1:] == [STATELESS_SESSION] * 3
 
 
 def test_session_cannot_be_reused_with_a_lower_scope_token(app, tmp_path):

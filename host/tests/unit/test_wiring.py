@@ -657,6 +657,23 @@ def test_build_app_profile_argument_selects_the_default(tmp_path):
         gw.close()
 
 
+def test_build_app_serves_several_profiles_without_a_default(tmp_path):
+    """One serve for every VM: a config with several profiles and no default_profile is usable."""
+    profs = {name: ProfileConfig(name=name, mode="endpoint", token_source="env", require_isolation=False,
+                                 backends=(BackendConfig(id="x64", arch="x64", url="http://127.0.0.1:1/",
+                                                         token_env="T"),))
+             for name in ("a", "b")}
+    cfg = GatewayConfig(jobs_root=str(tmp_path / "jobs"), profiles=profs)
+    gw = build_app(cfg, environ={"T": GOOD}, clock=FakeClock(), cache_dir=tmp_path / "c")
+    try:
+        assert gw.runtime("b").profile.name == "b"
+        assert set(gw.session_status()["profiles"]) == {"a", "b"}
+    finally:
+        gw.close()
+    with pytest.raises(ConfigError):
+        build_app(cfg, profile="nope", environ={"T": GOOD}, clock=FakeClock())
+
+
 def test_build_runtime_with_injected_vm_and_guest_does_not_need_vmrun(tmp_path):
     prof = ProfileConfig(name="p", mode="vmware", vmx=str(tmp_path / "x.vmx"), vmrun="/nonexistent/vmrun",
                          guest_user="u", guest_password_env="PW",

@@ -77,8 +77,23 @@ for the static export (``ida_sync.*`` before the rename; nothing reads either ba
 Because a collection starts by deleting ``raw/extra``,
 earlier downloads are moved to ``artifacts/downloads/`` first.
 
+Several VMs: one gateway serves every configured profile. Each profile has its own
+runtime (VM, ``VmOpLock``, supervisor and epochs, proxy, catalog), operation runner and
+live job, so a VM operation of one profile never waits for, reverts or bumps the epochs
+of another. Calls that name no profile (mirrored tools, ``debugger_*`` and ``vm_*`` tools
+without ``profile``, job tools without ``job_id``) go to the *target* of the client
+session (``app_api.CLIENT_SESSION``): explicit argument > the session's target (set by
+``analysis_start`` and ``debugger_select``) > the only configured profile > the profile
+of the only live job (not for calls that change a VM or kill a debugger: another client's
+job never picks the VM they change) > the default profile. Live jobs on several profiles
+without a target (a profile whose job state is unreadable counts as one), or several
+profiles without any default, raise TARGET_AMBIGUOUS: nothing is guessed and nothing is
+sent. ``session_status()`` acknowledges only the VM those calls go to. Two profiles of the
+same .vmx share one operation runner, never have live jobs at once, and neither changes
+the VM while the other has one.
+
 Thread-safety: every public method may be called from several threads. The
-gateway's own bookkeeping (runtimes, runners, selected backends, the job store
+gateway's own bookkeeping (runtimes, runners, session targets, the job store
 handle, download slot numbers) is guarded by one lock, which is held only for
 short local work: building a runtime, opening the job store, reserving a
 download file name. Jobs, runtimes and runners have their own locks; no guest,
@@ -103,6 +118,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -112,7 +128,7 @@ from typing import Any
 
 from . import ida_sync, policy, report, static_tools, transfer
 from . import platform as gw_platform
-from .app_api import GatewayApp
+from .app_api import CLIENT_SESSION, STATELESS_SESSION, GatewayApp
 from .catalog import ToolCatalog
 from .config import BackendConfig, GatewayConfig
 from .contracts import (
@@ -142,6 +158,7 @@ from .errors import (
     PathNotAllowed,
     ProtectedSnapshotError,
     StateViolation,
+    TargetAmbiguous,
     TransferError,
     VmLocked,
     VmNotReady,
@@ -159,7 +176,7 @@ from .wiring import Runtime, builtin_catalog_for
 log = logging.getLogger(__name__)
 
 # InvalidArgument lives in errors.py; it stays importable from here for older callers.
-__all__ = ["LOOP_RULES", "Gateway", "InvalidArgument", "probe_vmrun_version"]
+__all__ = ["LOOP_RULES", "MULTI_VM_RULES", "Gateway", "InvalidArgument", "probe_vmrun_version"]
 
 
 LOOP_RULES = """\
@@ -188,6 +205,24 @@ the static image base + RVA (the image base of the tool's database), a runtime a
 base + RVA. Convert addresses with static_rebase, take x64dbg labels, comments, bookmarks and breakpoints \
 to the static tool with static_export_annotations, and bring its names and comments back with \
 static_import_annotations."""
+
+#: Added to the instructions when more than one profile is configured ({profiles}: their names).
+MULTI_VM_RULES = """\
+Several VMs (gateway profiles) are configured: {profiles}. Each VM has its own jobs, debugger backends \
+and epochs; an operation on one VM never touches another.
+- analysis_start(profile=...) picks the VM and makes it the current target of this client session; \
+debugger_select(profile=..., backend_id=...) switches the target.
+- Mirrored x64dbg tools, debugger_call, vm_screenshot, vm_snapshots_list and tools called without job_id \
+act on the current target, else on the only VM with a live job, else on the default profile. Tools that \
+change a VM or kill a debugger (vm_snapshot_*, vm_power, debugger_restart, analysis_start) never follow \
+another client's job: they need the target, an explicit profile or the default. With live jobs on several \
+VMs and no target the gateway refuses with TARGET_AMBIGUOUS instead of guessing: call \
+debugger_select(profile=...) or pass profile / job_id.
+- Pass job_id to analysis_collect, analysis_finish and the static_* tools: the job decides the VM.
+- session_status() without profile shows every VM but acknowledges only the one your calls go to; after \
+BACKEND_RESTARTED from another VM call session_status(profile=...) for it.
+- Every mirrored result ends with a [gateway] line naming the profile and backend that answered; check it \
+before acting on the result."""
 
 # ── tunables ────────────────────────────────────────────────────────
 DEFAULT_WAIT_CAP_S = 100.0
@@ -279,6 +314,25 @@ RECOVERY_NEXT_TOOL = {
     JobState.DISCARDED: "analysis_finish",
     JobState.REVERTING: "analysis_finish",
 }
+#: How many client sessions' targets are remembered (least recently used ones are forgotten:
+#: sessions end without telling the gateway). The HTTP front-end serves at most 3 x 64 sessions at
+#: a time, and only sessions the SDK validated get a key of their own.
+MAX_SESSION_TARGETS = 1024
+#: ``session`` argument of the target helpers: the session of the calling thread
+#: (``app_api.CLIENT_SESSION``). Work on an operation runner's thread passes the key it was given.
+_CURRENT: Any = object()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Target:
+    """The current target of one client session: a profile, optionally one of its backends."""
+
+    profile: str
+    backend: str | None
+    source: str  # "analysis_start" | "debugger_select"
+
+    def view(self) -> dict[str, Any]:
+        return {"profile": self.profile, "backend": self.backend, "source": self.source}
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -349,6 +403,11 @@ def _parse_now(clock: Clock) -> datetime:
     except ValueError:
         return datetime.now(UTC)
     return now if now.tzinfo else now.replace(tzinfo=UTC)
+
+
+def _vmx_key(vmx: str) -> str:
+    """Comparison key of a .vmx path: two profiles with the same key drive the same VM."""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(vmx)))
 
 
 def _gjoin(directory: str, name: str) -> str:
@@ -640,10 +699,11 @@ class Gateway(GatewayApp):
         self._start_join_s = start_join_s
         self._fetch_limits = fetch_limits or transfer.DEFAULT_FETCH_LIMITS
         self._lock = threading.RLock()
-        self._reload_lock = threading.Lock()
+        self._reload_locks: dict[str, threading.Lock] = {}  # per profile
         self._runtimes: dict[str, Runtime] = {}
         self._runners: dict[str, OperationRunner] = {}
-        self._selected: dict[str, str] = {}
+        self._targets: OrderedDict[str | None, _Target] = OrderedDict()  # client session -> target
+        self._finishers: OrderedDict[str, str | None] = OrderedDict()  # job id -> session that finishes it
         self._store: JobStore | None = None
         self._closed = False
         self._fallback_catalog: ToolCatalog | None = None
@@ -667,10 +727,14 @@ class Gateway(GatewayApp):
             return rt
 
     def _ops(self, rt: Runtime) -> OperationRunner:
+        """The profile's operation runner. Profiles of the same .vmx share one, so their long
+        operations (analysis_start, VM changes, finishes) run one at a time and each one's checks of
+        the other's job cannot race with the other's job creation."""
+        key = f"vm:{_vmx_key(str(rt.profile.vmx))}" if self._vm_siblings(rt) else rt.profile.name
         with self._lock:
-            runner = self._runners.get(rt.profile.name)
+            runner = self._runners.get(key)
             if runner is None:
-                runner = self._runners[rt.profile.name] = OperationRunner(self._clock, name=rt.profile.name)
+                runner = self._runners[key] = OperationRunner(self._clock, name=rt.profile.name)
             return runner
 
     def _jobs(self) -> JobStore:
@@ -711,30 +775,192 @@ class Gateway(GatewayApp):
     def _active_job(self, profile_name: str) -> Job | None:
         return self._jobs().active(profile_name)
 
-    def _resolve_job(self, job_id: str | None) -> Job:
+    # ── targets: which VM a call without a profile is for (module docstring) ──
+    def _target(self, session: Any = _CURRENT) -> _Target | None:
+        """The current target of ``session`` (default: the calling thread's client session)."""
+        key = CLIENT_SESSION.get() if session is _CURRENT else session
+        if key == STATELESS_SESSION:
+            return None
+        with self._lock:
+            target = self._targets.get(key)
+            if target is None:
+                return None
+            if target.profile not in self.config.profiles:
+                del self._targets[key]
+                return None
+            self._targets.move_to_end(key)
+            return target
+
+    def _set_target(self, profile: str, backend: str | None, source: str,
+                    session: Any = _CURRENT) -> _Target:
+        key = CLIENT_SESSION.get() if session is _CURRENT else session
+        target = _Target(profile, backend, source)
+        if key == STATELESS_SESSION:
+            return target  # nothing to remember it by
+        with self._lock:
+            self._targets[key] = target
+            self._targets.move_to_end(key)
+            while len(self._targets) > MAX_SESSION_TARGETS:
+                self._targets.popitem(last=False)
+        return target
+
+    def _multi(self) -> bool:
+        return len(self.config.profiles) > 1
+
+    def _only_profile(self) -> str | None:
+        return next(iter(self.config.profiles)) if len(self.config.profiles) == 1 else None
+
+    def _default_profile_name(self) -> str | None:
+        """The profile a call goes to when nothing else decides: the only configured one, else the
+        gateway's default (``serve --profile`` / ``gateway.default_profile``), else None."""
+        only = self._only_profile()
+        if only is not None:
+            return only
+        name = self._default_profile or self.config.default_profile
+        return name if name in self.config.profiles else None
+
+    def _live(self) -> tuple[list[Job], list[dict[str, Any]]]:
+        """(live jobs, views of the live jobs and of profiles whose job state is unknown), over the
+        configured profiles in config order. A profile with an unreadable job directory
+        (``JobStore.active`` refuses it) may have a live job: it counts as one in state UNKNOWN
+        (fail closed), so it can make a call ambiguous but never lets another job be "the only"."""
         store = self._jobs()
+        live: list[Job] = []
+        views: list[dict[str, Any]] = []
+        for name in self.config.profiles:
+            try:
+                job = store.active(name)
+            except StateViolation as e:
+                views.append({"job_id": e.details.get("job_id"), "profile": name, "state": "UNKNOWN",
+                              "backend_id": None})
+                continue
+            if job is not None:
+                live.append(job)
+                views.append(self._live_view(job))
+        return live, views
+
+    def _live_jobs(self) -> list[Job]:
+        return self._live()[0]
+
+    @staticmethod
+    def _live_view(job: Job) -> dict[str, Any]:
+        return {"job_id": job.id, "profile": job.profile, "state": JobState(job.state).value,
+                "backend_id": job.backend_id}
+
+    def _ambiguous(self, what: str, jobs: list[dict[str, Any]]) -> TargetAmbiguous:
+        """TARGET_AMBIGUOUS for ``what``; ``jobs``: the ``_live`` views."""
+        profiles = list(self.config.profiles)
+        listing = ", ".join(f"job {j['job_id']} ({j['state']}) on {j['profile']}" for j in jobs)
+        if len(jobs) > 1:
+            message = (f"{what}: several VMs have live jobs ({listing}) and this client session has no "
+                       "target VM; nothing was sent")
+            example = jobs[0]["profile"]
+        elif jobs:
+            message = (f"{what} changes a VM but names none: this client session has no target VM, the "
+                       f"only live job ({listing}) does not choose one for it and there is no default "
+                       "profile; nothing was done")
+            example = jobs[0]["profile"]
+        else:
+            message = (f"{what}: several VMs are configured ({', '.join(profiles)}), none is the target "
+                       "of this client session and there is no default profile; nothing was sent")
+            example = profiles[0] if profiles else "<profile>"
+        return TargetAmbiguous(
+            message, stage="route", next_tool="debugger_select",
+            hint=f"choose the VM with debugger_select(profile='{example}') (profiles: "
+                 f"{', '.join(profiles)}), or pass profile (or job_id) to this call",
+            details={"active_jobs": jobs, "profiles": profiles},
+        )
+
+    def _target_profile(self, profile: str | None, *, what: str, session: Any = _CURRENT,
+                        follow_job: bool = True) -> str:
+        """The profile a call acts on: ``profile`` > the session's target > the only configured
+        profile > the profile of the only live job (``follow_job``) > the default profile.
+        TargetAmbiguous for live jobs on several profiles, or several profiles and no default.
+
+        ``follow_job=False`` for calls that change a VM (revert, power, snapshots, a new job):
+        another client's job never chooses the VM they change, only the session's own target or
+        the configured default does."""
+        if profile is not None:
+            return self._profile_name(profile)
+        target = self._target(session)
+        if target is not None:
+            return target.profile
+        only = self._only_profile()
+        if only is not None:
+            return only
+        _live, views = self._live()
+        if len(views) > 1:
+            raise self._ambiguous(what, views)
+        if len(views) == 1 and follow_job:
+            return str(views[0]["profile"])
+        name = self._default_profile_name()
+        if name is None:
+            raise self._ambiguous(what, views)
+        return name
+
+    def _target_runtime(self, profile: str | None, *, what: str, session: Any = _CURRENT,
+                        follow_job: bool = True) -> Runtime:
+        return self.runtime(self._target_profile(profile, what=what, session=session,
+                                                 follow_job=follow_job))
+
+    def _selected_backend(self, profile_name: str, session: Any = _CURRENT) -> str | None:
+        target = self._target(session)
+        return target.backend if target is not None and target.profile == profile_name else None
+
+    def _current_job(self, session: Any = _CURRENT) -> Job | None:
+        """The job a call without job_id is about: the live job of the session target's profile;
+        without a target the only live job (TargetAmbiguous for live jobs on several profiles);
+        else the default profile's (``JobStore.active``: a corrupt job directory raises)."""
+        store = self._jobs()
+        target = self._target(session)
+        if target is not None:
+            return store.active(target.profile)
+        only = self._only_profile()
+        if only is not None:
+            return store.active(only)
+        live, views = self._live()
+        if len(views) > 1:
+            raise self._ambiguous("no job_id given", views)
+        if views:  # its job, or the profile's unreadable state (JobStore.active raises and explains)
+            return live[0] if live else store.active(str(views[0]["profile"]))
+        name = self._default_profile_name()
+        return store.active(name) if name is not None else None
+
+    def _no_active_job(self, session: Any = _CURRENT) -> StateViolation:
+        target = self._target(session) if self._multi() else None
+        hint = "start one with analysis_start"
+        message = "there is no active job"
+        if target is not None:
+            message += f" on profile {target.profile} (the target of this client session)"
+            others = [j for j in self._live_jobs() if j.profile != target.profile]
+            if others:
+                hint += "; live jobs on other VMs: " + ", ".join(f"{j.id} on {j.profile}" for j in others) + \
+                        " (pass job_id, or debugger_select(profile=...) to work on that VM)"
+        return StateViolation(message, hint=hint, next_tool="analysis_start",
+                              details={"profile": target.profile} if target is not None else {})
+
+    def _resolve_job(self, job_id: str | None) -> Job:
         if job_id:
-            return store.get(job_id)
-        job = store.active(self._profile_name(None))
+            return self._jobs().get(job_id)
+        job = self._current_job()
         if job is None:
-            raise StateViolation(
-                "there is no active job", hint="start one with analysis_start", next_tool="analysis_start"
-            )
+            raise self._no_active_job()
         return job
 
-    def _route(self, rt: Runtime, backend_id: str | None = None, job: Job | None = None) -> str:
-        """Backend for a call: explicit id, else the active job's, else the selected one, else the first."""
+    def _route(self, rt: Runtime, backend_id: str | None = None, job: Job | None = None,
+               selected: str | None = None) -> str:
+        """Backend for a call: explicit id, else the active job's, else the session's selection
+        (``selected``), else the first."""
         if backend_id is not None:
             if backend_id not in rt.backends:
                 raise InvalidArgument(
                     f"unknown backend {backend_id!r}",
-                    hint=f"configured backends: {', '.join(rt.backends) or 'none'}",
+                    hint=f"configured backends of profile {rt.profile.name}: "
+                         f"{', '.join(rt.backends) or 'none'}",
                 )
             return backend_id
         if job is not None and job.backend_id in rt.backends:
             return str(job.backend_id)
-        with self._lock:
-            selected = self._selected.get(rt.profile.name)
         if selected in rt.backends:
             return str(selected)
         first = rt.default_backend_id()
@@ -808,6 +1034,12 @@ class Gateway(GatewayApp):
                 rt.connect(bid)
                 return rt.proxy.call(bid, tool, arguments, job_id=job.id if job else None)
         except BackendRestarted as e:
+            e.details.setdefault("profile", rt.profile.name)
+            if self._multi():  # session_status() without profile acknowledges only the routed VM
+                ack = f"call session_status(profile='{rt.profile.name}')"
+                hint = e.hint or "call session_status to acknowledge"
+                e.hint = hint.replace("call session_status", ack, 1) if "call session_status" in hint \
+                    else f"{ack} to acknowledge; {hint}"
             # reload_on_restart: the relaunched debugger gets the sample again before the client
             # hears about the restart; details.reloaded tells whether it is loaded now
             job = self._sync_job(rt, job)
@@ -832,10 +1064,11 @@ class Gateway(GatewayApp):
             raise
 
     @staticmethod
-    def _call_result(bid: str, res: ToolCallResult) -> dict[str, Any]:
+    def _call_result(rt: Runtime, bid: str, res: ToolCallResult) -> dict[str, Any]:
         meta = res.raw.get("gateway") if isinstance(res.raw, dict) else None
         epoch = meta.get("epoch") if isinstance(meta, dict) else None
-        return {"texts": list(res.texts), "is_error": bool(res.is_error), "epoch": epoch, "backend_id": bid}
+        return {"texts": list(res.texts), "is_error": bool(res.is_error), "epoch": epoch, "backend_id": bid,
+                "profile": rt.profile.name}
 
     def _on_hang(self, profile_name: str, backend_id: str, report: HealthReport) -> None:
         """Supervisor hang hook: keep a screenshot of the hung debugger in the job dir."""
@@ -1064,7 +1297,90 @@ class Gateway(GatewayApp):
 
     # ── observation ─────────────────────────────────────────────────
     def session_status(self, profile: str | None = None) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        """One profile's status (``profile`` given, or only one configured), else every
+        profile's in compact form plus the session's target (``_all_status``)."""
+        if profile is not None or not self._multi():
+            return self._profile_status(self.runtime(profile))
+        return self._all_status()
+
+    def _all_status(self) -> dict[str, Any]:
+        """Every profile's status at once (checked in parallel), compacted, plus this client
+        session's target and where its calls without a profile go now.
+
+        Only the VM those calls go to (``routing``) is acknowledged and has its operation outcome
+        marked delivered, as a single status call would; the other VMs are only looked at, so the
+        client working on one of them still meets BACKEND_RESTARTED there."""
+        session = CLIENT_SESSION.get()  # the worker threads below run without this context
+        names = list(self.config.profiles)
+        target = self._target(session)
+        _live, views = self._live()
+        routing: dict[str, Any]
+        try:
+            routed: str | None = self._target_profile(None, what="routing", session=session)
+            why = ("this session's target" if target is not None
+                   else "the only VM with a live job" if len(views) == 1 else "the default profile")
+            routing = {"profile": routed, "reason": why}
+        except TargetAmbiguous as e:
+            routed = None
+            routing = {"profile": None, "reason": "ambiguous: calls without profile are refused "
+                       "(TARGET_AMBIGUOUS); nothing was acknowledged", "hint": e.hint}
+
+        def one(name: str) -> dict[str, Any]:
+            try:
+                return self._compact_status(self._profile_status(self.runtime(name), session=session,
+                                                                 acknowledge=name == routed))
+            except GatewayError as e:
+                return {"error": {"code": e.code, "message": _clip(e.message), "hint": e.hint}}
+            except Exception as e:  # noqa: BLE001 - one profile's bug must not hide the others
+                log.warning("session_status: profile %s failed", name, exc_info=True)
+                return {"error": {"code": "INTERNAL", "message": f"checking profile {name} failed: "
+                                  f"{type(e).__name__}", "hint": "see the gateway log"}}
+
+        with ThreadPoolExecutor(max_workers=max(1, len(names)), thread_name_prefix="gw-status-vm") as pool:
+            entries = list(pool.map(one, names))
+        return {
+            "profile": None,
+            "profiles": dict(zip(names, entries, strict=True)),
+            "target": target.view() if target is not None else None,
+            "routing": routing,
+            "active_jobs": views,
+            "hint": "call session_status(profile=...) for one VM's full status (that also acknowledges "
+                    "its backend restarts)",
+        }
+
+    @staticmethod
+    def _compact_status(st: Mapping[str, Any]) -> dict[str, Any]:
+        """A profile's ``_profile_status`` without per-backend health details and job paths."""
+        backends: dict[str, Any] = {}
+        for bid, entry in st["backends"].items():
+            short = {k: entry.get(k) for k in ("arch", "health", "epoch", "acked_epoch", "selected")}
+            err = entry.get("error")
+            if isinstance(err, Mapping):
+                short["error"] = {"code": err.get("code"), "message": err.get("message")}
+            backends[bid] = short
+        job = st.get("job")
+        if isinstance(job, Mapping):
+            sample = job.get("sample") if isinstance(job.get("sample"), Mapping) else {}
+            job = {**{k: job.get(k) for k in ("job_id", "state", "backend_id", "epoch", "restarts")},
+                   "sample": sample.get("original_name") if sample else None}
+        recovery = [{k: r[k] for k in ("job_id", "state", "kind", "recovery_hint", "next_tool") if k in r}
+                    for r in st.get("needs_recovery", ()) if isinstance(r, Mapping)]
+        return {
+            "mode": st["mode"],
+            "vm": st["vm"],
+            "backends": backends,
+            "selected_backend": st["selected_backend"],
+            "job": job,
+            "operation": st["operation"],  # with its result: polling clients read the outcome here
+            "needs_recovery": recovery,
+            "isolation_warnings": st["isolation_warnings"],
+            "warnings": st["warnings"],
+        }
+
+    def _profile_status(self, rt: Runtime, session: Any = _CURRENT, *,
+                        acknowledge: bool = True) -> dict[str, Any]:
+        """One profile's full status. ``acknowledge``: acknowledge its backend epochs and mark its
+        operation outcome delivered (False: only look, for ``_all_status``)."""
         name = rt.profile.name
         store = self._jobs()
         warnings: list[str] = []
@@ -1093,7 +1409,7 @@ class Gateway(GatewayApp):
             warnings.append(e.message)
         job = self._sync_job(rt, job)
         busy = rt.supervisor.is_paused() or bool(rt.lock.state()["writer"])
-        routed = self._route_or_none(rt, job)
+        routed = self._route_or_none(rt, job, session)
 
         def one(item: tuple[str, BackendConfig]) -> dict[str, Any]:
             bid, cfg = item
@@ -1133,7 +1449,8 @@ class Gateway(GatewayApp):
             # Acknowledge after looking, so mutating calls are accepted again - but only for a
             # real health report outside a running operation: an epoch seen mid-revert must
             # still surface as BACKEND_RESTARTED once the operation is over.
-            if op_running or entry["health"] in (None, "PAUSED", "UNRESOLVED") or entry["error"] is not None:
+            if (not acknowledge or op_running or entry["health"] in (None, "PAUSED", "UNRESOLVED")
+                    or entry["error"] is not None):
                 entry["acked_epoch"] = rt.proxy.acked_epoch(bid)
             else:
                 entry["acked_epoch"] = rt.proxy.ack(bid)
@@ -1144,7 +1461,7 @@ class Gateway(GatewayApp):
             "backends": backends,
             "selected_backend": routed,
             "job": self._job_view(job),
-            "operation": runner.current(deliver=True),  # the client sees the outcome here
+            "operation": runner.current(deliver=acknowledge),  # the client sees the outcome here
             "needs_recovery": recovery,
             "isolation_warnings": isolation,
             "warnings": warnings,
@@ -1162,9 +1479,9 @@ class Gateway(GatewayApp):
             )
         return hint
 
-    def _route_or_none(self, rt: Runtime, job: Job | None) -> str | None:
+    def _route_or_none(self, rt: Runtime, job: Job | None, session: Any = _CURRENT) -> str | None:
         try:
-            return self._route(rt, None, job)
+            return self._route(rt, None, job, self._selected_backend(rt.profile.name, session))
         except GatewayError:
             return None
 
@@ -1552,26 +1869,54 @@ class Gateway(GatewayApp):
 
     def instructions(self) -> str:
         parts = [LOOP_RULES, self._static_instructions()]
-        try:
-            rt = self.runtime()
-        except GatewayError:
+        if not self._multi():
+            try:
+                rt = self.runtime()
+            except GatewayError:
+                return "\n\n".join(parts)
+            for bid, cfg in rt.backends.items():
+                text = rt.catalog.instructions(bid)
+                if text:
+                    parts.append(
+                        f"x64dbg plugin notes for backend {bid} ({cfg.arch}), cached from the plugin:\n{text}"
+                    )
             return "\n\n".join(parts)
-        for bid, cfg in rt.backends.items():
-            text = rt.catalog.instructions(bid)
-            if text:
-                parts.append(
-                    f"x64dbg plugin notes for backend {bid} ({cfg.arch}), cached from the plugin:\n{text}"
-                )
+        parts.append(MULTI_VM_RULES.format(profiles=", ".join(self.config.profiles)))
+        notes: dict[str, list[str]] = {}  # the same plugin build in several VMs: its notes once
+        for name in self.config.profiles:
+            try:
+                rt = self.runtime(name)
+            except GatewayError:
+                continue
+            for bid, cfg in rt.backends.items():
+                text = rt.catalog.instructions(bid)
+                if text:
+                    notes.setdefault(text, []).append(f"{name}/{bid} ({cfg.arch})")
+        for text, where in notes.items():
+            parts.append(f"x64dbg plugin notes for backends {', '.join(where)} (profile/backend), cached "
+                         f"from the plugin:\n{text}")
         return "\n\n".join(parts)
 
     def list_mirrored_tools(self) -> list[ToolInfo]:
-        try:
-            rt = self.runtime()
-            tools = rt.catalog.tools(self._route(rt, None, self._active_or_none(rt)))
-            if tools:
-                return tools
-        except GatewayError:
-            pass
+        """The routed backend's tools; with several profiles the union over every profile's
+        routed backend (one tools/list serves every VM; a tool that is read-only in one plugin
+        build and not in another is listed as mutating)."""
+        merged: dict[str, ToolInfo] = {}
+        for name in (self.config.profiles if self._multi() else (None,)):
+            try:
+                rt = self.runtime(name)
+                job = self._active_or_none(rt)
+                tools = rt.catalog.tools(self._route(rt, None, job, self._selected_backend(rt.profile.name)))
+            except GatewayError:
+                continue
+            for tool in tools:
+                seen = merged.get(tool.name)
+                if seen is None:
+                    merged[tool.name] = tool
+                elif seen.read_only and not tool.read_only:
+                    merged[tool.name] = dataclasses.replace(seen, read_only=False)
+        if merged:
+            return list(merged.values())
         with self._lock:
             if self._fallback_catalog is None:
                 self._fallback_catalog = ToolCatalog(
@@ -1597,13 +1942,35 @@ class Gateway(GatewayApp):
         holds up a VM operation that arrives meanwhile. Only the token read (bounded by
         what is left of ``timeout_s`` while VMware Tools start) and the version probe
         (``GET /``, cancelled by a VM operation) run under the shared read lock.
+
+        Several profiles: every profile's backends are learnt at the same time within the one
+        ``timeout_s``; the result is ``{"profile": None, "backends": {}, "profiles": {name:
+        <the result above for that profile, or {"profile", "backends": {}, "error"}>}}``.
         """
-        try:
-            rt = self.runtime()
-        except GatewayError as e:
-            return {"profile": None, "backends": {}, "error": e.code}
         budget = max(0.0, float(timeout_s))
         deadline = time.monotonic() + budget
+        if not self._multi():
+            try:
+                rt = self.runtime()
+            except GatewayError as e:
+                return {"profile": None, "backends": {}, "error": e.code}
+            return self._warm_up_end(rt, self._warm_up_begin(rt, deadline), budget, deadline)
+        profiles: dict[str, dict[str, Any]] = {}
+        begun: dict[str, tuple[Runtime, Any]] = {}
+        for name in self.config.profiles:
+            try:
+                rt = self.runtime(name)
+            except GatewayError as e:
+                profiles[name] = {"profile": name, "backends": {}, "error": e.code}
+                continue
+            begun[name] = (rt, self._warm_up_begin(rt, deadline))
+        for name, (rt, started) in begun.items():
+            profiles[name] = self._warm_up_end(rt, started, budget, deadline)
+        return {"profile": None, "backends": {}, "profiles": {n: profiles[n] for n in self.config.profiles}}
+
+    def _warm_up_begin(self, rt: Runtime, deadline: float
+                       ) -> tuple[dict[str, threading.Thread], dict[str, dict[str, Any]]]:
+        """Start one learning thread per backend of ``rt`` (``warm_up``)."""
         results: dict[str, dict[str, Any]] = {bid: {} for bid in rt.backends}
         vm_lock = threading.Lock()
         vm_seen: dict[str, Any] = {}
@@ -1650,10 +2017,18 @@ class Gateway(GatewayApp):
                 out["error"] = type(e).__name__
                 log.warning("warm-up of backend %s failed", bid, exc_info=True)
 
-        threads = {bid: threading.Thread(target=learn, args=(bid,), name=f"gw-warm-up-{bid}", daemon=True)
+        threads = {bid: threading.Thread(target=learn, args=(bid,), daemon=True,
+                                         name=f"gw-warm-up-{rt.profile.name}-{bid}")
                    for bid in rt.backends}
         for t in threads.values():
             t.start()
+        return threads, results
+
+    def _warm_up_end(self, rt: Runtime,
+                     started: tuple[dict[str, threading.Thread], dict[str, dict[str, Any]]],
+                     budget: float, deadline: float) -> dict[str, Any]:
+        """Wait for ``rt``'s learning threads until ``deadline`` and report (``warm_up``)."""
+        threads, results = started
         for t in threads.values():
             t.join(max(0.0, deadline - time.monotonic()))
         summary: dict[str, dict[str, Any]] = {}
@@ -1672,10 +2047,11 @@ class Gateway(GatewayApp):
         versions = {bid: (o["version"], o["source"]) for bid, o in summary.items()}
         pending = [bid for bid, o in summary.items() if o.get("pending")]
         if pending:
-            log.warning("warm-up: backend(s) %s did not answer within %.1f s; their first tool list is the "
-                        "cached / builtin one (%s) and changes once they answer", pending, budget, versions)
+            log.warning("warm-up of profile %s: backend(s) %s did not answer within %.1f s; their first tool "
+                        "list is the cached / builtin one (%s) and changes once they answer", rt.profile.name,
+                        pending, budget, versions)
         else:
-            log.info("warm-up: %s", versions)
+            log.info("warm-up of profile %s: %s", rt.profile.name, versions)
         return {"profile": rt.profile.name, "backends": summary}
 
     def _active_or_none(self, rt: Runtime) -> Job | None:
@@ -1685,7 +2061,38 @@ class Gateway(GatewayApp):
             return None
 
     # ── VM ──────────────────────────────────────────────────────────
+    def _vm_siblings(self, rt: Runtime) -> list[str]:
+        """The other configured profiles of the same .vmx (one VM configured twice)."""
+        if rt.profile.mode != "vmware" or not rt.profile.vmx:
+            return []
+        mine = _vmx_key(rt.profile.vmx)
+        return [name for name, prof in self.config.profiles.items()
+                if name != rt.profile.name and prof.mode == "vmware" and prof.vmx
+                and _vmx_key(prof.vmx) == mine]
+
+    def _refuse_sibling_jobs(self, rt: Runtime, what: str) -> None:
+        """Profiles of the same VM share it: none may change it, or start a job in it, while
+        another has a live job (each profile has its own VM lock, so nothing else orders them)."""
+        store = self._jobs()
+        for name in self._vm_siblings(rt):
+            try:
+                job = store.active(name)
+            except StateViolation as e:
+                raise StateViolation(
+                    f"{what} refused: profile {name} uses the same VM and its job state is unknown "
+                    f"({e.message})", stage="vm", hint=e.hint, next_tool="session_status",
+                    details={"profile": name, **e.details}) from e
+            if job is not None:
+                state = JobState(job.state).value
+                raise StateViolation(
+                    f"{what} refused: profile {name} uses the same VM ({rt.profile.vmx}) and has live job "
+                    f"{job.id} ({state})", stage="vm", next_tool="session_status",
+                    hint=f"finish that job first (analysis_collect, analysis_finish), or work in profile "
+                         f"{name}",
+                    details={"profile": name, "job_id": job.id, "state": state})
+
     def _guard_vm_op(self, rt: Runtime, op: policy.VmOp) -> None:
+        self._refuse_sibling_jobs(rt, op)
         job = self._active_job(rt.profile.name)
         try:
             policy.assert_vm_op_allowed(op, job)
@@ -1698,7 +2105,7 @@ class Gateway(GatewayApp):
             raise
 
     def vm_snapshots_list(self, profile: str | None = None) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_snapshots_list")
         self._require_vm(rt)
         with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
             snaps = rt.vm.list_snapshots()
@@ -1747,7 +2154,7 @@ class Gateway(GatewayApp):
         return name
 
     def vm_snapshot_take(self, name: str, profile: str | None = None) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_snapshot_take", follow_job=False)
         self._require_vm(rt)
         name = self._check_new_snapshot_name(rt, name)
         self._guard_vm_op(rt, "snapshot_take")
@@ -1770,7 +2177,7 @@ class Gateway(GatewayApp):
     def vm_snapshot_revert(
         self, name: str | None = None, profile: str | None = None, wait_s: float | None = None
     ) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_snapshot_revert", follow_job=False)
         self._require_vm(rt)
         target = name or rt.profile.clean_snapshot
         if not target:
@@ -1791,7 +2198,7 @@ class Gateway(GatewayApp):
         return self._ops(rt).run("vm_snapshot_revert", target, work, wait_s=wait)
 
     def vm_snapshot_delete(self, name: str, profile: str | None = None) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_snapshot_delete", follow_job=False)
         self._require_vm(rt)
         policy.check_snapshot_delete(name, rt.profile)
         self._guard_vm_op(rt, "snapshot_delete")
@@ -1810,7 +2217,7 @@ class Gateway(GatewayApp):
     ) -> dict[str, Any]:
         if action not in POWER_ACTIONS:
             raise InvalidArgument(f"action must be one of {', '.join(POWER_ACTIONS)}")
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_power", follow_job=False)
         self._require_vm(rt)
         # start/resume loses nothing and is allowed while ANALYZING; stop/suspend/reset lose the
         # debuggee (or freeze it mid-analysis) and follow the revert rules
@@ -1863,16 +2270,18 @@ class Gateway(GatewayApp):
             return {"action": "start", **info, "resumed": False, "epochs": self._epochs(rt)}
 
     def vm_screenshot(self, profile: str | None = None) -> dict[str, Any]:
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="vm_screenshot")
         self._require_vm(rt)
         job = self._active_or_none(rt)
         base = Path(job.host_root) / "screens" if job else self.config.jobs_root_path / "_screens"
         self._jobs()  # creates the jobs root with private permissions first
-        target = self._screenshot_path(base, "screen")
+        # the shared _screens directory of several VMs: the file name says which VM it shows
+        prefix = f"screen-{_safe_name(rt.profile.name)}" if self._multi() and job is None else "screen"
+        target = self._screenshot_path(base, prefix)
         with rt.lock.read(timeout_s=READ_LOCK_TIMEOUT_S):
             rt.vm.screenshot(target)
         _chmod_private(target)
-        return {"host_path": str(target), "job_id": job.id if job else None}
+        return {"host_path": str(target), "job_id": job.id if job else None, "profile": rt.profile.name}
 
     # ── files ───────────────────────────────────────────────────────
     def _host_source(self, host_path: str) -> Path:
@@ -1919,8 +2328,8 @@ class Gateway(GatewayApp):
                 f"file is larger than {MAX_UPLOAD_BYTES} bytes", stage="upload", details={"size": size}
             )
         store = self._jobs()
-        job = store.get(job_id) if job_id else store.active(self._profile_name(None))
-        rt = self.runtime(job.profile if job else None)
+        job = store.get(job_id) if job_id else self._current_job()
+        rt = self.runtime(job.profile) if job else self._target_runtime(None, what="file_upload")
         self._require_vm(rt)
         assert rt.channel is not None
         if guest_dir is None:
@@ -2006,25 +2415,43 @@ class Gateway(GatewayApp):
                 return dest
 
     # ── debugger ────────────────────────────────────────────────────
-    def debugger_select(self, backend_id: str) -> dict[str, Any]:
-        rt = self.runtime()
-        bid = self._route(rt, backend_id)
-        with self._lock:
-            self._selected[rt.profile.name] = bid
+    def debugger_select(self, backend_id: str | None = None, profile: str | None = None) -> dict[str, Any]:
+        """Make ``profile`` (default: the current target) and ``backend_id`` (default: the
+        active job's, else the first) the target of the calling client session."""
+        if backend_id is None and profile is None:
+            raise InvalidArgument("pass profile (the VM), backend_id (the debugger) or both",
+                                  hint=f"profiles: {', '.join(self.config.profiles)}")
+        rt = self._target_runtime(profile, what="debugger_select")
+        # a backend chosen before in this profile stays chosen unless another one is named
+        bid = (self._route(rt, backend_id) if backend_id is not None
+               else self._selected_backend(rt.profile.name))
+        self._set_target(rt.profile.name, bid, "debugger_select")
         job = self._active_or_none(rt)
+        routed = self._route(rt, None, job, bid)
         out: dict[str, Any] = {
-            "selected": bid,
-            "arch": rt.backends[bid].arch,
+            "selected": bid or routed,
+            "routed_backend": routed,
+            "profile": rt.profile.name,
+            "arch": rt.backends[routed].arch,
+            "active_job": job.id if job else None,
             "active_job_backend": job.backend_id if job else None,
         }
-        if job is not None and job.backend_id and job.backend_id != bid:
+        if job is not None and job.backend_id and bid is not None and job.backend_id != bid:
             out["note"] = (
                 f"the active job {job.id} keeps routing mirrored calls to {job.backend_id}; "
                 "use debugger_call(backend_id=...) to reach another backend"
             )
+        if CLIENT_SESSION.get() == STATELESS_SESSION:
+            out["scope"] = ("not kept: this client has no MCP session the gateway can tell apart, so later "
+                            "calls are routed on their own; pass profile to debugger_call / debugger_restart "
+                            "and the vm_* tools, and job_id to the job tools")
+        elif self._multi():
+            out["scope"] = ("this client session: mirrored tools, debugger_* and vm_* tools without profile "
+                            f"and job tools without job_id now act on profile {rt.profile.name}")
         return out
 
-    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested") -> dict[str, Any]:
+    def debugger_restart(self, backend_id: str | None = None, reason: str = "requested",
+                         profile: str | None = None) -> dict[str, Any]:
         """Kill the backend's debugger (if running) and relaunch it.
 
         The relaunch configuration and the restart budget are checked before
@@ -2032,12 +2459,13 @@ class Gateway(GatewayApp):
         budget for relaunches without a job (reset by a VM revert), not the active
         job's crash-loop budget, which stays reserved for debuggers the sample kills.
         """
-        rt = self.runtime()
+        # it kills a debugger and its debuggee: another client's job never chooses which
+        rt = self._target_runtime(profile, what="debugger_restart", follow_job=False)
         self._require_vm(rt)
         assert rt.channel is not None
         self._ops(rt).settle()
         job = self._active_or_none(rt)
-        bid = self._route(rt, backend_id, job)
+        bid = self._route(rt, backend_id, job, self._selected_backend(rt.profile.name))
         cfg = rt.backend(bid)
         self._check_relaunch_config(rt, bid)
         why = _clip(reason, 200)
@@ -2063,6 +2491,7 @@ class Gateway(GatewayApp):
         job = self._sync_job(rt, job)
         out: dict[str, Any] = {
             "backend_id": bid,
+            "profile": rt.profile.name,
             "epoch": epoch,
             "previous_epoch": before,
             "killed": killed,
@@ -2119,17 +2548,18 @@ class Gateway(GatewayApp):
         return killed
 
     def debugger_call(
-        self, tool: str, arguments: Mapping[str, Any] | None = None, backend_id: str | None = None
+        self, tool: str, arguments: Mapping[str, Any] | None = None, backend_id: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(tool, str) or not _TOOL_NAME_RE.fullmatch(tool):
             raise InvalidArgument("tool must be a plugin tool name such as GetDebugState")
         if arguments is not None and not isinstance(arguments, Mapping):
             raise InvalidArgument("arguments must be an object")
-        rt = self.runtime()
+        rt = self._target_runtime(profile, what=tool)  # TARGET_AMBIGUOUS before anything is sent
         self._ops(rt).settle()  # the guest may change: an unreported VM-op result is stale now
         job = self._active_or_none(rt)
-        bid = self._route(rt, backend_id, job)
-        return self._call_result(bid, self._call(rt, bid, tool, arguments, job))
+        bid = self._route(rt, backend_id, job, self._selected_backend(rt.profile.name))
+        return self._call_result(rt, bid, self._call(rt, bid, tool, arguments, job))
 
     def call_mirrored(self, tool: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return self.debugger_call(tool, arguments)
@@ -2153,7 +2583,7 @@ class Gateway(GatewayApp):
             raise InvalidArgument(f"arch must be one of {', '.join(ARCH_CHOICES)}")
         if args is not None and not isinstance(args, str):
             raise InvalidArgument("args must be a string")
-        rt = self.runtime(profile)
+        rt = self._target_runtime(profile, what="analysis_start", follow_job=False)
         self._require_vm(rt)
         src = self._host_source(sample_path)
         guest_cwd = validate_guest_path(cwd) if cwd else None
@@ -2178,12 +2608,18 @@ class Gateway(GatewayApp):
             "load": bool(load),
             "target": target,
             "reload_on_restart": bool(reload_on_restart),
+            # the work runs on the profile's runner thread, outside the caller's context
+            "session": CLIENT_SESSION.get(),
         }
 
         def work(progress: Progress) -> dict[str, Any]:
             return self._analysis_start(rt, src, digest, opts, progress)
 
-        return self._ops(rt).run("analysis_start", (rt.profile.name, digest), work, wait_s=wait)
+        out = self._ops(rt).run("analysis_start", (rt.profile.name, digest), work, wait_s=wait)
+        # (again: a caller that joined the same start in progress from another session works on
+        # this VM now too; the runner thread set it for the session that started the job)
+        self._set_target(rt.profile.name, self._selected_backend(rt.profile.name), "analysis_start")
+        return out
 
     def _analysis_start(
         self, rt: Runtime, src: Path, digest: str, opts: dict[str, Any], progress: Progress
@@ -2206,6 +2642,7 @@ class Gateway(GatewayApp):
                         "discard it",
                         next_tool="session_status",
                     )
+                self._refuse_sibling_jobs(rt, "analysis_start")
             with steps.step("isolation") as st:
                 violations = policy.isolation_gate(rt.vm.isolation_report(), require=prof.require_isolation)
                 steps.warnings.extend(violations)
@@ -2213,6 +2650,10 @@ class Gateway(GatewayApp):
             with steps.step("create_job") as st:
                 job = store.create(prof.name, prof.job_root_guest)
                 progress("create_job", job_id=job.id)
+                # the caller works on this VM now: its session's calls without a profile go here
+                # (a backend it selected in this profile before stays selected)
+                self._set_target(prof.name, self._selected_backend(prof.name, opts["session"]),
+                                 "analysis_start", session=opts["session"])
                 st["detail"] = job.id
             with steps.step("copy_sample") as st:
                 sample, arch, bid, do_load = self._prepare_sample(rt, job, src, digest, opts, steps)
@@ -2388,7 +2829,7 @@ class Gateway(GatewayApp):
                 steps.warnings.append(
                     f"{pe.kind} sample: uploaded only, not loaded (pass arch to load it anyway)"
                 )
-            bid = self._route_or_none(rt, None)
+            bid = self._route_or_none(rt, None, opts.get("session"))
         else:
             matches = [b for b, cfg in rt.backends.items() if cfg.arch == arch]
             if not matches:
@@ -2518,7 +2959,9 @@ class Gateway(GatewayApp):
             return None  # LOADING / COLLECTING / ...: the orchestrator is busy with the debugger
         if job.sample is None or not job.sample.guest_path:
             return None
-        with self._reload_lock:
+        with self._lock:  # one reload at a time per profile: another VM's reload never waits for it
+            reload_lock = self._reload_locks.setdefault(rt.profile.name, threading.Lock())
+        with reload_lock:
             try:
                 job = self._jobs().get(job.id)
             except GatewayError:
@@ -2782,12 +3225,16 @@ class Gateway(GatewayApp):
     ) -> dict[str, Any]:
         if job_id is None:
             # a client polling by repeating the call: the job of the finish it started
-            pending = self._ops(self.runtime()).pending_key("analysis_finish")
-            job_id = pending if isinstance(pending, str) else None
+            job_id = self._pending_finish()
         job = self._resolve_job(job_id)
         rt = self.runtime(job.profile)
         if self._ops(rt).pending_key("analysis_finish") != job.id:
             self._check_finishable(job, revert)  # else run() answers in_progress / the outcome
+            with self._lock:  # whose polls (analysis_finish without job_id) this finish answers
+                self._finishers[job.id] = CLIENT_SESSION.get()
+                self._finishers.move_to_end(job.id)
+                while len(self._finishers) > MAX_SESSION_TARGETS:
+                    self._finishers.popitem(last=False)
         if revert or keep_snapshot:
             self._require_vm(rt)
         if revert and not rt.profile.clean_snapshot:
@@ -2798,6 +3245,21 @@ class Gateway(GatewayApp):
             return self._analysis_finish(rt, job.id, bool(revert), bool(keep_snapshot), progress)
 
         return self._ops(rt).run("analysis_finish", job.id, work, wait_s=wait, job_id=job.id)
+
+    def _pending_finish(self) -> str | None:
+        """The job of the analysis_finish this client session started that still runs (or whose
+        outcome it has not received yet): a client polls by repeating the call without job_id.
+        Never another session's finish (None: none, or several)."""
+        session = CLIENT_SESSION.get()
+        if session == STATELESS_SESSION:
+            return None
+        with self._lock:
+            runners = list(self._runners.values())
+            owners = dict(self._finishers)
+        keys = {key for runner in runners
+                if isinstance(key := runner.pending_key("analysis_finish"), str)
+                and key in owners and owners[key] == session}
+        return next(iter(keys)) if len(keys) == 1 else None
 
     @staticmethod
     def _check_finishable(job: Job, revert: bool) -> None:
