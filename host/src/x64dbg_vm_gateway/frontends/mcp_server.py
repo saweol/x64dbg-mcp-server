@@ -50,6 +50,10 @@ both ``tools/list`` and ``tools/call`` to the scope's risk tiers:
 
 A denied call returns code ``FORBIDDEN`` and never reaches the app.
 
+Prompts (``prompts/list``, ``prompts/get``): the analysis plans of ``prompts`` (analyze-sample,
+trace-api, find-oep, static-dynamic, report). They only return text and never reach the app, so
+every scope may read them; bad arguments or an unknown name answer JSON-RPC INVALID_PARAMS.
+
 Thread-safety / state: the server holds no global state; one ``Server`` per
 ``build_server`` call.
 """
@@ -68,7 +72,7 @@ from typing import Any, Protocol, runtime_checkable
 import anyio
 import anyio.to_thread
 from anyio.lowlevel import RunVar
-from mcp import types
+from mcp import MCPError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
@@ -77,6 +81,7 @@ from ..app_api import GatewayApp
 from ..contracts import ToolInfo
 from ..errors import GatewayError
 from ..policy import RiskTier, tier_for_mirror
+from . import prompts
 from .tool_defs import (
     CALLABLE_TOOLS,
     GATEWAY_TOOLS,
@@ -313,6 +318,16 @@ class _Handlers:
                      if tier_for_mirror(read_only=info.read_only) in self.tiers)
         return types.ListToolsResult(tools=tools)
 
+    # ── prompts/list, prompts/get (every scope: text only) ──────────
+    async def list_prompts(self, ctx: Any, params: Any) -> types.ListPromptsResult:
+        return prompts.list_result()
+
+    async def get_prompt(self, ctx: Any, params: types.GetPromptRequestParams) -> types.GetPromptResult:
+        try:
+            return prompts.get_result(params.name, params.arguments, static_note=self.static_note)
+        except prompts.PromptError as e:
+            raise MCPError(types.INVALID_PARAMS, str(e)) from None
+
     # ── tools/call ──────────────────────────────────────────────────
     async def call_tool(self, ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         name = params.name
@@ -470,6 +485,8 @@ def build_server(app: GatewayApp, *, scope: str | None = None, audit: AuditHook 
         instructions=_instructions(app),
         on_list_tools=handlers.list_tools,
         on_call_tool=handlers.call_tool,
+        on_list_prompts=handlers.list_prompts,
+        on_get_prompt=handlers.get_prompt,
     )
 
 
