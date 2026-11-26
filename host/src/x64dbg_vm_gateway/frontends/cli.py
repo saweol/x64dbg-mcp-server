@@ -1679,33 +1679,82 @@ def claude_tool_name(server: str, tool: str) -> str:
     return f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', server)}__{tool}"
 
 
-def _plugin_tool_names() -> list[str]:
-    """Every plugin tool of the builtin catalogs (data/tools-v*.json) that the gateway mirrors."""
-    names: set[str] = set()
+def _plugin_tools() -> dict[str, bool]:
+    """Every plugin tool of the builtin catalogs (data/tools-v*.json) that the gateway mirrors, and
+    whether it is read-only: only when every catalog that lists it says so (fail closed)."""
+    tools: dict[str, bool] = {}
     for entry in resources.files(_PACKAGE).joinpath("data").iterdir():
         if entry.name.startswith("tools-v") and entry.name.endswith(".json"):
             doc = json.loads(entry.read_text(encoding="utf-8"))
-            names.update(t["name"] for t in doc.get("tools", []) if isinstance(t, dict)
-                         and isinstance(t.get("name"), str))
-    return sorted(names - RESERVED_TOOL_NAMES)
+            for t in doc.get("tools", []):
+                name = t.get("name") if isinstance(t, dict) else None
+                if isinstance(name, str) and name not in RESERVED_TOOL_NAMES:
+                    tools[name] = tools.get(name, True) and t.get("read_only") is True
+    return dict(sorted(tools.items()))
 
 
-def permissions_snippet(server: str) -> dict[str, Any]:
-    """Claude Code ``settings.json`` permissions for the gateway registered as ``server``: allow the
-    observe and guest-mutating gateway tools and every mirrored plugin tool (exact names), ask
-    before the host-destructive gateway tools."""
-    destructive = [t.name for t in GATEWAY_TOOLS if t.tier is RiskTier.HOST_DESTRUCTIVE]
-    allowed = [t.name for t in GATEWAY_TOOLS if t.tier is not RiskTier.HOST_DESTRUCTIVE]
-    allowed += _plugin_tool_names()
-    return {"permissions": {"allow": [claude_tool_name(server, n) for n in allowed],
-                            "ask": [claude_tool_name(server, n) for n in destructive]}}
+PERMISSION_MODES = ("strict", "lab")
+#: gateway tools strict mode allows besides the observe tier: they change the disposable guest only
+#: in the gateway's own checked ways (start reverts to the clean snapshot first, collect / upload /
+#: static sync move files and labels); debugger_call and the debugger controls are asked for
+STRICT_GATEWAY_ALLOW = frozenset({"analysis_start", "analysis_collect", "file_upload",
+                                  "static_export_annotations", "static_import_annotations"})
 
 
-def _permission_notes(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+def permissions_snippet(server: str, mode: str = "strict") -> dict[str, Any]:
+    """Claude Code ``settings.json`` permissions for the gateway registered as ``server``.
+
+    ``strict`` (default): allow the observe-tier gateway tools, ``STRICT_GATEWAY_ALLOW`` and the
+    read-only plugin tools; ask for every other tool (debugger_call, the debugger controls, every
+    plugin tool that changes the debuggee or writes files, the host-destructive gateway tools).
+    ``lab``, for disposable lab VMs that are reverted after each job: allow every observe and
+    guest-mutating tool (all plugin tools included), ask only for the host-destructive ones."""
+    if mode not in PERMISSION_MODES:
+        raise ValueError(f"unknown permissions mode {mode!r}")
+    allow: list[str] = []
+    ask: list[str] = []
+    for tool in GATEWAY_TOOLS:
+        if tool.tier is RiskTier.HOST_DESTRUCTIVE:
+            ask.append(tool.name)
+        elif mode == "lab" or tool.tier is RiskTier.OBSERVE or tool.name in STRICT_GATEWAY_ALLOW:
+            allow.append(tool.name)
+        else:
+            ask.append(tool.name)
+    for name, read_only in _plugin_tools().items():
+        (allow if mode == "lab" or read_only else ask).append(name)
+    return {"permissions": {"allow": [claude_tool_name(server, n) for n in allow],
+                            "ask": [claude_tool_name(server, n) for n in ask]}}
+
+
+def _permissions_mode(args: argparse.Namespace, config: gw_config.GatewayConfig) -> tuple[str, list[str]]:
+    """(mode, warnings): an endpoint profile (a debugger that is not in a disposable VM) is always
+    strict."""
+    requested = args.permissions_mode or "strict"
+    try:
+        profiles = [config.profile(args.profile)]
+    except ConfigError:  # several profiles and no default: any of them may be served
+        profiles = list(config.profiles.values())
+    endpoints = [p.name for p in profiles if p.mode != "vmware"]
+    if requested == "lab" and endpoints:
+        return "strict", [f"profile {', '.join(endpoints)} is an endpoint profile (its debugger does not "
+                          "run in a disposable VM): strict permissions instead of lab"]
+    return requested, []
+
+
+def _permission_notes(entries: Sequence[Mapping[str, Any]], mode: str) -> list[str]:
     static = [e["name"] for e in entries if e["id"] != "gateway"]
+    if mode == "lab":
+        what = ("lab mode, for disposable lab VMs reverted after every job: Claude Code runs every "
+                "gateway and x64dbg tool that only changes the guest without asking (debugger_call and "
+                "ExecuteDebuggerCommand included) and asks before the host/VM-destructive ones")
+    else:
+        what = ("strict mode: Claude Code runs the read-only tools, analysis_start, analysis_collect, "
+                "file_upload and the static_* tools without asking and asks before every tool that changes "
+                "the debuggee (SetBreakpoint, run, WriteMemToAddress, ExecuteDebuggerCommand, debugger_call, "
+                "...) or the host/VM; --permissions-mode lab allows the guest-changing ones too, for "
+                "disposable lab VMs")
     notes = ["merge this into .claude/settings.json (this project) or ~/.claude/settings.json (every "
-             "project): Claude Code then runs the listed gateway and x64dbg tools without asking and asks "
-             "before the host/VM-destructive ones (snapshots, power, file_download, analysis_finish)",
+             "project); " + what,
              "tools that a plugin build newer than the builtin tool lists adds are not listed: Claude Code "
              "asks for them"]
     if static:
@@ -1915,6 +1964,8 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
         raise UsageError("--apply runs `claude mcp add`: it only works with --client claude")
     if args.yes and not args.apply:
         raise UsageError("--yes only applies together with --apply")
+    if args.permissions_mode and not args.permissions:
+        raise UsageError("--permissions-mode only applies together with --permissions")
     path = _config_target(args)
     config = gw_config.load_config(path, environ=os.environ)
     entries = _select_entries(args, config, path)
@@ -1923,10 +1974,14 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
     if args.permissions:
         server = next((e["name"] for e in mcp_config_entries(args, config, path) if e["id"] == "gateway"),
                       MCP_SERVER_NAME)
-        snippet, notes = permissions_snippet(server), _permission_notes(entries)
+        mode, warnings = _permissions_mode(args, config)
+        snippet, notes = permissions_snippet(server, mode), _permission_notes(entries, mode)
         if out.json_mode:
-            out.data({"ok": True, "server": server, "settings": snippet, "notes": notes})
+            out.data({"ok": True, "server": server, "mode": mode, "settings": snippet, "notes": notes,
+                      "warnings": warnings})
         else:
+            for warning in warnings:
+                out.note(f"warning: {warning}")
             for note in notes:
                 out.note(f"note: {note}")
             out.data(snippet, lambda d: _dumps(d))
@@ -2111,8 +2166,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", action="append", metavar="NAME=VALUE",
                    help="fill in the <NAME> placeholder, e.g. --set binary=/path/a.exe (repeatable)")
     p.add_argument("--permissions", action="store_true",
-                   help="print a Claude Code settings.json snippet instead: allow the read-only and "
-                        "guest-changing tools, ask before the host/VM-destructive ones")
+                   help="print a Claude Code settings.json permissions snippet instead "
+                        "(see --permissions-mode)")
+    p.add_argument("--permissions-mode", choices=PERMISSION_MODES,
+                   help="strict (default): allow the read-only tools, analysis_start/collect, "
+                        "file_upload and static_*, ask for the rest; lab: also allow every tool that only "
+                        "changes the guest, for disposable lab VMs (endpoint profiles are always strict)")
     p.add_argument("--apply", action="store_true",
                    help="run the `claude mcp add` commands that need nothing filled in (asks first)")
     p.add_argument("--yes", action="store_true", help="with --apply: do not ask for confirmation")

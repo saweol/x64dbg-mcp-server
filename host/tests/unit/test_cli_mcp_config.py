@@ -42,41 +42,111 @@ def name(tool: str) -> str:
 
 
 # ── (a) --permissions ───────────────────────────────────────────────
-def test_permissions_snippet(tmp_path, capsys):
-    cfg = static_config(tmp_path)
-    assert run(["--config", str(cfg), "mcp-config", "--permissions"]) == 0
+#: plugin tools the review named: never allowed without asking in strict mode
+RISKY_PLUGIN_TOOLS = {"ExecuteDebuggerCommand", "WriteMemToAddress", "AllocateMemory", "FreeMemory",
+                      "Assemble", "SetRegister", "LoadBinary", "RestartDebug", "StopDebug", "DumpMemory",
+                      "DumpModule", "AttachProcess", "SetBreakpoint", "run"}
+#: gateway tools strict mode allows besides the observe tier
+STRICT_GATEWAY = {"analysis_start", "analysis_collect", "file_upload", "static_export_annotations",
+                  "static_import_annotations"}
+
+
+def catalog_read_only() -> dict[str, bool]:
+    """Plugin tool -> read-only in every builtin catalog that lists it."""
+    from importlib import resources
+
+    flags: dict[str, bool] = {}
+    for version in ("1.9", "1.10"):
+        doc = json.loads(resources.files("x64dbg_vm_gateway").joinpath(f"data/tools-v{version}.json")
+                         .read_text(encoding="utf-8"))
+        for t in doc["tools"]:
+            flags[t["name"]] = flags.get(t["name"], True) and bool(t["read_only"])
+    return flags
+
+
+def snippet(tmp_path: Path, capsys: Any, *extra: str, config: Path | None = None) -> tuple[dict, str]:
+    cfg = config or static_config(tmp_path)
+    assert run(["--config", str(cfg), "mcp-config", "--permissions", *extra]) == 0
     captured = capsys.readouterr()
-    doc = json.loads(captured.out)  # stdout is the snippet itself, ready to merge into settings.json
-    perms = doc["permissions"]
+    return json.loads(captured.out)["permissions"], captured.err  # stdout: the snippet, ready to merge
+
+
+def test_strict_permissions_are_the_default(tmp_path, capsys):
+    perms, err = snippet(tmp_path, capsys)
     allow, ask = perms["allow"], perms["ask"]
-    assert len(allow) == len(set(allow)) and not set(allow) & set(ask)
-    assert set(ask) == {name(t) for t in DESTRUCTIVE}
+    assert len(allow) == len(set(allow)) and len(ask) == len(set(ask)) and not set(allow) & set(ask)
     for tool in GATEWAY_TOOLS:
-        expected = ask if tool.tier is RiskTier.HOST_DESTRUCTIVE else allow
-        assert name(tool.name) in expected, tool.name
-    for plugin_tool in ("SetBreakpoint", "run", "GetDebugState", "DumpMemory", "GetServerInfo",
-                        "SetArtifactDir"):
-        assert name(plugin_tool) in allow, plugin_tool  # v1.9 and v1.10 plugin tools
+        allowed = tool.tier is RiskTier.OBSERVE or tool.name in STRICT_GATEWAY
+        assert name(tool.name) in (allow if allowed else ask), tool.name
+    for gateway_tool in ("debugger_call", "debugger_restart", "debugger_select", *DESTRUCTIVE):
+        assert name(gateway_tool) in ask, gateway_tool
+    flags = catalog_read_only()
+    for tool, read_only in flags.items():
+        assert name(tool) in (allow if read_only else ask), tool  # the catalog's read_only flag decides
+    for tool in RISKY_PLUGIN_TOOLS:
+        assert name(tool) in ask, tool
+    for tool in ("GetDebugState", "ReadMemory", "ListModules", "GetCallStack", "GetServerInfo"):
+        assert name(tool) in allow, tool
     assert not any(name(alias) in allow + ask for alias in DEPRECATED_ALIASES)  # never listed, never called
     assert all(n.startswith(f"mcp__{SERVER}__") for n in allow + ask)
-    assert "settings.json" in captured.err
+    assert "settings.json" in err and "strict" in err
+
+
+def test_lab_permissions_allow_every_guest_changing_tool(tmp_path, capsys):
+    perms, err = snippet(tmp_path, capsys, "--permissions-mode", "lab")
+    allow, ask = perms["allow"], perms["ask"]
+    assert set(ask) == {name(t) for t in DESTRUCTIVE}
+    for tool in GATEWAY_TOOLS:
+        assert name(tool.name) in (ask if tool.tier is RiskTier.HOST_DESTRUCTIVE else allow), tool.name
+    for tool in catalog_read_only():
+        assert name(tool) in allow, tool
+    assert "disposable" in err  # lab mode is for lab VMs that are reverted anyway
+
+
+def test_an_endpoint_profile_always_gets_strict_permissions(tmp_path, capsys):
+    cfg = tmp_path / "endpoint.toml"
+    cfg.write_text(f"""
+[gateway]
+jobs_root = "{(tmp_path / 'jobs').as_posix()}"
+default_profile = "remote"
+
+[profiles.remote]
+mode = "endpoint"
+
+[profiles.remote.backends.x64]
+url = "http://127.0.0.1:9094/"
+token_env = "GW_TEST_X64_TOKEN"
+""", encoding="utf-8")
+    perms, err = snippet(tmp_path, capsys, "--permissions-mode", "lab", config=cfg)
+    assert name("ExecuteDebuggerCommand") in perms["ask"] and name("debugger_call") in perms["ask"]
+    assert "endpoint" in err and "strict" in err
+    lab = ["--permissions", "--permissions-mode", "lab"]
+    assert run(["--config", str(cfg), "--json", "mcp-config", *lab]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["mode"] == "strict" and any("endpoint" in w for w in data["warnings"])
 
 
 def test_permissions_tiers_come_from_the_policy_tables():
-    # the ask list is exactly the host-destructive gateway tools of the tier tables
     tiers = policy.GATEWAY_TOOL_TIERS
     assert {t for t, tier in tiers.items() if tier is RiskTier.HOST_DESTRUCTIVE} == DESTRUCTIVE
-    perms = cli.permissions_snippet(SERVER)["permissions"]
+    perms = cli.permissions_snippet(SERVER, mode="lab")["permissions"]
     assert set(perms["ask"]) == {name(t) for t in DESTRUCTIVE}
+    strict = cli.permissions_snippet(SERVER)["permissions"]
+    assert {name(t) for t in DESTRUCTIVE} <= set(strict["ask"])
 
 
 def test_permissions_json(tmp_path, capsys):
     cfg = static_config(tmp_path)
     assert run(["--config", str(cfg), "--json", "mcp-config", "--permissions"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["ok"] is True and data["server"] == SERVER
+    assert data["ok"] is True and data["server"] == SERVER and data["mode"] == "strict"
     assert name("session_status") in data["settings"]["permissions"]["allow"]
-    assert data["notes"]
+    assert data["notes"] and data["warnings"] == []
+
+
+def test_permissions_mode_needs_permissions(tmp_path, capsys):
+    cfg = static_config(tmp_path)
+    assert run(["--config", str(cfg), "mcp-config", "--permissions-mode", "lab"]) == 2
 
 
 @pytest.mark.parametrize("server,expected", [
