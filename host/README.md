@@ -290,32 +290,42 @@ One `serve` handles every profile in the config (`--profile` only sets the defau
 profile (VM) can have its own live job at the same time. Each VM has its own VM lock, operation
 runner, debugger supervision and epochs: a revert, power change or debugger restart of one VM never
 waits for, reverts or bumps the epochs of another. Two profiles that name the same `.vmx` share one
-operation runner and never have live jobs at once.
+operation runner and the VM's debuggers: while one has a live job the other cannot start a job,
+change the VM, restart the debugger or make mutating debugger calls (read-only ones work), and a
+revert through either starts a new epoch in both.
 
 - `analysis_start(profile=...)` makes that VM the *target* of the client session (each MCP session
   has its own; stdio has one). `debugger_select(profile=..., backend_id=...)` switches it.
 - Mirrored x64dbg tools, `debugger_call`, `vm_screenshot`, `vm_snapshots_list` without `profile`
-  and job tools without `job_id` go to: the session's target, else the only profile, else the VM
-  with the only live job, else the default profile. Tools that change a VM or kill a debugger
-  (`vm_snapshot_*`, `vm_power`, `debugger_restart`, `analysis_start`) skip the live-job step:
-  another client's job never picks the VM they change. With live jobs on several VMs and no target
-  the call is refused with `TARGET_AMBIGUOUS` (the jobs and the `debugger_select` call are in the
-  error); nothing is sent. A profile whose job directory is unreadable counts as busy.
-  `debugger_call` and `debugger_restart` also take `profile`.
+  and the read-only job tools `static_rebase` and `analysis_report` without `job_id` go to: the
+  session's target, else the only profile, else the VM with the only live job, else the default
+  profile. Tools that change a VM, a job or a debugger (`vm_snapshot_*`, `vm_power`,
+  `debugger_restart`, `analysis_start`, `analysis_collect`, `analysis_finish`, `file_upload`,
+  `file_download`, `static_export_annotations`, `static_import_annotations`) skip the live-job step:
+  another client's job is never picked for them. With live jobs on several VMs and no target (or
+  such a call, a live job elsewhere and no default) the call is refused with `TARGET_AMBIGUOUS`
+  (the jobs and the `debugger_select` call are in the error); nothing is sent. A profile whose job
+  directory is unreadable counts as busy, and so does a session whose target the gateway forgot
+  (it keeps the 1024 most recently active sessions). `debugger_call` and `debugger_restart` also
+  take `profile`.
 - Every mirrored result ends with `[gateway] epoch=N backend=ID profile=NAME retried=...`.
 - `session_status` without `profile` lists every VM compactly (VM, backends, live job, running
   operation) and shows the session's `target`, the `routing` decision and the `active_jobs`; it
   acknowledges restarts only on the routed VM. `session_status(profile=...)` shows (and
   acknowledges) one VM in full; `BACKEND_RESTARTED` from another VM names that call in its hint.
-- A polled `analysis_finish` without `job_id` answers only the client session that started it.
+- A polled `analysis_finish` without `job_id` answers only the client session that started it,
+  and only while that finish is for the session's current target VM. An operation shown by
+  `session_status(profile=...)` for the other profile of the same VM is labelled with its profile
+  and its outcome is left for that profile.
 - Over HTTP a target needs an MCP session (handshake protocol versions, whose session id the SDK
   validates). Requests of the stateless 2026 protocol keep no target: pass `profile` / `job_id`,
   or rely on a single live job or the default profile.
 - A `read` HTTP token cannot call `debugger_select` (guest-mutating tier), so while several VMs
   have live jobs its mirrored calls are refused with `TARGET_AMBIGUOUS`; `session_status` still
   shows every VM.
-- `serve` and the CLI accept a config with several profiles and no `default_profile`; commands
-  such as `doctor` then need `--profile`.
+- `serve` and the CLI accept a config with several profiles and no `default_profile`; `doctor`
+  (and `gateway_doctor`) without `--profile` then checks every profile, naming each check
+  `<profile>: <check>`.
 
 ## Static analysis tools
 

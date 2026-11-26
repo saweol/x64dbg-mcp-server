@@ -28,6 +28,11 @@ stand in for new work (a later deliberate revert would otherwise do nothing):
 ``progress(stage, *, job_id=None)`` records the current stage (and the job id
 once the operation knows it).
 
+Owners: ``run(..., profile=...)`` records which gateway profile an operation belongs to
+(profiles of one VM share a runner). An identical ``(op_name, key)`` of another profile is
+refused like any other operation (never joined or replayed), and ``current(profile=...)``
+of another profile shows the operation without its outcome and never marks it delivered.
+
 Thread-safety: all public methods may be called from any thread; state is
 guarded by one lock that is never held while ``fn`` runs or while waiting.
 """
@@ -71,6 +76,7 @@ class _Op:
     key: Hashable
     started_at: str
     job_id: str | None = None
+    profile: str | None = None  # the gateway profile it belongs to (None: not recorded)
     stage: str = "starting"
     state: str = "running"  # running | done | failed
     finished_at: str | None = None
@@ -116,15 +122,17 @@ class OperationRunner:
         *,
         wait_s: float | None,
         job_id: str | None = None,
+        profile: str | None = None,
     ) -> Any:
         """Run ``fn(progress)`` in the background; see the module docstring.
 
         ``wait_s=None`` waits until the operation finishes; ``wait_s <= 0`` never waits.
+        ``profile``: the owner (see "Owners" in the module docstring).
         """
         with self._lock:
             cur = self._op
             if cur is not None and cur.state == "running":
-                if (cur.op, cur.key) == (op_name, key):
+                if (cur.op, cur.key, cur.profile) == (op_name, key, profile):
                     return self._in_progress(cur)
                 raise StateViolation(
                     f"operation {cur.op} is still running (stage {cur.stage}); {op_name} was not started",
@@ -137,9 +145,10 @@ class OperationRunner:
                         "stage": cur.stage,
                         "job_id": cur.job_id,
                         "requested": op_name,
+                        **({"profile": cur.profile} if cur.profile is not None else {}),
                     },
                 )
-            if cur is not None and self._replayable(cur, op_name, key):
+            if cur is not None and cur.profile == profile and self._replayable(cur, op_name, key):
                 cur.delivered = True
                 return self._outcome(cur)
             op = _Op(
@@ -148,6 +157,7 @@ class OperationRunner:
                 key=key,
                 started_at=self._clock.now_iso(),
                 job_id=job_id,
+                profile=profile,
             )
             self._op = op
         worker = threading.Thread(
@@ -162,17 +172,21 @@ class OperationRunner:
             op.delivered = True
         return self._outcome(op)
 
-    def current(self, *, deliver: bool = False) -> dict[str, Any] | None:
+    def current(self, *, deliver: bool = False, profile: str | None = None) -> dict[str, Any] | None:
         """The running or last operation, or None before the first one.
 
         ``deliver=True`` marks a finished outcome as delivered (the caller shows it
         to the client), so a later identical ``run()`` starts the work again.
+        ``profile``: the asking profile. An operation recorded for another profile is
+        reported without its result or error (``note`` names its profile) and is never
+        marked delivered by this call.
         """
         with self._lock:
             op = self._op
             if op is None:
                 return None
-            if deliver and op.state != "running":
+            other = profile is not None and op.profile is not None and op.profile != profile
+            if deliver and op.state != "running" and not other:
                 op.delivered = True
             out: dict[str, Any] = {
                 "op_id": op.op_id,
@@ -183,6 +197,12 @@ class OperationRunner:
                 "started_at": op.started_at,
                 "finished_at": op.finished_at,
             }
+            if op.profile is not None:
+                out["profile"] = op.profile
+            if other:
+                out["note"] = (f"operation of profile {op.profile} (the same VM); its outcome is reported to "
+                               f"session_status(profile='{op.profile}')")
+                return out
             if op.state == "done":
                 out["result"] = op.result
             elif op.state == "failed" and op.error is not None:

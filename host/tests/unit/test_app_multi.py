@@ -18,6 +18,7 @@ from starlette.testclient import TestClient
 
 from tests.fakes.fake_runtime import make_labs
 from tests.unit.test_http_server import ADMIN_TOKEN, BASE, ENV, LOCAL, cfg, open_session, rpc
+from x64dbg_vm_gateway import app as app_module
 from x64dbg_vm_gateway.app_api import STATELESS_SESSION, client_session
 from x64dbg_vm_gateway.contracts import JobState, PowerState
 from x64dbg_vm_gateway.errors import (
@@ -205,14 +206,43 @@ def test_two_live_jobs_without_a_target_refuse_mirrored_calls(labs):
         assert gw.call_mirrored("GetDebugState")["profile"] == "lab"
 
 
-def test_a_single_live_job_is_the_target_of_every_session(labs):
+def test_a_single_live_job_is_followed_only_by_reading_tools(labs):
+    """Another session's only live job is where its mirrored calls and reads go, but collecting,
+    finishing (a revert) and uploading into it need job_id, a target or a default profile."""
     gw = labs.gateway()
     with client_session("one"):
         b = start(gw, labs, "lab2", "b.exe")
     with client_session("two"):
         out = gw.call_mirrored("GetDebugState")
         assert out["profile"] == "lab2"
-        assert gw.analysis_collect()["job_id"] == b["job_id"]
+        assert gw.static_rebase("0x401000", direction="runtime_to_rva")["job_id"] == b["job_id"]
+        assert gw.analysis_report()["job_id"] == b["job_id"]
+        for call in (gw.analysis_collect, gw.analysis_finish, gw.static_export_annotations,
+                     lambda: gw.static_import_annotations([{"rva": "0x10", "name": "f"}], module="b.exe"),
+                     lambda: gw.file_download(f"C:\\mcp\\jobs\\{b['job_id']}\\out\\x.bin"),
+                     lambda: gw.file_upload(str(labs["lab2"].sample("extra.bin")))):
+            with pytest.raises(TargetAmbiguous):
+                call()
+        assert gw.analysis_collect(b["job_id"])["job_id"] == b["job_id"]  # naming the job is enough
+        with pytest.raises(TargetAmbiguous):
+            gw.analysis_finish()  # collected now, but still another client's job
+    assert reverts(labs, "lab2") == 1 and gw.get_job(b["job_id"])["state"] == JobState.COLLECTED
+
+
+def test_job_changing_tools_without_job_id_use_the_default_profile_not_another_job(tmp_path):
+    labs = make_labs(tmp_path, default_profile="lab")
+    try:
+        gw = labs.gateway()
+        with client_session("one"):
+            b = start(gw, labs, "lab2", "b.exe")
+            gw.analysis_collect()
+        with client_session("nine"):
+            with pytest.raises(StateViolation) as ei:
+                gw.analysis_finish()
+            assert not isinstance(ei.value, TargetAmbiguous) and ei.value.next_tool == "analysis_start"
+        assert reverts(labs, "lab2") == 1 and gw.get_job(b["job_id"])["state"] == JobState.COLLECTED
+    finally:
+        labs.close()
 
 
 def test_without_jobs_or_a_default_the_gateway_asks_which_vm(labs):
@@ -323,9 +353,9 @@ def test_polling_analysis_finish_answers_only_for_the_finish_this_session_starte
     finally:
         release.set()
     assert gw._ops(gw.runtime("lab")).wait_idle(10)
-    with client_session("nine"), pytest.raises(StateViolation) as ei:
-        gw.analysis_finish()  # the only live job now is lab2's, which is not collected
-    assert not isinstance(ei.value, TargetAmbiguous) and ei.value.details.get("job_id") != a["job_id"]
+    with client_session("nine"), pytest.raises(TargetAmbiguous) as ei:
+        gw.analysis_finish()  # neither lab's finished job nor lab2's live one: it named no job
+    assert [j["job_id"] for j in ei.value.details["active_jobs"]] == [b["job_id"]]
     with client_session("one"):  # the session that started it gets the outcome
         done = gw.analysis_finish()
         assert done["job_id"] == a["job_id"] and done["state"] == JobState.DONE
@@ -612,6 +642,194 @@ def test_two_profiles_of_the_same_vm_cannot_start_jobs_at_the_same_moment(labs):
     assert gw._ops(gw.runtime("lab")).wait_idle(10)
     assert [j["profile"] for j in gw.list_jobs()["jobs"] if j["state"] != "FAILED"] == ["lab"]
     assert reverts(labs, "lab2") == 0
+
+
+def same_vm(labs) -> None:
+    """lab2 names lab's .vmx: two profiles of one VM (one x64dbg in it)."""
+    labs.set_profile("lab2", vmx=labs.config.profile("lab").vmx)
+
+
+def test_a_restart_through_the_other_profile_of_the_vm_never_kills_its_jobs_debugger(labs):
+    same_vm(labs)
+    gw = labs.gateway()
+    a = start(gw, labs, "lab", "a.exe")
+    labs["lab2"].servers["x64"].stop()
+    with client_session("two"), pytest.raises(StateViolation) as ei:
+        gw.debugger_restart(profile="lab2")
+    assert a["job_id"] in ei.value.message and "debugger_select(profile='lab')" in (ei.value.hint or "")
+    assert labs["lab2"].guest.calls_of("kill_process") == [] and labs["lab2"].launches == []
+    assert gw.get_job(a["job_id"])["state"] == JobState.ANALYZING
+
+
+def test_a_restart_rechecks_the_other_profile_right_before_the_kill(labs):
+    """A job the other profile creates after the first check still stops the kill."""
+    same_vm(labs)
+    gw = labs.gateway()
+    labs["lab2"].servers["x64"].stop()
+    original = labs["lab2"].guest.list_processes
+
+    def job_appears_meanwhile():
+        if not gw.list_jobs()["jobs"]:
+            gw._jobs().create("lab", "C:\\mcp\\jobs")  # as if lab's analysis_start got there first
+        return original()
+
+    labs["lab2"].guest.list_processes = job_appears_meanwhile  # type: ignore[method-assign]
+    with pytest.raises(StateViolation):
+        gw.debugger_restart(profile="lab2")
+    assert labs["lab2"].guest.calls_of("kill_process") == []
+
+
+def test_debugger_calls_through_the_other_profile_of_the_vm_only_read(labs):
+    """The other profile's debugger is the job's debugger: mutating tools only via the job's
+    profile, where the job's epoch guard and crash-loop count apply."""
+    same_vm(labs)
+    gw = labs.gateway()
+    a = start(gw, labs, "lab", "a.exe")
+    with client_session("two"):
+        for call in (lambda: gw.debugger_call("SetBreakpoint", {"address": "0x401000"}, profile="lab2"),
+                     lambda: gw.debugger_call("NoSuchTool", {}, profile="lab2")):  # unknown: mutating
+            with pytest.raises(StateViolation) as ei:
+                call()
+            assert a["job_id"] in ei.value.message and ei.value.next_tool == "debugger_select"
+        assert calls(labs, "lab2", "SetBreakpoint") == 0
+        gw.debugger_select(profile="lab2")
+        with pytest.raises(StateViolation):
+            gw.call_mirrored("run")
+        assert gw.debugger_call("GetDebugState", profile="lab2")["is_error"] is False  # read-only
+    with client_session("one"):
+        assert gw.call_mirrored("SetBreakpoint", {"address": "0x401000"})["profile"] == "lab"
+
+
+def test_a_revert_starts_a_new_epoch_in_every_profile_of_the_vm(labs):
+    same_vm(labs)
+    gw = labs.gateway()
+    before = gw.session_status("lab2")["backends"]["x64"]["epoch"]  # lab2's runtime is built
+    gw.vm_snapshot_revert(profile="lab")
+    assert gw.session_status("lab2")["backends"]["x64"]["epoch"] == before + 1
+    assert gw.session_status("lab")["backends"]["x64"]["epoch"] == before + 1
+
+
+def test_a_revert_bumps_the_other_profile_of_the_vm_before_any_ack(labs):
+    same_vm(labs)
+    gw = labs.gateway()
+    gw.debugger_call("GetDebugState", profile="lab2")  # lab2 known, epoch acknowledged
+    gw.vm_snapshot_revert(profile="lab")
+    with pytest.raises(BackendRestarted):
+        gw.debugger_call("SetBreakpoint", {"address": "0x1"}, profile="lab2")
+
+
+def test_the_status_of_one_profile_neither_shows_nor_consumes_the_other_profiles_operation(labs):
+    same_vm(labs)
+    gw = labs.gateway()
+    started = start(gw, labs, "lab", "a.exe", wait_s=0)
+    assert started["state"] == "in_progress"
+    assert gw._ops(gw.runtime("lab")).wait_idle(10)
+    other = gw.session_status("lab2")["operation"]
+    assert other["profile"] == "lab" and "result" not in other and "lab" in other["note"]
+    replay = start(gw, labs, "lab", "a.exe", wait_s=0)  # repeating the call still gets the outcome
+    assert replay["job_id"] == gw.session_status("lab")["job"]["job_id"]
+    assert gw.session_status("lab")["operation"]["profile"] == "lab"
+
+
+def test_the_other_profile_of_the_vm_never_joins_this_profiles_operation(labs):
+    same_vm(labs)
+    gw = labs.gateway()
+    entered, release = threading.Event(), threading.Event()
+    original = labs["lab"].vm.revert_snapshot
+
+    def slow_revert(name: str) -> None:
+        entered.set()
+        release.wait(10)
+        original(name)
+
+    labs["lab"].vm.revert_snapshot = slow_revert  # type: ignore[method-assign]
+    assert gw.vm_snapshot_revert(profile="lab", wait_s=0)["state"] == "in_progress" and entered.wait(5)
+    try:
+        with pytest.raises(StateViolation):  # same op and key, other profile: refused, not joined
+            gw.vm_snapshot_revert(profile="lab2", wait_s=0)
+    finally:
+        release.set()
+    assert gw._ops(gw.runtime("lab")).wait_idle(10)
+
+
+def test_a_finish_pending_for_another_vm_never_answers_a_finish_of_the_target(labs):
+    gw = labs.gateway()
+    a = start(gw, labs, "lab", "a.exe")
+    gw.analysis_collect()
+    assert gw.analysis_finish(wait_s=0)["state"] == "in_progress"
+    assert gw._ops(gw.runtime("lab")).wait_idle(10)  # its outcome is not delivered yet
+    b = start(gw, labs, "lab2", "b.exe")  # the target is lab2 now
+    gw.analysis_collect()
+    done = gw.analysis_finish()
+    assert done["job_id"] == b["job_id"] and done["state"] == JobState.DONE
+    assert gw.get_job(a["job_id"])["state"] == JobState.DONE
+
+
+def test_a_forgotten_target_is_refused_not_guessed(labs, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_SESSION_TARGETS", 2)
+    gw = labs.gateway()
+    with client_session("old"):
+        start(gw, labs, "lab2", "b.exe")
+    for other in ("a", "b"):
+        with client_session(other):
+            gw.debugger_select(profile="lab")
+    with client_session("old"):
+        with pytest.raises(TargetAmbiguous) as ei:
+            gw.call_mirrored("SetBreakpoint", {"address": "0x401000"})
+        assert "forgot" in ei.value.message and ei.value.next_tool == "debugger_select"
+        assert gw.session_status()["routing"]["profile"] is None
+        gw.debugger_select(profile="lab2")
+        assert gw.call_mirrored("GetDebugState")["profile"] == "lab2"
+    assert calls(labs, "lab", "SetBreakpoint") == calls(labs, "lab2", "SetBreakpoint") == 0
+
+
+def test_a_forgotten_target_with_a_single_profile_needs_no_choice(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_SESSION_TARGETS", 1)
+    labs = make_labs(tmp_path, names=("solo",))
+    try:
+        gw = labs.gateway()
+        with client_session("old"):
+            gw.debugger_select(profile="solo")
+        with client_session("new"):
+            gw.debugger_select(profile="solo")
+        with client_session("old"):
+            assert gw.call_mirrored("GetDebugState")["profile"] == "solo"
+    finally:
+        labs.close()
+
+
+def test_analysis_report_follows_the_session_target(tmp_path):
+    labs = make_labs(tmp_path, default_profile="lab")
+    try:
+        gw = labs.gateway()
+        with client_session("one"):
+            b = start(gw, labs, "lab2", "b.exe")
+            assert gw.analysis_report()["job_id"] == b["job_id"]
+        with client_session("two"):  # no target: the only live job (reading only)
+            assert gw.analysis_report()["job_id"] == b["job_id"]
+            gw.debugger_select(profile="lab")
+            with pytest.raises(StateViolation):
+                gw.analysis_report()  # lab has no jobs yet
+    finally:
+        labs.close()
+
+
+def test_doctor_without_profile_checks_every_vm_when_there_is_no_default(labs):
+    rep = labs.gateway().doctor()
+    names = [c["name"] for c in rep["checks"]]
+    assert rep["profile"] is None and set(rep["profiles"]) == {"lab", "lab2"}
+    assert "lab: vmx" in names and "lab2: vmx" in names
+    assert names.count("host_jobs_root") == 1 and names.count("static_tools") == 1
+    assert rep["ok"] == all(c["ok"] for c in rep["checks"])
+
+
+def test_doctor_without_profile_uses_the_default_when_there_is_one(tmp_path):
+    labs = make_labs(tmp_path, default_profile="lab2")
+    try:
+        rep = labs.gateway().doctor()
+        assert rep["profile"] == "lab2" and "profiles" not in rep
+    finally:
+        labs.close()
 
 
 def test_a_vm_whose_job_state_is_unknown_counts_as_busy(labs):
