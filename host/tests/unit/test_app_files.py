@@ -56,6 +56,18 @@ def test_upload_outside_the_allowed_roots_is_refused(lab, tmp_path):
     assert not lab.guest.calls_of("copy_to_guest")
 
 
+def test_upload_outside_the_allowed_roots_names_the_roots_and_the_setting(lab, tmp_path):
+    """The refusal says which roots are allowed and which config key widens them."""
+    secret = tmp_path / "notes.txt"
+    secret.write_bytes(b"x")
+    with pytest.raises(PathNotAllowed) as ei:
+        lab.gateway().file_upload(str(secret), guest_dir="C:\\Tools")
+    err = ei.value
+    assert str(lab.samples.resolve()) in err.message
+    assert "gateway.upload_roots" in err.message and "gateway.upload_roots" in (err.hint or "")
+    assert err.details["allowed_roots"] == [str(lab.samples.resolve())]
+
+
 @pytest.mark.skipif(not POSIX, reason="symlinks")
 def test_upload_symlink_escaping_the_root_is_refused(lab, tmp_path):
     secret = tmp_path / "secret.txt"

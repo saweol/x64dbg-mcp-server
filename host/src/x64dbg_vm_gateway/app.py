@@ -1883,7 +1883,17 @@ class Gateway(GatewayApp):
         and the gateway's own config / env file are refused: a prompt injected via
         guest output must not be able to make the client ship host secrets.
         """
-        src = policy.host_path_allowed(host_path, list(self.config.upload_roots))
+        try:
+            src = policy.host_path_allowed(host_path, list(self.config.upload_roots))
+        except PathNotAllowed as e:
+            if "allowed_roots" not in e.details:
+                raise
+            listed = ", ".join(str(r) for r in e.details["allowed_roots"]) or "none"
+            e.message = f"host path is outside the allowed upload roots (gateway.upload_roots: {listed})"
+            e.args = (e.message,)
+            e.hint = ("copy the file into one of those folders, or add its folder to gateway.upload_roots in "
+                      "the gateway config (then restart the gateway)")
+            raise
         roots = [r for r in (_resolved(x) for x in self.config.upload_roots) if r is not None]
         containing = [r for r in roots if src.is_relative_to(r)]
         if containing and all(_hidden_below(src, r) for r in containing):
