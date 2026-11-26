@@ -389,7 +389,9 @@ after every job, also allows every tool that only changes the guest; an endpoint
 strict.
 
 On Windows the printed commands are for PowerShell (every argument that is not a plain word is
-single-quoted, including `'--'`); elsewhere they are for a POSIX shell.
+single-quoted, including `'--'`); elsewhere they are for a POSIX shell. PowerShell takes an
+argument whose value is `--%` as its stop-parsing token even when it is quoted, so a command with
+that argument is refused (`CONFIG_INVALID`) instead of printed.
 
 User-specific parts stay as `<...>` placeholders and are listed under `fill in`. Each tool's entry
 also names its install command, its sync script in this installation and its caveats; `setup` ends

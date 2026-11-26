@@ -208,8 +208,19 @@ SHELL_METACHARACTERS = [
     ("1kb", "1kb", "'1kb'"),  # a number (1024) in PowerShell
     ("-Dfoo.bar=1", "-Dfoo.bar=1", "'-Dfoo.bar=1'"),  # Windows PowerShell splits it at the dot
     ("--", "--", "'--'"),  # PowerShell's end-of-parameters token, eaten by .ps1 shims
-    ("--%", "--%", "'--%'"),  # PowerShell's stop-parsing token
 ]
+
+
+def test_powershell_lines_refuse_the_stop_parsing_token():
+    # PowerShell treats an argument whose value is --% as its stop-parsing token even when it is
+    # quoted, and passes the rest of the line to the program re-split (seen with pwsh on the CI
+    # runner): no quoting can pass it unchanged, so a PowerShell line with it is refused.
+    from x64dbg_vm_gateway.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="--%"):
+        cli.shell_join(["claude", "mcp", "add", "x", "--%", "a b"], windows=True)
+    assert cli.shell_join(["claude", "--%"], windows=False) == "claude --%"
+    assert cli.shell_join(["claude", "x--%", "--%x"], windows=True) == "claude 'x--%' '--%x'"
 
 
 @pytest.mark.parametrize(("arg", "posix", "powershell"), SHELL_METACHARACTERS)

@@ -1157,6 +1157,10 @@ POWERSHELL_NOTE = "The commands are for PowerShell (in cmd.exe the quoting diffe
 _PS_BAREWORD_RE = re.compile(r"[A-Za-z/\\][A-Za-z0-9_\-./:=+~\\]*|--?[A-Za-z][A-Za-z0-9-]*")
 
 
+#: PowerShell's stop-parsing token: no quoting passes an argument with this value to a program
+POWERSHELL_STOP_PARSING = "--%"
+
+
 def _windows_host() -> bool:
     return os.name == "nt"
 
@@ -1177,6 +1181,13 @@ def shell_join(argv: Sequence[str], *, windows: bool | None = None) -> str:
     quoting (``powershell_quote``; a quoted program is run with the call operator ``&``)."""
     if not (windows if windows is not None else _windows_host()):
         return shlex.join(argv)
+    if POWERSHELL_STOP_PARSING in argv:
+        # PowerShell takes an argument whose value is --% as its stop-parsing token even when it
+        # is quoted, and hands the rest of the line to the program re-split: no quoting passes it.
+        raise ConfigError(f"a PowerShell command line cannot pass the argument {POWERSHELL_STOP_PARSING!r} "
+                          "unchanged to a program (PowerShell takes it as its stop-parsing token even "
+                          "when quoted)",
+                          hint="change that value (it comes from the config or a --set value)")
     words = [powershell_quote(arg) for arg in argv]
     if words and words[0] != argv[0]:
         words.insert(0, "&")
