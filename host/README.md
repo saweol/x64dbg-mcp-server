@@ -251,23 +251,33 @@ Further behaviour worth knowing:
 One `serve` handles every profile in the config (`--profile` only sets the default), and each
 profile (VM) can have its own live job at the same time. Each VM has its own VM lock, operation
 runner, debugger supervision and epochs: a revert, power change or debugger restart of one VM never
-waits for, reverts or bumps the epochs of another. Two profiles that name the same `.vmx` never have
-live jobs at once.
+waits for, reverts or bumps the epochs of another. Two profiles that name the same `.vmx` share one
+operation runner and never have live jobs at once.
 
 - `analysis_start(profile=...)` makes that VM the *target* of the client session (each MCP session
   has its own; stdio has one). `debugger_select(profile=..., backend_id=...)` switches it.
-- Mirrored x64dbg tools, `debugger_call`, `debugger_restart` and the `vm_*` tools without
-  `profile`, and job tools without `job_id`, go to: the session's target, else the only profile,
-  else the VM with the only live job, else the default profile. With live jobs on several VMs and no
-  target the call is refused with `TARGET_AMBIGUOUS` (the jobs and the `debugger_select` call are
-  in the error); nothing is sent. `debugger_call` and `debugger_restart` also take `profile`.
+- Mirrored x64dbg tools, `debugger_call`, `vm_screenshot`, `vm_snapshots_list` without `profile`
+  and job tools without `job_id` go to: the session's target, else the only profile, else the VM
+  with the only live job, else the default profile. Tools that change a VM or kill a debugger
+  (`vm_snapshot_*`, `vm_power`, `debugger_restart`, `analysis_start`) skip the live-job step:
+  another client's job never picks the VM they change. With live jobs on several VMs and no target
+  the call is refused with `TARGET_AMBIGUOUS` (the jobs and the `debugger_select` call are in the
+  error); nothing is sent. A profile whose job directory is unreadable counts as busy.
+  `debugger_call` and `debugger_restart` also take `profile`.
 - Every mirrored result ends with `[gateway] epoch=N backend=ID profile=NAME retried=...`.
 - `session_status` without `profile` lists every VM compactly (VM, backends, live job, running
-  operation), acknowledges each, and shows the session's `target`, the `routing` decision and the
-  `active_jobs`; with `profile` it shows that VM in full.
+  operation) and shows the session's `target`, the `routing` decision and the `active_jobs`; it
+  acknowledges restarts only on the routed VM. `session_status(profile=...)` shows (and
+  acknowledges) one VM in full; `BACKEND_RESTARTED` from another VM names that call in its hint.
+- A polled `analysis_finish` without `job_id` answers only the client session that started it.
+- Over HTTP a target needs an MCP session (handshake protocol versions, whose session id the SDK
+  validates). Requests of the stateless 2026 protocol keep no target: pass `profile` / `job_id`,
+  or rely on a single live job or the default profile.
 - A `read` HTTP token cannot call `debugger_select` (guest-mutating tier), so while several VMs
   have live jobs its mirrored calls are refused with `TARGET_AMBIGUOUS`; `session_status` still
   shows every VM.
+- `serve` and the CLI accept a config with several profiles and no `default_profile`; commands
+  such as `doctor` then need `--profile`.
 
 ## Static analysis tools
 

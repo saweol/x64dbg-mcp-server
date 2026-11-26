@@ -183,12 +183,17 @@ _PROFILE = _str("Gateway profile (VM) to act on. Omit for this session's target 
 _TARGET_PROFILE = _str("Gateway profile (VM) for this call only. Omit for this session's target VM (set by "
                        "analysis_start or debugger_select), else the VM with the only live job, else the "
                        "default profile.")
-_STATUS_PROFILE = _str("Only this gateway profile (VM), in full detail. Omit for every configured profile "
-                       "(a compact entry per VM when there are several).")
+_CHANGE_PROFILE = _str("Gateway profile (VM) to change. Omit for this session's target VM (set by "
+                       "analysis_start or debugger_select), else the default profile; another client's job "
+                       "never picks the VM, and with live jobs on several VMs the call is refused.")
+_RESTART_PROFILE = _str("Gateway profile (VM) whose debugger to restart. Omit for this session's target VM, "
+                        "else the default profile; another client's job never picks the VM.")
+_STATUS_PROFILE = _str("Only this gateway profile (VM), in full detail; acknowledges its restarts. Omit for "
+                       "every configured profile (a compact entry per VM when there are several).")
 _DOCTOR_PROFILE = _str("Gateway profile (VM) to check. Omit to use the configured default profile.")
 _START_PROFILE = _str("Gateway profile (VM) to analyse in; it becomes this session's target VM. Omit for "
-                      "this session's target VM, else the default profile (required when several VMs are "
-                      "configured and neither is set).")
+                      "this session's target VM, else the default profile (refused when several VMs are "
+                      "configured and neither is set, or while several VMs have live jobs).")
 _JOB_ID = _str("Job id (YYYYMMDD-HHMMSS-xxxxxx); the job decides the VM. Omit to use the active job of "
                "this session's target VM (or the only live job; with live jobs on several VMs and no "
                "target the call is refused).")
@@ -235,9 +240,10 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "mutating debugger tools are accepted again (re-check addresses afterwards). The acknowledgement is "
         "gateway-wide: a call from any client session, read-scope HTTP clients included, clears the restart "
         "guard for every session. With several VMs (profiles) and no profile it reports every VM compactly "
-        "(VM, backends, live job, running operation), acknowledges each, and says which VM this session's "
-        "calls without a profile go to (target, routing, active_jobs). Read-only apart from that "
-        "acknowledgement.",
+        "(VM, backends, live job, running operation) and says which VM this session's calls without a "
+        "profile go to (target, routing, active_jobs); it acknowledges only that VM, so after "
+        "BACKEND_RESTARTED from another VM call session_status(profile=...) for it. Read-only apart from "
+        "that acknowledgement.",
         _obj({"profile": _STATUS_PROFILE}),
     ),
     _def(
@@ -289,7 +295,7 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "running sample). Use names with the gateway prefix (e.g. 'gw-before-unpack'): only such snapshots "
         "can later be removed with vm_snapshot_delete. Side effects: writes a snapshot to the host disk and "
         "briefly pauses the VM; refused while a job is uploading, collecting or reverting.",
-        _obj({"name": _str("Snapshot name; prefer the gateway prefix 'gw-'."), "profile": _PROFILE},
+        _obj({"name": _str("Snapshot name; prefer the gateway prefix 'gw-'."), "profile": _CHANGE_PROFILE},
              ("name",)),
     ),
     _def(
@@ -301,14 +307,15 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "epoch increases. Refused while a job holds uncollected results: run analysis_collect first. "
         "Returns state='in_progress' if not done within wait_s.",
         _obj({"name": _str("Snapshot to revert to. Omit for the profile's clean snapshot."),
-              "profile": _PROFILE, "wait_s": _wait_s("the revert and readiness checks")}),
+              "profile": _CHANGE_PROFILE, "wait_s": _wait_s("the revert and readiness checks")}),
     ),
     _def(
         "vm_snapshot_delete", "Delete VM snapshot",
         "Permanently delete a gateway-created snapshot (its name must start with the gateway prefix, "
         "default 'gw-'). The clean snapshot and every protected snapshot are always refused. Side effects: "
         "IRREVERSIBLE - the snapshot and the guest state it holds are gone.",
-        _obj({"name": _str("Gateway snapshot to delete (prefix 'gw-')."), "profile": _PROFILE}, ("name",)),
+        _obj({"name": _str("Gateway snapshot to delete (prefix 'gw-')."), "profile": _CHANGE_PROFILE},
+             ("name",)),
         idempotent=True,
     ),
     _def(
@@ -321,7 +328,7 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "uploading, collecting or reverting. Returns state='in_progress' if not done within wait_s.",
         _obj({"action": {"type": "string", "enum": ["start", "stop", "suspend", "reset"],
                          "description": "Power action."},
-              "profile": _PROFILE, "wait_s": _wait_s("the power change")}, ("action",)),
+              "profile": _CHANGE_PROFILE, "wait_s": _wait_s("the power change")}, ("action",)),
     ),
     # files
     _def(
@@ -371,7 +378,7 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         "VMs are not touched.",
         _obj({"backend_id": _str("Backend to restart. Omit for the active backend."),
               "reason": _str("Short reason recorded in the job history."),
-              "profile": _TARGET_PROFILE}),
+              "profile": _RESTART_PROFILE}),
     ),
     _def(
         "debugger_call", "Call any debugger tool",

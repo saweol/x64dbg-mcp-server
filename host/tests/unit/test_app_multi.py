@@ -18,10 +18,16 @@ from starlette.testclient import TestClient
 
 from tests.fakes.fake_runtime import make_labs
 from tests.unit.test_http_server import ADMIN_TOKEN, BASE, ENV, LOCAL, cfg, open_session, rpc
-from x64dbg_vm_gateway.app_api import client_session
+from x64dbg_vm_gateway.app_api import STATELESS_SESSION, client_session
 from x64dbg_vm_gateway.contracts import JobState, PowerState
-from x64dbg_vm_gateway.errors import GatewayError, InvalidArgument, StateViolation, TargetAmbiguous
-from x64dbg_vm_gateway.frontends import http_server
+from x64dbg_vm_gateway.errors import (
+    BackendRestarted,
+    GatewayError,
+    InvalidArgument,
+    StateViolation,
+    TargetAmbiguous,
+)
+from x64dbg_vm_gateway.frontends import http_server, mcp_server
 
 
 @pytest.fixture
@@ -244,6 +250,99 @@ def test_vm_tools_follow_the_session_target_and_refuse_when_ambiguous(labs):
         gw.vm_screenshot()
 
 
+def test_vm_changing_tools_never_pick_a_vm_from_another_sessions_job(labs):
+    """Only reading tools and job work follow the only live job; a revert, power change or snapshot
+    without a profile needs the session's target or a default profile."""
+    gw = labs.gateway()
+    with client_session("one"):
+        b = start(gw, labs, "lab2", "b.exe")
+        gw.analysis_collect()  # collected: the policy would let a revert of lab2 through
+    with client_session("nine"):
+        for call in (gw.vm_snapshot_revert, lambda: gw.vm_power("stop"),
+                     lambda: gw.vm_snapshot_take("gw-x"), lambda: gw.vm_snapshot_delete("gw-x")):
+            with pytest.raises(TargetAmbiguous):
+                call()
+        assert gw.vm_screenshot()["profile"] == "lab2"  # observing follows the live job
+    assert reverts(labs, "lab2") == 1 and labs["lab2"].vm.power == PowerState.RUNNING
+    assert gw.get_job(b["job_id"])["state"] == JobState.COLLECTED
+
+
+def test_vm_changing_tools_without_a_target_use_the_default_profile(tmp_path):
+    labs = make_labs(tmp_path, default_profile="lab")
+    try:
+        gw = labs.gateway()
+        with client_session("one"):
+            start(gw, labs, "lab2", "b.exe")
+            gw.analysis_collect()
+        with client_session("nine"):
+            assert gw.vm_snapshot_revert()["snapshot"] == "MCP_CLEAN"
+        assert reverts(labs, "lab") == 1 and reverts(labs, "lab2") == 1
+    finally:
+        labs.close()
+
+
+def test_analysis_start_without_profile_is_refused_while_several_vms_have_jobs(tmp_path):
+    labs = make_labs(tmp_path, names=("lab", "lab2", "lab3"), default_profile="lab3")
+    try:
+        gw = labs.gateway()
+        with client_session("one"):
+            start(gw, labs, "lab", "a.exe")
+        with client_session("two"):
+            start(gw, labs, "lab2", "b.exe")
+        with client_session("nine"), pytest.raises(TargetAmbiguous) as ei:
+            gw.analysis_start(str(labs["lab3"].sample("c.exe")))
+        assert len(ei.value.details["active_jobs"]) == 2
+        assert reverts(labs, "lab3") == 0
+        with client_session("nine"):  # naming the VM is always enough
+            assert start(gw, labs, "lab3", "c.exe")["profile"] == "lab3"
+    finally:
+        labs.close()
+
+
+def test_polling_analysis_finish_answers_only_for_the_finish_this_session_started(labs):
+    gw = labs.gateway()
+    with client_session("one"):
+        a = start(gw, labs, "lab", "a.exe")
+        gw.analysis_collect()
+    with client_session("two"):
+        b = start(gw, labs, "lab2", "b.exe")
+    entered, release = threading.Event(), threading.Event()
+    original = labs["lab"].vm.revert_snapshot
+
+    def slow_revert(name: str) -> None:
+        entered.set()
+        release.wait(10)
+        original(name)
+
+    labs["lab"].vm.revert_snapshot = slow_revert  # type: ignore[method-assign]
+    with client_session("one"):
+        assert gw.analysis_finish(wait_s=0)["state"] == "in_progress" and entered.wait(5)
+    try:
+        with client_session("nine"), pytest.raises(TargetAmbiguous):
+            gw.analysis_finish()  # two live jobs (lab REVERTING, lab2 ANALYZING); not lab's finish
+    finally:
+        release.set()
+    assert gw._ops(gw.runtime("lab")).wait_idle(10)
+    with client_session("nine"), pytest.raises(StateViolation) as ei:
+        gw.analysis_finish()  # the only live job now is lab2's, which is not collected
+    assert not isinstance(ei.value, TargetAmbiguous) and ei.value.details.get("job_id") != a["job_id"]
+    with client_session("one"):  # the session that started it gets the outcome
+        done = gw.analysis_finish()
+        assert done["job_id"] == a["job_id"] and done["state"] == JobState.DONE
+    assert gw.get_job(b["job_id"])["state"] == JobState.ANALYZING
+
+
+def test_selecting_the_same_vm_again_keeps_its_backend(tmp_path):
+    labs = make_labs(tmp_path, backends=("x64", "x32"))
+    try:
+        gw = labs.gateway()
+        gw.debugger_select("x32", profile="lab2")
+        assert gw.debugger_select(profile="lab2")["selected"] == "x32"
+        assert gw.debugger_select(profile="lab")["selected"] == "x64"
+    finally:
+        labs.close()
+
+
 def test_screenshots_without_a_job_name_their_vm(labs):
     gw = labs.gateway()
     one, two = gw.vm_screenshot(profile="lab"), gw.vm_screenshot(profile="lab2")
@@ -347,16 +446,45 @@ def test_session_status_without_profile_lists_every_profile(labs):
     assert one["profile"] == "lab2" and one["job"]["job_id"] == b["job_id"] and "profiles" not in one
 
 
-def test_session_status_without_profile_acknowledges_every_profile(labs):
+def test_session_status_without_profile_acknowledges_only_the_vm_this_session_works_on(labs):
+    """Another client's VM keeps its restart guard: its client still learns of the restart."""
     gw = labs.gateway()
-    start(gw, labs, "lab", "a.exe")
-    start(gw, labs, "lab2", "b.exe")
+    with client_session("one"):
+        start(gw, labs, "lab", "a.exe")
+    with client_session("two"):
+        start(gw, labs, "lab2", "b.exe")
     for p in ("lab", "lab2"):
         gw.runtime(p).supervisor.bump_epoch("x64", "test restart")
-    gw.session_status()
+    with client_session("one"):
+        st = gw.session_status()
+        lab2 = st["profiles"]["lab2"]["backends"]["x64"]
+        assert lab2["acked_epoch"] < lab2["epoch"]
+        assert gw.call_mirrored("SetBreakpoint", {"address": "0x401000"})["profile"] == "lab"
+        with pytest.raises(BackendRestarted) as ei:
+            gw.debugger_call("SetBreakpoint", {"address": "0x401000"}, profile="lab2")
+        assert ei.value.details["profile"] == "lab2" and "session_status(profile='lab2')" in ei.value.hint
+    with client_session("two"):
+        with pytest.raises(BackendRestarted):
+            gw.call_mirrored("SetBreakpoint", {"address": "0x401000"})
+        gw.session_status()
+        assert gw.call_mirrored("SetBreakpoint", {"address": "0x401000"})["profile"] == "lab2"
+
+
+def test_session_status_without_a_routed_vm_acknowledges_nothing(labs):
+    gw = labs.gateway()
+    with client_session("one"):
+        start(gw, labs, "lab", "a.exe")
+    with client_session("two"):
+        start(gw, labs, "lab2", "b.exe")
     for p in ("lab", "lab2"):
-        out = gw.debugger_call("SetBreakpoint", {"address": "0x401000"}, profile=p)
-        assert out["is_error"] is False
+        gw.runtime(p).supervisor.bump_epoch("x64", "test restart")
+    with client_session("three"):
+        st = gw.session_status()
+        assert st["routing"]["profile"] is None
+        assert all(e["backends"]["x64"]["acked_epoch"] < e["backends"]["x64"]["epoch"]
+                   for e in st["profiles"].values())
+        gw.session_status("lab2")  # an explicit profile acknowledges that VM
+        assert gw.debugger_call("SetBreakpoint", {"address": "0x1"}, profile="lab2")["is_error"] is False
 
 
 def test_session_status_reports_a_profile_that_cannot_be_built(labs):
@@ -457,3 +585,86 @@ def test_two_profiles_of_the_same_vm_never_run_jobs_at_once(labs):
     with pytest.raises(StateViolation):
         gw.vm_snapshot_revert(profile="lab2")
     assert reverts(labs, "lab2") == 0
+
+
+def test_two_profiles_of_the_same_vm_cannot_start_jobs_at_the_same_moment(labs):
+    """The check of the other profile's job and the creation of this one's must not interleave:
+    the profiles of one VM share one operation runner."""
+    labs.set_profile("lab2", vmx=labs.config.profile("lab").vmx)
+    gw = labs.gateway()
+    entered, release = threading.Event(), threading.Event()
+    original = labs["lab"].vm.isolation_report
+
+    def slow_isolation():
+        entered.set()
+        release.wait(10)
+        return original()
+
+    labs["lab"].vm.isolation_report = slow_isolation  # type: ignore[method-assign]
+    assert start(gw, labs, "lab", "a.exe", wait_s=0)["state"] == "in_progress" and entered.wait(5)
+    try:
+        with pytest.raises(StateViolation):
+            start(gw, labs, "lab2", "b.exe")
+        with pytest.raises(StateViolation):
+            gw.vm_snapshot_revert(profile="lab2")
+    finally:
+        release.set()
+    assert gw._ops(gw.runtime("lab")).wait_idle(10)
+    assert [j["profile"] for j in gw.list_jobs()["jobs"] if j["state"] != "FAILED"] == ["lab"]
+    assert reverts(labs, "lab2") == 0
+
+
+def test_a_vm_whose_job_state_is_unknown_counts_as_busy(labs):
+    """Fail closed: a job directory that cannot be read may hold a live job, so it can make a call
+    ambiguous but never leaves another VM's job as "the only one"."""
+    gw = labs.gateway()
+    with client_session("one"):
+        start(gw, labs, "lab2", "b.exe")
+    gw.close()
+    corrupt = labs.tmp / "jobs" / "20261123-000000-abcdef"
+    corrupt.mkdir()
+    (corrupt / "state.json").write_text("{not json", encoding="utf-8")
+    (corrupt / "intent.log").write_text(json.dumps({"op": "create", "profile": "lab", "job_id": corrupt.name})
+                                        + "\n", encoding="utf-8")
+    gw = labs.gateway()
+    with client_session("two"), pytest.raises(TargetAmbiguous) as ei:
+        gw.call_mirrored("GetDebugState")
+    states = {j["profile"]: j["state"] for j in ei.value.details["active_jobs"]}
+    assert states["lab"] == "UNKNOWN" and states["lab2"] == "ANALYZING"
+
+
+# ── front-end session keys ──────────────────────────────────────────
+class _Req:
+    def __init__(self, headers: dict[str, str]) -> None:
+        self.headers = headers
+
+
+class _Ctx:
+    def __init__(self, request: object, protocol_version: str) -> None:
+        self.request = request
+        self.protocol_version = protocol_version
+
+
+def test_session_keys_trust_only_sessions_the_sdk_validated():
+    sid = {"mcp-session-id": "abc123"}
+    assert mcp_server.session_key("analyze", _Ctx(None, "2025-06-18")) is None  # stdio / in memory
+    assert mcp_server.session_key("analyze", _Ctx(_Req(sid), "2025-06-18")) == "http:analyze:abc123"
+    assert mcp_server.session_key("admin", _Ctx(_Req(sid), "2025-06-18")) == "http:admin:abc123"
+    # the 2026 protocol has no sessions: its header is the client's own word and keeps nothing
+    assert mcp_server.session_key("analyze", _Ctx(_Req(sid), "2026-07-28")) == STATELESS_SESSION
+    assert mcp_server.session_key("analyze", _Ctx(_Req({}), "2025-06-18")) == STATELESS_SESSION
+
+
+def test_a_stateless_client_keeps_no_target(labs):
+    gw = labs.gateway()
+    with client_session("one"):
+        start(gw, labs, "lab", "a.exe")
+    with client_session(STATELESS_SESSION):
+        start(gw, labs, "lab2", "b.exe")
+        sel = gw.debugger_select(profile="lab2")
+        assert "not kept" in sel["scope"]
+        with pytest.raises(TargetAmbiguous):
+            gw.call_mirrored("GetDebugState")
+        assert gw.debugger_call("GetDebugState", profile="lab2")["profile"] == "lab2"
+    with client_session("one"):
+        assert gw.call_mirrored("GetDebugState")["profile"] == "lab"

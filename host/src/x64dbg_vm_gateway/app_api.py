@@ -38,6 +38,11 @@ CLIENT_SESSION: ContextVar[str | None] = ContextVar("x64dbg_vm_gateway_client_se
 """Key of the client session the current app call comes from (see the module docstring).
 Never part of a tool's arguments: a client cannot name another client's session."""
 
+STATELESS_SESSION = "<stateless>"
+"""``CLIENT_SESSION`` of a call from a client without a session the front-end can vouch for
+(e.g. a stateless HTTP request): it never keeps a target, so each such call is routed on its
+own (explicit profile, the only live job, the default profile, or TARGET_AMBIGUOUS)."""
+
 
 @contextlib.contextmanager
 def client_session(key: str | None) -> Iterator[None]:

@@ -865,11 +865,13 @@ def build_app(
     cache_dir: Path | str | None = None,
 ) -> Gateway:
     """The orchestrator for ``config``. Reads the env file (ConfigError if unusable) and
-    validates ``profile``; runtimes and the job store are created on first use."""
+    validates ``profile``; runtimes and the job store are created on first use. Several
+    profiles need no default: the gateway serves them all (``app`` module docstring)."""
     from .app import Gateway
 
     env = resolve_environ(config, environ)
-    config.profile(profile)  # unknown profile -> ConfigError now, not on first use
+    if profile is not None or len(config.profiles) <= 1:
+        config.profile(profile)  # unknown profile -> ConfigError now, not on first use
 
     def factory(name: str) -> Runtime:
         return build_runtime(config, name, environ=env, clock=clock, cache_dir=cache_dir)
