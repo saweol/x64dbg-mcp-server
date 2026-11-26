@@ -65,6 +65,7 @@ def test_gateway_tool_tiers_match_plan():
         "gateway_doctor": RiskTier.OBSERVE,
         "vm_snapshots_list": RiskTier.OBSERVE,
         "vm_screenshot": RiskTier.OBSERVE,
+        "analysis_report": RiskTier.OBSERVE,  # reads the job directory, writes nothing
         "file_upload": RiskTier.GUEST_MUTATE,
         "debugger_restart": RiskTier.GUEST_MUTATE,
         "debugger_select": RiskTier.GUEST_MUTATE,

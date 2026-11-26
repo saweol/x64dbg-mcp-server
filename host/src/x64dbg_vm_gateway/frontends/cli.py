@@ -7,6 +7,7 @@ Commands::
     status                              session status (VM, backends, job)
     init                                write a config file (wizard, or --non-interactive flags)
     jobs [list | show JOB_ID]           read-only view of the job directories
+    jobs report JOB_ID [--out FILE]     the job's report (Markdown, or --format json)
     discard JOB_ID [--yes]              human-only: mark a job DISCARDED so it may be reverted
     provision --x64dbg-root PATH ...    prepare the guest (plugin config, tasks, auto-logon)
     install-plugin [--dist DIR] ...     copy a plugin build (default: the bundled one) into the guest
@@ -30,7 +31,8 @@ The orchestrator (``wiring.build_app``) and the provisioning module are
 imported lazily inside the commands, so importing this module stays cheap and
 tests can substitute them through ``sys.modules``. ``jobs`` reads the
 ``state.json`` files directly (read-only, no store lock) so it also works while
-a gateway is serving.
+a gateway is serving; ``jobs report`` builds the report from the job directory alone
+(``report.py``) and writes a file only with ``--out``.
 
 A serving gateway holds the jobs root (``JobStore`` process lock). Commands
 that need it (``discard``, ``status``, ``doctor``, ``provision``,
@@ -446,23 +448,57 @@ def _format_jobs(rows: Any) -> str:
                      for row in table)
 
 
+def _load_job(root: Path, job_id_arg: str | None, action: str) -> Job:
+    if not job_id_arg:
+        raise UsageError(f"jobs {action} needs a JOB_ID")
+    job_id = validate_job_id(job_id_arg)
+    state_file = root / job_id / "state.json"
+    if not state_file.is_file():
+        raise JobNotFound(f"job {job_id} not found under {root}", details={"job_id": job_id},
+                          hint=f"run `{PROG} jobs list`")
+    try:
+        return _read_job(state_file)
+    except (OSError, ValueError) as e:
+        raise StateViolation(f"job {job_id} has an unreadable state.json ({type(e).__name__})",
+                             details={"job_id": job_id}) from None
+
+
+def _jobs_report(args: argparse.Namespace, out: _Output, root: Path) -> int:
+    """The job's report (``report.py``) from the job directory, read without the store lock."""
+    from .. import report
+
+    job = _load_job(root, args.job_id, "report")
+    fmt = args.format or ("json" if out.json_mode else "markdown")  # --json: the JSON document by default
+    result = report.job_report(job, root / job.id, fmt=fmt)
+    if args.out:
+        target = Path(args.out).expanduser()
+        text = result["report"] if fmt == "markdown" else _dumps(result["report"]) + "\n"
+        try:
+            _write_private(target, text, replace=True)
+        except OSError as e:
+            raise GatewayError(f"cannot write the report to {target}: {e.strerror or type(e).__name__}",
+                               stage="cli", details={"path": str(target)}) from None
+        out.data({"ok": True, "job_id": job.id, "format": fmt, "path": str(target)},
+                 lambda r: f"wrote the report of job {r['job_id']} to {r['path']}")
+        return EXIT_OK
+    if out.json_mode:
+        out.data({"ok": True, **result})
+    elif fmt == "json":
+        out.data(result["report"])
+    else:
+        out.data(result, lambda r: r["report"].rstrip("\n"))
+    return EXIT_OK
+
+
 def cmd_jobs(args: argparse.Namespace, out: _Output) -> int:
     config = _load_config(args)
     root = config.jobs_root_path
+    if args.action != "report" and (args.out or args.format):
+        raise UsageError("--out and --format only apply to `jobs report JOB_ID`")
+    if args.action == "report":
+        return _jobs_report(args, out, root)
     if args.action == "show":
-        if not args.job_id:
-            raise UsageError("jobs show needs a JOB_ID")
-        job_id = validate_job_id(args.job_id)
-        state_file = root / job_id / "state.json"
-        if not state_file.is_file():
-            raise JobNotFound(f"job {job_id} not found under {root}", details={"job_id": job_id},
-                              hint=f"run `{PROG} jobs list`")
-        try:
-            job = _read_job(state_file)
-        except (OSError, ValueError) as e:
-            raise StateViolation(f"job {job_id} has an unreadable state.json ({type(e).__name__})",
-                                 details={"job_id": job_id}) from None
-        out.data(job.to_json())
+        out.data(_load_job(root, args.job_id, "show").to_json())
         return EXIT_OK
     if args.job_id:
         raise UsageError("jobs list takes no JOB_ID (did you mean `jobs show JOB_ID`?)")
@@ -1611,9 +1647,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(f"--{arch}-token-env", metavar="VAR",
                        help=f"endpoint mode: env var with the {arch} token")
 
-    p = command("jobs", cmd_jobs, "list jobs or show one job (read-only)")
-    p.add_argument("action", nargs="?", choices=("list", "show"), default="list")
+    p = command("jobs", cmd_jobs, "list jobs, show one job or print its report (read-only)")
+    p.add_argument("action", nargs="?", choices=("list", "show", "report"), default="list")
     p.add_argument("job_id", nargs="?", metavar="JOB_ID")
+    p.add_argument("--out", metavar="FILE",
+                   help="report: write it to FILE (0600) instead of printing it, e.g. "
+                        "<jobs_root>/<JOB_ID>/artifacts/report.md")
+    p.add_argument("--format", choices=("markdown", "json"), help="report: markdown (default) or json")
 
     p = command("discard", cmd_discard, "mark a job DISCARDED (human-only) so the VM may be reverted")
     p.add_argument("job_id", metavar="JOB_ID")

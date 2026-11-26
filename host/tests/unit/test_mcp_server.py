@@ -419,6 +419,7 @@ def test_scope_denies_calls_with_forbidden(app, scope, tool, args):
     ("analyze", "ida_import_annotations", {"items": [{"rva": "0x1", "name": "f"}], "module": "a.exe"}),
     ("read", "jobs_list", {"profile": "lab"}),
     ("read", "jobs_show", {"job_id": "20261123-101010-abcdef"}),
+    ("read", "analysis_report", {"job_id": "20261123-101010-abcdef", "format": "json"}),
     ("analyze", "SetBreakpoint", {"address": "0x1"}),
     ("analyze", "analysis_start", {"sample_path": "/s/a.exe"}),
     ("admin", "vm_snapshot_delete", {"name": "gw-job-x"}),
@@ -426,6 +427,16 @@ def test_scope_denies_calls_with_forbidden(app, scope, tool, args):
 def test_scope_allows_permitted_calls(app, scope, tool, args):
     res = drive(mcp_server.build_server(app, scope=scope), lambda c: c.call_tool(tool, args))
     assert res.is_error is False
+
+
+def test_analysis_report_passes_its_arguments_and_refuses_other_formats(app):
+    server = mcp_server.build_server(app, scope="read")
+    out = drive(server, lambda c: c.call_tool("analysis_report", {"format": "json"}))
+    assert out.is_error is False and payload(out)["format"] == "json"
+    assert app.called("analysis_report") == [{"job_id": None, "format": "json"}]
+    bad = drive(server, lambda c: c.call_tool("analysis_report", {"format": "html"}))
+    assert bad.is_error is True and payload(bad)["code"] == "INVALID_ARGUMENTS"
+    assert len(app.called("analysis_report")) == 1
 
 
 def test_unknown_scope_is_rejected(app):

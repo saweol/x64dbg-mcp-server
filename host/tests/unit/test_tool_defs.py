@@ -18,6 +18,7 @@ EXPECTED = {
     "vm_snapshot_delete", "vm_power", "vm_screenshot", "file_upload", "file_download", "debugger_select",
     "debugger_restart", "debugger_call", "analysis_start", "analysis_collect", "analysis_finish",
     "static_rebase", "static_export_annotations", "static_import_annotations", "jobs_list", "jobs_show",
+    "analysis_report",
 }
 #: tools whose GatewayApp method has another name
 METHODS = {"gateway_doctor": "doctor", "jobs_list": "list_jobs", "jobs_show": "get_job"}
@@ -25,7 +26,7 @@ METHODS = {"gateway_doctor": "doctor", "jobs_list": "list_jobs", "jobs_show": "g
 
 def test_exactly_the_gateway_tools_are_defined():
     names = [t.name for t in GATEWAY_TOOLS]
-    assert len(names) == len(set(names))
+    assert len(names) == len(set(names)) == 22
     assert set(names) == EXPECTED
     assert set(TOOLS_BY_NAME) == EXPECTED
     assert tool_defs.GATEWAY_TOOL_NAMES == frozenset(EXPECTED)
@@ -79,6 +80,14 @@ def test_tier_matches_policy_or_local_table(tool):
     else:
         assert tool.tier is tool_defs.LOCAL_TIERS[tool.name]
     assert tool_defs.tool_tier(tool.name) is tool.tier
+
+
+def test_the_report_is_a_read_only_tool():
+    # it only returns text built from the job directory; `jobs report --out FILE` (CLI) writes files
+    tool = TOOLS_BY_NAME["analysis_report"]
+    assert tool.tier is RiskTier.OBSERVE and tool.annotations["readOnlyHint"] is True
+    assert tool.input_schema["properties"]["format"]["enum"] == ["markdown", "json"]
+    assert "untrusted" in tool.description.lower()
 
 
 def test_static_tiers():

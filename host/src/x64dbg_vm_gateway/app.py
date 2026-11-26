@@ -110,7 +110,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from . import ida_sync, policy, static_tools, transfer
+from . import ida_sync, policy, report, static_tools, transfer
 from . import platform as gw_platform
 from .app_api import GatewayApp
 from .catalog import ToolCatalog
@@ -3419,6 +3419,32 @@ class Gateway(GatewayApp):
             "recovery_hint": self._recovery_hint(job) if recovering else None,
             "next_tool": RECOVERY_NEXT_TOOL.get(state) if recovering else None,
         }
+
+    def analysis_report(self, job_id: str | None = None, format: str = "markdown") -> dict[str, Any]:
+        """The report of one job (``report.job_report``), built from its host job directory.
+
+        Default job: the active one of the default profile, else its newest job. Reads files
+        only (no VM or backend access, no operation lock), so it is safe at any time.
+        """
+        if format not in report.REPORT_FORMATS:
+            raise InvalidArgument(f"format must be one of {', '.join(report.REPORT_FORMATS)}",
+                                  details={"format": _clip(format, 40)})
+        store = self._jobs()
+        if job_id:
+            job = store.get(job_id)
+        else:
+            name = self._profile_name(None)
+            try:
+                job = store.active(name)
+            except StateViolation:  # an unreadable job blocks the profile; report the newest readable one
+                job = None
+            if job is None:
+                jobs = store.list(name)
+                if not jobs:
+                    raise StateViolation(f"profile {name} has no jobs yet",
+                                         hint="start one with analysis_start", next_tool="analysis_start")
+                job = jobs[-1]  # oldest first
+        return report.job_report(job, Path(job.host_root), fmt=format)
 
     def close(self) -> None:
         with self._lock:

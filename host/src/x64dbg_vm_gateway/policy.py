@@ -74,6 +74,8 @@ GATEWAY_TOOL_TIERS: Mapping[str, RiskTier] = MappingProxyType({
     "gateway_doctor": RiskTier.OBSERVE,
     "vm_snapshots_list": RiskTier.OBSERVE,
     "vm_screenshot": RiskTier.OBSERVE,
+    # reads the job directory and returns text; writing it to a file is the CLI's (jobs report --out)
+    "analysis_report": RiskTier.OBSERVE,
     "file_upload": RiskTier.GUEST_MUTATE,
     "debugger_restart": RiskTier.GUEST_MUTATE,
     "debugger_select": RiskTier.GUEST_MUTATE,

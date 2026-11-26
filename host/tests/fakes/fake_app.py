@@ -250,6 +250,10 @@ class FakeApp:
         return self._record("get_job", {"job_id": job_id, "state": "ANALYZING", "history": []},
                             job_id=job_id)
 
+    def analysis_report(self, job_id: str | None = None, format: str = "markdown") -> JSON:
+        answer = {"job_id": job_id or "20261123-000000-abcdef", "format": format, "report": "# Report"}
+        return self._record("analysis_report", answer, job_id=job_id, format=format)
+
     # ── human-only ──────────────────────────────────────────────────
     def discard_job(self, job_id: str, actor: str) -> JSON:
         return self._record("discard_job", {"job_id": job_id, "state": "DISCARDED"}, job_id=job_id,

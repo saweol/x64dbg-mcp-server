@@ -157,6 +157,13 @@ class GatewayApp(Protocol):
         ``next_tool``. Raises InvalidJobId / JobNotFound. Changes nothing."""
         ...
 
+    def analysis_report(self, job_id: str | None = None, format: str = "markdown") -> JSON:
+        """{"job_id", "format", "report"}: the job's report (``report.job_report``) as Markdown
+        text (``format="markdown"``) or the JSON document (``"json"``). Default job: the active
+        one, else the newest of the default profile (StateViolation when there is none). Reads
+        the job directory only; changes and writes nothing. InvalidArgument for another format."""
+        ...
+
     # ── human-only (CLI) operations — never exposed as MCP tools ────
     def discard_job(self, job_id: str, actor: str) -> JSON: ...
     def close(self) -> None: ...
