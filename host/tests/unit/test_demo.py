@@ -27,6 +27,7 @@ from x64dbg_vm_gateway.frontends import cli, demo
 from x64dbg_vm_gateway.jobs import JobStore
 
 KERNEL32 = 0x7FFC12340000
+SLEEP = KERNEL32 + 0x1234  # where the fake kernel32.Sleep breakpoint stops
 
 
 def state_text(module: str, address: int = 0x401000) -> str:
@@ -47,6 +48,10 @@ class DemoLab:
         self.work = tmp_path / "cache" / "demo"
         self.configs: list[Any] = []
         self.kernel32_after = {b: 2 for b in backends}  # GetDebugState says kernel32 from this run on
+        #: (backend, runs so far) -> GetDebugState text, overriding the default model
+        self.debug_state: Any = None
+        #: gateway method name -> wrapper(original) applied to every gateway the demo builds
+        self.patches: dict[str, Any] = {}
         monkeypatch.setattr(sample_bundle, "bundle_root", lambda: self.bundle)
         monkeypatch.setattr(demo, "demo_root", lambda: self.work)
         monkeypatch.setattr(cli, "_load_config", lambda args: self.lab.config)
@@ -55,12 +60,16 @@ class DemoLab:
         monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.wiring", wiring)
         for bid in backends:
             self.lab.servers[bid].on_tool("GetDebugState", self._debug_state(bid))
+            # the plugin's EvalExpression answer: "0x{X} ({d})"
+            self.lab.servers[bid].on_tool("EvalExpression", f"0x{SLEEP:X} ({SLEEP})")
 
     def _debug_state(self, bid: str) -> Any:
         srv = self.lab.servers[bid]
 
         def answer(_args: dict[str, Any]) -> str:
             runs = len(srv.tool_calls("run"))
+            if self.debug_state is not None:
+                return self.debug_state(bid, runs)
             if runs >= self.kernel32_after[bid]:
                 return state_text("kernel32.dll", KERNEL32 + 0x1234)
             loaded = srv.tool_calls("LoadBinary")
@@ -74,9 +83,12 @@ class DemoLab:
         original = self.lab.config
         self.lab.config = config
         try:
-            return self.lab.gateway()
+            gw = self.lab.gateway()
         finally:
             self.lab.config = original
+        for method, wrapper in self.patches.items():
+            setattr(gw, method, wrapper(getattr(gw, method)))
+        return gw
 
     def jobs(self) -> list[Any]:
         with JobStore(Path(self.lab.config.jobs_root)) as store:
@@ -306,3 +318,214 @@ def test_demo_poll_reports_a_failed_operation():
     with pytest.raises(demo.OperationFailed) as ei:
         runner.wait({"state": "in_progress", "op_id": "op-2", "op": "analysis_collect"}, "analysis_collect")
     assert ei.value.code == "VM_NOT_READY" and ei.value.hint == "check VMware Tools"
+
+
+# ── the demo only ever cleans up a job this run created (review H) ──
+def test_a_foreign_job_that_blocks_the_start_is_never_touched(dlab64, capsys, monkeypatch):
+    """analysis_start refuses with details.job_id = the EXISTING job: the demo must not adopt it
+    (check_idle is bypassed here, as if the profiles had been resolved differently)."""
+    with JobStore(Path(dlab64.lab.config.jobs_root)) as store:
+        foreign = store.create("lab", "C:\\mcp\\jobs")
+    monkeypatch.setattr(demo, "check_idle", lambda app, profile: None)
+    before = dlab64.reverts()
+    assert run(["--json", "demo", "--arch", "x64"]) == 1
+    (res,) = json.loads(capsys.readouterr().out)["results"]
+    assert res["failed_step"] == "analysis_start" and "STATE_VIOLATION" in res["steps"][0]["detail"]
+    assert res["job_id"] is None and res["leftover"] is None
+    assert not [s for s in res["steps"] if s.get("cleanup")]
+    (job,) = dlab64.jobs()
+    assert job.id == foreign.id and job.state == JobState.CREATED
+    assert [h["to"] for h in job.history] == []  # no collect, no discard, no finish
+    assert dlab64.reverts() == before
+
+
+def test_an_interrupt_cleans_up_the_own_job_and_stops(dlab, capsys):
+    def interrupt_on_run(original: Any) -> Any:
+        def call(tool: str, arguments: Any = None) -> Any:
+            if tool == "run":
+                raise KeyboardInterrupt
+            return original(tool, arguments)
+        return call
+
+    dlab.patches["call_mirrored"] = interrupt_on_run
+    assert run(["demo"]) == 130
+    out = capsys.readouterr().out
+    assert "interrupted" in out and "cleanup: analysis_collect" in out and "cleanup: analysis_finish" in out
+    assert "demo x32" not in out  # no further architecture after an interrupt
+    (job,) = dlab.jobs()
+    assert job.state == JobState.DONE and job.backend_id == "x64"
+
+
+def test_an_interrupt_during_the_cleanup_names_the_job_left_behind(dlab64, capsys):
+    def interrupt(original: Any) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            raise KeyboardInterrupt
+        return call
+
+    def interrupt_on_run(original: Any) -> Any:
+        def call(tool: str, arguments: Any = None) -> Any:
+            if tool == "run":
+                raise KeyboardInterrupt
+            return original(tool, arguments)
+        return call
+
+    dlab64.patches["call_mirrored"] = interrupt_on_run
+    dlab64.patches["analysis_collect"] = interrupt
+    assert run(["--json", "demo", "--arch", "x64"]) == 130
+    (res,) = json.loads(capsys.readouterr().out)["results"]
+    (job,) = dlab64.jobs()
+    assert job.state == JobState.ANALYZING  # left as it is: fail closed
+    left = res["leftover"]
+    assert left["job_id"] == job.id and left["state"] == "ANALYZING"
+    assert left["command"] == f"x64dbg-vm-gateway discard {job.id}"
+    assert "analysis_finish" in left["advice"]
+
+
+def test_a_failed_cleanup_stops_the_next_architecture_and_names_the_job(dlab, capsys):
+    from x64dbg_vm_gateway.errors import VmrunError
+
+    def failing_finish(original: Any) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            raise VmrunError("vmrun revertToSnapshot failed")
+        return call
+
+    dlab.kernel32_after["x64"] = 99
+    dlab.patches["analysis_finish"] = failing_finish
+    assert run(["demo"]) == 1
+    captured = capsys.readouterr()
+    (job,) = dlab.jobs()
+    assert job.state == JobState.COLLECTED and job.backend_id == "x64"  # collected, not reverted
+    assert "demo x32" not in captured.out
+    left = captured.out.split(f"left: job {job.id} (COLLECTED)", 1)
+    assert len(left) == 2 and "analysis_finish" in left[1].splitlines()[0]
+    assert "discard" not in left[1].splitlines()[0]  # a collected job needs no discard
+
+
+def test_the_sleep_stop_is_checked_by_status_and_address(dlab64, capsys):
+    other = KERNEL32 + 0x40  # another kernel32 function stops first
+    stops = {1: state_text("e2e.exe"), 2: state_text("kernel32.dll", other),
+             3: state_text("kernel32.dll", SLEEP)}
+    dlab64.debug_state = lambda bid, runs: stops[runs]
+    assert run(["--json", "demo", "--arch", "x64"]) == 0
+    (res,) = json.loads(capsys.readouterr().out)["results"]
+    names = [s["step"] for s in res["steps"]]
+    assert names[:5] == ["analysis_start", "SetBreakpoint", "run 1/4", "run 2/4", "run 3/4"]
+    assert f"0x{SLEEP:X}" in res["steps"][1]["detail"]  # SetBreakpoint resolved kernel32.Sleep
+    assert "not kernel32.Sleep" in res["steps"][3]["detail"]
+
+
+def test_a_sample_that_still_runs_is_not_run_again(dlab64, capsys):
+    running = "isDebugging: true\nisRunning: true\npid: 4321\nstatus: RUNNING"
+    dlab64.debug_state = lambda bid, runs: running
+    assert run(["--json", "demo", "--arch", "x64"]) == 1
+    (res,) = json.loads(capsys.readouterr().out)["results"]
+    assert res["failed_step"] == "run" and "running" in res["steps"][2]["detail"].lower()
+    assert len(dlab64.lab.servers["x64"].tool_calls("run")) == 1
+
+
+# ── scripted gateway: timeouts and unreadable state (no FakeLab) ────
+SAMPLE_SHA = "1" * 64
+
+
+def scripted(tmp_path: Path, *, op_state: str = "running",
+             job_state: str = "LOADING") -> tuple[FakeApp, Path, dict[str, Any]]:
+    """A FakeApp whose analysis_start creates job J and answers in_progress; the operation stays
+    ``op_state``; J's state is ``job_state`` (changed by the scripted collect / discard / finish)."""
+    import hashlib
+
+    sample = tmp_path / "e2e_sample_x86_64.exe"
+    sample.write_bytes(b"MZ scripted demo sample")
+    sha = hashlib.sha256(sample.read_bytes()).hexdigest()
+    job: dict[str, Any] = {"job_id": "20261126-101010-abcdef", "profile": "lab", "state": job_state,
+                           "sample": {"sha256": sha, "original_name": sample.name}}
+    jobs: list[dict[str, Any]] = []
+    app = FakeApp()
+
+    def start(**_kw: Any) -> dict[str, Any]:
+        jobs.append(job)
+        return {"state": "in_progress", "op_id": "op-1", "op": "analysis_start"}
+
+    def move(to: str, answer: dict[str, Any]) -> Any:
+        def act(**_kw: Any) -> dict[str, Any]:
+            job["state"] = to
+            return {**answer, "state": to}
+        return act
+
+    app.results.update({
+        "analysis_start": start,
+        "list_jobs": lambda **_kw: {"profile": "lab", "jobs": [dict(j) for j in jobs], "corrupt": []},
+        "get_job": lambda **_kw: {**job, "history": []},
+        "session_status": lambda **_kw: {"operation": {"op_id": "op-1", "op": "analysis_start",
+                                                       "state": op_state, "job_id": job["job_id"]}},
+        "analysis_collect": move("COLLECTED_PARTIAL", {"partial": True}),
+        "discard_job": move("DISCARDED", {}),
+        "analysis_finish": move("DONE", {"reverted": True}),
+    })
+    return app, sample, job
+
+
+def quick_run(app: FakeApp, sample: Path) -> dict[str, Any]:
+    """A DemoRun whose waits time out at once (the scripted start answers in_progress)."""
+    runner = demo.DemoRun(app, profile="lab", sleep=lambda s: None, poll_s=0.0, op_timeout_s=0.0)
+    return runner.run("x64", sample)
+
+
+def test_an_in_progress_timeout_leaves_a_running_job_alone_and_names_it(tmp_path):
+    app, sample, job = scripted(tmp_path, op_state="running")
+    res = quick_run(app, sample)
+    assert res["failed_step"] == "analysis_start" and "TIMEOUT" in res["steps"][0]["detail"]
+    assert res["job_id"] == job["job_id"]  # found through session_status + the identity check
+    assert app.called("analysis_collect") == [] and app.called("discard_job") == []
+    assert app.called("analysis_finish") == []
+    left = res["leftover"]
+    assert left["job_id"] == job["job_id"] and "still running" in left["advice"]
+
+
+def test_an_in_progress_timeout_cleans_up_once_the_operation_is_over(tmp_path):
+    app, sample, job = scripted(tmp_path, op_state="done", job_state="ANALYZING")
+    res = quick_run(app, sample)
+    cleanup = [s["step"] for s in res["steps"] if s.get("cleanup")]
+    assert cleanup == ["cleanup: analysis_collect", "cleanup: discard", "cleanup: analysis_finish"]
+    assert job["state"] == "DONE" and res["leftover"] is None
+
+
+def test_a_job_with_another_sample_is_never_adopted(tmp_path):
+    app, sample, job = scripted(tmp_path, op_state="done", job_state="ANALYZING")
+    job["sample"]["sha256"] = SAMPLE_SHA  # the running operation's job holds another sample
+    res = quick_run(app, sample)
+    assert res["job_id"] is None and app.called("analysis_collect") == [] and app.called("discard_job") == []
+
+
+def test_a_job_that_existed_before_the_run_is_never_adopted(tmp_path):
+    app, sample, job = scripted(tmp_path, op_state="done", job_state="ANALYZING")
+    # the job is there before the run starts
+    app.results["list_jobs"] = lambda **_kw: {"profile": "lab", "jobs": [dict(job)], "corrupt": []}
+    res = quick_run(app, sample)
+    assert res["job_id"] is None and app.called("analysis_collect") == []
+
+
+def test_an_unreadable_job_state_is_a_warning_not_a_clean_up(tmp_path):
+    from x64dbg_vm_gateway.errors import StateViolation
+
+    app, sample, job = scripted(tmp_path, op_state="done", job_state="ANALYZING")
+    real_get = app.results["get_job"]
+    calls = {"n": 0}
+
+    def get_job(**kw: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:  # the identity check reads it, then the store fails
+            raise StateViolation("job store unreadable")
+        return real_get(**kw)
+
+    app.results["get_job"] = get_job
+    res = quick_run(app, sample)
+    warn = next(s for s in res["steps"] if s["step"] == "cleanup: job state")
+    assert warn["ok"] is False and "could not read" in warn["detail"]
+    assert res["leftover"]["job_id"] == job["job_id"]
+
+
+def test_discard_only_where_it_is_valid(tmp_path):
+    app, sample, job = scripted(tmp_path, op_state="done", job_state="REVERTING")
+    res = quick_run(app, sample)
+    assert app.called("discard_job") == [] and app.called("analysis_collect") == []
+    assert [s["step"] for s in res["steps"] if s.get("cleanup")] == ["cleanup: analysis_finish"]

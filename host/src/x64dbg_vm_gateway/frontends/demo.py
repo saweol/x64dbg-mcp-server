@@ -31,6 +31,7 @@ Thread-safety: one DemoRun per thread; it calls a thread-safe GatewayApp.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import re
 import shutil
@@ -64,6 +65,16 @@ _MODULE_RE = re.compile(r"^\s*currentModule:\s*(\S+)", re.MULTILINE)
 _ADDRESS_RE = re.compile(r"^\s*currentAddress:\s*(0x[0-9A-Fa-f]+)", re.MULTILINE)
 _STATUS_RE = re.compile(r"^\s*status:\s*(\w+)", re.MULTILINE)
 _NOT_DEBUGGING_RE = re.compile(r"^\s*isDebugging:\s*false", re.MULTILINE | re.IGNORECASE)
+_HEX_RE = re.compile(r"\b0x([0-9A-Fa-f]+)\b")
+#: x64dbg expression for the address the demo breakpoint stops at (EvalExpression)
+SLEEP_EXPRESSION = "kernel32:Sleep"
+#: GetDebugState status words of a stopped debuggee ("LOCKED": plugin builds before the fix)
+_STOPPED = ("PAUSED", "LOCKED")
+#: job states the cleanup collects (and discards when the collection stays incomplete)
+_COLLECTABLE = ("ANALYZING", "COLLECTED_PARTIAL")
+#: job states analysis_finish(revert=true) accepts
+_FINISHABLE = ("COLLECTED", "DISCARDED", "REVERTING")
+PROG = "x64dbg-vm-gateway"
 
 #: what to check when a step fails (shown with the error's own hint)
 STEP_HINTS = {
@@ -184,15 +195,43 @@ class _StepFailed(Exception):
         self.error = error
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _leftover_advice(job_id: str, state: str | None) -> tuple[str | None, str]:
+    """(CLI command, what to do) for a demo job that is still live."""
+    if state in ("COLLECTED", "DISCARDED", "REVERTING"):
+        return None, ("finish it with analysis_finish(revert=true) through the MCP tools, which reverts "
+                      "the VM to the clean snapshot")
+    command = f"{PROG} discard {job_id}"
+    return command, ("finish it through the MCP tools (analysis_collect, then analysis_finish), or run "
+                     f"`{command}` and then analysis_finish(revert=true) through the MCP tools; it holds "
+                     "only the bundled benign sample")
+
+
 class DemoRun:
     """Runs the demo for one architecture against ``app`` (a GatewayApp with ``get_job`` and
-    ``discard_job``). ``on_step(step)`` is called after each step (the CLI prints it)."""
+    ``discard_job``). ``on_step(step)`` is called after each step (the CLI prints it).
 
-    def __init__(self, app: Any, *, on_step: Callable[[dict[str, Any]], None] | None = None,
+    Own job: the demo cleans up only a job this run created. That is the job of a successful
+    ``analysis_start`` answer, or a job found after a failed start (timeout, interrupt) through
+    ``session_status().operation`` or ``list_jobs`` that holds this run's sample (sha256 and
+    original name), belongs to ``profile`` and did not exist before the run started. A job an
+    error names (``details.job_id`` of a refused start is the job that was already there) is never
+    adopted."""
+
+    def __init__(self, app: Any, *, profile: str | None = None,
+                 on_step: Callable[[dict[str, Any]], None] | None = None,
                  poll_s: float | None = None, op_timeout_s: float = OP_TIMEOUT_S,
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic) -> None:
         self.app = app
+        self.profile = profile
         self.on_step = on_step
         self.poll_s = POLL_S if poll_s is None else poll_s
         self.op_timeout_s = op_timeout_s
@@ -208,8 +247,7 @@ class DemoRun:
         deadline = self.monotonic() + self.op_timeout_s
         while self.monotonic() < deadline:
             self.sleep(self.poll_s)
-            status = self.app.session_status()
-            cur = status.get("operation") if isinstance(status, Mapping) else None
+            cur = self._operation()
             if not isinstance(cur, Mapping) or cur.get("op_id") != op_id or cur.get("state") == "running":
                 continue
             if cur.get("state") == "done":
@@ -219,7 +257,81 @@ class DemoRun:
                                                             f"{self.op_timeout_s:g} s",
                                "hint": "poll session_status (x64dbg-vm-gateway status) for its outcome"}, op)
 
+    def _operation(self) -> Mapping[str, Any] | None:
+        status = self.app.session_status(self.profile)
+        cur = status.get("operation") if isinstance(status, Mapping) else None
+        return cur if isinstance(cur, Mapping) else None
+
+    def _operation_running(self) -> str | None:
+        """The name of a gateway operation that still runs, or None (also when it cannot be told)."""
+        try:
+            cur = self._operation()
+        except GatewayError:
+            return None
+        return str(cur.get("op")) if cur is not None and cur.get("state") == "running" else None
+
+    # ── own job ─────────────────────────────────────────────────────
+    def _job_ids(self) -> set[str] | None:
+        """The ids of the profile's jobs now (None when the store cannot be listed)."""
+        try:
+            listing = self.app.list_jobs(self.profile)
+        except GatewayError:
+            return None
+        jobs = listing.get("jobs") if isinstance(listing, Mapping) else None
+        if not isinstance(jobs, list):
+            return None
+        return {str(j.get("job_id")) for j in jobs if isinstance(j, Mapping)}
+
+    def _is_own(self, view: Any, ident: Mapping[str, Any]) -> bool:
+        if not isinstance(view, Mapping) or ident["before"] is None:
+            return False
+        sample = view.get("sample") if isinstance(view.get("sample"), Mapping) else {}
+        return (str(view.get("job_id")) not in ident["before"]
+                and (self.profile is None or view.get("profile") == self.profile)
+                and sample.get("sha256") == ident["sha256"] and sample.get("original_name") == ident["name"])
+
+    def _find_own(self, ident: Mapping[str, Any]) -> tuple[str | None, bool]:
+        """(the job this run created, True if several candidates match). Every candidate is read
+        back with get_job and must pass the identity check."""
+        candidates: list[str] = []
+        try:
+            cur = self._operation()
+        except GatewayError:
+            cur = None
+        if cur is not None and cur.get("op") == "analysis_start" and cur.get("job_id"):
+            candidates.append(str(cur["job_id"]))
+        try:
+            listing = self.app.list_jobs(self.profile)
+        except GatewayError:
+            listing = None
+        for view in (listing.get("jobs") or []) if isinstance(listing, Mapping) else []:
+            if self._is_own(view, ident) and str(view.get("job_id")) not in candidates:
+                candidates.append(str(view.get("job_id")))
+        own: list[str] = []
+        for job_id in candidates:
+            try:
+                view = self.app.get_job(job_id)
+            except GatewayError:
+                continue
+            if self._is_own(view, ident):
+                own.append(job_id)
+        if len(own) > 1:
+            return None, True
+        return (own[0] if own else None), False
+
+    def _job_state(self, job_id: str) -> str | None:
+        try:
+            view = self.app.get_job(job_id)
+        except GatewayError:
+            return None
+        return str(view.get("state")) if isinstance(view, Mapping) and view.get("state") else None
+
     # ── steps ───────────────────────────────────────────────────────
+    def _record(self, steps: list[dict[str, Any]], entry: dict[str, Any]) -> None:
+        steps.append(entry)
+        if self.on_step is not None:
+            self.on_step(entry)
+
     def _step(self, steps: list[dict[str, Any]], name: str, fn: Callable[[], str], *,
               cleanup: bool = False) -> bool:
         started = self.monotonic()
@@ -238,10 +350,15 @@ class DemoRun:
             entry.update(ok=False, detail=f"unexpected {type(e).__name__} (run with --verbose for details)")
             log.debug("demo step %s failed", name, exc_info=True)
         entry["seconds"] = round(self.monotonic() - started, 3)
-        steps.append(entry)
-        if self.on_step is not None:
-            self.on_step(entry)
+        self._record(steps, entry)
         return bool(entry["ok"])
+
+    def _note(self, steps: list[dict[str, Any]], name: str, detail: str, *, ok: bool = False,
+              cleanup: bool = True) -> None:
+        entry: dict[str, Any] = {"step": name, "ok": ok, "seconds": 0.0, "detail": detail}
+        if cleanup:
+            entry["cleanup"] = True
+        self._record(steps, entry)
 
     def _call(self, tool: str, args: Mapping[str, Any] | None = None) -> str:
         res = self.app.call_mirrored(tool, dict(args or {}))
@@ -250,45 +367,63 @@ class DemoRun:
             raise _StepFailed(f"{tool} reported an error: {_short(text) or 'no text'}")
         return text
 
-    def run(self, arch: str, sample: Path) -> dict[str, Any]:
-        """The demo for ``arch`` with the staged ``sample``: ``{"arch", "ok", "sample", "job_id",
-        "seconds", "failed_step", "steps", "hints"}``."""
-        started = self.monotonic()
-        steps: list[dict[str, Any]] = []
-        state: dict[str, Any] = {"job_id": None, "sha256": None, "collected": False, "finished": False}
+    def _sequence(self, steps: list[dict[str, Any]], state: dict[str, Any], ident: Mapping[str, Any],
+                  arch: str, sample: Path) -> str | None:
+        """The demo steps; the name of the failed step, or None."""
 
         def start() -> str:
-            res = self.wait(self.app.analysis_start(str(sample), arch=arch), "analysis_start")
+            res = self.wait(self.app.analysis_start(str(sample), profile=self.profile, arch=arch),
+                            "analysis_start")
             res = res if isinstance(res, Mapping) else {}
-            state["job_id"] = res.get("job_id")
-            info = res.get("sample")
-            state["sha256"] = info.get("sha256") if isinstance(info, Mapping) else None
+            info = res.get("sample") if isinstance(res.get("sample"), Mapping) else {}
+            job_id = res.get("job_id")
+            if job_id and info.get("sha256") == ident["sha256"] and (
+                    ident["before"] is None or str(job_id) not in ident["before"]):
+                state["job_id"] = str(job_id)  # the job this start created
+            elif job_id:
+                raise _StepFailed(f"analysis_start answered with job {job_id}, which does not hold this "
+                                  "demo's sample: it is left alone")
             if res.get("state") != "ANALYZING" or not res.get("loaded"):
-                raise _StepFailed(f"job {res.get('job_id')} is {res.get('state')}, "
-                                  f"loaded={res.get('loaded')}")
+                raise _StepFailed(f"job {job_id} is {res.get('state')}, loaded={res.get('loaded')}")
             if not res.get("paused"):
-                raise _StepFailed(f"job {res.get('job_id')}: the sample was loaded but the debugger did not "
-                                  "report a pause (see its warnings)")
-            return (f"job {res.get('job_id')}: backend {res.get('backend_id')} epoch {res.get('epoch')}, "
-                    "paused at the system breakpoint")
+                raise _StepFailed(f"job {job_id}: the sample was loaded but the debugger did not report a "
+                                  "pause (see its warnings)")
+            return (f"job {job_id}: backend {res.get('backend_id')} epoch {res.get('epoch')}, paused at the "
+                    "system breakpoint")
 
         def breakpoint_() -> str:
             self._call("SetBreakpoint", {"target": DEMO_API})
-            return DEMO_API
+            try:  # where the stop must be: "0x{X} ({d})"; unknown when it cannot be evaluated
+                lines = _lines(self._call("EvalExpression", {"expression": SLEEP_EXPRESSION}))
+                found = _HEX_RE.search(lines[0]) if lines else None
+                value = int(found.group(1), 16) if found else 0
+            except (_StepFailed, GatewayError):
+                value = 0
+            state["sleep_address"] = value or None
+            return f"{DEMO_API} at 0x{value:X}" if value else f"{DEMO_API} (address not resolved)"
 
         def run_once(i: int) -> str:
             self._call("run", {"timeoutMs": RUN_TIMEOUT_MS})
             text = self._call("GetDebugState")
             if _NOT_DEBUGGING_RE.search(text):
                 raise _StepFailed(f"the sample exited before it stopped in {DEMO_API}")
+            status = _STATUS_RE.search(text)
+            word = status.group(1).upper() if status else "UNKNOWN"
+            if word not in _STOPPED:
+                raise _StepFailed(f"the debuggee is {word.lower()} after run(timeoutMs={RUN_TIMEOUT_MS}): "
+                                  "it did not stop in time (not running it again)")
             module = _MODULE_RE.search(text)
             address = _ADDRESS_RE.search(text)
-            status = _STATUS_RE.search(text)
             where = _short(module.group(1), 80) if module else "an unknown module"
-            at = f" at {address.group(1)}" if address else ""
-            detail = f"{(status.group(1) if status else 'stopped').lower()} in {where}{at}"
-            state["in_kernel32"] = bool(module and module.group(1).lower().startswith("kernel32"))
-            if not state["in_kernel32"] and i == MAX_RUNS:
+            at = int(address.group(1), 16) if address else None
+            detail = f"{word.lower()} in {where}" + (f" at 0x{at:X}" if at is not None else "")
+            in_kernel32 = bool(module and module.group(1).lower().startswith("kernel32"))
+            expected = state.get("sleep_address")
+            if in_kernel32 and expected is not None and at != expected:
+                detail += f" (not kernel32.Sleep at 0x{expected:X})"
+                in_kernel32 = False
+            state["in_sleep"] = in_kernel32
+            if not in_kernel32 and i == MAX_RUNS:
                 raise _StepFailed(f"{detail}; not in {DEMO_API} after {MAX_RUNS} runs")
             return detail
 
@@ -306,7 +441,6 @@ class DemoRun:
                                    for e in (res.get("errors") or []) if isinstance(e, Mapping))
                 errors = errors or "see analysis_collect's errors"
                 raise _StepFailed(f"collection is {res.get('state')} (partial): {errors}")
-            state["collected"] = True
             return f"{res.get('file_count', 0)} file(s) collected, manifest {res.get('manifest_path')}"
 
         def finish() -> str:
@@ -317,87 +451,131 @@ class DemoRun:
             state["finished"] = True
             return "job DONE, VM reverted to the clean snapshot"
 
-        failed: str | None = None
         if not self._step(steps, "analysis_start", start):
-            failed = "analysis_start"
-            details = (steps[-1].get("error") or {}).get("details") or {}
-            state["job_id"] = state["job_id"] or details.get("job_id")  # the gateway names the failed job
-        elif not self._step(steps, "SetBreakpoint", breakpoint_):
-            failed = "SetBreakpoint"
-        else:
-            for i in range(1, MAX_RUNS + 1):
-                state["in_kernel32"] = False
-                if not self._step(steps, f"run {i}/{MAX_RUNS}", lambda i=i: run_once(i)):
-                    failed = "run"
-                    break
-                if state["in_kernel32"]:
-                    break
-            if failed is None and not self._step(steps, "GetCallStack", callstack):
-                failed = "GetCallStack"
-            if failed is None and not self._step(steps, "analysis_collect", collect):
-                failed = "analysis_collect"
-            if failed is None and not self._step(steps, "analysis_finish", finish):
-                failed = "analysis_finish"
-        if failed is not None and state["job_id"] and not state["finished"]:
-            self._cleanup(steps, state)
-        hints = self._hints(steps, failed)
+            return "analysis_start"
+        if not self._step(steps, "SetBreakpoint", breakpoint_):
+            return "SetBreakpoint"
+        for i in range(1, MAX_RUNS + 1):
+            state["in_sleep"] = False
+            if not self._step(steps, f"run {i}/{MAX_RUNS}", lambda i=i: run_once(i)):
+                return "run"
+            if state["in_sleep"]:
+                break
+        tail = (("GetCallStack", callstack), ("analysis_collect", collect), ("analysis_finish", finish))
+        for name, fn in tail:
+            if not self._step(steps, name, fn):
+                return name
+        return None
+
+    def run(self, arch: str, sample: Path) -> dict[str, Any]:
+        """The demo for ``arch`` with the staged ``sample``: ``{"arch", "ok", "sample", "job_id",
+        "seconds", "failed_step", "steps", "hints", "leftover", "interrupted"}``. ``leftover`` (else
+        None) names the demo job that is still live and what to do with it."""
+        started = self.monotonic()
+        steps: list[dict[str, Any]] = []
+        ident = {"sha256": _sha256(sample), "name": sample.name, "before": self._job_ids()}
+        state: dict[str, Any] = {"job_id": None, "finished": False, "sleep_address": None}
+        interrupted: BaseException | None = None
+        try:
+            failed = self._sequence(steps, state, ident, arch, sample)
+        except (KeyboardInterrupt, SystemExit) as e:
+            interrupted, failed = e, "interrupted"
+            self._note(steps, "interrupted", f"{type(e).__name__}: the demo was stopped", cleanup=False)
+        leftover: dict[str, Any] | None = None
+        if failed is not None and not state["finished"]:
+            ambiguous = False
+            try:
+                if state["job_id"] is None:
+                    state["job_id"], ambiguous = self._find_own(ident)
+                if state["job_id"] is not None:
+                    self._cleanup(steps, state["job_id"])
+            except (KeyboardInterrupt, SystemExit) as e:
+                interrupted = interrupted or e
+                self._note(steps, "cleanup: interrupted", f"{type(e).__name__}: the cleanup was stopped")
+            leftover = self._leftover(state["job_id"], ambiguous)
         return {
             "arch": arch, "ok": failed is None,
             "sample": {"name": sample.name, "size": sample.stat().st_size if sample.exists() else None,
-                       "sha256": state["sha256"]},
+                       "sha256": ident["sha256"]},
             "job_id": state["job_id"], "seconds": round(self.monotonic() - started, 3),
-            "failed_step": failed, "steps": steps, "hints": hints,
+            "failed_step": failed, "steps": steps, "hints": self._hints(steps, failed, leftover),
+            "leftover": leftover, "interrupted": interrupted is not None,
         }
 
-    def _cleanup(self, steps: list[dict[str, Any]], state: dict[str, Any]) -> None:
-        """Leave the profile free and the VM clean: collect, discard the demo's own job if the
-        collection stays partial, finish with revert. Only the job this run created."""
-        job_id = state["job_id"]
-
-        def job_state() -> str | None:
-            try:
-                view = self.app.get_job(job_id)
-            except GatewayError:
+    def _leftover(self, job_id: str | None, ambiguous: bool) -> dict[str, Any] | None:
+        if job_id is None:
+            if not ambiguous:
                 return None
-            return view.get("state") if isinstance(view, Mapping) else None
+            return {"job_id": None, "state": None, "command": None,
+                    "advice": f"more than one job holds this demo's sample: check `{PROG} jobs list`; the "
+                              "demo touched none of them"}
+        current = self._job_state(job_id)
+        if current in TERMINAL:
+            return None
+        command, advice = _leftover_advice(job_id, current)
+        running = self._operation_running()
+        if running:
+            advice = (f"the gateway operation {running} was still running for it when the demo stopped "
+                      f"(it ends with this process); check `{PROG} status`, then {advice}")
+        if current is None:
+            advice = f"its state could not be read; check `{PROG} jobs show {job_id}`, then {advice}"
+        return {"job_id": job_id, "state": current, "command": command, "advice": advice}
 
-        current = job_state()
-        if current in TERMINAL or current is None:
-            return  # a failed start: the job is FAILED; the next analysis_start reverts the VM
-        if current in ("ANALYZING", "COLLECTED_PARTIAL", "COLLECTING"):
+    def _cleanup(self, steps: list[dict[str, Any]], job_id: str) -> None:
+        """Leave the profile free and the VM clean: collect, discard (only from ANALYZING or
+        COLLECTED_PARTIAL, when the collection did not complete), finish with revert. Only for the
+        job this run created; nothing while a gateway operation still runs."""
+        running = self._operation_running()
+        if running:
+            self._note(steps, "cleanup: skipped",
+                       f"the gateway operation {running} still runs for job {job_id}")
+            return
+        current = self._job_state(job_id)
+        if current is None:
+            self._note(steps, "cleanup: job state",
+                       f"could not read the state of job {job_id}: not cleaned up")
+            return
+        if current in TERMINAL:
+            return  # a failed start: the job is FAILED and the next analysis_start reverts the VM
+        if current in _COLLECTABLE:
             def collect() -> str:
                 res = self.wait(self.app.analysis_collect(job_id), "analysis_collect")
                 return f"job {job_id} is {res.get('state') if isinstance(res, Mapping) else '?'}"
 
             self._step(steps, "cleanup: analysis_collect", collect, cleanup=True)
-            current = job_state()
-        if current not in ("COLLECTED", "DISCARDED"):
+            current = self._job_state(job_id)
+        if current in _COLLECTABLE:
             def discard() -> str:
                 self.app.discard_job(job_id, actor=DISCARD_ACTOR)
                 return (f"job {job_id} (the bundled benign sample only) discarded: its collection did not "
                         "complete")
 
             self._step(steps, "cleanup: discard", discard, cleanup=True)
+            current = self._job_state(job_id)
+        if current in _FINISHABLE:
+            def finish() -> str:
+                res = self.wait(self.app.analysis_finish(job_id, revert=True), "analysis_finish")
+                reverted = res.get("reverted") if isinstance(res, Mapping) else None
+                return f"job {job_id} finished, VM reverted: {reverted}"
 
-        def finish() -> str:
-            res = self.wait(self.app.analysis_finish(job_id, revert=True), "analysis_finish")
-            reverted = res.get("reverted") if isinstance(res, Mapping) else None
-            return f"job {job_id} finished, VM reverted: {reverted}"
-
-        self._step(steps, "cleanup: analysis_finish", finish, cleanup=True)
+            self._step(steps, "cleanup: analysis_finish", finish, cleanup=True)
+        elif current not in TERMINAL:
+            self._note(steps, "cleanup: not finished",
+                       f"job {job_id} is {current}: the demo does not finish it")
 
     @staticmethod
-    def _hints(steps: Sequence[Mapping[str, Any]], failed: str | None) -> list[str]:
+    def _hints(steps: Sequence[Mapping[str, Any]], failed: str | None,
+               leftover: Mapping[str, Any] | None) -> list[str]:
         hints: list[str] = []
         for step in steps:
             err = step.get("error")
             if not step.get("ok") and isinstance(err, Mapping) and err.get("hint"):
                 hints.append(f"{step['step']}: {_short(err['hint'], 300)}")
-        if failed is not None:
+        if failed is not None and failed in STEP_HINTS:
             hints.append(STEP_HINTS[failed])
-        if any(s.get("cleanup") and not s.get("ok") for s in steps):
-            hints.append("the cleanup failed: run `x64dbg-vm-gateway jobs list`; finish or discard the demo "
-                         "job before the next analysis")
+        if leftover is not None:
+            who = f"job {leftover['job_id']}" if leftover.get("job_id") else "a demo job"
+            hints.append(f"{who} is still live: {leftover['advice']}")
         return hints
 
 
@@ -407,10 +585,20 @@ def format_step(step: Mapping[str, Any]) -> str:
     return f"  [{tag}] {step['seconds']:7.1f} s  {step['step']:<26} {step.get('detail') or ''}".rstrip()
 
 
+def format_leftover(left: Mapping[str, Any]) -> str:
+    if left.get("job_id") is None:
+        return f"left: {left['advice']}"
+    return f"left: job {left['job_id']} ({left.get('state') or 'state unknown'}): {left['advice']}"
+
+
 def format_arch(result: Mapping[str, Any]) -> str:
     if result["ok"]:
         return f"demo {result['arch']}: PASS in {result['seconds']:.1f} s (job {result['job_id']})"
-    return f"demo {result['arch']}: FAIL at {result['failed_step']} after {result['seconds']:.1f} s"
+    how = "INTERRUPTED" if result.get("interrupted") else "FAIL"
+    line = f"demo {result['arch']}: {how} at {result['failed_step']} after {result['seconds']:.1f} s"
+    if result.get("leftover"):
+        line += "\n" + format_leftover(result["leftover"])
+    return line
 
 
 def format_result(doc: Mapping[str, Any], *, streamed: bool = False) -> str:
@@ -423,11 +611,14 @@ def format_result(doc: Mapping[str, Any], *, streamed: bool = False) -> str:
             lines.append(format_arch(res))
     archs = ", ".join(r["arch"] for r in doc["results"])
     failed = [r for r in doc["results"] if not r["ok"]]
-    if not failed:
+    skipped = [a for a in doc.get("archs", []) if a not in {r["arch"] for r in doc["results"]}]
+    if not failed and not skipped:
         lines.append(f"demo: PASS ({archs})")
         return "\n".join(lines)
     where = ", ".join(f"{r['arch']} at {r['failed_step']}" for r in failed)
-    lines.append(f"demo: FAIL ({where})")
+    if skipped:
+        where += ("; " if where else "") + f"not run: {', '.join(skipped)}"
+    lines.append(f"demo: {'INTERRUPTED' if any(r.get('interrupted') for r in failed) else 'FAIL'} ({where})")
     hints = [h for r in failed for h in r["hints"]]
     if hints:
         lines.append("hints:")

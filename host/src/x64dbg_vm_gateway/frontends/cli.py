@@ -541,7 +541,7 @@ def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
         with _app(args, demo_config) as app:
             _claim_jobs_root(app)  # LOCK_TIMEOUT while another gateway serves this jobs root
             demo.check_idle(app, prof.name)  # this profile's VM only (another profile is another VM)
-            runner = demo.DemoRun(app, on_step=show if streamed else None)
+            runner = demo.DemoRun(app, profile=prof.name, on_step=show if streamed else None)
             for arch in archs:
                 if streamed:
                     _emit(sys.stdout, f"demo {arch}: {samples[arch].name} (bundled benign sample) on profile "
@@ -550,13 +550,17 @@ def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
                 results.append(res)
                 if streamed:
                     _emit(sys.stdout, demo.format_arch(res))
-                if not res["ok"] and res["job_id"] and res["steps"] and not res["steps"][-1]["ok"] \
-                        and res["steps"][-1].get("cleanup"):
-                    out.note(f"demo: stopping: job {res['job_id']} could not be cleaned up")
+                if res["interrupted"] or res["leftover"] is not None:
+                    # never start the next architecture next to a job the demo could not clean up
+                    out.note("demo: stopped" + (f": job {res['leftover']['job_id']} is left"
+                                                if res["leftover"] and res["leftover"]["job_id"] else ""))
                     break
+    interrupted = any(r["interrupted"] for r in results)
     doc = {"ok": bool(results) and all(r["ok"] for r in results) and len(results) == len(archs),
-           "profile": prof.name, "archs": archs, "results": results}
+           "profile": prof.name, "archs": archs, "results": results, "interrupted": interrupted}
     out.data(doc, lambda d: demo.format_result(d, streamed=True))
+    if interrupted:
+        return 130
     return EXIT_OK if doc["ok"] else EXIT_FAILURE
 
 
