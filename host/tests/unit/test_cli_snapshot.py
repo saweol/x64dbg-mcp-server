@@ -200,8 +200,16 @@ def test_refresh_records_the_old_and_the_new_clean_snapshot(cfg_path, wiring, pr
     assert run(["--config", str(cfg_path), "snapshot", "refresh", "--name", "MCP_CLEAN_2"]) == 0
     conf = gw_config.load_config(cfg_path, environ={})
     entries = snapshot_ledger.entries(conf.jobs_root_path, profile="win10", vmx="/vms/win10/win10.vmx")
-    assert [(e.name, e.source) for e in entries] == [("MCP_CLEAN", "clean_snapshot"),
-                                                     ("MCP_CLEAN_2", "refresh")]
+    # the replaced one was the clean snapshot; the new one is not, until the config says so
+    assert [(e.name, e.source, e.was_clean) for e in entries] == [("MCP_CLEAN", "clean_snapshot", True),
+                                                                  ("MCP_CLEAN_2", "refresh", False)]
+
+
+def test_refresh_with_set_clean_records_the_new_one_as_clean(init_config, wiring, provision, capsys):
+    assert run(["--config", str(init_config), "snapshot", "refresh", "--name", "C2", "--set-clean"]) == 0
+    conf = gw_config.load_config(init_config, environ={})
+    entries = snapshot_ledger.entries(conf.jobs_root_path, profile="win10", vmx="/vms/w10/w10.vmx")
+    assert [(e.name, e.was_clean) for e in entries] == [("MCP_CLEAN", True), ("C2", True)]
 
 
 # ── --set-clean ─────────────────────────────────────────────────────
@@ -261,22 +269,51 @@ def test_set_clean_gives_up_when_the_edit_would_change_more(init_config, wiring,
 # ── the clean snapshot ledger ───────────────────────────────────────
 def test_ledger_keeps_each_snapshot_once_per_profile_and_vm(tmp_path):
     root = tmp_path / "jobs"
-    assert snapshot_ledger.record(root, profile="p", vmx="/v/a.vmx", name="C1", source="provision") is True
-    assert snapshot_ledger.record(root, profile="p", vmx="/v/a.vmx", name="c1", source="refresh") is False
-    assert snapshot_ledger.record(root, profile="p", vmx="/v/b.vmx", name="C1", source="provision") is True
-    assert snapshot_ledger.record(root, profile="q", vmx="/v/a.vmx", name="C2", source="provision") is True
-    assert [e.name for e in snapshot_ledger.entries(root, profile="p", vmx="/v/a.vmx")] == ["C1"]
+    kw = {"profile": "p", "vmx": "/v/a.vmx"}
+    assert snapshot_ledger.record_taken(root, **kw, name="C1", source="provision", clean=True) is True
+    assert snapshot_ledger.record_taken(root, profile="p", vmx="/v/b.vmx", name="C1", source="provision",
+                                        clean=False) is True
+    assert snapshot_ledger.record_taken(root, profile="q", vmx="/v/a.vmx", name="C2", source="provision",
+                                        clean=False) is True
+    assert [e.name for e in snapshot_ledger.entries(root, **kw)] == ["C1"]
     assert [e.name for e in snapshot_ledger.entries(root, profile="q", vmx="/v/a.vmx")] == ["C2"]
     data = json.loads(snapshot_ledger.path_for(root).read_text(encoding="utf-8"))
     assert data["version"] == 1 and len(data["snapshots"]) == 3
+
+
+def test_ledger_a_snapshot_taken_again_under_an_old_name_is_a_new_one(tmp_path):
+    """Review finding: a re-used name must not keep the old entry's place (prune would call the
+    snapshot just taken 'old')."""
+    root = tmp_path / "jobs"
+    kw = {"profile": "p", "vmx": "/v/a.vmx"}
+    snapshot_ledger.mark_clean(root, **kw, name="A")
+    snapshot_ledger.record_taken(root, **kw, name="B", source="refresh", clean=True)
+    snapshot_ledger.record_taken(root, **kw, name="a", source="refresh", clean=False)
+    assert [(e.name, e.was_clean) for e in snapshot_ledger.entries(root, **kw)] == [("B", True), ("a", False)]
+
+
+def test_ledger_mark_clean_adds_or_flags_and_forget_removes(tmp_path):
+    root = tmp_path / "jobs"
+    kw = {"profile": "p", "vmx": "/v/a.vmx"}
+    snapshot_ledger.record_taken(root, **kw, name="C1", source="refresh", clean=False)
+    assert snapshot_ledger.mark_clean(root, **kw, name="c1") is True
+    assert snapshot_ledger.mark_clean(root, **kw, name="C1") is False  # already flagged
+    assert snapshot_ledger.mark_clean(root, **kw, name="C0") is True
+    rows = [(e.name, e.was_clean) for e in snapshot_ledger.entries(root, **kw)]
+    assert rows == [("C1", True), ("C0", True)]
+    snapshot_ledger.forget(root, **kw, names=["c0"])
+    assert [e.name for e in snapshot_ledger.entries(root, **kw)] == ["C1"]
 
 
 def test_ledger_that_cannot_be_read_counts_as_empty_and_is_not_overwritten(tmp_path):
     root = tmp_path / "jobs"
     root.mkdir()
     snapshot_ledger.path_for(root).write_text("{not json", encoding="utf-8")
-    assert snapshot_ledger.entries(root, profile="p", vmx="/v/a.vmx") == []
-    assert snapshot_ledger.record(root, profile="p", vmx="/v/a.vmx", name="C1", source="provision") is False
+    kw = {"profile": "p", "vmx": "/v/a.vmx"}
+    assert snapshot_ledger.entries(root, **kw) == []
+    assert snapshot_ledger.record_taken(root, **kw, name="C1", source="provision", clean=True) is False
+    assert snapshot_ledger.mark_clean(root, **kw, name="C1") is False
+    snapshot_ledger.forget(root, **kw, names=["C1"])
     assert snapshot_ledger.path_for(root).read_text(encoding="utf-8") == "{not json"
 
 
@@ -289,7 +326,7 @@ def test_provision_records_the_clean_snapshot_it_took(cfg_path, wiring, fake, mo
                 "--snapshot", "MCP_CLEAN"]) == 0, capsys.readouterr()
     conf = gw_config.load_config(cfg_path, environ={})
     entries = snapshot_ledger.entries(conf.jobs_root_path, profile="win10", vmx="/vms/win10/win10.vmx")
-    assert [(e.name, e.source) for e in entries] == [("MCP_CLEAN", "provision")]
+    assert [(e.name, e.source, e.was_clean) for e in entries] == [("MCP_CLEAN", "provision", True)]
 
 
 # ── the fake lab: real Gateway, FakeVm, real take_clean_snapshot ────
@@ -305,8 +342,9 @@ def lab(tmp_path, monkeypatch):
     lab.close()
 
 
-def lab_config(lab, tmp_path: Path) -> Path:
-    """The config file the CLI reads: the lab's profile, as `init` would write it."""
+def lab_config(lab, tmp_path: Path, other: dict[str, Any] | None = None) -> Path:
+    """The config file the CLI reads: the lab's profile, as `init` would write it; ``other`` adds
+    a second profile ("other") on the same VM."""
     prof = lab.profile
     doc = {"gateway": {"jobs_root": str(lab.tmp / "jobs"), "default_profile": PROFILE},
            "profiles": {PROFILE: {"mode": "vmware", "vmx": prof.vmx, "clean_snapshot": prof.clean_snapshot,
@@ -314,6 +352,9 @@ def lab_config(lab, tmp_path: Path) -> Path:
                                   "guest_password_env": "GW_TEST_GUEST_PW",
                                   "backends": {"x64": {"port": 9094,
                                                        "config": "C:\\dbg\\x64\\mcp_config.json"}}}}}
+    if other is not None:
+        doc["profiles"]["other"] = {"mode": "vmware", "vmx": prof.vmx, "guest_user": "mcp",
+                                    "guest_password_env": "GW_TEST_GUEST_PW", **other}
     path = tmp_path / "lab.toml"
     header = f"x64dbg-vm-gateway configuration (written by `{cli.PROG} init`)."
     path.write_text(cli.to_toml(doc, header=header), encoding="utf-8")
@@ -349,11 +390,15 @@ def _lab_snapshots(lab, *names: str) -> None:
     lab.vm.snapshots = [Snapshot(n) for n in names]
 
 
-def _ledger(lab, path: Path, *names: str) -> None:
+def _ledger(lab, path: Path, *clean: str, taken: tuple[str, ...] = ()) -> None:
+    """Record ``clean`` as snapshots that were the profile's clean snapshot, ``taken`` as ones a
+    refresh took without making them clean."""
     conf = gw_config.load_config(path, environ={})
-    for name in names:
-        snapshot_ledger.record(conf.jobs_root_path, profile=PROFILE, vmx=lab.profile.vmx, name=name,
-                               source="refresh")
+    kw = {"profile": PROFILE, "vmx": lab.profile.vmx}
+    for name in clean:
+        snapshot_ledger.mark_clean(conf.jobs_root_path, **kw, name=name)
+    for name in taken:
+        snapshot_ledger.record_taken(conf.jobs_root_path, **kw, name=name, source="refresh", clean=False)
 
 
 def test_lab_prune_is_a_dry_run_by_default(lab, tmp_path, capsys):
@@ -396,17 +441,122 @@ def test_lab_prune_keep_zero_still_spares_protected_and_current(lab, tmp_path, c
     assert snapshot_names(lab) == ["BASE", "MCP_CLEAN"]
 
 
-def test_lab_prune_keeps_a_clean_snapshot_newer_than_the_current_one(lab, tmp_path, capsys):
+def test_lab_prune_keeps_a_refreshed_snapshot_that_never_was_the_clean_one(lab, tmp_path, capsys):
     """A refresh without --set-clean: the new snapshot is not in use yet, so it is no "old"
     clean snapshot, not even with --keep 0."""
     path = lab_config(lab, tmp_path)
     _lab_snapshots(lab, "MCP_CLEAN", "BASE", "C_OLD", "C_NEXT")
-    _ledger(lab, path, "C_OLD", "MCP_CLEAN", "C_NEXT")
+    _ledger(lab, path, "C_OLD", "MCP_CLEAN", taken=("C_NEXT",))
     rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
                         capsys)
     assert rc == 0, data
     assert data["deleted"] == ["C_OLD"] and "C_NEXT" in snapshot_names(lab)
-    assert "newer than the current clean" in {s["name"]: s["reason"] for s in data["snapshots"]}["C_NEXT"]
+    assert "never the clean snapshot" in {s["name"]: s["reason"] for s in data["snapshots"]}["C_NEXT"]
+
+
+def test_lab_refresh_with_the_clean_snapshot_missing_is_not_pruned_afterwards(lab, tmp_path, capsys):
+    """Review finding: the configured clean snapshot is gone from the VM (refresh allows that);
+    the snapshot a refresh takes then must not count as old."""
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "BASE")
+    rc = run(["--config", str(path), "snapshot", "refresh", "--name", "V2"])
+    assert rc == 0, capsys.readouterr()
+    capsys.readouterr()
+    lab.gw = lab.gateway()
+    sys.modules["x64dbg_vm_gateway.wiring"] = types.SimpleNamespace(build_app=lambda *a, **kw: lab.gw)
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0, data
+    assert data["deleted"] == [] and snapshot_names(lab) == ["BASE", "V2"]
+
+
+def test_lab_prune_forgets_what_it_deleted(lab, tmp_path, capsys):
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE", "C0")
+    _ledger(lab, path, "C0", "MCP_CLEAN")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0 and data["deleted"] == ["C0"]
+    conf = gw_config.load_config(path, environ={})
+    names = [e.name for e in snapshot_ledger.entries(conf.jobs_root_path, profile=PROFILE,
+                                                     vmx=lab.profile.vmx)]
+    assert names == ["MCP_CLEAN"]
+
+
+def test_lab_prune_never_deletes_what_the_plan_should_not_have_listed(lab, tmp_path, monkeypatch, capsys):
+    """The last guard before each delete: protected and clean names, whatever the plan says."""
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE", "C0")
+    rows = [cli._PruneRow("MCP_CLEAN", "delete", "bad plan"), cli._PruneRow("base", "delete", "bad plan"),
+            cli._PruneRow("C0", "delete", "fine")]
+    monkeypatch.setattr(cli, "_prune_plan", lambda *a, **kw: (rows, 0))
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0 and data["deleted"] == ["C0"] and snapshot_names(lab) == ["MCP_CLEAN", "BASE"]
+
+
+def test_lab_prune_compares_names_without_case(lab, tmp_path, capsys):
+    path = lab_config(lab, tmp_path)
+    _lab_snapshots(lab, "mcp_clean", "base", "C0")
+    _ledger(lab, path, "C0", "mcp_clean", "base")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0 and data["deleted"] == ["C0"] and snapshot_names(lab) == ["mcp_clean", "base"]
+
+
+def test_lab_prune_spares_the_clean_snapshot_of_another_profile_on_the_same_vm(lab, tmp_path, capsys):
+    """Review finding: snapshots belong to the VM, so every profile on it protects its own."""
+    path = lab_config(lab, tmp_path, other={"clean_snapshot": "OTHER_CLEAN", "protected_snapshots": ["KEEP"]})
+    _lab_snapshots(lab, "MCP_CLEAN", "BASE", "OTHER_CLEAN", "KEEP", "C0")
+    _ledger(lab, path, "C0", "OTHER_CLEAN", "KEEP", "MCP_CLEAN")
+    rc, data = json_run(["--config", str(path), "--json", "snapshot", "prune", "--keep", "0", "--yes"],
+                        capsys)
+    assert rc == 0, data
+    assert data["deleted"] == ["C0"]
+    reasons = {s["name"]: s["reason"] for s in data["snapshots"]}
+    assert "other" in reasons["OTHER_CLEAN"] and "other" in reasons["KEEP"]
+
+
+def test_refresh_refuses_an_unfinished_job_of_another_profile_on_the_same_vm(tmp_path, wiring, provision,
+                                                                            fake, capsys):
+    cfg = write_config(tmp_path)
+    text = cfg.read_text(encoding="utf-8") + """
+[profiles.second]
+mode = "vmware"
+vmx = "/vms/win10/win10.vmx"
+clean_snapshot = "SECOND_CLEAN"
+guest_user = "analyst"
+guest_password_env = "GW_TEST_GUEST_PW"
+"""
+    cfg.write_text(text, encoding="utf-8")
+    fake.results["list_jobs"] = {"profile": None, "corrupt": [],
+                                 "jobs": [{"job_id": JOB_A, "profile": "second", "state": "ANALYZING"},
+                                          {"job_id": JOB_B, "profile": "elsewhere", "state": "ANALYZING"}]}
+    rc, data = json_run(["--config", str(cfg), "--json", "snapshot", "refresh", "--name", "NEW"], capsys)
+    assert rc == 1 and JOB_A in data["error"]["message"] and JOB_B not in data["error"]["message"]
+    assert provision.calls == []
+
+
+def test_lab_refresh_refuses_a_second_vm_instance(tmp_path, monkeypatch, capsys):
+    """The real doctor's single_vm_instance check (an orphan vmware-vmx process) stops a refresh."""
+    from tests.fakes.fake_vm_instances import InstanceVm
+
+    lab = make_lab(tmp_path / "lab", protected_snapshots=("MCP_CLEAN", "BASE"))
+    try:
+        vm = InstanceVm()
+        vm.ip, vm.snapshots = lab.vm.ip, list(lab.vm.snapshots)
+        vm.add_orphan()
+        lab.vm = vm
+        gw = lab.gateway()
+        wiring_mod = types.SimpleNamespace(build_app=lambda *a, **kw: gw)
+        monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.wiring", wiring_mod)
+        monkeypatch.setitem(sys.modules, "x64dbg_vm_gateway.provision", real_provision)
+        path = lab_config(lab, tmp_path)
+        rc = run(["--config", str(path), "snapshot", "refresh", "--name", "NEW"])
+        err = capsys.readouterr().err
+        assert rc == 1 and "single_vm_instance" in err and "NEW" not in snapshot_names(lab)
+    finally:
+        lab.close()
 
 
 def test_lab_prune_spares_the_live_jobs_snapshots(lab, tmp_path, capsys):

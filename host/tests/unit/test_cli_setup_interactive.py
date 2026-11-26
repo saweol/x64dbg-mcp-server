@@ -34,7 +34,16 @@ PASSWORD = "lab-only pw'1"  # noqa: S105 - a test value (a space and a quote: th
 PW_ENV = cli.DEFAULT_PASSWORD_ENV
 USER_ENV = cli.DEFAULT_USER_ENV
 ROOT = "C:\\Users\\analyst\\Desktop\\x64dbg\\release"
-ALL_GREEN = {"ok": True, "checks": [{"name": "vmrun", "ok": True, "detail": "/usr/bin/vmrun", "hint": None}]}
+#: a vmware doctor always reports guest_credentials: only a pass lets setup save the password
+CREDENTIALS_OK = {"name": "guest_credentials", "ok": True, "detail": "1 guest processes listed", "hint": None}
+ALL_GREEN = {"ok": True, "checks": [{"name": "vmrun", "ok": True, "detail": "/usr/bin/vmrun", "hint": None},
+                                   CREDENTIALS_OK]}
+REFUSED = {"ok": False, "checks": [{"name": "guest_credentials", "ok": False,
+                                    "detail": "GUEST_AUTH_FAILED: invalid user name or password",
+                                    "hint": "x"}]}
+VM_OFF = {"ok": False, "checks": [
+    {"name": "vm_power", "ok": False, "detail": "VM is off", "hint": "start it"},
+    {"name": "guest_credentials", "ok": False, "detail": "skipped: the VM is not running", "hint": None}]}
 FOUND = [{"root": ROOT,
           "x64": {"exe": True, "plugin": {"present": False}, "config": {"state": "missing"}, "ready": False},
           "x32": {"exe": True, "plugin": {"present": False}, "config": {"state": "missing"}, "ready": False}}]
@@ -199,7 +208,8 @@ def test_first_run_asks_for_the_four_values_and_saves_the_credentials(
     # the config: the chosen VM, the credentials through the env file
     conf = gw_config.load_config(path, environ={})
     prof = conf.profile()
-    assert prof.vmx == str(vm_file) and prof.guest_user is None and prof.guest_user_env == USER_ENV
+    # the profile names the user itself: the password file is written only once the guest accepts it
+    assert prof.vmx == str(vm_file) and prof.guest_user == "analyst" and prof.guest_user_env is None
     assert prof.guest_password_env == PW_ENV
     assert prof.backends[0].exe == f"{ROOT}\\x64\\x64dbg.exe"
     env_file = environment / "win10.env"
@@ -207,7 +217,10 @@ def test_first_run_asks_for_the_four_values_and_saves_the_credentials(
     assert env_values(env_file) == {USER_ENV: "analyst", PW_ENV: PASSWORD}
     if POSIX:
         assert mode(env_file) == 0o600
-    # the search used the typed credentials; provisioning got them through the env file
+    # what a later `serve` resolves from the config alone (no environment): user and password
+    later = envfile.resolve_environ(conf, {})
+    assert later[USER_ENV] == "analyst" and later[PW_ENV] == PASSWORD
+    # the search used the typed credentials; this run's provisioning got them too
     assert guest.opened == [{"vmx": str(vm_file), "vmrun": "auto", "user": "analyst", "password": PASSWORD}]
     (prov,) = called(provision, "provision_guest")
     assert prov["user"] == "analyst" and prov["password"].reveal() == PASSWORD
@@ -517,7 +530,12 @@ def test_password_file_values_read_back_unchanged(tmp_path, value):
     assert envfile.read_env_file(target) == {PW_ENV: value}
 
 
-@pytest.mark.parametrize("value", ["two\nlines", "cr\rhere", "nul\x00"])
+#: every character str.splitlines (the env file reader) ends a line at, and NUL
+UNSTORABLE = ["two\nlines", "cr\rhere", "nul\x00", "vt\x0bhere", "ff\x0chere", "fs\x1chere", "gs\x1dhere",
+              "rs\x1ehere", "nel\x85here", "ls here", "ps here"]
+
+
+@pytest.mark.parametrize("value", UNSTORABLE)
 def test_password_file_refuses_values_it_cannot_store(tmp_path, value):
     with pytest.raises(cli.UsageError):
         cli.write_password_file(tmp_path / "x.env", [(PW_ENV, value)], profile="win10", force=False)
@@ -557,3 +575,214 @@ def test_password_file_acl_failure_on_windows_is_reported_not_raised(tmp_path):
                                          environ={"USERNAME": "analyst"}) is False
     assert gw_platform.restrict_to_owner(tmp_path / "x.env", system="Windows", run=failing,
                                          environ={}) is False
+
+
+# ── review findings: the password is saved only once the guest accepted it ──
+@pytest.mark.usefixtures("bundle")
+def test_a_password_the_guest_refuses_is_not_saved_and_is_asked_again(
+        tmp_path, environment, terminal, guest, wiring, provision, fake, vm_file, capsys):
+    fake.results["doctor"] = REFUSED
+    terminal.passwords = ["wrong"]
+    terminal.answers = [""]  # yes, save it
+    path = tmp_path / "config.toml"
+    flags = ["--vmx", str(vm_file), "--guest-user", "analyst", "--x64dbg-root", ROOT]
+    rc = run(["--config", str(path), "setup", *flags])
+    captured = capsys.readouterr()
+    assert rc == 1
+    target = environment / "win10.env"
+    assert not target.exists()  # the precheck refused it before anything was saved
+    assert "not saved" in captured.out and "refused" in captured.out
+    assert "wrong" not in captured.out + captured.err
+    assert Path(gw_config.load_config(path, environ={}).env_file) == target  # the config names the file
+    assert called(provision, "provision_guest") == []
+    # the next run asks again (the file is missing) and saves it there once the guest accepts it
+    fake.results["doctor"] = ALL_GREEN
+    terminal.passwords = [PASSWORD]
+    terminal.answers = [""]
+    rc = run(["--config", str(path), "setup"])
+    assert rc == 0, capsys.readouterr()
+    assert env_values(target) == {PW_ENV: PASSWORD}  # the config names the user (guest_user)
+    assert envfile.resolve_environ(gw_config.load_config(path, environ={}), {})[PW_ENV] == PASSWORD
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_password_the_guest_could_not_check_is_not_saved(tmp_path, environment, terminal, wiring, provision,
+                                                           fake, vm_file, capsys):
+    fake.results["doctor"] = VM_OFF
+    terminal.passwords = [PASSWORD]
+    terminal.answers = [""]
+    rc = run(["--config", str(tmp_path / "config.toml"), "--json", "setup", "--vmx", str(vm_file),
+              "--guest-user", "analyst", "--x64dbg-root", ROOT])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 1 and not (environment / "win10.env").exists()
+    pf = data["password_file"]
+    assert pf["status"] == "not_written" and "not running" in pf["reason"]
+
+
+@pytest.mark.usefixtures("bundle")
+def test_the_config_is_written_before_the_password_file(tmp_path, environment, wiring, provision, vm_file,
+                                                        monkeypatch, capsys):
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+
+    def broken(*a: Any, **kw: Any) -> Any:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "_write_setup_config", broken)
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file"])
+    assert rc == 1 and not (environment / "win10.env").exists() and wiring.calls == []
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_configured_env_file_that_is_missing_stops_a_non_interactive_run_early(tmp_path, wiring,
+                                                                                 monkeypatch, capsys):
+    cfg = _config_with_env_file(tmp_path, tmp_path / "missing.env")
+    monkeypatch.setenv("GW_TEST_GUEST_PW", PASSWORD)
+    assert run(["--config", str(cfg), "setup"]) == 1
+    err = capsys.readouterr().err
+    assert "missing.env" in err and "--save-password-file" in err and wiring.calls == []
+
+
+@pytest.mark.usefixtures("bundle")
+def test_the_search_uses_the_password_of_the_env_file(tmp_path, terminal, guest, wiring, provision, capsys):
+    env_file = tmp_path / "lab.env"
+    env_file.write_text("GW_TEST_GUEST_PW=from-the-file\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    cfg = _config_with_env_file(tmp_path, env_file)
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace(
+        "config = 'C:\\x64dbg\\release\\x64\\mcp_config.json'", "config = 'C:\\elsewhere\\mcp_config.json'"),
+        encoding="utf-8")  # the root cannot be derived: setup asks for it
+    terminal.answers = ["", "1"]  # search, pick the first
+    rc = run(["--config", str(cfg), "setup"])
+    assert rc == 0, capsys.readouterr()
+    assert terminal.password_prompts == []
+    assert [o["password"] for o in guest.opened] == ["from-the-file"]
+
+
+@pytest.mark.usefixtures("bundle")
+def test_save_password_file_on_a_terminal_asks_for_a_password_that_is_not_exported(
+        tmp_path, terminal, wiring, provision, capsys):
+    env_file = tmp_path / "lab.env"
+    env_file.write_text("GW_TEST_GUEST_PW=stale\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    cfg = _config_with_env_file(tmp_path, env_file)
+    terminal.passwords = [PASSWORD]
+    rc = run(["--config", str(cfg), "setup", "--save-password-file", "--force"])
+    assert rc == 0, capsys.readouterr()
+    assert terminal.password_prompts and env_values(env_file) == {"GW_TEST_GUEST_PW": PASSWORD}
+
+
+@pytest.mark.usefixtures("bundle")
+def test_run_only_user_is_not_saved_in_the_password_file(tmp_path, wiring, provision, monkeypatch, capsys):
+    """--user names the account for this run's provisioning only; the file keeps the profile's."""
+    cfg = tmp_path / "qs.toml"
+    cfg.write_text(f"""
+[gateway]
+jobs_root = "{(tmp_path / 'jobs').as_posix()}"
+default_profile = "lab"
+
+[profiles.lab]
+mode = "vmware"
+vmx = "/vms/lab/lab.vmx"
+clean_snapshot = "MCP_CLEAN"
+guest_user_env = "GW_QS_USER"
+guest_password_env = "GW_QS_PW"
+
+[profiles.lab.backends.x64]
+port = 9094
+config = 'C:\\x64dbg\\release\\x64\\mcp_config.json'
+""", encoding="utf-8")
+    monkeypatch.setenv("GW_QS_USER", "labuser")
+    monkeypatch.setenv("GW_QS_PW", PASSWORD)
+    target = tmp_path / "lab.env"
+    rc = run(["--config", str(cfg), "setup", "--user", "someone-else", "--save-password-file", str(target)])
+    assert rc == 0, capsys.readouterr()
+    assert env_values(target) == {"GW_QS_USER": "labuser", "GW_QS_PW": PASSWORD}
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_password_file_that_cannot_be_restricted_is_not_written(tmp_path, environment, wiring, provision,
+                                                                  vm_file, monkeypatch, capsys):
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+    monkeypatch.setattr(gw_platform, "restrict_to_owner", lambda path, **kw: False)
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert not (environment / "win10.env").exists()
+    assert "warning:" in out and "not saved" in out
+
+
+def test_write_password_file_never_puts_the_secret_in_an_unrestricted_file(tmp_path, monkeypatch):
+    seen: list[bytes] = []
+
+    def refuse(path: Path, **kw: Any) -> bool:
+        seen.append(Path(path).read_bytes())  # what the file holds while it is not restricted yet
+        return False
+
+    monkeypatch.setattr(gw_platform, "restrict_to_owner", refuse)
+    with pytest.raises(cli.ConfigError):
+        cli.write_password_file(tmp_path / "x.env", [(PW_ENV, PASSWORD)], profile="win10", force=False)
+    assert seen == [b""] and not (tmp_path / "x.env").exists()
+
+
+@pytest.mark.usefixtures("bundle")
+def test_dry_run_lists_an_existing_password_file_as_a_problem(tmp_path, wiring, provision, vm_file,
+                                                              monkeypatch, capsys):
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+    target = tmp_path / "lab.env"
+    target.write_text("X=1\n", encoding="utf-8")
+    rc, out = run(["--config", str(tmp_path / "c.toml"), "--json", "setup", "--dry-run",
+                   *new_config_flags(vm_file), "--save-password-file", str(target)]), capsys.readouterr().out
+    data = json.loads(out)
+    assert rc == 1 and any("exists already" in p["message"] for p in data["problems"])
+    assert data["steps"][0]["status"] == "planned"  # the rest of the plan is still shown
+
+
+@pytest.mark.usefixtures("bundle")
+def test_a_password_file_path_that_is_a_folder_is_refused(tmp_path, wiring, provision, vm_file, monkeypatch,
+                                                          capsys):
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+    rc = run(["--config", str(tmp_path / "c.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file", str(tmp_path), "--force"])
+    assert rc == 1 and "not a file" in capsys.readouterr().err and wiring.calls == []
+
+
+def test_password_file_update_of_a_file_that_is_not_utf8_is_refused(tmp_path):
+    target = tmp_path / "x.env"
+    target.write_bytes(b"A=\xff\n")
+    with pytest.raises(cli.ConfigError):
+        cli.write_password_file(target, [(PW_ENV, PASSWORD)], profile="win10", force=True)
+    assert target.read_bytes() == b"A=\xff\n"
+
+
+def test_an_empty_upload_root_is_refused(tmp_path, vm_file):
+    assert run(["--config", str(tmp_path / "c.toml"), "init", "--non-interactive", "--vmx", str(vm_file),
+                "--guest-user", "u", "--x64dbg-root", ROOT, "--upload-root", ""]) == 2
+    assert not (tmp_path / "c.toml").exists()
+
+
+def test_odd_answers_are_asked_again(tmp_path, terminal, guest, wiring, provision, vm_file, monkeypatch,
+                                     capsys):
+    monkeypatch.setattr(vm_inventory, "running_vms", lambda runner: [str(vm_file)])
+    terminal.answers = ["\u00b2", f'"{vm_file}"']  # a superscript two, then a pasted quoted path
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "cancelled" in err and "unexpected" not in err  # end of input at the next question
+    assert "Guest user" in err  # the quoted path was taken
+
+
+def test_a_password_prompt_that_would_echo_is_refused(tmp_path, terminal, wiring, vm_file, monkeypatch,
+                                                      capsys):
+    import getpass as getpass_module
+    import warnings
+
+    def echoing(prompt: str = "", stream: Any = None) -> str:
+        warnings.warn("Can not control echo on the terminal.", getpass_module.GetPassWarning, stacklevel=2)
+        return PASSWORD
+
+    monkeypatch.setattr("getpass.getpass", echoing)
+    terminal.answers = ["analyst"]
+    rc = run(["--config", str(tmp_path / "c.toml"), "setup", "--vmx", str(vm_file), "--x64dbg-root", ROOT])
+    err = capsys.readouterr().err
+    assert rc == 2 and "echo" in err and PW_ENV in err and not (tmp_path / "c.toml").exists()
