@@ -15,6 +15,8 @@ plus the VM provider, so it is unit-testable with FakeGuest / FakeVm.
   every replaced build up once in ``<root>\\<arch>\\plugins_backup``, never in
   ``plugins\\``), relaunches the debuggers through the logon tasks and reports
   what answers.
+- :func:`take_clean_snapshot` takes a new clean snapshot of the running guest after the
+  same readiness wait (``snapshot refresh``; never replaces a snapshot).
 - :func:`guest_boot_time` reads the guest's ``LastBootUpTime``; the reboot wait
   compares it, together with the guest's uptime, with the values read before the
   reboot (E2).
@@ -129,6 +131,7 @@ __all__ = [
     "install_plugin",
     "packaged_provision_script",
     "provision_guest",
+    "take_clean_snapshot",
 ]
 
 log = logging.getLogger(__name__)
@@ -1180,6 +1183,43 @@ def _clean_guest_tmp(channel: GuestChannel) -> int:
             log.warning("stale guest helper file %s could not be removed before the snapshot (%s)",
                         path, exc.code)
     return removed
+
+
+def take_clean_snapshot(
+    runtime: RuntimeLike,
+    name: str,
+    *,
+    wait_ready_s: float = 60.0,
+    http_probe: HttpProbe | None = None,
+    poll_s: float = 5.0,
+    probe_timeout_s: float = 3.0,
+) -> dict[str, Any]:
+    """Take ``name`` as a new clean snapshot of the guest as it is now (``snapshot refresh``).
+
+    The same steps ``provision_guest`` ends with: the name must be free (an existing snapshot is
+    never replaced, protected or not); VMware Tools, the guest IP and every backend port must
+    answer (HTTP 200, 401 or 429) within ``wait_ready_s``, else VmNotReady; stale PowerShell
+    helper files are removed from the guest temp folder; then the snapshot is taken. The caller
+    holds the VM write lock, has paused supervision and has checked that no job is live (a
+    clean snapshot must not contain a sample). ``http_probe`` defaults to
+    :func:`default_http_probe`.
+    """
+    plan = _plan_snapshot(runtime, name, overwrite=False)
+    if plan.error is not None:
+        raise plan.error
+    wait_ready_s = _positive("wait_ready_s", wait_ready_s)
+    poll_s = _positive("poll_s", poll_s)
+    probe_timeout_s = _positive("probe_timeout_s", probe_timeout_s)
+    targets = {b.id: b.port for b in runtime.backends.values() if b.port is not None}
+    start = runtime.clock.monotonic()
+    obs = _wait_up(runtime, targets, deadline=start + wait_ready_s, poll_s=poll_s,
+                   probe=http_probe or default_http_probe, probe_timeout_s=probe_timeout_s, stage="snapshot",
+                   timeout_s=wait_ready_s)
+    ready_s = round(runtime.clock.monotonic() - start, 1)
+    cleaned = _clean_guest_tmp(runtime.channel)
+    snapshot = _take_snapshot(runtime, plan.name, False)
+    return {"snapshot": snapshot, "ready_s": ready_s, "readiness": dict(obs.statuses),
+            "cleaned_guest_tmp": cleaned}
 
 
 # ── plugin deployment ───────────────────────────────────────────────

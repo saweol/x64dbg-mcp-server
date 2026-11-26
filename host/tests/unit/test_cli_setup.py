@@ -20,7 +20,7 @@ from tests.fakes.fake_app import FakeApp
 from tests.unit.test_cli import _fake_bundle, run, write_config
 from x64dbg_vm_gateway import config as gw_config
 from x64dbg_vm_gateway import platform as gw_platform
-from x64dbg_vm_gateway import plugin_bundle
+from x64dbg_vm_gateway import plugin_bundle, vm_inventory
 from x64dbg_vm_gateway import provision as real_provision
 from x64dbg_vm_gateway.contracts import Secret
 from x64dbg_vm_gateway.errors import GuestOperationError, LockTimeout
@@ -50,6 +50,14 @@ def posix_host(monkeypatch) -> None:
     """The printed commands follow the host's shell: the tests pin a POSIX host (CI runs them on
     Windows too); the Windows tests set ``_windows_host`` to True themselves."""
     monkeypatch.setattr(cli, "_windows_host", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def no_terminal(monkeypatch) -> None:
+    """stdin is not a terminal (also under ``pytest -s``): setup asks nothing here; its questions
+    are tested in test_cli_setup_interactive. ``vmrun list`` is never run."""
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(vm_inventory, "running_vms", lambda runner: [])
 
 
 @pytest.fixture
@@ -543,6 +551,21 @@ def test_setup_creates_the_config_first(tmp_path, wiring, provision, capsys):
     assert wiring.calls[0]["config"].profile().vmx == "/vms/w10/w10.vmx"
 
 
+@pytest.mark.usefixtures("wiring", "provision", "ready", "vmrun_found")
+def test_setup_new_config_takes_the_upload_roots(tmp_path, capsys):
+    path = tmp_path / "config.toml"
+    samples = tmp_path / "samples"
+    assert run(["--config", str(path), "setup", *INIT_FLAGS, "--upload-root", str(samples)]) == 0, \
+        capsys.readouterr()
+    assert gw_config.load_config(path, environ={}).upload_roots == (str(samples),)
+
+
+@pytest.mark.usefixtures("wiring", "provision", "ready")
+def test_setup_upload_root_with_an_existing_config_is_not_used(cfg_path, capsys):
+    _, data = json_run(["--config", str(cfg_path), "--json", "setup", "--upload-root", "/x"], capsys)
+    assert any("--upload-root" in n and "not used" in n for n in data["notes"]), data["notes"]
+
+
 @pytest.mark.usefixtures("wiring", "ready", "vmrun_found")
 def test_setup_new_config_takes_the_profile_and_snapshot_names(tmp_path, provision, capsys):
     path = tmp_path / "config.toml"
@@ -577,12 +600,15 @@ def test_setup_init_usage_error_writes_nothing(tmp_path, wiring):
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready", "vmrun_found")
-def test_setup_interactive_init(tmp_path, monkeypatch, capsys):
-    answers = iter(["", "lab", "/vms/lab/lab.vmx", "", "analyst", PW_ENV, "C:\\tools\\x64dbg\\release", ""])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+def test_setup_without_a_terminal_does_not_run_the_init_wizard(tmp_path, monkeypatch, capsys):
+    """setup asks its own questions on a terminal (test_cli_setup_interactive); without one it
+    takes the flags and names the missing ones."""
+    monkeypatch.setattr("builtins.input", lambda _prompt="": pytest.fail("setup must not ask"))
     path = tmp_path / "config.toml"
-    assert run(["--config", str(path), "setup"]) == 0, capsys.readouterr()
-    assert gw_config.load_config(path, environ={}).profile("lab").vmx == "/vms/lab/lab.vmx"
+    assert run(["--config", str(path), "setup"]) == 2
+    err = capsys.readouterr().err
+    assert "--vmx" in err and "--guest-user" in err and "--x64dbg-root" in err and "not a terminal" in err
+    assert not path.exists()
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready")
@@ -788,3 +814,43 @@ def test_the_static_tools_check_is_advisory_and_never_stops_setup():
     """static_tools only reports which static tools and MCP servers are found (WARN, never FAIL)."""
     assert cli.setup_check_kind("static_tools") == "advisory"
     assert "static_tools" not in cli.SETUP_BLOCKING_CHECKS
+
+
+# ── help texts (first-time usability) ───────────────────────────────
+def _setup_parser() -> Any:
+    from tests.unit.test_cli import _subparser
+
+    return _subparser("setup")
+
+
+def test_setup_help_shows_a_first_run_example(capsys):
+    assert run(["setup", "--help"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    (i,) = [n for n, line in enumerate(lines) if line.strip().startswith("x64dbg-vm-gateway setup --vmx")]
+    example = " ".join(lines[i:i + 2])
+    assert "--guest-user" in example and "--x64dbg-root" in example
+    flat = " ".join(out.split())
+    assert "three values" in flat and "--dry-run" in flat and "--non-interactive" in flat
+
+
+def test_setup_help_groups_have_short_titles(capsys):
+    assert run(["setup", "--help"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    groups = {g.title: g for g in _setup_parser()._action_groups if g._group_actions}
+    assert {"config creation", "plugin", "provisioning"} <= set(groups), groups
+    assert all(len(t or "") <= 30 for t in groups), list(groups)
+    assert all(f"{t}:" in out for t in groups)  # each title stands on its own line
+    assert "no config file" in (groups["config creation"].description or "")
+
+
+@pytest.mark.parametrize(("option", "other"), [
+    ("--user", "--guest-user"), ("--guest-user", "--user"),
+    ("--snapshot", "--clean-snapshot"), ("--clean-snapshot", "--snapshot"),
+    ("--profile-name", "--profile"), ("--profile", "--profile-name"),
+])
+def test_setup_help_tells_the_option_pairs_apart(option, other):
+    from tests.unit.test_cli import _option_help
+
+    words = _option_help("setup", option).replace(",", " ").replace(")", " ").replace("(", " ").split()
+    assert other in words, (option, words)

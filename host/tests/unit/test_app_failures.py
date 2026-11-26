@@ -218,6 +218,15 @@ def test_sample_outside_upload_roots_is_refused(lab, tmp_path):
     assert jobs(lab) == []
 
 
+def test_sample_outside_upload_roots_names_the_roots_and_the_setting(lab, tmp_path):
+    outside = tmp_path / "elsewhere.exe"
+    outside.write_bytes(b"MZ")
+    with pytest.raises(PathNotAllowed) as ei:
+        lab.gateway().analysis_start(str(outside))
+    assert str(lab.samples.resolve()) in ei.value.message
+    assert "gateway.upload_roots" in ei.value.message and "gateway.upload_roots" in (ei.value.hint or "")
+
+
 def test_missing_sample_is_refused(lab):
     gw = lab.gateway()
     with pytest.raises(PathNotAllowed):
