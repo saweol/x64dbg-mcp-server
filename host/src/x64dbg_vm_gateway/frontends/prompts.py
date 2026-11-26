@@ -121,15 +121,13 @@ def _analyze_sample(a: Mapping[str, str], _note: str | None) -> str:
         "verification and loads it paused at the system breakpoint (it never runs the sample). Note job_id, "
         "backend_id, sample.guest_path and guest_out_dir.",
         "3. Look before running anything: GetDebugState(), ListModules(), GetImports(module=<sample "
-        "module>), "
-        "GetStrings(module=<sample module>), Disassemble(address=\"cip\", count=30).",
+        "module>), GetStrings(module=<sample module>), Disassemble(address=\"cip\", count=30).",
         "4. Run in small steps: SetBreakpoint(target=\"kernel32.CreateFileW\") or another API that matters, "
         f"then {_RUN}; at every stop GetDebugState(), GetCallStack(), GetAllRegisters() and "
         "GetArguments(count=4). Save dumps into guest_out_dir with DumpMemory(address=..., size=..., "
         "filePath=<guest_out_dir>\\dump.bin) or DumpModule(module=..., filePath=...).",
         "5. analysis_collect(): copies guest_out_dir and the debugger database to the host; check partial "
-        "and "
-        "errors, and collect again after fixing a cause.",
+        "and errors, and collect again after fixing a cause.",
         "6. analysis_report(job_id=<job_id>): summarise the job for the user. Then ask the user before "
         "analysis_finish(revert=true), which reverts the VM.",
         "",
@@ -149,10 +147,8 @@ def _trace_api(a: Mapping[str, str], _note: str | None) -> str:
         f"4. Repeat: {_RUN}, then GetDebugState() (stop when the process has exited). At a stop in the API: "
         "GetArguments(count=6) (x64: rcx, rdx, r8, r9, then the stack; x86: the stack), GetCallStack() for "
         "the caller, ReadMemory(address=<pointer argument>, size=256) for strings and buffers, then "
-        "StepOut() "
-        "and GetAllRegisters() for the return value (rax / eax). Record caller, arguments and result of "
-        "every "
-        "call; stop after enough calls to answer the question.",
+        "StepOut() and GetAllRegisters() for the return value (rax / eax). Record caller, arguments and "
+        "result of every call; stop after enough calls to answer the question.",
         "5. Mark interesting call sites with CommentOrLabelAtAddress(address=<caller>, value=\"...\", "
         "mode=\"Comment\"); analysis_collect saves them with the debugger database.",
         _finish(6),
@@ -168,9 +164,8 @@ def _find_oep(a: Mapping[str, str], _note: str | None) -> str:
         "",
         f"1. {_START}",
         f"2. {_start_call(a)}; note the sample module (the file name of sample.guest_path) and "
-        "guest_out_dir. "
-        "GetMemoryMap() shows its sections; DetectOEP(module=<sample module>) gives a first guess from the "
-        "section layout.",
+        "guest_out_dir. GetMemoryMap() shows its sections; DetectOEP(module=<sample module>) gives a first "
+        "guess from the section layout.",
         "3. Break on the unpacker's memory calls: SetBreakpoint(target=\"kernel32.VirtualAlloc\") and "
         "SetBreakpoint(target=\"kernel32.VirtualProtect\"), and the ntdll functions "
         "\"ntdll.NtAllocateVirtualMemory\" / \"ntdll.NtProtectVirtualMemory\" when the packer calls them "
@@ -205,16 +200,14 @@ def _static_dynamic(a: Mapping[str, str], note: str | None) -> str:
         "runtime address of that code under ASLR (module base + RVA).",
         f"4. SetBreakpoint(target=<runtime address>), then {_RUN} until GetDebugState() shows currentAddress "
         "at it. Inspect: GetAllRegisters(), GetCallStack(), GetArguments(count=4), "
-        "ReadMemory(address=<pointer>, "
-        "size=256), Disassemble(address=\"cip\", count=30).",
+        "ReadMemory(address=<pointer>, size=256), Disassemble(address=\"cip\", count=30).",
         "5. Annotate back: name what you found in x64dbg with CommentOrLabelAtAddress(address=<runtime "
         "address>, value=\"...\", mode=\"Label\"); static_export_annotations(job_id=<job_id>) writes "
         "artifacts/static_sync.json (module + RVA) for the static tool's sync script. For one address use "
         f"static_rebase(address=<runtime address>, direction=\"runtime_to_static\", imagebase={base}) and "
-        "set "
-        "the name or comment through the static tool's own MCP server. "
-        "static_import_annotations(items=[...], "
-        f"module=<sample module>, imagebase={base}) brings the static tool's names into x64dbg.",
+        "set the name or comment through the static tool's own MCP server. "
+        f"static_import_annotations(items=[...], module=<sample module>, imagebase={base}) brings the static "
+        "tool's names into x64dbg.",
         _finish(6),
     ]
     if note:
@@ -263,8 +256,7 @@ PROMPTS: tuple[PromptDef, ...] = (
               "with DetectOEP and dump the unpacked image.", (_SAMPLE, _ARCH), _find_oep),
     PromptDef("static-dynamic", "Static address to runtime and back",
               "Take an address from the static tool (IDA, Ghidra, radare2/rizin, Cutter) to the debugger "
-              "with "
-              "static_rebase, break there, and annotate the result back.",
+              "with static_rebase, break there, and annotate the result back.",
               (_SAMPLE,
                PromptArg("static_address", f"Address in the static tool's database ({_ADDRESS_HELP}).",
                          max_len=24, check=_match(_ADDRESS_RE, f"must be an address, {_ADDRESS_HELP}")),
