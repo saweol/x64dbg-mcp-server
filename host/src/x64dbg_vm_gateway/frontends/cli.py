@@ -52,6 +52,18 @@ job folders) stops on a failed check setup cannot fix
 on an existing target snapshot (provisioning never replaces one). With
 provisioning the plugin is installed without relaunch (on a fresh guest the
 logon tasks do not exist yet; the provisioning reboot starts the debuggers).
+
+``setup`` on a terminal (stdin a TTY, no ``--non-interactive``) asks for what the
+flags, the config and the environment leave open: the VM (from ``vm_inventory``:
+``vmrun list`` and the VMware library), the guest user, the guest password
+(``getpass``; never echoed, logged or printed) and the x64dbg folder (offering
+``provision.discover_x64dbg`` in the running guest), then offers to save the
+credentials in a 0600 env file (``--save-password-file [PATH]`` does that without
+asking; ``--force`` updates an existing one). A new config then names the file in
+gateway.env_file; an existing config is never edited (setup prints the line).
+Without a terminal, setup asks nothing and names the missing flags. Typed values
+reach this run's gateway through the environment mapping handed to
+``wiring.build_app``, never through ``os.environ``.
 """
 
 from __future__ import annotations
@@ -59,6 +71,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import getpass
 import importlib
 import json
 import logging
@@ -72,15 +85,17 @@ import textwrap
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import Any, TextIO
 
 from .. import config as gw_config
 from .. import envfile, plugin_bundle, static_scripts, static_tools
 from .. import platform as gw_platform
 from .. import ps as gw_ps
+from ..contracts import PowerState, Secret
 from ..errors import (
     ConfigError,
     GatewayError,
+    GuestAuthFailed,
     JobNotFound,
     LockTimeout,
     StateViolation,
@@ -90,9 +105,6 @@ from ..errors import (
 from ..jobs import DISCARD_ACTOR, JOB_ID_RE, Job, validate_job_id
 from ..proxy import sanitize_untrusted_text
 from .tool_defs import InternalError
-
-if TYPE_CHECKING:
-    from ..contracts import Secret
 
 log = logging.getLogger(__name__)
 
@@ -224,8 +236,12 @@ def _import(module: str) -> Any:
 
 
 @contextlib.contextmanager
-def _app(args: argparse.Namespace, config: gw_config.GatewayConfig) -> Iterator[Any]:
-    app = _import("wiring").build_app(config, profile=args.profile, environ=os.environ)
+def _app(args: argparse.Namespace, config: gw_config.GatewayConfig,
+         environ: Mapping[str, str] | None = None) -> Iterator[Any]:
+    """The gateway for ``config``; ``environ`` (default: the process environment) is what its
+    ``*_env`` names resolve in, over gateway.env_file."""
+    app = _import("wiring").build_app(config, profile=args.profile,
+                                      environ=os.environ if environ is None else environ)
     try:
         yield app
     finally:
@@ -583,18 +599,22 @@ class _ProvisionInputs:
 
 
 def _provision_inputs(args: argparse.Namespace, config: gw_config.GatewayConfig,
-                      prof: gw_config.ProfileConfig) -> _ProvisionInputs:
-    """The guest user and password (``--user``, the profile, gateway.env_file); fails before any VM work."""
+                      prof: gw_config.ProfileConfig, *, environ: Mapping[str, str] | None = None,
+                      also: str = "") -> _ProvisionInputs:
+    """The guest user and password (``--user``, the profile, gateway.env_file); fails before any VM
+    work. ``environ``: an already resolved environment (setup adds what it asked for); ``also``
+    extends the hint of a missing password."""
     _check_wait_ready(args.wait_ready)
-    # the same resolution as the serving gateway: the real environment over gateway.env_file
-    environ = envfile.resolve_environ(config, os.environ)
+    if environ is None:
+        # the same resolution as the serving gateway: the real environment over gateway.env_file
+        environ = envfile.resolve_environ(config, os.environ)
     user = args.user or prof.guest_user or (environ.get(prof.guest_user_env) if prof.guest_user_env else None)
     if not user:
         raise UsageError(
             "--user is required because the profile has no guest_user"
             + (f" and {prof.guest_user_env} is not set" if prof.guest_user_env else "")
         )
-    password = gw_config.resolve_secret(prof.guest_password_env, environ)
+    password = gw_config.resolve_secret(prof.guest_password_env, dict(environ))
     autologon = not args.no_autologon
     if autologon and password is None:
         env_name = prof.guest_password_env
@@ -603,7 +623,7 @@ def _provision_inputs(args: argparse.Namespace, config: gw_config.GatewayConfig,
             + (f"environment variable {env_name} is not set (environment or gateway.env_file)" if env_name
                else f"profile {prof.name!r} has no guest_password_env"),
             stage="provision",
-            hint="export the guest password in that variable, or pass --no-autologon",
+            hint="export the guest password in that variable, or pass --no-autologon" + also,
             details={"key": f"profiles.{prof.name}.guest_password_env"},
         )
     return _ProvisionInputs(user, password, autologon)
@@ -752,7 +772,7 @@ def _ask(prompt: str, default: str | None = None, *, required: bool = True,
         try:
             raw = _prompt(f"{prompt}{suffix}: ")
         except EOFError:
-            raise UsageError("init cancelled (end of input)") from None
+            raise UsageError("cancelled (end of input)") from None
         value = raw.strip() or (default or "")
         if not value:
             if not required:
@@ -780,6 +800,7 @@ def _init_answers(args: argparse.Namespace) -> dict[str, Any]:
         "x64_url": args.x64_url, "x64_token_env": args.x64_token_env,
         "x32_url": args.x32_url, "x32_token_env": args.x32_token_env,
         "upload_roots": _upload_roots(getattr(args, "upload_roots", None)),
+        "env_file": getattr(args, "env_file", None), "guest_user_env": getattr(args, "guest_user_env", None),
     }
     if args.non_interactive:
         if a["mode"] == "vmware":
@@ -844,7 +865,9 @@ def _init_document(a: Mapping[str, Any], vmrun_value: str) -> dict[str, Any]:
             "vmrun": vmrun_value,
             "clean_snapshot": a["clean_snapshot"],
             "protected_snapshots": [a["clean_snapshot"]],
-            "guest_user": a["guest_user"],
+            # setup with a password file: the user comes from it, like the password
+            **({"guest_user_env": a["guest_user_env"]} if a.get("guest_user_env")
+               else {"guest_user": a["guest_user"]}),
             "guest_password_env": a["guest_password_env"],
             "require_isolation": True,
             "token_source": "guest-config",
@@ -858,6 +881,8 @@ def _init_document(a: Mapping[str, Any], vmrun_value: str) -> dict[str, Any]:
     gateway: dict[str, Any] = {"jobs_root": a["jobs_root"], "default_profile": name}
     if a.get("upload_roots"):
         gateway["upload_roots"] = list(a["upload_roots"])
+    if a.get("env_file"):
+        gateway["env_file"] = a["env_file"]
     return {"gateway": gateway, "profiles": {name: profile}}
 
 
@@ -990,7 +1015,7 @@ SETUP_BLOCKING_CHECKS = frozenset({
 SETUP_ADVISORY_CHECKS = frozenset({"static_tools"})
 #: init options that only matter while setup creates the config (--x64dbg-root also feeds the guest steps)
 _SETUP_INIT_ONLY = ("profile_name", "vmx", "clean_snapshot", "guest_user", "guest_password_env", "jobs_root",
-                    "vmrun", "upload_roots", "non_interactive")
+                    "vmrun", "upload_roots")
 _INIT_FLAG_NAMES = {"upload_roots": "--upload-root"}
 _ENDPOINT_INIT_DEFAULTS = {"mode": None, "force": False, "x64_url": None, "x64_token_env": None,
                            "x32_url": None, "x32_token_env": None}
@@ -1075,17 +1100,30 @@ class _SetupReport:
         self.data["notes"].append(text)
 
 
-def _setup_init_args(args: argparse.Namespace) -> argparse.Namespace:
-    """The init options of ``setup`` as ``init`` sees them (vmware mode, never --force); the global
-    --profile and --snapshot name the new profile and its clean snapshot unless given explicitly."""
+def _setup_init_args(args: argparse.Namespace, session: _SetupSession) -> argparse.Namespace:
+    """The init options of ``setup`` as ``init`` sees them (vmware mode, never --force, never the
+    init wizard: setup asked its own questions already); the global --profile and --snapshot name
+    the new profile and its clean snapshot unless given explicitly. With a password file the new
+    profile reads the guest user and password from it (gateway.env_file, guest_user_env)."""
     ns = argparse.Namespace(**{**_ENDPOINT_INIT_DEFAULTS, **vars(args)})
+    ns.force = False
+    ns.non_interactive = True
     ns.profile_name = args.profile_name or args.profile
     ns.clean_snapshot = args.clean_snapshot or args.snapshot
+    pf = session.password_file
+    ns.env_file = str(pf.path) if pf is not None else None
+    ns.guest_user_env = pf.user_var if pf is not None else None
     return ns
 
 
-def _setup_config(args: argparse.Namespace, out: _Output, path: Path,
-                  report: _SetupReport) -> tuple[gw_config.GatewayConfig, _InitPlan | None]:
+def _check_profile_names(args: argparse.Namespace) -> None:
+    if args.profile and args.profile_name and args.profile != args.profile_name:
+        raise UsageError(f"--profile {args.profile} and --profile-name {args.profile_name} name different "
+                         "profiles for the new config")
+
+
+def _setup_config(args: argparse.Namespace, out: _Output, path: Path, report: _SetupReport,
+                  session: _SetupSession) -> tuple[gw_config.GatewayConfig, _InitPlan | None]:
     """(a) The existing config, or the one the init logic would write (with its plan; nothing is
     written here)."""
     if path.exists():
@@ -1097,10 +1135,8 @@ def _setup_config(args: argparse.Namespace, out: _Output, path: Path,
             report.note(f"the config exists, so {', '.join(given)} were not used (edit {path}, or run "
                         f"`{PROG} init --force`)")
         return config, None
-    if args.profile and args.profile_name and args.profile != args.profile_name:
-        raise UsageError(f"--profile {args.profile} and --profile-name {args.profile_name} name different "
-                         "profiles for the new config")
-    plan = _plan_init(_setup_init_args(args), out, path)
+    _check_profile_names(args)
+    plan = _plan_init(_setup_init_args(args, session), out, path)
     report.set("init", "planned", f"write {path} (profile {plan.answers['profile_name']!r})",
                document=plan.document)
     return plan.config, plan
@@ -1130,7 +1166,7 @@ class _SetupPlan:
 
 
 def _plan_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig,
-                report: _SetupReport) -> _SetupPlan:
+                report: _SetupReport, session: _SetupSession) -> _SetupPlan:
     """Everything that can be checked without the VM (usage errors always raise; other problems are
     listed for --dry-run and raised otherwise), and the planned steps in the report."""
     vmware = prof.mode == "vmware"
@@ -1151,7 +1187,9 @@ def _plan_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof:
     _check_wait_ready(args.wait_ready)
     skip_hint = ", or run setup with --skip-plugin"
     source = attempt(lambda: _plugin_source(args.dist, also=skip_hint)) if install else None
-    inputs = attempt(lambda: _provision_inputs(args, config, prof)) if provision else None
+    ask_hint = "" if session.interactive else "; on a terminal (without --non-interactive) setup asks for it"
+    inputs = attempt(lambda: _provision_inputs(args, config, prof, environ=session.environ(config),
+                                               also=ask_hint)) if provision else None
     if inputs is not None:  # what provision_guest checks first, but only after the plugin install
         backends = {b.id: b for b in prof.backends}
         attempt(lambda: _import("provision").check_provision_arguments(user=inputs.user, bind=args.bind,
@@ -1207,6 +1245,8 @@ def _plan_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof:
     else:
         report.set("provision", "skipped", skip_why or "--skip-provision")
     report.set("doctor", pending, "doctor again, after the changes")
+    if provision and not args.no_autologon:
+        report.data["autologon_warning"] = AUTOLOGON_WARNING
     if args.dry_run:
         report.data["problems"] = [p.to_dict() for p in problems]
     return plan
@@ -1275,9 +1315,10 @@ def _doctor_ok(result: Any) -> bool:
 
 
 def _run_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig,
-               plan: _SetupPlan, report: _SetupReport, out: _Output, current: list[str]) -> bool:
+               plan: _SetupPlan, report: _SetupReport, out: _Output, current: list[str],
+               session: _SetupSession) -> bool:
     """(b)-(e) against the VM; ``current[0]`` names the running step (for error reports)."""
-    with _app(args, config) as app:
+    with _app(args, config, {**os.environ, **session.env}) as app:
         current[0] = "precheck"
         _claim_jobs_root(app)
         out.note("setup: checking the configuration, the VM and the guest (doctor) ...")
@@ -1371,6 +1412,11 @@ def _format_setup(report: Mapping[str, Any]) -> str:
             lines.extend("    " + line for line in _format_doctor(step["result"]).splitlines())
         if report["dry_run"] and step.get("command"):
             lines.append(f"    = {_safe_command(step['command'])}")
+    pf = report.get("password_file")
+    if isinstance(pf, Mapping):
+        verb = {"written": "wrote", "planned": "would write"}.get(pf["status"], pf["status"])
+        lines.append(f"password file: {verb} {_safe(pf['path'])} ({', '.join(pf['variables'])}; only you can "
+                     "read it)")
     lines.extend(f"note: {_safe(n)}" for n in report.get("notes", ()))
     for problem in report.get("problems", ()):
         lines.append(f"problem [{problem['code']}]: {_safe(problem['message'])}")
@@ -1379,6 +1425,9 @@ def _format_setup(report: Mapping[str, Any]) -> str:
     if report.get("mcp_config"):  # the same block as `mcp-config`
         lines += ["", "register the MCP servers with Claude Code:", "",
                   format_mcp_config(report["mcp_config"]), ""]
+    provision = next((st for st in report["steps"] if st["step"] == "provision"), None)
+    if report.get("autologon_warning") and provision is not None and provision["status"] != "not_run":
+        lines.append(f"warning: {report['autologon_warning']}")
     if report["dry_run"]:
         lines.append("dry run: nothing was changed")
     elif report["ok"]:
@@ -1388,23 +1437,483 @@ def _format_setup(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ── setup: questions on a terminal, the password file ───────────────
+DEFAULT_USER_ENV = "X64DBG_GW_GUEST_USER"
+#: the one-line warning at the end of a setup run that configures auto-logon
+AUTOLOGON_WARNING = ("Windows auto-logon stores the guest password in the guest registry (Winlogon "
+                     "DefaultPassword), so the clean snapshot and every later one contain it: use a "
+                     "lab-only password")
+#: what a first setup needs to create the config, and a placeholder for each in the hint
+_SETUP_REQUIRED = (("--vmx", "vmx", "--vmx PATH/TO/VM.vmx"),
+                   ("--guest-user", "guest_user", "--guest-user USER"),
+                   ("--x64dbg-root", "x64dbg_root", "--x64dbg-root 'C:\\x64dbg\\release'"))
+_PASSWORD_TRIES = 3
+_USER_FORBIDDEN = frozenset('"/[]:;|=,+*?<>')  # provision.check_provision_arguments refuses these too
+_ENV_VALUE_FORBIDDEN = frozenset("\r\n\x00")
+
+
+def _stdin_is_tty() -> bool:
+    stream = sys.stdin
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _ask_secret(prompt: str) -> str:
+    """Read a secret on the terminal; nothing is echoed (EOFError at end of input)."""
+    return getpass.getpass(prompt, stream=sys.stderr)
+
+
+def _yes(prompt: str) -> bool:
+    """A yes/no question whose default (an empty answer) is yes."""
+    while True:
+        try:
+            answer = _prompt(prompt).strip().lower()
+        except EOFError:
+            raise UsageError("cancelled (end of input)") from None
+        if answer in ("", "y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        _emit(sys.stderr, "  answer y or n")
+
+
+@dataclasses.dataclass
+class _PasswordFile:
+    """The 0600 env file setup writes the guest credentials to (``--save-password-file``)."""
+
+    path: Path
+    user_var: str | None  # None: the profile names the user itself (guest_user)
+    values: list[tuple[str, str]] = dataclasses.field(repr=False)  # (variable, value); never printed
+    config_line: str | None = None  # the gateway.env_file line the user puts into an existing config
+    status: str = "planned"  # -> "written"
+
+    def public(self) -> dict[str, Any]:
+        return {"path": str(self.path), "status": self.status, "variables": [k for k, _ in self.values],
+                "config_line": self.config_line}
+
+
+@dataclasses.dataclass
+class _SetupSession:
+    """What setup learned in this run besides the flags and the config: values typed on the
+    terminal (by variable name; they reach this run's gateway, never os.environ or the output)
+    and the password file to write."""
+
+    interactive: bool
+    env: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
+    typed_password: bool = False
+    save: bool = False  # the user said yes to saving the credentials
+    password_file: _PasswordFile | None = None
+
+    def environ(self, config: gw_config.GatewayConfig) -> dict[str, str]:
+        """The environment ``*_env`` names resolve in for this run: the real environment over
+        gateway.env_file (unless that is the password file setup has not written yet), then the
+        values of this session."""
+        pf = self.password_file
+        pending = (pf is not None and pf.status == "planned" and not pf.path.exists()
+                   and _env_file_path(config) == pf.path)
+        if pending or not config.env_file:
+            base = dict(os.environ)
+        else:
+            base = envfile.resolve_environ(config, os.environ)
+        return {**base, **self.env}
+
+    def environ_before_saving(self, config: gw_config.GatewayConfig) -> dict[str, str]:
+        """:meth:`environ` while the password file is still being decided: a gateway.env_file
+        that does not exist yet counts as empty (setup may be about to write it)."""
+        try:
+            return self.environ(config)
+        except ConfigError:
+            path = _env_file_path(config)
+            if path is None or path.exists():
+                raise
+            return {**os.environ, **self.env}
+
+
+def _env_file_path(config: gw_config.GatewayConfig) -> Path | None:
+    """gateway.env_file as a path (a relative one is relative to the config's folder)."""
+    if not config.env_file:
+        return None
+    path = Path(config.env_file).expanduser()
+    if not path.is_absolute() and config.config_path:
+        path = Path(config.config_path).expanduser().parent / path
+    return path.absolute()
+
+
+def _default_password_file(profile: str) -> Path:
+    return gw_config.default_config_path().parent / f"{profile}.env"
+
+
+def _check_guest_user(value: str) -> str | None:
+    if value != value.strip() or any(c in _USER_FORBIDDEN for c in value):
+        return 'a Windows user name: no spaces at the ends and none of " / [ ] : ; | = , + * ? < >'
+    return None
+
+
+def _ask_guest_user(default: str | None) -> str:
+    return _ask("Guest user: the Windows account in the VM that logs on and runs the debuggers", default,
+                check=_check_guest_user)
+
+
+def _ask_password(user: str) -> str:
+    while True:
+        try:
+            value = _ask_secret(f"Password of guest user {user} (not shown; lab-only: auto-logon stores it "
+                                "in the guest): ")
+        except EOFError:
+            raise UsageError("cancelled (end of input)") from None
+        if value and not any(c in _ENV_VALUE_FORBIDDEN for c in value):
+            return value
+        _emit(sys.stderr, "  a password is required: guest operations and auto-logon log on with it")
+
+
+def _vm_candidates(vmrun: str | None, vmrun_type: str) -> list[Any]:
+    """The VMs ``vm_inventory`` finds (``vmrun list`` when vmrun is installed, the VM library)."""
+    from .. import vm_inventory
+    from ..vmrun import VmrunCli
+
+    try:
+        path = gw_platform.find_vmrun(vmrun or "auto")
+    except VmrunNotFound:
+        runner = None
+    else:
+        runner = VmrunCli(path, None, gw_platform.vmrun_type(vmrun_type), None)
+    return vm_inventory.find_vms(runner)
+
+
+def _ask_vm(vmrun: str | None, out: _Output) -> str:
+    found = _vm_candidates(vmrun, "auto")
+    if found:
+        out.note("VMs on this host:")
+        for i, vm in enumerate(found, 1):
+            tags = ", ".join(t for t in (vm.name, "running" if vm.running else None) if t)
+            out.note(f"  {i}) {_safe(vm.vmx)}" + (f"  ({_safe(tags)})" if tags else ""))
+    else:
+        out.note("setup: no VM found (vmrun list, the VMware library); type the path of the VM's .vmx file")
+
+    def check(value: str) -> str | None:
+        if value.isdigit():
+            if found and 1 <= int(value) <= len(found):
+                return None
+            if found:
+                return f"choose 1 to {len(found)}, or type a path"
+            return "type the path of the VM's .vmx file"
+        p = Path(value).expanduser()
+        if p.suffix.lower() != ".vmx":
+            return "the path of the VM's .vmx file"
+        return None if p.is_file() else f"no such file: {p}"
+
+    answer = _ask("VM: a number from the list, or the path of its .vmx file" if found
+                  else "VM: the path of its .vmx file", "1" if found else None, check=check)
+    return found[int(answer) - 1].vmx if answer.isdigit() else str(Path(answer).expanduser().absolute())
+
+
+def _open_guest(vmx: str, *, vmrun: str, vmrun_type: str, user: str, password: Secret) -> tuple[Any, Any]:
+    """A VM provider and a guest channel for ``vmx`` with these credentials, without a config:
+    what the x64dbg search of a first setup uses (tests replace it)."""
+    from ..contracts import GuestCredentials
+    from ..guest import VixChannel
+    from ..vmrun import VmrunCli, VmrunProvider
+
+    runner = VmrunCli(gw_platform.find_vmrun(vmrun), vmx, gw_platform.vmrun_type(vmrun_type),
+                      GuestCredentials(user=user, password=password))
+    return VmrunProvider(runner, vmx), VixChannel(runner)
+
+
+def _search_x64dbg(out: _Output, session: _SetupSession, *, vmx: str, vmrun: str, vmrun_type: str, user: str,
+                   password_var: str) -> list[Mapping[str, Any]]:
+    """``provision.discover_x64dbg`` in the guest; [] (with a note) when the VM does not run or the
+    search fails. A typed password the guest refuses is asked again."""
+    for attempt in range(1, _PASSWORD_TRIES + 1):
+        password = session.env.get(password_var) or os.environ.get(password_var) or ""
+        out.note("setup: searching the guest for x64dbg (the user profiles and C:\\, 4 folders deep; this "
+                 "can take a minute) ...")
+        try:
+            vm, channel = _open_guest(vmx, vmrun=vmrun, vmrun_type=vmrun_type, user=user,
+                                      password=Secret(password))
+            power = vm.power_state()
+            if power != PowerState.RUNNING:
+                out.note(f"  the VM is not running ({power.value}), so its guest cannot be searched: type "
+                         "the folder (setup needs the VM running, start it before the next step)")
+                return []
+            found = [e for e in _import("provision").discover_x64dbg(channel) if isinstance(e, Mapping)]
+        except GuestAuthFailed:
+            if not session.typed_password or attempt == _PASSWORD_TRIES:
+                out.note(f"  the guest refused the user name or password of {user}: type the folder (the "
+                         "doctor check guest_credentials stops setup before anything changes)")
+                return []
+            out.note(f"  the guest refused the user name or password of {user}; type the password again")
+            session.env[password_var] = _ask_password(user)
+            continue
+        except GatewayError as e:
+            out.note(f"  the search failed ({e.code}: {_safe(e.message)}): type the folder")
+            return []
+        if not found:
+            out.note("  no x64dbg found (a folder holding x64\\x64dbg.exe or x32\\x32dbg.exe)")
+        return found
+    return []
+
+
+def _debuggers(entry: Mapping[str, Any]) -> str:
+    names = [exe for arch, exe in (("x64", "x64dbg.exe"), ("x32", "x32dbg.exe"))
+             if isinstance(entry.get(arch), Mapping) and entry[arch].get("exe")]
+    return ", ".join(names) or "no debugger"
+
+
+def _ask_x64dbg_root(args: argparse.Namespace, out: _Output, session: _SetupSession, *, vmx: str, vmrun: str,
+                     vmrun_type: str, user: str, password_var: str) -> str:
+    found: list[Mapping[str, Any]] = []
+    if args.dry_run:
+        out.note("setup: --dry-run contacts nothing, so the guest is not searched for x64dbg")
+    elif _yes("Search the guest for x64dbg now (the VM must be running)? [Y/n] "):
+        found = _search_x64dbg(out, session, vmx=vmx, vmrun=vmrun, vmrun_type=vmrun_type, user=user,
+                               password_var=password_var)
+    if found:
+        out.note("x64dbg in the guest:")
+        for i, entry in enumerate(found, 1):
+            out.note(f"  {i}) {_safe(entry.get('root'))}  ({_debuggers(entry)})")
+
+    def check(value: str) -> str | None:
+        if found and value.isdigit():
+            return None if 1 <= int(value) <= len(found) else f"choose 1 to {len(found)}, or type a path"
+        return _check_windows_abs(value)
+
+    answer = _ask("x64dbg release folder in the guest (it holds x64\\ and x32\\)"
+                  + (": a number from the list, or a path" if found else ", e.g. C:\\x64dbg\\release"),
+                  "1" if found else None, check=check)
+    if found and answer.isdigit():
+        return str(found[int(answer) - 1]["root"])
+    return str(PureWindowsPath(answer.replace("/", "\\")))
+
+
+def _offer_save(target: Path, args: argparse.Namespace, out: _Output) -> bool:
+    if target.exists() and not args.force:
+        out.note(f"setup: {target} exists already, so the password is not saved there (setup "
+                 "--save-password-file --force updates it)")
+        return False
+    return _yes(f"Save the guest user and password in {target} (only you can read it) so the MCP server can "
+                "log on to the guest later? [Y/n] ")
+
+
+def _missing_flags(missing: Sequence[tuple[str, str, str]], path: Path, non_interactive: bool) -> str:
+    flags = [flag for flag, _key, _example in missing]
+    named = flags[0] if len(flags) == 1 else ", ".join(flags[:-1]) + " and " + flags[-1]
+    why = ("--non-interactive asks nothing" if non_interactive
+           else "stdin is not a terminal, so setup cannot ask for them")
+    return (f"setup needs {named} to create the config {path} ({why})\n"
+            f"  add: {' '.join(example for _flag, _key, example in missing)}")
+
+
+def _new_config_questions(args: argparse.Namespace, out: _Output, session: _SetupSession, path: Path) -> None:
+    """No config yet: the VM, the guest user, the guest password and the x64dbg folder (each only
+    when its flag is missing; the password when its variable is not set), then whether to save the
+    credentials. Without a terminal or with --non-interactive: a usage error naming the missing flags."""
+    _check_profile_names(args)
+    missing = [entry for entry in _SETUP_REQUIRED if not getattr(args, entry[1])]
+    password_var = args.guest_password_env or DEFAULT_PASSWORD_ENV
+    if not session.interactive:
+        if missing:
+            raise UsageError(_missing_flags(missing, path, args.non_interactive))
+        return
+    if _check_env_name(password_var):
+        raise UsageError(f"--guest-password-env {_check_env_name(password_var)}")
+    if missing or not os.environ.get(password_var):
+        out.note(f"setup: there is no config at {path} yet; setup asks for what it needs to create it "
+                 "(Ctrl-C stops; nothing is written before the questions are done)")
+    if not args.vmx:
+        args.vmx = _ask_vm(args.vmrun, out)
+    if not args.guest_user:
+        args.guest_user = _ask_guest_user(args.user)
+    if not os.environ.get(password_var):
+        session.env[password_var] = _ask_password(args.guest_user)
+        session.typed_password = True
+    if not args.x64dbg_root:
+        args.x64dbg_root = _ask_x64dbg_root(args, out, session, vmx=args.vmx, vmrun=args.vmrun or "auto",
+                                            vmrun_type="auto", user=args.guest_user,
+                                            password_var=password_var)
+    if session.typed_password and args.save_password_file is None:
+        profile = args.profile_name or args.profile or DEFAULT_PROFILE_NAME
+        session.save = _offer_save(_default_password_file(profile), args, out)
+
+
+def _existing_config_questions(args: argparse.Namespace, out: _Output, session: _SetupSession,
+                               config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig) -> None:
+    """A config exists: on a terminal, the guest user, the guest password and the x64dbg folder
+    when the config, the flags and the environment do not give them, then whether to save the
+    credentials."""
+    if not session.interactive or prof.mode != "vmware":
+        return
+    env_file = _env_file_path(config)
+    environ = session.environ_before_saving(config)
+    user = args.user or prof.guest_user or (environ.get(prof.guest_user_env) if prof.guest_user_env else None)
+    if not user:
+        user = args.user = _ask_guest_user(None)
+        if prof.guest_user_env:
+            session.env[prof.guest_user_env] = user
+    password_var = prof.guest_password_env
+    if password_var and not environ.get(password_var):
+        session.env[password_var] = _ask_password(prof.guest_user or user)
+        session.typed_password = True
+    guest_steps = not (args.skip_plugin and args.skip_provision)
+    root_needed = guest_steps and not args.x64dbg_root and _derive_x64dbg_root(prof) is None
+    if root_needed and password_var and prof.vmx:
+        args.x64dbg_root = _ask_x64dbg_root(args, out, session, vmx=prof.vmx, vmrun=prof.vmrun,
+                                            vmrun_type=prof.vmrun_type, user=prof.guest_user or user,
+                                            password_var=password_var)
+    if session.typed_password and args.save_password_file is None:
+        session.save = _offer_save(env_file or _default_password_file(prof.name), args, out)
+
+
+def _plan_password_file(args: argparse.Namespace, session: _SetupSession, *, profile: str, user: str | None,
+                        user_var: str | None, password_var: str | None, config_env_file: Path | None,
+                        new_config: bool) -> _PasswordFile | None:
+    """The password file to write (``--save-password-file [PATH]``, or yes to the question): the
+    path given, else the file gateway.env_file names, else ``<config folder>/<profile>.env``.
+    Refused before anything is written when it exists (without --force) or there is no password."""
+    if not (session.save or args.save_password_file is not None):
+        return None
+    if not password_var:
+        raise UsageError("--save-password-file needs a vmware profile with guest_password_env")
+    if args.save_password_file:
+        target = Path(args.save_password_file).expanduser().absolute()
+    else:
+        target = config_env_file or _default_password_file(profile)
+    password = session.env.get(password_var) or os.environ.get(password_var)
+    if not password:
+        raise ConfigError(f"--save-password-file: there is no guest password to save ({password_var} is not "
+                          "set)", stage="setup", hint="export it, or run setup on a terminal to type it",
+                          details={"variable": password_var})
+    keys = ", ".join(k for k in (user_var, password_var) if k)
+    if target.exists() and not args.force:
+        raise ConfigError(f"{target} exists already; setup does not overwrite it", stage="setup",
+                          details={"path": str(target)},
+                          hint=f"pass --force to update its {keys} lines (other lines are kept), or name "
+                               "another file with --save-password-file PATH")
+    values = ([(user_var, user)] if user_var and user else []) + [(password_var, password)]
+    for key, value in values:
+        _env_line(key, value)  # refuses what an env file cannot hold, before anything is written
+    line = None if new_config or config_env_file == target else f"env_file = {_toml_str(str(target))}"
+    return _PasswordFile(target, user_var if user_var and user else None, values, line)
+
+
+def _env_line(key: str, value: str, *, export: bool = False) -> str:
+    """``KEY='value'``: envfile.read_env_file strips one pair of surrounding quotes and nothing
+    else, so any value without CR, LF or NUL reads back unchanged."""
+    if any(c in _ENV_VALUE_FORBIDDEN for c in value):
+        raise UsageError(f"{key}: a value with a line break or NUL cannot be stored in an env file")
+    return f"{'export ' if export else ''}{key}='{value}'"
+
+
+def write_password_file(path: Path, values: Sequence[tuple[str, str]], *, profile: str, force: bool) -> bool:
+    """Write ``values`` to the env file ``path`` (0600; on Windows the ACL is cut down to the
+    current user with icacls, see ``platform.restrict_to_owner``). An existing file is only
+    changed with ``force``: the lines of these variables are replaced, every other line is kept.
+    Returns whether the file is restricted to its owner."""
+    lines = [_env_line(k, v) for k, v in values]  # refuses unstorable values before anything is written
+    if path.exists():
+        if not force:
+            raise ConfigError(f"{path} exists already; setup does not overwrite it", stage="setup",
+                              hint="pass --force to update it", details={"path": str(path)})
+        wanted = dict(values)
+        kept: list[str] = []
+        done: set[str] = set()
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.strip()
+            export = stripped.startswith("export ")
+            key = (stripped[len("export "):] if export else stripped).partition("=")[0].strip()
+            if key in wanted and not stripped.startswith("#"):
+                if key not in done:
+                    kept.append(_env_line(key, wanted[key], export=export))
+                    done.add(key)
+                continue
+            kept.append(raw)
+        kept += [_env_line(k, v) for k, v in values if k not in done]
+        _write_private(path, "\n".join(kept) + "\n", replace=True)
+    else:
+        header = [f"# x64dbg-vm-gateway: guest credentials of profile {profile!r} (written by "
+                  f"`{PROG} setup`).",
+                  "# The config's gateway.env_file names this file; keep it readable only by you.",
+                  "# Lab-only password: Windows auto-logon stores it in the guest registry and in every "
+                  "snapshot."]
+        _write_private(path, "\n".join(header + lines) + "\n", replace=False)
+    return gw_platform.restrict_to_owner(path)
+
+
+def _write_password_file_step(pf: _PasswordFile, args: argparse.Namespace, profile: str, report: _SetupReport,
+                              out: _Output) -> None:
+    restricted = write_password_file(pf.path, pf.values, profile=profile, force=bool(args.force))
+    pf.status = "written"
+    report.data["password_file"] = pf.public()
+    out.note(f"setup: wrote {pf.path}")
+    if not restricted:
+        report.note(f"{pf.path} could not be restricted to your account (icacls failed); check its "
+                    "permissions")
+
+
+def _password_file_notes(session: _SetupSession, report: _SetupReport, config_path: Path,
+                         config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig) -> None:
+    pf = session.password_file
+    config_env_file = _env_file_path(config)
+    if pf is not None:
+        report.data["password_file"] = pf.public()
+        if pf.config_line:
+            what = ("change gateway.env_file in the [gateway] table of" if config_env_file is not None
+                    else "add this line to the [gateway] table of")
+            report.note(f"setup does not edit an existing config: {what} {config_path} so serve finds the "
+                        f"password file: {pf.config_line}")
+    elif session.typed_password and prof.guest_password_env:
+        report.note("the guest password typed for this run was not saved: before the MCP client starts "
+                    f"serve, export {prof.guest_password_env} where it runs, or run setup "
+                    "--save-password-file to keep it in a file only you can read")
+
+
 def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
     path = _config_target(args)
     report = _SetupReport(args, path)
-    config, init = _setup_config(args, out, path, report)
+    session = _SetupSession(interactive=not args.non_interactive and _stdin_is_tty())
+    new_config = not path.exists()
+    if new_config:
+        _new_config_questions(args, out, session, path)
+        password_var = args.guest_password_env or DEFAULT_PASSWORD_ENV
+        profile = args.profile_name or args.profile or DEFAULT_PROFILE_NAME
+        session.password_file = _plan_password_file(
+            args, session, profile=profile, user=args.guest_user, user_var=DEFAULT_USER_ENV,
+            password_var=password_var, config_env_file=None, new_config=True)
+        if session.password_file is not None and args.guest_user:
+            session.env[DEFAULT_USER_ENV] = args.guest_user  # the new profile reads the user from the file
+    config, init = _setup_config(args, out, path, report, session)
     prof = config.profile(args.profile)
     report.data["config"]["profile"] = prof.name
-    plan = _plan_setup(args, config, prof, report)  # raises (outside --dry-run) before anything is written
-    if init is not None and not args.dry_run:
-        config = _write_setup_config(path, init, report, out)
-        prof = config.profile(args.profile)
+    if not new_config:
+        _existing_config_questions(args, out, session, config, prof)
+        if prof.mode == "vmware":
+            user = args.user or prof.guest_user
+            saving = args.save_password_file is not None or session.save
+            if not user and prof.guest_user_env and saving:
+                user = session.environ_before_saving(config).get(prof.guest_user_env)
+            session.password_file = _plan_password_file(
+                args, session, profile=prof.name, user=user, user_var=prof.guest_user_env,
+                password_var=prof.guest_password_env, config_env_file=_env_file_path(config),
+                new_config=False)
+        elif args.save_password_file is not None:
+            raise UsageError("--save-password-file only applies to a vmware profile")
+    _password_file_notes(session, report, path, config, prof)
+    # raises (outside --dry-run) before anything is written
+    plan = _plan_setup(args, config, prof, report, session)
+    if not args.dry_run:
+        if session.password_file is not None:
+            _write_password_file_step(session.password_file, args, prof.name, report, out)
+        if init is not None:
+            config = _write_setup_config(path, init, report, out)
+            prof = config.profile(args.profile)
     error: GatewayError | None = None
     if args.dry_run:
         ok = not report.data["problems"]
     else:
         current = ["precheck"]
         try:
-            ok = _run_setup(args, config, prof, plan, report, out, current)
+            ok = _run_setup(args, config, prof, plan, report, out, current, session)
         except GatewayError as e:
             error = _explain(e, "setup")
             step = report.step(current[0])
@@ -1752,6 +2261,21 @@ def build_parser() -> argparse.ArgumentParser:
         "config creation", _wrap("Used only when there is no config file yet (see init); --x64dbg-root also "
                                  "feeds install-plugin and provision.", 76))
     _add_init_options(group, setup=True)
+    group = p.add_argument_group(
+        "password file", _wrap(
+            "The guest password comes from the variable --guest-password-env names (default "
+            f"{DEFAULT_PASSWORD_ENV}), from gateway.env_file, or, on a terminal, from a question. Auto-logon "
+            "stores it in the guest registry: use a lab-only password.", 76))
+    group.add_argument("--save-password-file", metavar="PATH", nargs="?", const="",
+                       help="write the guest user and password to a new env file only you can read "
+                            "(default PATH: the file gateway.env_file names, else <profile>.env in the "
+                            "per-user config folder, e.g. ~/.config/x64dbg-vm-gateway/win10.env); a new "
+                            "config gets gateway.env_file, an "
+                            "existing one is not edited (setup prints the line to add). On a terminal setup "
+                            "offers this after asking for the password")
+    group.add_argument("--force", action="store_true",
+                       help="with --save-password-file: update an existing env file (only the user and "
+                            "password lines change; the config file itself is never overwritten)")
     group = p.add_argument_group("plugin")
     group.add_argument("--dist", metavar="DIR",
                        help="host folder holding x64/plugins and x32/plugins (default: the bundled build)")

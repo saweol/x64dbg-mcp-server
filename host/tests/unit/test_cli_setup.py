@@ -20,7 +20,7 @@ from tests.fakes.fake_app import FakeApp
 from tests.unit.test_cli import _fake_bundle, run, write_config
 from x64dbg_vm_gateway import config as gw_config
 from x64dbg_vm_gateway import platform as gw_platform
-from x64dbg_vm_gateway import plugin_bundle
+from x64dbg_vm_gateway import plugin_bundle, vm_inventory
 from x64dbg_vm_gateway import provision as real_provision
 from x64dbg_vm_gateway.contracts import Secret
 from x64dbg_vm_gateway.errors import GuestOperationError, LockTimeout
@@ -50,6 +50,14 @@ def posix_host(monkeypatch) -> None:
     """The printed commands follow the host's shell: the tests pin a POSIX host (CI runs them on
     Windows too); the Windows tests set ``_windows_host`` to True themselves."""
     monkeypatch.setattr(cli, "_windows_host", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def no_terminal(monkeypatch) -> None:
+    """stdin is not a terminal (also under ``pytest -s``): setup asks nothing here; its questions
+    are tested in test_cli_setup_interactive. ``vmrun list`` is never run."""
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(vm_inventory, "running_vms", lambda runner: [])
 
 
 @pytest.fixture
@@ -592,12 +600,15 @@ def test_setup_init_usage_error_writes_nothing(tmp_path, wiring):
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready", "vmrun_found")
-def test_setup_interactive_init(tmp_path, monkeypatch, capsys):
-    answers = iter(["", "lab", "/vms/lab/lab.vmx", "", "analyst", PW_ENV, "C:\\tools\\x64dbg\\release", ""])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+def test_setup_without_a_terminal_does_not_run_the_init_wizard(tmp_path, monkeypatch, capsys):
+    """setup asks its own questions on a terminal (test_cli_setup_interactive); without one it
+    takes the flags and names the missing ones."""
+    monkeypatch.setattr("builtins.input", lambda _prompt="": pytest.fail("setup must not ask"))
     path = tmp_path / "config.toml"
-    assert run(["--config", str(path), "setup"]) == 0, capsys.readouterr()
-    assert gw_config.load_config(path, environ={}).profile("lab").vmx == "/vms/lab/lab.vmx"
+    assert run(["--config", str(path), "setup"]) == 2
+    err = capsys.readouterr().err
+    assert "--vmx" in err and "--guest-user" in err and "--x64dbg-root" in err and "not a terminal" in err
+    assert not path.exists()
 
 
 @pytest.mark.usefixtures("wiring", "provision", "ready")

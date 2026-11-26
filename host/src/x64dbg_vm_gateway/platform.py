@@ -217,6 +217,34 @@ def secure_file(path: Path | str, *, system: str | None = None,
     return _secure(path, 0o600, system, chmod)
 
 
+ICACLS_TIMEOUT_S = 30.0
+
+
+def restrict_to_owner(path: Path | str, *, system: str | None = None,
+                      environ: Mapping[str, str] | None = None, run: Runner = subprocess.run,
+                      chmod: Callable[[Any, int], None] = os.chmod) -> bool:
+    """Make a secret file readable by its owner only: chmod 0600 on POSIX hosts; on Windows
+    ``icacls <path> /inheritance:r /grant:r <DOMAIN>\\<user>:F`` (the inherited entries, such as
+    the Users group of a folder outside the profile, are dropped; only the current user keeps
+    access). Returns False when that could not be done (no user name, icacls failed); never
+    raises for it."""
+    if host_system(system) != "Windows":
+        chmod(path, 0o600)
+        return True
+    env = os.environ if environ is None else environ
+    user = env.get("USERNAME")
+    if not user:
+        return False
+    account = f"{env['USERDOMAIN']}\\{user}" if env.get("USERDOMAIN") else user
+    icacls = ntpath.join(env.get("SystemRoot") or "C:\\Windows", "System32", "icacls.exe")
+    try:
+        res = run([icacls, str(path), "/inheritance:r", "/grant:r", f"{account}:F"], capture_output=True,
+                  timeout=ICACLS_TIMEOUT_S, check=False, **subprocess_kwargs(system))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return getattr(res, "returncode", 1) == 0
+
+
 # ── hypervisor processes of one VM (E1: duplicate VM instances) ─────
 def _scan_failed(message: str, **details: Any) -> GatewayError:
     return GatewayError(
