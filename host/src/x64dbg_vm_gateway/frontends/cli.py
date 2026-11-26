@@ -93,7 +93,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -513,8 +512,12 @@ def _jobs_report(args: argparse.Namespace, out: _Output, root: Path) -> int:
     if args.out:
         target = Path(args.out).expanduser()
         text = result["report"] if fmt == "markdown" else _dumps(result["report"]) + "\n"
+        if not args.force and (target.exists() or target.is_symlink()):
+            raise GatewayError(f"{target} already exists; refusing to overwrite it", stage="cli",
+                               hint="pass --force to replace it, or choose another --out FILE",
+                               details={"path": str(target)})
         try:
-            _write_private(target, text, replace=True)
+            _write_private(target, text, replace=bool(args.force))  # without --force: O_EXCL
         except OSError as e:
             raise GatewayError(f"cannot write the report to {target}: {e.strerror or type(e).__name__}",
                                stage="cli", details={"path": str(target)}) from None
@@ -533,8 +536,10 @@ def _jobs_report(args: argparse.Namespace, out: _Output, root: Path) -> int:
 def cmd_jobs(args: argparse.Namespace, out: _Output) -> int:
     config = _load_config(args)
     root = config.jobs_root_path
-    if args.action != "report" and (args.out or args.format):
-        raise UsageError("--out and --format only apply to `jobs report JOB_ID`")
+    if args.action != "report" and (args.out or args.format or args.force):
+        raise UsageError("--out, --format and --force only apply to `jobs report JOB_ID`")
+    if args.force and not args.out:
+        raise UsageError("--force only applies together with --out")
     if args.action == "report":
         return _jobs_report(args, out, root)
     if args.action == "show":
@@ -571,7 +576,7 @@ def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
         with _app(args, demo_config) as app:
             _claim_jobs_root(app)  # LOCK_TIMEOUT while another gateway serves this jobs root
             demo.check_idle(app, prof.name)  # this profile's VM only (another profile is another VM)
-            runner = demo.DemoRun(app, on_step=show if streamed else None)
+            runner = demo.DemoRun(app, profile=prof.name, on_step=show if streamed else None)
             for arch in archs:
                 if streamed:
                     _emit(sys.stdout, f"demo {arch}: {samples[arch].name} (bundled benign sample) on profile "
@@ -580,13 +585,17 @@ def cmd_demo(args: argparse.Namespace, out: _Output) -> int:
                 results.append(res)
                 if streamed:
                     _emit(sys.stdout, demo.format_arch(res))
-                if not res["ok"] and res["job_id"] and res["steps"] and not res["steps"][-1]["ok"] \
-                        and res["steps"][-1].get("cleanup"):
-                    out.note(f"demo: stopping: job {res['job_id']} could not be cleaned up")
+                if res["interrupted"] or res["leftover"] is not None:
+                    # never start the next architecture next to a job the demo could not clean up
+                    out.note("demo: stopped" + (f": job {res['leftover']['job_id']} is left"
+                                                if res["leftover"] and res["leftover"]["job_id"] else ""))
                     break
+    interrupted = any(r["interrupted"] for r in results)
     doc = {"ok": bool(results) and all(r["ok"] for r in results) and len(results) == len(archs),
-           "profile": prof.name, "archs": archs, "results": results}
+           "profile": prof.name, "archs": archs, "results": results, "interrupted": interrupted}
     out.data(doc, lambda d: demo.format_result(d, streamed=True))
+    if interrupted:
+        return 130
     return EXIT_OK if doc["ok"] else EXIT_FAILURE
 
 
@@ -1172,10 +1181,11 @@ def resolve_gateway_program(*, argv0: str | None = None, which: Callable[[str], 
     """(program to put in the register line, how it was found: "argv0", "PATH" or None).
 
     The running console script (``sys.argv[0]`` named x64dbg-vm-gateway[.exe]) first, then the
-    one on PATH; both as absolute paths (a symlink such as ~/.local/bin/x64dbg-vm-gateway is kept:
-    it survives upgrades). The bare name when neither is found."""
+    one on PATH (``search_path``: never the current directory); both as absolute paths (a
+    symlink such as ~/.local/bin/x64dbg-vm-gateway is kept: it survives upgrades). The bare name
+    when neither is found."""
     argv0 = (sys.argv[0] if sys.argv else "") if argv0 is None else argv0
-    which = which or shutil.which
+    which = which or search_path  # never the current directory (see search_path)
     is_file = is_file or os.path.isfile
     if argv0:
         windows_style = "\\" in argv0 or PureWindowsPath(argv0).drive != ""
@@ -2794,33 +2804,82 @@ def claude_tool_name(server: str, tool: str) -> str:
     return f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', server)}__{tool}"
 
 
-def _plugin_tool_names() -> list[str]:
-    """Every plugin tool of the builtin catalogs (data/tools-v*.json) that the gateway mirrors."""
-    names: set[str] = set()
+def _plugin_tools() -> dict[str, bool]:
+    """Every plugin tool of the builtin catalogs (data/tools-v*.json) that the gateway mirrors, and
+    whether it is read-only: only when every catalog that lists it says so (fail closed)."""
+    tools: dict[str, bool] = {}
     for entry in resources.files(_PACKAGE).joinpath("data").iterdir():
         if entry.name.startswith("tools-v") and entry.name.endswith(".json"):
             doc = json.loads(entry.read_text(encoding="utf-8"))
-            names.update(t["name"] for t in doc.get("tools", []) if isinstance(t, dict)
-                         and isinstance(t.get("name"), str))
-    return sorted(names - RESERVED_TOOL_NAMES)
+            for t in doc.get("tools", []):
+                name = t.get("name") if isinstance(t, dict) else None
+                if isinstance(name, str) and name not in RESERVED_TOOL_NAMES:
+                    tools[name] = tools.get(name, True) and t.get("read_only") is True
+    return dict(sorted(tools.items()))
 
 
-def permissions_snippet(server: str) -> dict[str, Any]:
-    """Claude Code ``settings.json`` permissions for the gateway registered as ``server``: allow the
-    observe and guest-mutating gateway tools and every mirrored plugin tool (exact names), ask
-    before the host-destructive gateway tools."""
-    destructive = [t.name for t in GATEWAY_TOOLS if t.tier is RiskTier.HOST_DESTRUCTIVE]
-    allowed = [t.name for t in GATEWAY_TOOLS if t.tier is not RiskTier.HOST_DESTRUCTIVE]
-    allowed += _plugin_tool_names()
-    return {"permissions": {"allow": [claude_tool_name(server, n) for n in allowed],
-                            "ask": [claude_tool_name(server, n) for n in destructive]}}
+PERMISSION_MODES = ("strict", "lab")
+#: gateway tools strict mode allows besides the observe tier: they change the disposable guest only
+#: in the gateway's own checked ways (start reverts to the clean snapshot first, collect / upload /
+#: static sync move files and labels); debugger_call and the debugger controls are asked for
+STRICT_GATEWAY_ALLOW = frozenset({"analysis_start", "analysis_collect", "file_upload",
+                                  "static_export_annotations", "static_import_annotations"})
 
 
-def _permission_notes(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+def permissions_snippet(server: str, mode: str = "strict") -> dict[str, Any]:
+    """Claude Code ``settings.json`` permissions for the gateway registered as ``server``.
+
+    ``strict`` (default): allow the observe-tier gateway tools, ``STRICT_GATEWAY_ALLOW`` and the
+    read-only plugin tools; ask for every other tool (debugger_call, the debugger controls, every
+    plugin tool that changes the debuggee or writes files, the host-destructive gateway tools).
+    ``lab``, for disposable lab VMs that are reverted after each job: allow every observe and
+    guest-mutating tool (all plugin tools included), ask only for the host-destructive ones."""
+    if mode not in PERMISSION_MODES:
+        raise ValueError(f"unknown permissions mode {mode!r}")
+    allow: list[str] = []
+    ask: list[str] = []
+    for tool in GATEWAY_TOOLS:
+        if tool.tier is RiskTier.HOST_DESTRUCTIVE:
+            ask.append(tool.name)
+        elif mode == "lab" or tool.tier is RiskTier.OBSERVE or tool.name in STRICT_GATEWAY_ALLOW:
+            allow.append(tool.name)
+        else:
+            ask.append(tool.name)
+    for name, read_only in _plugin_tools().items():
+        (allow if mode == "lab" or read_only else ask).append(name)
+    return {"permissions": {"allow": [claude_tool_name(server, n) for n in allow],
+                            "ask": [claude_tool_name(server, n) for n in ask]}}
+
+
+def _permissions_mode(args: argparse.Namespace, config: gw_config.GatewayConfig) -> tuple[str, list[str]]:
+    """(mode, warnings): an endpoint profile (a debugger that is not in a disposable VM) is always
+    strict."""
+    requested = args.permissions_mode or "strict"
+    try:
+        profiles = [config.profile(args.profile)]
+    except ConfigError:  # several profiles and no default: any of them may be served
+        profiles = list(config.profiles.values())
+    endpoints = [p.name for p in profiles if p.mode != "vmware"]
+    if requested == "lab" and endpoints:
+        return "strict", [f"profile {', '.join(endpoints)} is an endpoint profile (its debugger does not "
+                          "run in a disposable VM): strict permissions instead of lab"]
+    return requested, []
+
+
+def _permission_notes(entries: Sequence[Mapping[str, Any]], mode: str) -> list[str]:
     static = [e["name"] for e in entries if e["id"] != "gateway"]
+    if mode == "lab":
+        what = ("lab mode, for disposable lab VMs reverted after every job: Claude Code runs every "
+                "gateway and x64dbg tool that only changes the guest without asking (debugger_call and "
+                "ExecuteDebuggerCommand included) and asks before the host/VM-destructive ones")
+    else:
+        what = ("strict mode: Claude Code runs the read-only tools, analysis_start, analysis_collect, "
+                "file_upload and the static_* tools without asking and asks before every tool that changes "
+                "the debuggee (SetBreakpoint, run, WriteMemToAddress, ExecuteDebuggerCommand, debugger_call, "
+                "...) or the host/VM; --permissions-mode lab allows the guest-changing ones too, for "
+                "disposable lab VMs")
     notes = ["merge this into .claude/settings.json (this project) or ~/.claude/settings.json (every "
-             "project): Claude Code then runs the listed gateway and x64dbg tools without asking and asks "
-             "before the host/VM-destructive ones (snapshots, power, file_download, analysis_finish)",
+             "project); " + what,
              "tools that a plugin build newer than the builtin tool lists adds are not listed: Claude Code "
              "asks for them"]
     if static:
@@ -2930,8 +2989,40 @@ def mcp_servers_document(entries: Sequence[Mapping[str, Any]]) -> tuple[dict[str
     return {"mcpServers": servers}, notes
 
 
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+_ALREADY_REGISTERED_RE = re.compile(r"\balready exists\b", re.IGNORECASE)
+
+
+def search_path(name: str, *, path_env: str | None = None, pathext: str | None = None,
+                windows: bool | None = None) -> str | None:
+    """The program ``name`` from the absolute PATH entries only: never the current directory (on
+    Windows ``shutil.which`` and CreateProcess look there first, so a planted ``claude.exe`` in the
+    working directory would run), never a relative or empty entry. Windows tries the PATHEXT
+    extensions; elsewhere the file must be executable."""
+    windows = _windows_host() if windows is None else windows
+    raw = os.environ.get("PATH", "") if path_env is None else path_env
+    entries = raw.split(";" if windows else ":")
+    if windows:
+        exts = [e for e in (pathext if pathext is not None else os.environ.get("PATHEXT", _DEFAULT_PATHEXT))
+                .split(";") if e]
+        names = [name] if any(name.lower().endswith(e.lower()) for e in exts) else [name + e for e in exts]
+    else:
+        names = [name]
+    for entry in entries:
+        entry = entry.strip().strip('"')
+        # a drive path on Windows (or, for a test on another host, that host's absolute path)
+        absolute = os.path.isabs(entry) or (windows and PureWindowsPath(entry).is_absolute())
+        if not entry or not absolute:
+            continue
+        for candidate in names:
+            path = os.path.join(entry, candidate)
+            if os.path.isfile(path) and (windows or os.access(path, os.X_OK)):
+                return path
+    return None
+
+
 def _find_claude() -> str | None:
-    return shutil.which("claude")
+    return search_path("claude")
 
 
 def _stdin_is_tty() -> bool:
@@ -2942,8 +3033,9 @@ def _stdin_is_tty() -> bool:
 
 
 def _run_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=APPLY_TIMEOUT_S, check=False,
-                          **gw_platform.subprocess_kwargs())
+    """Run ``argv`` (a list: every value one argument, never through a shell)."""
+    return subprocess.run(list(argv), shell=False, capture_output=True, text=True,  # noqa: S603
+                          timeout=APPLY_TIMEOUT_S, check=False, **gw_platform.subprocess_kwargs())
 
 
 def _apply_plan(entries: Sequence[Mapping[str, Any]], claude: str
@@ -2999,7 +3091,11 @@ def _apply(entries: Sequence[Mapping[str, Any]], args: argparse.Namespace, out: 
             code, output = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except (OSError, subprocess.SubprocessError) as e:
             code, output = -1, f"could not run claude: {type(e).__name__}"
-        applied.append({"name": name, "command": shell_join(argv), "returncode": code, "ok": code == 0,
+        # claude mcp add refuses a name it knows ("MCP server NAME already exists in local config"):
+        # the server is registered, which is what --apply is for; replacing it is the user's call
+        already = code != 0 and bool(_ALREADY_REGISTERED_RE.search(output))
+        applied.append({"name": name, "command": shell_join(argv), "returncode": code,
+                        "ok": code == 0 or already, "already_registered": already,
                         "output": _safe(output.strip())[:2000]})
     return {"applied": applied, "skipped": skipped, "aborted": False}
 
@@ -3007,6 +3103,10 @@ def _apply(entries: Sequence[Mapping[str, Any]], args: argparse.Namespace, out: 
 def _format_apply(result: Mapping[str, Any]) -> str:
     lines: list[str] = []
     for a in result["applied"]:
+        if a.get("already_registered"):
+            lines.append(f"already registered: {_safe(a['name'])} (to replace it, run `claude mcp remove "
+                         f"{_safe(a['name'])}` and --apply again)")
+            continue
         status = "ok" if a["ok"] else f"failed, exit {a['returncode']}"
         lines.append(f"ran: {_safe_command(a['command'])} ({status})")
         lines.extend(f"  {line}" for line in a["output"].splitlines() if line.strip())
@@ -3030,6 +3130,8 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
         raise UsageError("--apply runs `claude mcp add`: it only works with --client claude")
     if args.yes and not args.apply:
         raise UsageError("--yes only applies together with --apply")
+    if args.permissions_mode and not args.permissions:
+        raise UsageError("--permissions-mode only applies together with --permissions")
     path = _config_target(args)
     config = gw_config.load_config(path, environ=os.environ)
     entries = _select_entries(args, config, path)
@@ -3038,10 +3140,14 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
     if args.permissions:
         server = next((e["name"] for e in mcp_config_entries(args, config, path) if e["id"] == "gateway"),
                       MCP_SERVER_NAME)
-        snippet, notes = permissions_snippet(server), _permission_notes(entries)
+        mode, warnings = _permissions_mode(args, config)
+        snippet, notes = permissions_snippet(server, mode), _permission_notes(entries, mode)
         if out.json_mode:
-            out.data({"ok": True, "server": server, "settings": snippet, "notes": notes})
+            out.data({"ok": True, "server": server, "mode": mode, "settings": snippet, "notes": notes,
+                      "warnings": warnings})
         else:
+            for warning in warnings:
+                out.note(f"warning: {warning}")
             for note in notes:
                 out.note(f"note: {note}")
             out.data(snippet, lambda d: _dumps(d))
@@ -3057,7 +3163,7 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
         return EXIT_OK
     if args.apply:
         result = _apply(entries, args, out)
-        ok = not result["aborted"] and all(a["ok"] for a in result["applied"])
+        ok = all(a["ok"] for a in result["applied"])  # answering no registers nothing: no failure
         out.data({**base, "ok": ok, **result}, _format_apply)
         return EXIT_OK if ok else EXIT_FAILURE
     out.data(base, _format_mcp_config_result)
@@ -3248,6 +3354,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="report: write it to FILE (0600) instead of printing it, e.g. "
                         "<jobs_root>/<JOB_ID>/artifacts/report.md")
     p.add_argument("--format", choices=("markdown", "json"), help="report: markdown (default) or json")
+    p.add_argument("--force", action="store_true", help="report --out: replace a file that exists")
 
     p = command("discard", cmd_discard, "mark a job DISCARDED (human-only) so the VM may be reverted")
     p.add_argument("job_id", metavar="JOB_ID")
@@ -3332,8 +3439,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", action="append", metavar="NAME=VALUE",
                    help="fill in the <NAME> placeholder, e.g. --set binary=/path/a.exe (repeatable)")
     p.add_argument("--permissions", action="store_true",
-                   help="print a Claude Code settings.json snippet instead: allow the read-only and "
-                        "guest-changing tools, ask before the host/VM-destructive ones")
+                   help="print a Claude Code settings.json permissions snippet instead "
+                        "(see --permissions-mode)")
+    p.add_argument("--permissions-mode", choices=PERMISSION_MODES,
+                   help="strict (default): allow the read-only tools, analysis_start/collect, "
+                        "file_upload and static_*, ask for the rest; lab: also allow every tool that only "
+                        "changes the guest, for disposable lab VMs (endpoint profiles are always strict)")
     p.add_argument("--apply", action="store_true",
                    help="run the `claude mcp add` commands that need nothing filled in (asks first)")
     p.add_argument("--yes", action="store_true", help="with --apply: do not ask for confirmation")

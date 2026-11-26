@@ -36,10 +36,12 @@ __all__ = ["PROMPTS", "PROMPTS_BY_NAME", "PromptArg", "PromptDef", "PromptError"
            "render"]
 
 #: what a value may not contain: C0/C1 controls (newlines included), DEL, bidi controls, separators
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029"
-                         r"\ud800-\udfff]")
+#: also the invisible ones: zero-width space / joiners, word joiner, BOM, Unicode tag characters
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\u2028\u2029\ufeff"
+                         r"\ud800-\udfff\U000e0000-\U000e007f]")
 _API_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_?@$][A-Za-z0-9_?@$]*)?")  # kernel32.CreateFileW
 _ADDRESS_RE = re.compile(r"0[xX][0-9A-Fa-f]{1,16}|[0-9]{1,20}")
+_MODULE_RE = re.compile(r"[A-Za-z0-9_.@$~+ -]{1,255}")  # sample.exe, kernel32.dll, name@0x<base>
 _ARCHES = ("auto", "x64", "x32")
 
 
@@ -265,7 +267,7 @@ PROMPTS: tuple[PromptDef, ...] = (
                                       "radare2: baddr).",
                          max_len=24, check=_match(_ADDRESS_RE, f"must be an address, {_ADDRESS_HELP}")),
                PromptArg("module", "Module the address belongs to (default: the sample).", required=False,
-                         max_len=255),
+                         max_len=255, check=_match(_MODULE_RE, "must be a module name such as sample.exe")),
                _ARCH), _static_dynamic),
     PromptDef("report", "Report on a job",
               "Summarise one analysis job with analysis_report: sample, states, collected files, problems.",

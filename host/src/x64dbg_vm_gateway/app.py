@@ -3896,7 +3896,9 @@ class Gateway(GatewayApp):
         """The report of one job (``report.job_report``), built from its host job directory.
 
         Default job: the active one of the default profile, else its newest job. Reads files
-        only (no VM or backend access, no operation lock), so it is safe at any time.
+        only (no VM or backend access, no operation lock), so it is safe at any time. The job
+        directory is ``<jobs_root>/<job id>``: a host_root in state.json that points elsewhere is
+        not followed (the report warns about it).
         """
         if format not in report.REPORT_FORMATS:
             raise InvalidArgument(f"format must be one of {', '.join(report.REPORT_FORMATS)}",
@@ -3916,7 +3918,7 @@ class Gateway(GatewayApp):
                     raise StateViolation(f"profile {name} has no jobs yet",
                                          hint="start one with analysis_start", next_tool="analysis_start")
                 job = jobs[-1]  # oldest first
-        return report.job_report(job, Path(job.host_root), fmt=format)
+        return report.job_report(job, self.config.jobs_root_path / job.id, fmt=format)
 
     def close(self) -> None:
         with self._lock:

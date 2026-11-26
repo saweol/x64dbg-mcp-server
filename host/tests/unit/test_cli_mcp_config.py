@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,41 +44,111 @@ def name(tool: str) -> str:
 
 
 # ── (a) --permissions ───────────────────────────────────────────────
-def test_permissions_snippet(tmp_path, capsys):
-    cfg = static_config(tmp_path)
-    assert run(["--config", str(cfg), "mcp-config", "--permissions"]) == 0
+#: plugin tools the review named: never allowed without asking in strict mode
+RISKY_PLUGIN_TOOLS = {"ExecuteDebuggerCommand", "WriteMemToAddress", "AllocateMemory", "FreeMemory",
+                      "Assemble", "SetRegister", "LoadBinary", "RestartDebug", "StopDebug", "DumpMemory",
+                      "DumpModule", "AttachProcess", "SetBreakpoint", "run"}
+#: gateway tools strict mode allows besides the observe tier
+STRICT_GATEWAY = {"analysis_start", "analysis_collect", "file_upload", "static_export_annotations",
+                  "static_import_annotations"}
+
+
+def catalog_read_only() -> dict[str, bool]:
+    """Plugin tool -> read-only in every builtin catalog that lists it."""
+    from importlib import resources
+
+    flags: dict[str, bool] = {}
+    for version in ("1.9", "1.10"):
+        doc = json.loads(resources.files("x64dbg_vm_gateway").joinpath(f"data/tools-v{version}.json")
+                         .read_text(encoding="utf-8"))
+        for t in doc["tools"]:
+            flags[t["name"]] = flags.get(t["name"], True) and bool(t["read_only"])
+    return flags
+
+
+def snippet(tmp_path: Path, capsys: Any, *extra: str, config: Path | None = None) -> tuple[dict, str]:
+    cfg = config or static_config(tmp_path)
+    assert run(["--config", str(cfg), "mcp-config", "--permissions", *extra]) == 0
     captured = capsys.readouterr()
-    doc = json.loads(captured.out)  # stdout is the snippet itself, ready to merge into settings.json
-    perms = doc["permissions"]
+    return json.loads(captured.out)["permissions"], captured.err  # stdout: the snippet, ready to merge
+
+
+def test_strict_permissions_are_the_default(tmp_path, capsys):
+    perms, err = snippet(tmp_path, capsys)
     allow, ask = perms["allow"], perms["ask"]
-    assert len(allow) == len(set(allow)) and not set(allow) & set(ask)
-    assert set(ask) == {name(t) for t in DESTRUCTIVE}
+    assert len(allow) == len(set(allow)) and len(ask) == len(set(ask)) and not set(allow) & set(ask)
     for tool in GATEWAY_TOOLS:
-        expected = ask if tool.tier is RiskTier.HOST_DESTRUCTIVE else allow
-        assert name(tool.name) in expected, tool.name
-    for plugin_tool in ("SetBreakpoint", "run", "GetDebugState", "DumpMemory", "GetServerInfo",
-                        "SetArtifactDir"):
-        assert name(plugin_tool) in allow, plugin_tool  # v1.9 and v1.10 plugin tools
+        allowed = tool.tier is RiskTier.OBSERVE or tool.name in STRICT_GATEWAY
+        assert name(tool.name) in (allow if allowed else ask), tool.name
+    for gateway_tool in ("debugger_call", "debugger_restart", "debugger_select", *DESTRUCTIVE):
+        assert name(gateway_tool) in ask, gateway_tool
+    flags = catalog_read_only()
+    for tool, read_only in flags.items():
+        assert name(tool) in (allow if read_only else ask), tool  # the catalog's read_only flag decides
+    for tool in RISKY_PLUGIN_TOOLS:
+        assert name(tool) in ask, tool
+    for tool in ("GetDebugState", "ReadMemory", "ListModules", "GetCallStack", "GetServerInfo"):
+        assert name(tool) in allow, tool
     assert not any(name(alias) in allow + ask for alias in DEPRECATED_ALIASES)  # never listed, never called
     assert all(n.startswith(f"mcp__{SERVER}__") for n in allow + ask)
-    assert "settings.json" in captured.err
+    assert "settings.json" in err and "strict" in err
+
+
+def test_lab_permissions_allow_every_guest_changing_tool(tmp_path, capsys):
+    perms, err = snippet(tmp_path, capsys, "--permissions-mode", "lab")
+    allow, ask = perms["allow"], perms["ask"]
+    assert set(ask) == {name(t) for t in DESTRUCTIVE}
+    for tool in GATEWAY_TOOLS:
+        assert name(tool.name) in (ask if tool.tier is RiskTier.HOST_DESTRUCTIVE else allow), tool.name
+    for tool in catalog_read_only():
+        assert name(tool) in allow, tool
+    assert "disposable" in err  # lab mode is for lab VMs that are reverted anyway
+
+
+def test_an_endpoint_profile_always_gets_strict_permissions(tmp_path, capsys):
+    cfg = tmp_path / "endpoint.toml"
+    cfg.write_text(f"""
+[gateway]
+jobs_root = "{(tmp_path / 'jobs').as_posix()}"
+default_profile = "remote"
+
+[profiles.remote]
+mode = "endpoint"
+
+[profiles.remote.backends.x64]
+url = "http://127.0.0.1:9094/"
+token_env = "GW_TEST_X64_TOKEN"
+""", encoding="utf-8")
+    perms, err = snippet(tmp_path, capsys, "--permissions-mode", "lab", config=cfg)
+    assert name("ExecuteDebuggerCommand") in perms["ask"] and name("debugger_call") in perms["ask"]
+    assert "endpoint" in err and "strict" in err
+    lab = ["--permissions", "--permissions-mode", "lab"]
+    assert run(["--config", str(cfg), "--json", "mcp-config", *lab]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["mode"] == "strict" and any("endpoint" in w for w in data["warnings"])
 
 
 def test_permissions_tiers_come_from_the_policy_tables():
-    # the ask list is exactly the host-destructive gateway tools of the tier tables
     tiers = policy.GATEWAY_TOOL_TIERS
     assert {t for t, tier in tiers.items() if tier is RiskTier.HOST_DESTRUCTIVE} == DESTRUCTIVE
-    perms = cli.permissions_snippet(SERVER)["permissions"]
+    perms = cli.permissions_snippet(SERVER, mode="lab")["permissions"]
     assert set(perms["ask"]) == {name(t) for t in DESTRUCTIVE}
+    strict = cli.permissions_snippet(SERVER)["permissions"]
+    assert {name(t) for t in DESTRUCTIVE} <= set(strict["ask"])
 
 
 def test_permissions_json(tmp_path, capsys):
     cfg = static_config(tmp_path)
     assert run(["--config", str(cfg), "--json", "mcp-config", "--permissions"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["ok"] is True and data["server"] == SERVER
+    assert data["ok"] is True and data["server"] == SERVER and data["mode"] == "strict"
     assert name("session_status") in data["settings"]["permissions"]["allow"]
-    assert data["notes"]
+    assert data["notes"] and data["warnings"] == []
+
+
+def test_permissions_mode_needs_permissions(tmp_path, capsys):
+    cfg = static_config(tmp_path)
+    assert run(["--config", str(cfg), "mcp-config", "--permissions-mode", "lab"]) == 2
 
 
 @pytest.mark.parametrize("server,expected", [
@@ -253,15 +325,18 @@ def test_set_is_checked_like_the_config(tmp_path, capsys, setting, why):
 
 # ── (d) --apply ─────────────────────────────────────────────────────
 class Runner:
-    def __init__(self, returncodes: dict[str, int] | None = None) -> None:
+    """Stands in for ``claude``: ``errors`` maps a server name to the error text its add prints (exit 1)."""
+
+    def __init__(self, errors: dict[str, str] | None = None) -> None:
         self.calls: list[list[str]] = []
-        self.returncodes = returncodes or {}
+        self.errors = errors or {}
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
-        code = self.returncodes.get(argv[3] if len(argv) > 3 and argv[3] != "--transport" else argv[5], 0)
-        out = f"Added stdio MCP server {argv[3]}" if code == 0 else ""
-        return subprocess.CompletedProcess(argv, code, stdout=out, stderr="already exists" if code else "")
+        server = argv[3] if len(argv) > 3 and argv[3] != "--transport" else argv[5]
+        if server in self.errors:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=self.errors[server])
+        return subprocess.CompletedProcess(argv, 0, stdout=f"Added stdio MCP server {server}", stderr="")
 
 
 @pytest.fixture
@@ -298,14 +373,29 @@ def test_apply_with_set_registers_ghidra_too(tmp_path, capsys, runner):
 
 
 def test_apply_reports_a_failed_command(tmp_path, capsys, monkeypatch):
-    r = Runner({"ida-multi-mcp": 1})
+    r = Runner({"ida-multi-mcp": "Invalid transport type: stdio2"})
     monkeypatch.setattr(cli, "_run_command", r)
     monkeypatch.setattr(cli, "_find_claude", lambda: "/usr/local/bin/claude")
     cfg = static_config(tmp_path, '\n[static]\ntools = ["ida"]\n')
     assert run(["--config", str(cfg), "--json", "mcp-config", "--apply", "--yes"]) == 1
     data = json.loads(capsys.readouterr().out)
     assert [(a["name"], a["ok"]) for a in data["applied"]] == [("x64dbg-vm", True), ("ida-multi-mcp", False)]
-    assert "already exists" in data["applied"][1]["output"]
+    assert "Invalid transport" in data["applied"][1]["output"]
+
+
+def test_apply_reports_an_already_registered_server_as_such(tmp_path, capsys, monkeypatch):
+    r = Runner({"x64dbg-vm": "MCP server x64dbg-vm already exists in local config"})
+    monkeypatch.setattr(cli, "_run_command", r)
+    monkeypatch.setattr(cli, "_find_claude", lambda: "/usr/local/bin/claude")
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ida"]\n')
+    assert run(["--config", str(cfg), "mcp-config", "--apply", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "already registered: x64dbg-vm" in out and "claude mcp remove x64dbg-vm" in out
+    assert "failed" not in out
+    assert run(["--config", str(cfg), "--json", "mcp-config", "--apply", "--yes"]) == 0
+    applied = json.loads(capsys.readouterr().out)["applied"]
+    assert applied[0]["ok"] is True and applied[0]["already_registered"] is True
+    assert applied[1]["already_registered"] is False
 
 
 def test_apply_needs_a_confirmation(tmp_path, capsys, runner, monkeypatch):
@@ -316,9 +406,10 @@ def test_apply_needs_a_confirmation(tmp_path, capsys, runner, monkeypatch):
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     answers = iter(["n"])
     monkeypatch.setattr("builtins.input", lambda: next(answers))
-    assert run(["--config", str(cfg), "mcp-config", "--apply"]) == 1
+    assert run(["--config", str(cfg), "mcp-config", "--apply"]) == 0  # a "no" is no failure
     captured = capsys.readouterr()
     assert "[y/N]" in captured.err and "nothing was registered" in captured.err and runner.calls == []
+    assert "nothing was registered" in captured.out
     assert "claude mcp add x64dbg-vm" in captured.err  # the prompt shows what would run
     answers = iter(["y"])
     assert run(["--config", str(cfg), "mcp-config", "--apply"]) == 0
@@ -384,6 +475,89 @@ def test_apply_refuses_an_argument_that_carries_a_secret(tmp_path, capsys, runne
     (skip,) = data["skipped"]
     assert skip["name"] == "ida-multi-mcp" and "secret" in skip["reason"] and "abc123" not in skip["reason"]
     assert all("abc123" not in arg for argv in runner.calls for arg in argv)
+
+
+def test_run_command_never_uses_a_shell(monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen["argv"], seen["kwargs"] = argv, kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    cli._run_command(["/usr/local/bin/claude", "mcp", "add", "x", "--", "a b; rm -rf /"])
+    assert isinstance(seen["argv"], list) and seen["argv"][-1] == "a b; rm -rf /"
+    assert seen["kwargs"].get("shell", False) is False and "shell" in seen["kwargs"]
+    assert seen["kwargs"]["timeout"] > 0 and seen["kwargs"]["check"] is False
+
+
+# ── finding claude without the current directory (Windows runs ./claude.exe first) ─
+def _exe(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_search_path_skips_the_current_directory_on_windows(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _exe(tmp_path / "claude.exe")  # planted in the current directory
+    _exe(tmp_path / "rel" / "claude.exe")
+    good = _exe(tmp_path / "npm" / "claude.CMD")
+    path = ";".join(["", ".", "rel", str(tmp_path / "npm")])
+    found = cli.search_path("claude", path_env=path, pathext=".COM;.EXE;.BAT;.CMD", windows=True)
+    assert found is not None and Path(found) == good
+
+
+def test_search_path_skips_relative_entries_on_posix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _exe(tmp_path / "claude")
+    good = _exe(tmp_path / "bin" / "claude")
+    (tmp_path / "noexec").mkdir()
+    (tmp_path / "noexec" / "claude").write_text("x", encoding="utf-8")  # not executable
+    path = os.pathsep.join(["", ".", str(tmp_path / "noexec"), str(tmp_path / "bin")])
+    if os.name == "posix":
+        assert cli.search_path("claude", path_env=path, windows=False) == str(good)
+    assert cli.search_path("claude", path_env=".:", windows=False) is None
+
+
+def test_find_claude_and_the_gateway_program_use_the_safe_search(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "search_path", lambda name, **kw: calls.append(name) or f"/opt/bin/{name}")
+    assert cli._find_claude() == "/opt/bin/claude" and calls == ["claude"]
+    assert cli.resolve_gateway_program(argv0="/usr/bin/pytest") == ("/opt/bin/x64dbg-vm-gateway", "PATH")
+    assert calls == ["claude", "x64dbg-vm-gateway"]
+
+
+# ── the absolute program path end to end (not only the conftest pin) ─
+@pytest.fixture
+def installed_program(tmp_path, monkeypatch) -> Path:
+    """A console script x64dbg-vm-gateway that is "running": the real resolution finds it."""
+    exe = _exe(tmp_path / "venv" / "bin" / "x64dbg-vm-gateway")
+    monkeypatch.setattr(cli, "gateway_program", cli.resolve_gateway_program)
+    monkeypatch.setattr(sys, "argv", [str(exe), "mcp-config"])
+    return exe
+
+
+def test_mcp_config_with_the_real_program_resolution(tmp_path, capsys, installed_program):
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ida"]\n')
+    assert run(["--config", str(cfg), "--json", "mcp-config"]) == 0
+    gw = json.loads(capsys.readouterr().out)["servers"][0]
+    assert gw["program"] == str(installed_program) and gw["launch"]["command"] == str(installed_program)
+    assert gw["argv"][gw["argv"].index("--") + 1:] == [str(installed_program), "serve"]
+    assert run(["--config", str(cfg), "mcp-config", "--client", "json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["mcpServers"]["x64dbg-vm"]["command"] == str(installed_program)
+
+
+def test_setup_with_the_real_program_resolution(tmp_path, capsys, installed_program):
+    cfg = static_config(tmp_path, '\n[static]\ntools = ["ida"]\n')
+    run(["--config", str(cfg), "--json", "setup", "--dry-run"])
+    data = json.loads(capsys.readouterr().out)
+    argv = data["register"]["argv"]
+    assert argv[argv.index("--") + 1:] == [str(installed_program), "serve"]
+    assert data["register"]["command"] == cli.shell_join(argv)
+    assert data["mcp_config"][0]["program"] == str(installed_program)
 
 
 def test_help_lists_the_new_options(capsys):

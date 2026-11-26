@@ -244,9 +244,12 @@ Further behaviour worth knowing:
   directory: states with timestamps, the sample (name, size, sha256, arch), epoch and debugger
   restarts, the collected files (original guest path, size, sha256, host path), the module map,
   screenshots, downloads, the static export and warnings / errors. Default job: the active one,
-  else the newest. Guest-derived names and messages stay inside `<untrusted_guest_output>` blocks
-  (JSON: listed under `guest_derived`). It only returns text; `x64dbg-vm-gateway jobs report
-  JOB_ID --out FILE` writes it (0600), also while a gateway serves.
+  else the newest. Every Markdown value is a code span in a list (no Markdown or HTML in a guest
+  name is rendered), and whatever may come from the guest (file and module names, messages,
+  state reasons, flags) stays inside `<untrusted_guest_output>` blocks (JSON: listed under
+  `guest_derived`; at most 1000 files, `files_truncated`). It reads `<jobs_root>/<job id>` only and
+  returns text; `x64dbg-vm-gateway jobs report JOB_ID --out FILE [--force]` writes it (0600, an
+  existing file only with `--force`), also while a gateway serves.
 - MCP prompts (`prompts/list`, `prompts/get`, every HTTP scope): `analyze-sample` (`sample_path`,
   `arch`), `trace-api` (`sample_path`, `api` such as `kernel32.CreateFileW`), `find-oep`
   (`sample_path`), `static-dynamic` (`sample_path`, `static_address`, `imagebase`, `module`) and
@@ -329,20 +332,28 @@ x64dbg-vm-gateway mcp-config --json   # the same as a list
 x64dbg-vm-gateway mcp-config --client json      # an mcpServers document (Claude Desktop, Cursor, VS Code)
 x64dbg-vm-gateway mcp-config --tool ghidra --set binary=/srv/a.exe --set project-dir=/srv/ghidra ...
 x64dbg-vm-gateway mcp-config --apply  # run the commands that need nothing filled in (asks; --yes)
-x64dbg-vm-gateway mcp-config --permissions      # Claude Code settings.json permissions snippet
+x64dbg-vm-gateway mcp-config --permissions      # Claude Code settings.json permissions (strict)
+x64dbg-vm-gateway mcp-config --permissions --permissions-mode lab   # broader, for disposable lab VMs
 ```
 
 The gateway's command names this installation's executable by its absolute path when it can be
-resolved (the running `x64dbg-vm-gateway`, else the one on PATH). `--tool ID` limits the output to
+resolved (the running `x64dbg-vm-gateway`, else the one on PATH; the PATH search never looks in
+the current directory, for `claude` either). `--tool ID` limits the output to
 `gateway` or one static tool; `--set NAME=VALUE` fills the `<NAME>` placeholder (refused: control
 characters and values that look like a secret, as in the config). `--apply` runs `claude mcp add`
 only for registrations without placeholders, after a y/N question on a terminal or with `--yes`,
 never with an argument that looks like a secret (and, with an npm `claude.cmd` on Windows, never
-with an argument cmd.exe would misread), and reports each command and its output.
+with an argument cmd.exe would misread), and reports each command and its output (a server that is
+already registered is reported as such; answering N registers nothing and exits 0).
 `--permissions` prints `{"permissions": {"allow": [...], "ask": [...]}}` for the gateway's server
-name: every observe and guest-mutating gateway tool and every plugin tool of the builtin lists by
-exact name (`mcp__x64dbg-vm__<tool>`) under `allow`, the host/VM-destructive gateway tools under
-`ask`; merge it into `.claude/settings.json` or `~/.claude/settings.json`.
+name, by exact tool name (`mcp__x64dbg-vm__<tool>`); merge it into `.claude/settings.json` or
+`~/.claude/settings.json`. Strict (the default) allows the observe-tier gateway tools,
+`analysis_start`, `analysis_collect`, `file_upload`, the `static_*` tools and the plugin tools the
+builtin lists mark read-only, and asks for everything else (`debugger_call`, the debugger controls,
+`SetBreakpoint`, `run`, `WriteMemToAddress`, `ExecuteDebuggerCommand`, the dump tools, ... and the
+host/VM-destructive gateway tools). `--permissions-mode lab`, for disposable lab VMs that are reverted
+after every job, also allows every tool that only changes the guest; an endpoint profile is always
+strict.
 
 On Windows the printed commands are for PowerShell (every argument that is not a plain word is
 single-quoted, including `'--'`); elsewhere they are for a POSIX shell.
@@ -448,7 +459,7 @@ export NODE_EXTRA_CA_CERTS=/path/to/gw.crt     # Node-based clients and a self-s
 | `status` | session status (VM, backends, job) |
 | `init` | write the config file (`--upload-root DIR`, repeatable: `gateway.upload_roots`, default `~`) |
 | `jobs [list \| show JOB_ID]` | read-only view of the job directories (works while a gateway runs) |
-| `jobs report JOB_ID [--out FILE] [--format markdown\|json]` | the job's report (see `analysis_report`), printed or written to FILE |
+| `jobs report JOB_ID [--out FILE [--force]] [--format markdown\|json]` | the job's report (see `analysis_report`), printed or written to FILE |
 | `demo [--arch x64\|x32\|both]` | installation self-test on the VM with the bundled benign sample (see below) |
 | `discard JOB_ID [--yes]` | human-only: mark a job DISCARDED so it may be reverted without collection |
 | `provision --x64dbg-root PATH ...` | prepare the guest (see above) |
@@ -457,7 +468,7 @@ export NODE_EXTRA_CA_CERTS=/path/to/gw.crt     # Node-based clients and a self-s
 | `setup --save-password-file [PATH] [--force]` | also write the guest user and password to a 0600 env file, once the doctor precheck shows the guest accepts them (default: the file `gateway.env_file` names, else `<profile>.env` in the per-user config folder); a new config gets `gateway.env_file`, an existing config is not edited (the line to add is printed); `--force` updates an existing file's two lines |
 | `snapshot refresh --name NEW [--set-clean]` | human-only: take a new clean snapshot of the running guest after the readiness checks (no unfinished job, one VM instance, plugins answer); `--set-clean` also sets `clean_snapshot` / `protected_snapshots` in a config written by init or setup, otherwise the lines are printed |
 | `snapshot prune --keep N [--yes]` | human-only: list the `gw-*` snapshots and the recorded old clean snapshots beyond the newest N of each; deletes them only with `--yes`; protected snapshots and the clean snapshot are never deleted |
-| `mcp-config [--client claude\|json] [--tool ID] [--set NAME=VALUE] [--apply [--yes]] [--permissions]` | registration commands (or mcpServers JSON) for the gateway and the configured static tools; `--apply` runs them, `--permissions` prints Claude Code permissions |
+| `mcp-config [--client claude\|json] [--tool ID] [--set NAME=VALUE] [--apply [--yes]] [--permissions [--permissions-mode strict\|lab]]` | registration commands (or mcpServers JSON) for the gateway and the configured static tools; `--apply` runs them, `--permissions` prints Claude Code permissions |
 | `static-scripts [--dest DIR] [--force]` | where the static-tool sync scripts are installed, or a copy of them |
 
 Global options, before or after the command: `--config PATH`, `--profile NAME`, `--json`
@@ -468,12 +479,16 @@ and a hint), 2 usage error.
 `tests/vm/samples/hello.zig` by `scripts/build-release.sh`) for each architecture the profile has a
 backend for (or `--arch`): `analysis_start`, `SetBreakpoint kernel32.Sleep`, `run` until it stops in
 kernel32 (at most 4 times), `GetCallStack`, `analysis_collect`, `analysis_finish(revert=true)`. It
-prints every step with its time, then `PASS` or `FAIL` with hints (exit 0 / 1; `--json` for one
-document). The sample is copied to a private directory below `~/.cache/x64dbg-vm-gateway/demo`, which
-is the only upload root of the demo's own gateway (the config file is not changed). A failed step
-cleans up the demo's job (collect, discard if still partial, finish with revert). It refuses next to
-a serving gateway (`LOCK_TIMEOUT`), a live or unreadable job, an endpoint profile and missing samples
-(with how to build them). It reverts the VM to the clean snapshot.
+prints every step with its time, then `PASS` or `FAIL` with hints (exit 0 / 1, 130 after Ctrl-C;
+`--json` for one document). The stop must be `PAUSED` in kernel32 at the address `EvalExpression`
+gives for `kernel32:Sleep` (when it resolves). The sample is copied to a private directory below
+`~/.cache/x64dbg-vm-gateway/demo`, which is the only upload root of the demo's own gateway (the config
+file is not changed). A failed or interrupted step cleans up the demo's own job only (the job of its
+successful `analysis_start`, or a new job of the profile holding its sample): collect, discard if
+still partial, finish with revert; a job it cannot clean up (an operation still running, a failed
+revert) is named with the command to handle it, and the next architecture is not started. It
+refuses next to a serving gateway (`LOCK_TIMEOUT`), a live or unreadable job, an endpoint profile and
+missing samples (with how to build them). It reverts the VM to the clean snapshot.
 
 ## Safety
 

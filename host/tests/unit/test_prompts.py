@@ -96,6 +96,34 @@ def test_tool_names_in_the_texts_exist():
         assert snake <= known, (name, snake - known)
 
 
+def tool_schemas() -> dict[str, set[str]]:
+    """Tool -> its argument names: the gateway tools' schemas and every builtin plugin catalog."""
+    from x64dbg_vm_gateway.frontends.tool_defs import TOOLS_BY_NAME
+
+    schemas = {name: set(t.input_schema.get("properties", {})) for name, t in TOOLS_BY_NAME.items()}
+    for version in ("1.9", "1.10"):
+        doc = json.loads(resources.files("x64dbg_vm_gateway").joinpath(f"data/tools-v{version}.json")
+                         .read_text(encoding="utf-8"))
+        for t in doc["tools"]:
+            schemas.setdefault(t["name"], set()).update(t["inputSchema"].get("properties", {}))
+    return schemas
+
+
+@pytest.mark.parametrize("name", sorted(NAMES))
+def test_every_call_in_a_prompt_uses_the_tools_real_argument_names(name):
+    schemas = tool_schemas()
+    text = prompts.render(name, {**ARGS[name], "arch": "x64"} if name != "report" else ARGS[name])
+    calls = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\(([^()]*)\)", text)
+    checked = 0
+    for tool, args in calls:
+        if tool not in schemas:
+            continue
+        used = set(re.findall(r"(?:^|[\s,(])([A-Za-z_][A-Za-z0-9_]*)=", args))
+        assert used <= schemas[tool], (tool, used - schemas[tool])
+        checked += bool(used)
+    assert checked, "the prompt passes arguments to at least one tool"
+
+
 def test_arguments_are_quoted_into_the_text():
     text = prompts.render("analyze-sample", {"sample_path": 'C:\\samples\\a "b".exe'})
     assert json.dumps('C:\\samples\\a "b".exe') in text  # one JSON string literal: unambiguous
@@ -119,6 +147,11 @@ def test_report_without_a_job_id_uses_the_default_job():
     ("analyze-sample", {"sample_path": "x" * 5000}, "long"),
     ("analyze-sample", {"sample_path": SAMPLE, "arch": "arm64"}, "arch"),
     ("analyze-sample", {"sample_path": SAMPLE, "bogus": "1"}, "bogus"),
+    ("analyze-sample", {"sample_path": "a\u200bb"}, "control"),  # zero-width space
+    ("analyze-sample", {"sample_path": "a\ufeffb"}, "control"),  # BOM
+    ("analyze-sample", {"sample_path": "a\U000e0041b"}, "control"),  # a Unicode tag character
+    ("static-dynamic", {"sample_path": SAMPLE, "static_address": "0x1", "imagebase": "0x1",
+                        "module": "a`b<c>"}, "module"),
     ("trace-api", {"sample_path": SAMPLE, "api": "CreateFileW; rm -rf /"}, "api"),
     ("static-dynamic", {"sample_path": SAMPLE, "static_address": "main", "imagebase": "0x1"},
      "static_address"),
