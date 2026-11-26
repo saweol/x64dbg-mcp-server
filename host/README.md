@@ -166,7 +166,7 @@ host-only.
 
 ```console
 claude mcp add x64dbg-vm -- x64dbg-vm-gateway serve
-# another profile:  claude mcp add x64dbg-lab -- x64dbg-vm-gateway serve --profile lab
+# one serve drives every profile of the config (see "Several VMs"); --profile NAME sets the default
 ```
 
 `x64dbg-vm-gateway mcp-config` prints this command for your config (with
@@ -245,6 +245,29 @@ Further behaviour worth knowing:
   `install-plugin` run with supervision paused and the VM lock held, and start new backend epochs
   after a plugin install. A job whose debugger held the sample is marked `flags.debuggee_lost`
   (the CLI names it), and the next gateway's recovery hint says the sample is no longer loaded.
+
+### Several VMs
+
+One `serve` handles every profile in the config (`--profile` only sets the default), and each
+profile (VM) can have its own live job at the same time. Each VM has its own VM lock, operation
+runner, debugger supervision and epochs: a revert, power change or debugger restart of one VM never
+waits for, reverts or bumps the epochs of another. Two profiles that name the same `.vmx` never have
+live jobs at once.
+
+- `analysis_start(profile=...)` makes that VM the *target* of the client session (each MCP session
+  has its own; stdio has one). `debugger_select(profile=..., backend_id=...)` switches it.
+- Mirrored x64dbg tools, `debugger_call`, `debugger_restart` and the `vm_*` tools without
+  `profile`, and job tools without `job_id`, go to: the session's target, else the only profile,
+  else the VM with the only live job, else the default profile. With live jobs on several VMs and no
+  target the call is refused with `TARGET_AMBIGUOUS` (the jobs and the `debugger_select` call are
+  in the error); nothing is sent. `debugger_call` and `debugger_restart` also take `profile`.
+- Every mirrored result ends with `[gateway] epoch=N backend=ID profile=NAME retried=...`.
+- `session_status` without `profile` lists every VM compactly (VM, backends, live job, running
+  operation), acknowledges each, and shows the session's `target`, the `routing` decision and the
+  `active_jobs`; with `profile` it shows that VM in full.
+- A `read` HTTP token cannot call `debugger_select` (guest-mutating tier), so while several VMs
+  have live jobs its mirrored calls are refused with `TARGET_AMBIGUOUS`; `session_status` still
+  shows every VM.
 
 ## Static analysis tools
 
