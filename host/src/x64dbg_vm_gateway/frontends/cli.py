@@ -13,8 +13,10 @@ Commands::
     install-plugin [--dist DIR] ...     copy a plugin build (default: the bundled one) into the guest
     setup [--dry-run] ...               init (no config yet), doctor, install-plugin, provision,
                                         doctor, then print the ``claude mcp add`` commands
-    mcp-config [--client claude]        the ``claude mcp add`` commands for the gateway and the
-                                        configured static tools (placeholders as <...>)
+    mcp-config [--client claude|json]   the ``claude mcp add`` commands (or an mcpServers JSON document)
+                                        for the gateway and the configured static tools (placeholders as
+                                        <...>; --tool ID, --set NAME=VALUE); --permissions: a Claude
+                                        Code settings.json snippet; --apply [--yes]: run the commands
     demo [--arch x64|x32|both]          installation self-test: the bundled benign sample through
                                         the whole analysis loop on the VM (reverts it)
     static-scripts [--dest DIR]         where the packaged static-tool sync scripts are, or a copy
@@ -70,10 +72,13 @@ import math
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from importlib import resources
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -91,8 +96,9 @@ from ..errors import (
     VmrunNotFound,
 )
 from ..jobs import DISCARD_ACTOR, JOB_ID_RE, Job, validate_job_id
+from ..policy import RiskTier
 from ..proxy import sanitize_untrusted_text
-from .tool_defs import InternalError
+from .tool_defs import GATEWAY_TOOLS, RESERVED_TOOL_NAMES, InternalError
 
 if TYPE_CHECKING:
     from ..contracts import Secret
@@ -1109,12 +1115,48 @@ def _is_default_config(path: Path) -> bool:
     return norm(path) == norm(gw_config.default_config_path())
 
 
+def resolve_gateway_program(*, argv0: str | None = None, which: Callable[[str], str | None] | None = None,
+                            is_file: Callable[[str], bool] | None = None) -> tuple[str, str | None]:
+    """(program to put in the register line, how it was found: "argv0", "PATH" or None).
+
+    The running console script (``sys.argv[0]`` named x64dbg-vm-gateway[.exe]) first, then the
+    one on PATH; both as absolute paths (a symlink such as ~/.local/bin/x64dbg-vm-gateway is kept:
+    it survives upgrades). The bare name when neither is found."""
+    argv0 = (sys.argv[0] if sys.argv else "") if argv0 is None else argv0
+    which = which or shutil.which
+    is_file = is_file or os.path.isfile
+    if argv0:
+        windows_style = "\\" in argv0 or PureWindowsPath(argv0).drive != ""
+        base = PureWindowsPath(argv0).name if windows_style else os.path.basename(argv0)
+        stem = base[:-4] if base.lower().endswith(".exe") else base
+        if stem.lower() == PROG and is_file(argv0):
+            absolute = windows_style and PureWindowsPath(argv0).is_absolute()
+            return (argv0 if absolute else os.path.abspath(argv0)), "argv0"
+    found = which(PROG)
+    if found:
+        return os.path.abspath(found), "PATH"
+    return PROG, None
+
+
+def gateway_program() -> tuple[str, str | None]:
+    """The program of the register line (``resolve_gateway_program``; tests pin the bare name)."""
+    return resolve_gateway_program()
+
+
+def _program_note(program: str, how: str | None) -> str:
+    if how is None:
+        return (f"{PROG} was not found on PATH: the MCP client has to find it on its own PATH (or put its "
+                "absolute path into the command)")
+    return (f"the command names this installation's executable by its absolute path ({program}), so the MCP "
+            "client finds it whatever its PATH is; run mcp-config again after reinstalling it elsewhere")
+
+
 def _register_argv(args: argparse.Namespace, path: Path) -> list[str]:
     """``claude mcp add`` for this gateway; ``-e`` names the config only when it is not the default one."""
     argv = ["claude", "mcp", "add", MCP_SERVER_NAME]
     if not _is_default_config(path):
         argv += ["-e", f"{gw_config.ENV_CONFIG_PATH}={path.expanduser().absolute()}"]
-    argv += ["--", PROG, "serve"]
+    argv += ["--", gateway_program()[0], "serve"]
     if args.profile:
         argv += ["--profile", args.profile]
     return argv
@@ -1499,7 +1541,11 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
 
 
 # ── mcp-config ──────────────────────────────────────────────────────
-MCP_CLIENTS = ("claude",)
+MCP_CLIENTS = ("claude", "json")
+#: cmd.exe reads these even inside the quotes Python puts around an argument (a claude.cmd launcher)
+_CMD_META_RE = re.compile(r'[%^&|<>"!\r\n]')
+_SET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+APPLY_TIMEOUT_S = 120.0
 
 
 def _sync_script_path(tool_id: str) -> str | None:
@@ -1511,6 +1557,30 @@ def _sync_script_path(tool_id: str) -> str | None:
     return str(root.joinpath(*rel.split("/")))
 
 
+def _claude_argv(name: str, launch: Mapping[str, Any]) -> list[str]:
+    """``claude mcp add`` for a launch spec (``{"transport", "command", "args", "env"}`` for stdio,
+    ``{"transport", "url"}`` for http / sse)."""
+    if launch["transport"] == "stdio":
+        argv = ["claude", "mcp", "add", name]
+        for var, value in launch["env"].items():
+            argv += ["-e", f"{var}={value}"]
+        return [*argv, "--", launch["command"], *launch["args"]]
+    return ["claude", "mcp", "add", "--transport", launch["transport"], name, launch["url"] or ""]
+
+
+def _launch_placeholders(launch: Mapping[str, Any] | None) -> list[str]:
+    """The ``<...>`` placeholders left in a launch spec (env values, then the command), each once."""
+    if launch is None:
+        return []
+    texts = ([*launch["env"].values(), launch["command"], *launch["args"]] if launch["transport"] == "stdio"
+             else [launch["url"] or ""])
+    found: dict[str, None] = {}
+    for text in texts:
+        for match in static_tools.PLACEHOLDER_RE.findall(text):
+            found.setdefault(match)
+    return list(found)
+
+
 def _gateway_entry(args: argparse.Namespace, config: gw_config.GatewayConfig, path: Path) -> dict[str, Any]:
     argv = _register_argv(args, path)
     notes: list[str] = []
@@ -1520,8 +1590,13 @@ def _gateway_entry(args: argparse.Namespace, config: gw_config.GatewayConfig, pa
         note = None
     if note:
         notes.append(note)
+    program = argv[argv.index("--") + 1]
+    notes.append(_program_note(program, gateway_program()[1] if program != PROG else None))
+    env = {} if _is_default_config(path) else {gw_config.ENV_CONFIG_PATH: str(path.expanduser().absolute())}
+    launch = {"transport": "stdio", "command": program, "args": argv[argv.index("--") + 2:], "env": env}
     return {"id": "gateway", "display": PROG, "name": MCP_SERVER_NAME, "transport": "stdio", "verified": True,
-            "argv": argv, "command": shell_join(argv), "fill_in": [], "notes": notes}
+            "argv": argv, "command": shell_join(argv), "fill_in": [], "notes": notes, "program": program,
+            "launch": launch}
 
 
 def _static_entry(tool_id: str, static: gw_config.StaticConfig) -> dict[str, Any]:
@@ -1537,17 +1612,17 @@ def _static_entry(tool_id: str, static: gw_config.StaticConfig) -> dict[str, Any
         entry["error"] = {"message": e.message, "hint": e.hint}
     else:
         if recipe.command:
-            argv = ["claude", "mcp", "add", recipe.name]
-            for name, value in recipe.env:
-                argv += ["-e", f"{name}={value}"]
-            argv += ["--", *recipe.command]
+            launch = {"transport": "stdio", "command": recipe.command[0], "args": list(recipe.command[1:]),
+                      "env": dict(recipe.env)}
         else:
-            argv = ["claude", "mcp", "add", "--transport", recipe.transport, recipe.name, recipe.url or ""]
+            launch = {"transport": recipe.transport, "url": recipe.url}
+        argv = _claude_argv(recipe.name, launch)
     entry.update(
         project=recipe.project, homepage=recipe.homepage or None, transport=recipe.transport,
         verified=recipe.verified, argv=argv, command=shell_join(argv) if argv else None,
         fill_in=list(static_tools.placeholders(recipe)) if argv else [], install=recipe.install or None,
-        sync_script=_sync_script_path(tool_id), notes=list(recipe.notes), warning=recipe.warning or None)
+        sync_script=_sync_script_path(tool_id), notes=list(recipe.notes), warning=recipe.warning or None,
+        launch=launch if argv else None)
     return entry
 
 
@@ -1594,13 +1669,279 @@ def _format_mcp_config_result(result: Mapping[str, Any]) -> str:
     return format_mcp_config(result["servers"], shell=result.get("shell"))
 
 
+def claude_tool_name(server: str, tool: str) -> str:
+    """The name Claude Code gives an MCP tool in permission rules: ``mcp__<server>__<tool>``, with
+    every character of the server name other than letters, digits, ``_`` and ``-`` turned into ``_``."""
+    return f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', server)}__{tool}"
+
+
+def _plugin_tool_names() -> list[str]:
+    """Every plugin tool of the builtin catalogs (data/tools-v*.json) that the gateway mirrors."""
+    names: set[str] = set()
+    for entry in resources.files(_PACKAGE).joinpath("data").iterdir():
+        if entry.name.startswith("tools-v") and entry.name.endswith(".json"):
+            doc = json.loads(entry.read_text(encoding="utf-8"))
+            names.update(t["name"] for t in doc.get("tools", []) if isinstance(t, dict)
+                         and isinstance(t.get("name"), str))
+    return sorted(names - RESERVED_TOOL_NAMES)
+
+
+def permissions_snippet(server: str) -> dict[str, Any]:
+    """Claude Code ``settings.json`` permissions for the gateway registered as ``server``: allow the
+    observe and guest-mutating gateway tools and every mirrored plugin tool (exact names), ask
+    before the host-destructive gateway tools."""
+    destructive = [t.name for t in GATEWAY_TOOLS if t.tier is RiskTier.HOST_DESTRUCTIVE]
+    allowed = [t.name for t in GATEWAY_TOOLS if t.tier is not RiskTier.HOST_DESTRUCTIVE]
+    allowed += _plugin_tool_names()
+    return {"permissions": {"allow": [claude_tool_name(server, n) for n in allowed],
+                            "ask": [claude_tool_name(server, n) for n in destructive]}}
+
+
+def _permission_notes(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    static = [e["name"] for e in entries if e["id"] != "gateway"]
+    notes = ["merge this into .claude/settings.json (this project) or ~/.claude/settings.json (every "
+             "project): Claude Code then runs the listed gateway and x64dbg tools without asking and asks "
+             "before the host/VM-destructive ones (snapshots, power, file_download, analysis_finish)",
+             "tools that a plugin build newer than the builtin tool lists adds are not listed: Claude Code "
+             "asks for them"]
+    if static:
+        notes.append(f"the static tools' own MCP servers ({', '.join(static)}) are not covered")
+    return notes
+
+
+def _parse_sets(values: Sequence[str] | None) -> dict[str, str]:
+    """``--set NAME=VALUE`` values (UsageError when one is malformed or unsafe; never echoes a value)."""
+    settings: dict[str, str] = {}
+    for raw in values or ():
+        name, sep, value = raw.partition("=")
+        if not sep or not _SET_NAME_RE.fullmatch(name):
+            raise UsageError("--set takes NAME=VALUE with the placeholder name, e.g. "
+                             "--set binary=/path/a.exe")
+        if not value.strip():
+            raise UsageError(f"--set {name}: the value is empty")
+        if gw_config._UNPRINTABLE_RE.search(value):
+            raise UsageError(f"--set {name}: the value must not contain control characters (TAB, CR, LF, "
+                             "ESC, C1) or Unicode bidi controls")
+        why = static_tools.secret_in_argument(value)
+        if why:
+            raise UsageError(f"--set {name}: the value looks like it carries a secret ({why}); secrets do "
+                             "not belong in a registration command (give them to the MCP server itself)")
+        settings[name] = value
+    return settings
+
+
+def _fill(entry: dict[str, Any], settings: Mapping[str, str]) -> None:
+    """Put the ``--set`` values into the entry's ``<NAME>`` placeholders (argv, command and
+    fill_in follow); UsageError when the result would carry a secret."""
+    launch = entry.get("launch")
+    if launch is None:
+        return
+
+    def put(text: str) -> str:
+        return static_tools.PLACEHOLDER_RE.sub(lambda m: settings.get(m.group(0)[1:-1], m.group(0)), text)
+
+    if launch["transport"] == "stdio":
+        launch["command"] = put(launch["command"])
+        launch["args"] = [put(a) for a in launch["args"]]
+        launch["env"] = {var: put(value) for var, value in launch["env"].items()}
+        filled = [*launch["args"], *(f"{k}={v}" for k, v in launch["env"].items())]
+    else:
+        launch["url"] = put(launch["url"] or "")
+        filled = [launch["url"]]
+    for text in filled:
+        why = static_tools.secret_in_argument(text)
+        if why:
+            raise UsageError(f"--set: the {entry['name']} registration would carry a secret ({why})")
+    entry["argv"] = _claude_argv(entry["name"], launch)
+    entry["command"] = shell_join(entry["argv"])
+    entry["fill_in"] = _launch_placeholders(launch)
+
+
+def _select_entries(args: argparse.Namespace, config: gw_config.GatewayConfig, path: Path
+                    ) -> list[dict[str, Any]]:
+    """The registrations ``--tool`` selects (default: all), with the ``--set`` values filled in."""
+    entries = mcp_config_entries(args, config, path)
+    if args.tool:
+        valid = ("gateway", *static_tools.TOOL_IDS)
+        if args.tool not in valid:
+            raise UsageError(f"--tool {args.tool!r}: unknown, expected one of {', '.join(valid)}")
+        entries = [e for e in entries if e["id"] == args.tool]
+        if not entries:  # a known static tool that [static] does not list
+            entry = _static_entry(args.tool, config.static)
+            entry["notes"] = [f"{args.tool} is not in [static] tools: the gateway does not name it to the "
+                              "model", *entry["notes"]]
+            entries = [entry]
+    settings = _parse_sets(args.set)
+    if settings:
+        known = {p[1:-1] for e in entries for p in e["fill_in"]}
+        for name in settings:
+            if name not in known:
+                listed = ", ".join(sorted(f"<{k}>" for k in known)) or "none"
+                raise UsageError(f"--set {name}: there is no <{name}> placeholder in the selected "
+                                 f"registrations (placeholders: {listed})")
+        for entry in entries:
+            _fill(entry, settings)
+    return entries
+
+
+def mcp_servers_document(entries: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    """(``{"mcpServers": {...}}`` for JSON-configured clients such as Claude Desktop, Cursor and VS
+    Code, the notes to show next to it)."""
+    servers: dict[str, Any] = {}
+    notes: list[str] = []
+    for e in entries:
+        launch = e.get("launch")
+        if launch is None:
+            why = (e.get("error") or {}).get("message") or "no MCP server recipe"
+            notes.append(f"skipped {e['id']}: {why}")
+            continue
+        if launch["transport"] == "stdio":
+            spec: dict[str, Any] = {"command": launch["command"], "args": list(launch["args"])}
+            if launch["env"]:
+                spec["env"] = dict(launch["env"])
+        else:
+            spec = {"type": launch["transport"], "url": launch["url"]}
+        servers[e["name"]] = spec
+        if e.get("warning"):
+            notes.append(f"{e['name']}: WARNING: {e['warning']}")
+        if e["fill_in"]:
+            notes.append(f"{e['name']}: fill in {', '.join(e['fill_in'])} (or pass --set NAME=VALUE)")
+        if e["id"] == "gateway":
+            notes.extend(f"{e['name']}: {n}" for n in e["notes"])
+    return {"mcpServers": servers}, notes
+
+
+def _find_claude() -> str | None:
+    return shutil.which("claude")
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _run_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=APPLY_TIMEOUT_S, check=False,
+                          **gw_platform.subprocess_kwargs())
+
+
+def _apply_plan(entries: Sequence[Mapping[str, Any]], claude: str
+                ) -> tuple[list[tuple[str, list[str]]], list[dict[str, str]]]:
+    """(name, argv) of every registration --apply may run, and the skipped ones with the reason."""
+    batch = _windows_host() and claude.lower().endswith((".cmd", ".bat"))
+    plan: list[tuple[str, list[str]]] = []
+    skipped: list[dict[str, str]] = []
+    for e in entries:
+        launch = e.get("launch")
+        if launch is None:
+            skipped.append({"name": e["name"], "reason": (e.get("error") or {}).get("message")
+                            or "no MCP server recipe"})
+            continue
+        if e["fill_in"]:
+            skipped.append({"name": e["name"], "reason": f"fill in {', '.join(e['fill_in'])} first "
+                                                         "(--set NAME=VALUE)"})
+            continue
+        argv = _claude_argv(e["name"], launch)
+        why = next((w for w in map(static_tools.secret_in_argument, argv[1:]) if w), None)
+        if why:
+            skipped.append({"name": e["name"],
+                            "reason": f"an argument looks like it carries a secret ({why}); not run"})
+            continue
+        if batch and any(_CMD_META_RE.search(a) for a in argv[1:]):
+            skipped.append({"name": e["name"], "reason": f"{Path(claude).name} runs through cmd.exe, which "
+                                                         "misreads an argument with % ^ & | < > ! or \": run "
+                                                         "the printed command in PowerShell yourself"})
+            continue
+        plan.append((e["name"], argv))
+    return plan, skipped
+
+
+def _apply(entries: Sequence[Mapping[str, Any]], args: argparse.Namespace, out: _Output) -> dict[str, Any]:
+    claude = _find_claude()
+    if claude is None:
+        raise GatewayError("claude (the Claude Code command line) was not found on PATH", stage="cli",
+                           hint="install Claude Code, or run the printed `claude mcp add` commands yourself")
+    plan, skipped = _apply_plan(entries, claude)
+    if plan and not args.yes:
+        if not _stdin_is_tty():
+            raise UsageError("--apply asks before it registers anything: run it in a terminal or pass --yes")
+        out.note("about to run:")
+        for _name, argv in plan:
+            out.note(f"  {_safe_command(shell_join(argv))}")
+        if not _confirm(f"Register {len(plan)} MCP server(s) with Claude Code? [y/N] "):
+            out.note("aborted: nothing was registered")
+            return {"applied": [], "skipped": skipped, "aborted": True}
+    applied: list[dict[str, Any]] = []
+    for name, argv in plan:
+        try:
+            proc = _run_command([claude, *argv[1:]])
+            code, output = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            code, output = -1, f"could not run claude: {type(e).__name__}"
+        applied.append({"name": name, "command": shell_join(argv), "returncode": code, "ok": code == 0,
+                        "output": _safe(output.strip())[:2000]})
+    return {"applied": applied, "skipped": skipped, "aborted": False}
+
+
+def _format_apply(result: Mapping[str, Any]) -> str:
+    lines: list[str] = []
+    for a in result["applied"]:
+        status = "ok" if a["ok"] else f"failed, exit {a['returncode']}"
+        lines.append(f"ran: {_safe_command(a['command'])} ({status})")
+        lines.extend(f"  {line}" for line in a["output"].splitlines() if line.strip())
+    lines.extend(f"skipped {_safe(s['name'])}: {_safe(s['reason'])}" for s in result["skipped"])
+    if result.get("aborted"):
+        lines.append("nothing was registered")
+    elif result["applied"]:
+        lines.append("note: claude mcp add registers in Claude Code's local scope (this directory) by "
+                     "default; add --scope user to a printed command to register it for every project")
+    return "\n".join(lines) or "nothing to register"
+
+
 def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
-    """Print the registration commands for the gateway and the configured static tools (MCP client
-    ``--client``, only Claude Code so far); nothing is run or written."""
+    """Print the registration commands for the gateway and the configured static tools (``--client``
+    claude: ``claude mcp add`` lines; json: an mcpServers document), or (``--permissions``) a Claude
+    Code settings.json snippet; ``--apply`` runs the complete ``claude mcp add`` commands."""
+    if args.permissions and (args.apply or args.client != "claude"):
+        raise UsageError("--permissions prints Claude Code settings; it cannot be combined with --apply or "
+                         "--client json")
+    if args.apply and args.client != "claude":
+        raise UsageError("--apply runs `claude mcp add`: it only works with --client claude")
+    if args.yes and not args.apply:
+        raise UsageError("--yes only applies together with --apply")
     path = _config_target(args)
     config = gw_config.load_config(path, environ=os.environ)
-    out.data({"ok": True, "client": args.client, "config": str(path), "shell": command_shell(),
-              "servers": mcp_config_entries(args, config, path)}, _format_mcp_config_result)
+    entries = _select_entries(args, config, path)
+    base = {"ok": True, "client": args.client, "config": str(path), "shell": command_shell(),
+            "servers": entries}
+    if args.permissions:
+        server = next((e["name"] for e in mcp_config_entries(args, config, path) if e["id"] == "gateway"),
+                      MCP_SERVER_NAME)
+        snippet, notes = permissions_snippet(server), _permission_notes(entries)
+        if out.json_mode:
+            out.data({"ok": True, "server": server, "settings": snippet, "notes": notes})
+        else:
+            for note in notes:
+                out.note(f"note: {note}")
+            out.data(snippet, lambda d: _dumps(d))
+        return EXIT_OK
+    if args.client == "json":
+        document, notes = mcp_servers_document(entries)
+        if out.json_mode:
+            out.data({**base, **document, "notes": notes})
+        else:
+            for note in notes:
+                out.note(f"note: {_safe(note)}")
+            out.data(document, lambda d: _dumps(d))
+        return EXIT_OK
+    if args.apply:
+        result = _apply(entries, args, out)
+        ok = not result["aborted"] and all(a["ok"] for a in result["applied"])
+        out.data({**base, "ok": ok, **result}, _format_apply)
+        return EXIT_OK if ok else EXIT_FAILURE
+    out.data(base, _format_mcp_config_result)
     return EXIT_OK
 
 
@@ -1758,7 +2099,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("mcp-config", cmd_mcp_config,
                 "print the MCP client registration commands for the gateway and the configured static "
                 "tools (IDA, Ghidra, radare2, Cutter)")
-    p.add_argument("--client", choices=MCP_CLIENTS, default="claude", help="MCP client (default: claude)")
+    p.add_argument("--client", choices=MCP_CLIENTS, default="claude",
+                   help="claude (default): `claude mcp add` commands; json: an mcpServers document for "
+                        "JSON-configured clients (Claude Desktop, Cursor, VS Code)")
+    p.add_argument("--tool", metavar="ID",
+                   help=f"only this server: gateway or a static tool ({', '.join(static_tools.TOOL_IDS)})")
+    p.add_argument("--set", action="append", metavar="NAME=VALUE",
+                   help="fill in the <NAME> placeholder, e.g. --set binary=/path/a.exe (repeatable)")
+    p.add_argument("--permissions", action="store_true",
+                   help="print a Claude Code settings.json snippet instead: allow the read-only and "
+                        "guest-changing tools, ask before the host/VM-destructive ones")
+    p.add_argument("--apply", action="store_true",
+                   help="run the `claude mcp add` commands that need nothing filled in (asks first)")
+    p.add_argument("--yes", action="store_true", help="with --apply: do not ask for confirmation")
 
     p = command("demo", cmd_demo,
                 "installation self-test: analyse the bundled benign sample on the VM (analysis_start, a "
