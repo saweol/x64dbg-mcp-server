@@ -15,6 +15,11 @@ Commands::
     mcp-config [--client claude]        the ``claude mcp add`` commands for the gateway and the
                                         configured static tools (placeholders as <...>)
     static-scripts [--dest DIR]         where the packaged static-tool sync scripts are, or a copy
+    snapshot refresh --name NEW         human-only: a new clean snapshot of the running guest
+             [--set-clean]              (``provision.take_clean_snapshot``), recorded in
+                                        ``snapshot_ledger``; --set-clean edits an init-written config
+    snapshot prune --keep N [--yes]     human-only: gw-* and recorded old clean snapshots beyond the
+                                        newest N (dry run unless --yes; protected / clean never)
 
 Global options (before or after the command): ``--config PATH``, ``--profile NAME``,
 ``--json`` (machine-readable stdout), ``-v/--verbose``.
@@ -34,7 +39,7 @@ a gateway is serving.
 
 A serving gateway holds the jobs root (``JobStore`` process lock). Commands
 that need it (``discard``, ``status``, ``doctor``, ``provision``,
-``install-plugin``, ``setup``) then fail with LOCK_TIMEOUT naming the gateway's
+``install-plugin``, ``setup``, ``snapshot``) then fail with LOCK_TIMEOUT naming the gateway's
 pid and what to do instead (stop it, or use its MCP tools). ``provision`` and
 ``install-plugin`` claim the jobs root first (so they never run next to a
 serving gateway), pause supervision and hold the VM write lock while they
@@ -84,14 +89,16 @@ import tempfile
 import textwrap
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any, TextIO
 
 from .. import config as gw_config
 from .. import envfile, plugin_bundle, static_scripts, static_tools
 from .. import platform as gw_platform
+from .. import policy as gw_policy
 from .. import ps as gw_ps
-from ..contracts import PowerState, Secret
+from ..contracts import TERMINAL_JOB_STATES, PowerState, Secret
 from ..errors import (
     ConfigError,
     GatewayError,
@@ -132,6 +139,8 @@ _SERVING_ADVICE = {
     "install-plugin": "stop that gateway first: installing the plugin kills and relaunches the debuggers",
     "setup": "stop that gateway first: setup installs the plugin and reboots the guest",
     "serve": "a gateway is already serving this jobs root: connect to it, or stop it first",
+    "snapshot": "stop that gateway first: snapshot refresh and prune change the VM's snapshots (they have no "
+                "MCP tool)",
 }
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:\\")
@@ -662,6 +671,8 @@ def cmd_provision(args: argparse.Namespace, out: _Output) -> int:
         result = _provision_step(app, runtime, args.profile, inputs, x64dbg_root=x64dbg_root,
                                  bind=args.bind, reboot=not args.no_reboot, wait_ready_s=args.wait_ready,
                                  snapshot=args.snapshot, out=out)
+        if _result_ok(result):
+            _record_provisioned_snapshot(config, config.profile(args.profile), result, out)
     out.data(result)
     return EXIT_OK if _result_ok(result) else EXIT_FAILURE
 
@@ -1375,6 +1386,7 @@ def _run_setup(args: argparse.Namespace, config: gw_config.GatewayConfig, prof: 
             parts = (["rebooted"] if isinstance(result, Mapping) and result.get("rebooted") else []) + (
                 [f"snapshot {taken!r} taken"] if taken else [])
             report.set("provision", "done", ", ".join(parts) or "done", result=result)
+            _record_provisioned_snapshot(config, prof, result, out)
         current[0] = "doctor"
         out.note("setup: checking again (doctor) ...")
         after = app.doctor(args.profile)
@@ -1936,6 +1948,353 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
     return EXIT_OK if ok else EXIT_FAILURE
 
 
+# ── snapshot refresh / prune (human-only: no MCP tool) ──────────────
+SNAPSHOT_REFRESH_WAIT_S = 60.0
+_SNAPSHOT_NAME_MAX = 100  # app.SNAPSHOT_NAME_MAX
+_NO_AGE_LIMIT_DAYS = 36500  # prune keeps by count only
+#: failed doctor checks that do not stop a refresh: the current clean snapshot may well be missing
+_REFRESH_IGNORED_CHECKS = frozenset({"clean_snapshot"})
+_INIT_HEADER = f"# x64dbg-vm-gateway configuration (written by `{PROG} init`)."
+
+
+def _fold(name: str) -> str:
+    return name.strip().casefold()
+
+
+def _require_vmware(prof: gw_config.ProfileConfig, what: str) -> None:
+    if prof.mode != "vmware":
+        raise UsageError(f"{what} needs a vmware profile (profile {prof.name!r} is {prof.mode})")
+
+
+def _protected_names(prof: gw_config.ProfileConfig) -> set[str]:
+    names = {_fold(n) for n in prof.protected_snapshots}
+    if prof.clean_snapshot:
+        names.add(_fold(prof.clean_snapshot))
+    return names
+
+
+def _check_clean_name(name: str, prof: gw_config.ProfileConfig) -> str:
+    if not name or name != name.strip():
+        raise UsageError("--name must be a snapshot name without spaces at the ends")
+    if any(c in "/\\" or ord(c) < 0x20 or ord(c) == 0x7F for c in name):
+        raise UsageError("--name must not contain '/', '\\' or control characters")
+    if len(name) > _SNAPSHOT_NAME_MAX:
+        raise UsageError(f"--name is longer than {_SNAPSHOT_NAME_MAX} characters")
+    if prof.snapshot_prefix and name.startswith(prof.snapshot_prefix):
+        prefix = prof.snapshot_prefix
+        raise UsageError(f"--name must not start with {prefix!r}: that prefix marks the gateway's own "
+                         "snapshots, which the gateway may delete")
+    if _fold(name) in _protected_names(prof):
+        raise UsageError(f"{name!r} is the profile's clean snapshot or a protected one already: choose a new "
+                         "name")
+    return name
+
+
+def _unfinished_jobs(app: Any, prof: gw_config.ProfileConfig) -> list[dict[str, Any]]:
+    """The profile's jobs that are not DONE / FAILED, and its unreadable job folders."""
+    listing = app.list_jobs(prof.name)
+    listing = listing if isinstance(listing, Mapping) else {}
+    terminal = {s.value for s in TERMINAL_JOB_STATES}
+    jobs = [{"job_id": j.get("job_id"), "state": j.get("state")} for j in listing.get("jobs") or ()
+            if isinstance(j, Mapping) and j.get("state") not in terminal]
+    jobs += [{"job_id": c.get("job_id"), "state": "unreadable"} for c in listing.get("corrupt") or ()
+             if isinstance(c, Mapping)]
+    return jobs
+
+
+def _snapshot_listing(app: Any, profile: str | None) -> list[str]:
+    listing = app.vm_snapshots_list(profile)
+    snaps = listing.get("snapshots") if isinstance(listing, Mapping) else None
+    return [s["name"] for s in snaps or () if isinstance(s, Mapping) and isinstance(s.get("name"), str)]
+
+
+def _record_clean(config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig, name: str, source: str,
+                  out: _Output) -> None:
+    """Note a clean snapshot in the ledger ``snapshot prune`` reads (best effort)."""
+    from .. import snapshot_ledger
+
+    if not prof.vmx:
+        return
+    try:
+        snapshot_ledger.record(config.jobs_root_path, profile=prof.name, vmx=prof.vmx, name=name,
+                               source=source)
+    except OSError as e:
+        where = snapshot_ledger.path_for(config.jobs_root)
+        why = e.strerror or type(e).__name__
+        out.note(f"warning: could not record snapshot {name!r} in {where} ({why}); snapshot prune will not "
+                 "list it")
+
+
+def _record_provisioned_snapshot(config: gw_config.GatewayConfig, prof: gw_config.ProfileConfig, result: Any,
+                                 out: _Output) -> None:
+    snap = result.get("snapshot") if isinstance(result, Mapping) else None
+    name = snap.get("name") if isinstance(snap, Mapping) else None
+    if isinstance(name, str) and name:
+        _record_clean(config, prof, name, "provision", out)
+
+
+def _clean_snapshot_change(prof: gw_config.ProfileConfig, new: str) -> tuple[list[str], str | None]:
+    """The new protected_snapshots (the replaced clean snapshot drops out, the new one is added)
+    and the snapshot that loses its protection."""
+    old = prof.clean_snapshot
+    protected = [p for p in prof.protected_snapshots if not (old and _fold(p) == _fold(old))]
+    if _fold(new) not in {_fold(p) for p in protected}:
+        protected.append(new)
+    return protected, (old if old and _fold(old) != _fold(new) else None)
+
+
+def _edit_clean_snapshot(path: Path, profile: str, new: str, protected: list[str]) -> str | None:
+    """Rewrite ``clean_snapshot`` and ``protected_snapshots`` of ``[profiles.<profile>]`` in a
+    config that init or setup wrote. Returns why it was not done, or None. Nothing is written
+    unless the result parses to exactly the old document with those two values changed."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"cannot read {path} ({e.strerror or type(e).__name__})"
+    if not text.startswith(_INIT_HEADER):
+        return "the config was not written by init or setup, so setup does not edit it"
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return "the config is not valid TOML"
+    table = doc.get("profiles", {}).get(profile) if isinstance(doc.get("profiles"), dict) else None
+    if not isinstance(table, dict) or not {"clean_snapshot", "protected_snapshots"} <= set(table):
+        return f"[profiles.{profile}] has no clean_snapshot and protected_snapshots lines to change"
+    expected = json.loads(json.dumps(doc))
+    expected["profiles"][profile].update(clean_snapshot=new, protected_snapshots=list(protected))
+    header = "[" + ".".join(_toml_key(p) for p in ("profiles", profile)) + "]"
+    values = {"clean_snapshot": _toml_str(new), "protected_snapshots": _toml_value(list(protected))}
+    lines: list[str] = []
+    inside = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            inside = stripped == header
+        elif inside and stripped.partition("=")[0].strip() in values:
+            key = stripped.partition("=")[0].strip()
+            line = f"{key} = {values.pop(key)}{line[len(line.rstrip(chr(13) + chr(10))):]}"
+        lines.append(line)
+    new_text = "".join(lines)
+    try:
+        same = not values and tomllib.loads(new_text) == expected
+        gw_config.config_from_dict(expected, source=str(path))
+    except (tomllib.TOMLDecodeError, ConfigError):
+        same = False
+    if not same:
+        return "its clean_snapshot / protected_snapshots lines are not in the shape init writes"
+    _write_private(path, new_text, replace=True)
+    return None
+
+
+def _format_refresh(result: Mapping[str, Any]) -> str:
+    res = result.get("result") if isinstance(result.get("result"), Mapping) else {}
+    conf = result["config"]
+    lines = [f"snapshot {result['snapshot']!r} taken (the guest was ready after {res.get('ready_s', '?')} s; "
+             f"{res.get('cleaned_guest_tmp', 0)} stale helper file(s) removed from the guest temp folder)"]
+    if conf["updated"]:
+        lines.append(f"{conf['path']} now makes it the clean snapshot:")
+    else:
+        why = (f"--set-clean: {conf['reason']}; " if conf.get("set_clean") else
+               "--set-clean writes this into a config written by init or setup; ")
+        lines.append(f"to make it the clean snapshot, {why}set in [profiles.{result['profile']}] of "
+                     f"{conf['path']}:")
+    lines.extend(f"  {line}" for line in conf["lines"])
+    if conf.get("unprotected"):
+        then = "is no longer" if conf["updated"] else "is then no longer"
+        lines.append(f"{conf['unprotected']!r} {then} protected: `{PROG} snapshot prune` lists it, and "
+                     "deletes it only with --yes")
+    return "\n".join(lines)
+
+
+def cmd_snapshot_refresh(args: argparse.Namespace, out: _Output) -> int:
+    config = _load_config(args)
+    prof = config.profile(args.profile)
+    _require_vmware(prof, "snapshot refresh")
+    name = _check_clean_name(args.name, prof)
+    _check_wait_ready(args.wait_ready)
+    provision = _import("provision")
+    with _app(args, config) as app:
+        _claim_jobs_root(app)
+        unfinished = _unfinished_jobs(app, prof)
+        if unfinished:
+            listed = ", ".join(f"{j['job_id']} ({j['state']})" for j in unfinished)
+            raise StateViolation(
+                f"snapshot refresh: job(s) {listed} of profile {prof.name!r} are not finished, and a clean "
+                "snapshot must not contain a sample", stage="snapshot", details={"jobs": unfinished},
+                hint="collect and finish them from the MCP client (analysis_collect, analysis_finish), or "
+                     f"`{PROG} discard JOB_ID` one you give up, then run snapshot refresh again")
+        existing = _snapshot_listing(app, args.profile)
+        if any(_fold(n) == _fold(name) for n in existing):
+            raise StateViolation(f"snapshot {name!r} exists already; a refresh never replaces a snapshot",
+                                 stage="snapshot", details={"snapshot": name}, hint="choose another --name")
+        out.note("snapshot refresh: checking the VM, the guest and the plugins (doctor) ...")
+        checked = app.doctor(args.profile)
+        blockers = [c for c in _failed(checked) if str(c.get("name")) not in _REFRESH_IGNORED_CHECKS
+                    and setup_check_kind(str(c.get("name"))) != "advisory"]
+        if blockers:
+            if not out.json_mode:
+                out.note(_format_doctor(checked))
+            raise StateViolation(
+                "snapshot refresh: the guest is not ready for a clean snapshot: "
+                + ", ".join(str(c.get("name")) for c in blockers) + " failed", stage="snapshot",
+                details={"failed": [str(c.get("name")) for c in blockers], "doctor": checked},
+                hint=f"fix what doctor reports (`{PROG} doctor` shows the hints), then run snapshot refresh "
+                     "again")
+        runtime = _runtime(app, args.profile)
+        out.note(f"snapshot refresh: waiting for the plugins, then taking snapshot {name!r} (a memory "
+                 "snapshot takes a few minutes) ...")
+        with _holding_vm(runtime):
+            result = provision.take_clean_snapshot(runtime, name, wait_ready_s=float(args.wait_ready))
+    if prof.clean_snapshot and any(_fold(n) == _fold(prof.clean_snapshot) for n in existing):
+        _record_clean(config, prof, prof.clean_snapshot, "clean_snapshot", out)
+    _record_clean(config, prof, name, "refresh", out)
+    protected, unprotected = _clean_snapshot_change(prof, name)
+    path = _config_target(args)
+    lines = [f"clean_snapshot = {_toml_str(name)}", f"protected_snapshots = {_toml_value(protected)}"]
+    reason = (_edit_clean_snapshot(path, prof.name, name, protected) if args.set_clean
+              else "--set-clean not given")
+    conf: dict[str, Any] = {"path": str(path), "updated": reason is None, "set_clean": bool(args.set_clean),
+                            "lines": lines, "unprotected": unprotected}
+    if reason is not None:
+        conf["reason"] = reason
+    out.data({"ok": True, "profile": prof.name, "snapshot": name, "result": result, "config": conf},
+             _format_refresh)
+    return EXIT_OK
+
+
+@dataclasses.dataclass
+class _PruneRow:
+    name: str
+    action: str  # "delete" | "keep"
+    reason: str
+
+
+def _prune_plan(names: Sequence[str], prof: gw_config.ProfileConfig, ledger: Sequence[str], keep: int,
+                unfinished_ids: Sequence[str]) -> tuple[list[_PruneRow], int]:
+    """(rows, untouched): the gateway's ``gw-*`` snapshots (``policy.retention_plan``: the newest
+    ``keep`` job snapshots stay, so do those of unfinished jobs and gw-* names that are not job
+    snapshots), the recorded old clean snapshots (the newest ``keep`` stay, and so does every one
+    recorded after the current clean snapshot), the current clean snapshot and the protected ones
+    (always kept). ``untouched`` counts every other snapshot."""
+    protected = {_fold(p) for p in prof.protected_snapshots}
+    clean = _fold(prof.clean_snapshot) if prof.clean_snapshot else None
+    rows: dict[str, _PruneRow] = {}
+
+    def owned(name: str) -> bool:
+        try:
+            gw_policy.check_snapshot_delete(name, prof)
+        except GatewayError:
+            return False
+        return True
+
+    gateway = [n for n in names if owned(n)]
+    excluded = [j for j in unfinished_ids if isinstance(j, str) and JOB_ID_RE.fullmatch(j)]
+    retention = gw_config.RetentionConfig(max_gateway_snapshots=keep, max_age_days=_NO_AGE_LIMIT_DAYS)
+    doomed = set(gw_policy.retention_plan(gateway, prof.snapshot_prefix, retention, datetime.now(UTC),
+                                          sorted(protected | ({clean} if clean else set())),
+                                          exclude_job_ids=excluded))
+    job_name = re.compile(re.escape(prof.snapshot_prefix) + r"(?:job|pre-revert)-(.+)")
+    for name in gateway:
+        m = job_name.fullmatch(name)
+        if name in doomed:
+            rows[name] = _PruneRow(name, "delete", f"gateway snapshot, older than the newest {keep}")
+        elif m is None or not JOB_ID_RE.fullmatch(m.group(1)):
+            rows[name] = _PruneRow(name, "keep", f"not a job snapshot ({prof.snapshot_prefix}job-<job id>), "
+                                                 "delete it in VMware if you do not need it")
+        elif m.group(1) in excluded:
+            rows[name] = _PruneRow(name, "keep", f"snapshot of the unfinished job {m.group(1)}")
+        else:
+            rows[name] = _PruneRow(name, "keep", f"gateway snapshot, among the newest {keep}")
+    present = {_fold(n): n for n in names}
+    recorded = [present[_fold(n)] for n in dict.fromkeys(ledger) if _fold(n) in present]
+    current_at = next((i for i, n in enumerate(recorded) if _fold(n) == clean), None)
+    old = [n for i, n in enumerate(recorded) if _fold(n) != clean and _fold(n) not in protected
+           and n not in rows and (current_at is None or i < current_at)]
+    newer = [n for i, n in enumerate(recorded) if current_at is not None and i > current_at
+             and _fold(n) not in protected and n not in rows]
+    kept_old = set(old[len(old) - keep:]) if keep else set()
+    for name in old:
+        if name in kept_old:
+            rows[name] = _PruneRow(name, "keep", f"old clean snapshot, among the newest {keep}")
+        else:
+            rows[name] = _PruneRow(name, "delete", f"old clean snapshot, older than the newest {keep}")
+    for name in newer:
+        rows[name] = _PruneRow(name, "keep", "clean snapshot newer than the current clean snapshot (not in "
+                                             "use yet: make it clean_snapshot, or delete it in VMware)")
+    for name in names:
+        if clean is not None and _fold(name) == clean:
+            rows[name] = _PruneRow(name, "keep", "the current clean snapshot (never deleted)")
+        elif _fold(name) in protected:
+            rows[name] = _PruneRow(name, "keep", "protected (never deleted)")
+    ordered = [rows[n] for n in names if n in rows]
+    return ordered, len(names) - len(ordered)
+
+
+def _format_prune(result: Mapping[str, Any]) -> str:
+    rows = result["snapshots"]
+    keep = result["keep"]
+    lines = [f"snapshot prune, profile {result['profile']!r}: keep the newest {keep} gateway snapshots and "
+             f"the newest {keep} old clean snapshots"]
+    width = max([len(r["name"]) for r in rows] or [0])
+    lines.extend(f"  {r['action']:<6}  {_safe(r['name']):<{width}}  {r['reason']}" for r in rows)
+    if not rows:
+        lines.append("  (no gateway or clean snapshot)")
+    if result["untouched"]:
+        lines.append(f"{result['untouched']} other snapshot(s) are not the gateway's and are not touched")
+    for failure in result["failed"]:
+        lines.append(f"failed: {_safe(failure['name'])} ({failure['error']['code']}: "
+                     f"{_safe(failure['error']['message'])})")
+    n = len(result["delete"])
+    if result["dry_run"]:
+        lines.append(f"dry run: nothing was deleted; run again with --yes to delete {n} snapshot(s)" if n
+                     else "nothing to delete")
+    else:
+        lines.append(f"deleted {len(result['deleted'])} snapshot(s)")
+    return "\n".join(lines)
+
+
+def cmd_snapshot_prune(args: argparse.Namespace, out: _Output) -> int:
+    from .. import snapshot_ledger
+
+    if args.keep < 0:
+        raise UsageError("--keep must be 0 or more")
+    config = _load_config(args)
+    prof = config.profile(args.profile)
+    _require_vmware(prof, "snapshot prune")
+    assert prof.vmx is not None
+    ledger = [e.name for e in snapshot_ledger.entries(config.jobs_root_path, profile=prof.name, vmx=prof.vmx)]
+    deleted: list[str] = []
+    failed: list[dict[str, Any]] = []
+    with _app(args, config) as app:
+        _claim_jobs_root(app)
+        unfinished = [str(j["job_id"]) for j in _unfinished_jobs(app, prof) if j.get("job_id")]
+        names = _snapshot_listing(app, args.profile)
+        rows, untouched = _prune_plan(names, prof, ledger, args.keep, unfinished)
+        doomed = [r.name for r in rows if r.action == "delete"]
+        if args.yes and doomed:
+            runtime = _runtime(app, args.profile)
+            with _holding_vm(runtime):
+                for name in doomed:
+                    if _fold(name) in _protected_names(prof):  # never, whatever the plan says
+                        continue
+                    try:
+                        runtime.vm.delete_snapshot(name)
+                    except GatewayError as e:
+                        failed.append({"name": name, "error": e.to_dict()})
+                    else:
+                        deleted.append(name)
+    result = {"ok": not failed, "profile": prof.name, "dry_run": not args.yes, "keep": args.keep,
+              "snapshots": [dataclasses.asdict(r) for r in rows], "untouched": untouched, "delete": doomed,
+              "deleted": deleted, "failed": failed}
+    out.data(result, _format_prune)
+    return EXIT_OK if not failed else EXIT_FAILURE
+
+
+def cmd_snapshot(args: argparse.Namespace, out: _Output) -> int:
+    handler = {"refresh": cmd_snapshot_refresh, "prune": cmd_snapshot_prune}[args.snapshot_action]
+    return handler(args, out)
+
+
 # ── mcp-config ──────────────────────────────────────────────────────
 MCP_CLIENTS = ("claude",)
 
@@ -2299,6 +2658,39 @@ def build_parser() -> argparse.ArgumentParser:
                 "print the MCP client registration commands for the gateway and the configured static "
                 "tools (IDA, Ghidra, radare2, Cutter)")
     p.add_argument("--client", choices=MCP_CLIENTS, default="claude", help="MCP client (default: claude)")
+
+    snapshot_help = "human-only clean-snapshot maintenance: take a new clean snapshot, prune old snapshots"
+    p = command("snapshot", cmd_snapshot, snapshot_help, description=_wrap(
+        snapshot_help + ". There is no MCP tool for either: a client cannot replace or delete the clean "
+        "snapshot. Both stop with LOCK_TIMEOUT while an MCP client runs the gateway (serve)."))
+    actions = p.add_subparsers(dest="snapshot_action", metavar="ACTION", required=True)
+    refresh_help = ("take a new clean snapshot of the guest as it is now, after the readiness checks "
+                    "provision uses (no unfinished job, a single VM instance, the plugins answer)")
+    sp = actions.add_parser("refresh", help=refresh_help, description=_wrap(
+        refresh_help + ". It never replaces a snapshot. Without --set-clean it prints the clean_snapshot and "
+        "protected_snapshots lines to put into the config; the old clean snapshot then leaves "
+        "protected_snapshots, so snapshot prune may delete it later (only with --yes)."),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_global_options(sp, suppress=True)
+    sp.add_argument("--name", required=True, metavar="NEW", help="name of the new clean snapshot")
+    sp.add_argument("--set-clean", action="store_true",
+                    help="also make it the profile's clean_snapshot (and protect it) in the config: only in "
+                         "a config written by init or setup; any other config is not edited, the lines are "
+                         "printed")
+    sp.add_argument("--wait-ready", type=float, default=SNAPSHOT_REFRESH_WAIT_S, metavar="SECONDS",
+                    help="how long to wait for the plugins to answer before the snapshot "
+                         f"(default: {SNAPSHOT_REFRESH_WAIT_S:g})")
+    prune_help = ("list the gateway's gw-* snapshots and the old clean snapshots it recorded, and delete "
+                  "them with --yes (dry run by default)")
+    sp = actions.add_parser("prune", help=prune_help, description=_wrap(
+        prune_help + ". The newest --keep N of each kind stay, and so do the snapshots of unfinished jobs, "
+        "the profile's clean snapshot and its protected snapshots (always). Snapshots the gateway did not "
+        "make or record are never touched."), formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_global_options(sp, suppress=True)
+    sp.add_argument("--keep", type=int, required=True, metavar="N",
+                    help="how many of the newest gateway snapshots and of the newest old clean snapshots "
+                         "stay")
+    sp.add_argument("--yes", action="store_true", help="delete them (without it, only the list is printed)")
 
     p = command("static-scripts", cmd_static_scripts,
                 "show where the static-tool sync scripts (IDA, Ghidra, radare2/rizin/Cutter) are installed, "
