@@ -261,3 +261,29 @@
 - Ghidra GUI와 GhidraMCP GUI 모드, Ghidra 11.x
 - 태그 릴리스 워크플로의 실제 실행
 - ida-multi-mcp의 툴 이름은 문서 기준이다. 이번에 다시 실행해 보지는 않았다.
+
+## 사용성 개선 라운드 (2026-11-26)
+
+이번 라운드에 들어간 기능: `setup`의 대화식 질문과 암호 파일, `demo`, MCP 프롬프트 5개, `analysis_report`·`jobs report`, `mcp-config` 옵션(`--permissions` strict/lab, `--apply`, `--client json`, `--tool`, `--set`), `snapshot refresh/prune`, 게이트웨이 하나로 VM 여러 대. 기능마다 TDD로 만들고 다른 모델 리뷰(Sonnet·Fable, 일부 Mythos)를 반영했다. 합친 코드의 단위 테스트는 3915건 통과(6 skip)다.
+
+실 VM에서 확인한 것(대상: 스파이크 VM, 클린 스냅샷 `MCP_CLEAN_V110F`, `build-release.sh`로 만든 wheel의 격리 설치본):
+
+- **`demo --arch both`**: 통과, 92 s.
+  - x64: `analysis_start` 27.4 s(시스템 BP에서 멈춤) → `kernel32.Sleep` BP → `run` 2회 만에 Sleep에서 멈춤 → `GetCallStack` 첫 줄 `kernel32.Sleep` → 회수 6.0 s(파일 1개) → 복원 13.2 s. 합계 47.2 s.
+  - x32: 같은 순서로 44.5 s.
+  - 끝난 뒤 스파이크 VM의 `vmware-vmx`는 1개였다.
+- **`jobs report`**: demo의 job으로 Markdown 보고서를 만들었다. 플래그와 상태 사유는 `untrusted_guest_output` 블록 안에 있었다.
+- **실제 Claude Code(`claude -p`, 설치본 stdio)**
+  - 툴 105개(게이트웨이 22 + 플러그인 83)와 슬래시 명령 5개(`mcp__x64dbg-vm__analyze-sample`, `trace-api`, `find-oep`, `static-dynamic`, `report`)가 보였다.
+  - `/mcp__x64dbg-vm__report <job>`을 실행하자 `analysis_report(format="markdown")`와 `jobs_show`를 불러 보고서를 썼다.
+- **MCP Python SDK 클라이언트**: `prompts/list`가 5개를, `prompts/get analyze-sample`이 단계별 계획을 돌려줬다.
+- **`snapshot prune --keep 1`**(미리 보기만): 보호 스냅샷 6개와 현재 클린 스냅샷을 "삭제 안 함"으로 표시했고, 지운 것은 없다(스냅샷 7개 그대로).
+- **실 VM 테스트 스위트**: 10건 통과, 3분 21초.
+
+실 VM에서 확인하지 않은 것:
+
+- `setup`의 대화식 질문과 `--save-password-file`(이미 설정된 VM이라 첫 실행 경로를 다시 밟지 않았다)
+- `snapshot refresh`, `snapshot prune --yes`(스냅샷을 만들거나 지우는 일이라 사용자 결정 없이 하지 않았다)
+- 게이트웨이 하나로 VM 두 대(두 번째 VM이 아직 없다)
+- `mcp-config --apply`(이 host의 Claude 설정을 바꾸는 일이라 실행하지 않았다)와 `--permissions` 규칙이 Claude Code에서 실제로 적용되는지
+- 프롬프트 4개를 끝까지 실행한 결과

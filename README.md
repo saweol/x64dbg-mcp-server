@@ -68,7 +68,7 @@ analysis_start ──► 분석 (x64dbg 툴 83개 + 정적 도구) ──► ana
  디버거에 로드(정지 상태)
 ```
 
-게이트웨이가 AI에게 보여 주는 툴은 게이트웨이 툴 22개와 플러그인 툴 83개, 합계 105개입니다. 실제 Claude Code에서 확인한 것은 `analysis_report`가 들어가기 전의 104개입니다([검증 현황](#검증-현황)). 구성 요소, 시퀀스, 상태 전이는 [동작 구조](#동작-구조)에 그림으로 있습니다.
+게이트웨이가 AI에게 보여 주는 툴은 게이트웨이 툴 22개와 플러그인 툴 83개, 합계 105개입니다. 실제 Claude Code에서도 105개가 보였습니다([검증 현황](#검증-현황)). 구성 요소, 시퀀스, 상태 전이는 [동작 구조](#동작-구조)에 그림으로 있습니다.
 
 ## 필요한 것
 
@@ -222,7 +222,7 @@ analysis_start → SetBreakpoint kernel32.Sleep → run (kernel32에서 멈출 �
 
 단계마다 걸린 시간을 찍고, 끝에 `PASS` 또는 `FAIL`과 힌트를 냅니다(종료 코드 0 / 1). 끝나면 VM은 클린 스냅샷으로 돌아갑니다. 실패하면 데모가 만든 job만 정리합니다. 설정 파일은 바꾸지 않습니다.
 
-`demo`는 MCP 클라이언트가 게이트웨이를 돌리고 있으면 `LOCK_TIMEOUT`으로 멈춥니다. 그래서 Claude Code에 등록하기 전에, 또는 Claude Code를 닫고 실행합니다. `demo`는 단위 테스트로만 검증했습니다([검증 현황](#검증-현황)).
+`demo`는 MCP 클라이언트가 게이트웨이를 돌리고 있으면 `LOCK_TIMEOUT`으로 멈춥니다. 그래서 Claude Code에 등록하기 전에, 또는 Claude Code를 닫고 실행합니다. `demo`는 실 VM에서 x64·x32 모두 통과했습니다(92초, [검증 현황](#검증-현황)).
 
 ### 5단계: MCP 클라이언트에 등록
 
@@ -308,7 +308,7 @@ Claude Code에서는 `/`를 치면 `/x64dbg-vm:analyze-sample (MCP)`처럼 보�
 /mcp__x64dbg-vm__report
 ```
 
-`arch`는 `auto`(기본, PE 헤더로 판단), `x64`, `x32` 중 하나입니다. 잘못된 인자는 `INVALID_PARAMS`로 거부됩니다. MCP 프롬프트는 단위 테스트로만 검증했고, 슬래시 명령의 이름 규칙은 Claude Code 문서를 따른 것입니다.
+`arch`는 `auto`(기본, PE 헤더로 판단), `x64`, `x32` 중 하나입니다. 잘못된 인자는 `INVALID_PARAMS`로 거부됩니다. 실제 Claude Code에서 프롬프트 5개가 이 이름의 슬래시 명령으로 보였고, `report`를 실행해 봤습니다. 나머지 4개를 끝까지 실행한 결과는 아직 확인하지 않았습니다.
 
 ## 결과 보기
 
@@ -321,7 +321,7 @@ x64dbg-vm-gateway jobs report <JOB_ID> --out ~/mcp-lab/jobs/<JOB_ID>/artifacts/r
 x64dbg-vm-gateway jobs report <JOB_ID> --format json
 ```
 
-보고서에는 상태 이력과 시각, 샘플(이름, 크기, sha256, 아키텍처), epoch와 디버거 재기동, 회수한 파일(게스트 원래 경로, 크기, sha256, host 경로), 모듈 맵, 화면 캡처, 정적 도구 내보내기, 경고와 오류가 들어갑니다. 게스트에서 온 이름과 메시지는 `<untrusted_guest_output>` 블록 안에 둡니다. `--out`은 0600으로 쓰고, 이미 있는 파일은 `--force`일 때만 바꿉니다. 보고서 기능은 단위 테스트로만 검증했습니다.
+보고서에는 상태 이력과 시각, 샘플(이름, 크기, sha256, 아키텍처), epoch와 디버거 재기동, 회수한 파일(게스트 원래 경로, 크기, sha256, host 경로), 모듈 맵, 화면 캡처, 정적 도구 내보내기, 경고와 오류가 들어갑니다. 게스트에서 온 이름과 메시지는 `<untrusted_guest_output>` 블록 안에 둡니다. `--out`은 0600으로 쓰고, 이미 있는 파일은 `--force`일 때만 바꿉니다. 보고서는 실제 job으로 `jobs report`와 Claude Code의 `analysis_report` 호출에서 확인했습니다.
 
 **결과물 폴더.** 회수한 파일은 `~/mcp-lab/jobs/<job_id>/artifacts/`에 쌓입니다(전체 구조는 [host에 남는 것](#host에-남는-것)).
 
@@ -457,7 +457,7 @@ env = { GHIDRA_INSTALL_DIR = "/opt/ghidra_12.2_PUBLIC", JAVA_HOME = "/opt/jdk-25
 
 ## VM 여러 대
 
-게이트웨이 하나(`serve` 하나)가 설정의 모든 프로필을 다룹니다. 프로필 하나가 VM 하나이고, VM마다 job을 하나씩 동시에 돌릴 수 있습니다. VM마다 잠금, 작업 실행기, 디버거 감시, epoch가 따로 있어서, 한 VM의 복원이나 디버거 재기동이 다른 VM을 기다리게 하거나 건드리지 않습니다. 이 기능은 단위 테스트로만 검증했습니다.
+게이트웨이 하나(`serve` 하나)가 설정의 모든 프로필을 다룹니다. 프로필 하나가 VM 하나이고, VM마다 job을 하나씩 동시에 돌릴 수 있습니다. VM마다 잠금, 작업 실행기, 디버거 감시, epoch가 따로 있어서, 한 VM의 복원이나 디버거 재기동이 다른 VM을 기다리게 하거나 건드리지 않습니다. 이 기능은 단위 테스트로만 검증했습니다(두 번째 VM이 아직 없습니다).
 
 **프로필 더하기.** `config.toml`의 `[profiles.<이름>]`과 그 `backends` 절을 복사해 새 이름으로 바꾸고, `vmx`, `clean_snapshot`, `protected_snapshots`, `guest_user`, `guest_password_env`를 그 VM에 맞춥니다. 그 VM은 `setup --profile <이름>`으로 준비합니다. 첫 `setup`이 만든 암호 파일(`gateway.env_file`)에 그 VM의 암호 줄을 더하려면 `--save-password-file --force`를 붙입니다. 다른 줄은 그대로 둡니다.
 
@@ -488,7 +488,7 @@ guest_password_env = "X64DBG_GW_GUEST_PW_WIN11"
 
 ## 클린 스냅샷 갱신과 정리
 
-게스트에 도구를 더 깔거나 x64dbg를 바꿨다면 클린 스냅샷을 새로 찍습니다. 둘 다 **사람만** 하는 CLI 명령이고, MCP 툴은 없습니다. MCP 클라이언트가 게이트웨이를 돌리고 있으면 `LOCK_TIMEOUT`으로 멈추니 Claude Code를 닫고 실행합니다. 이 기능은 단위 테스트로만 검증했습니다.
+게스트에 도구를 더 깔거나 x64dbg를 바꿨다면 클린 스냅샷을 새로 찍습니다. 둘 다 **사람만** 하는 CLI 명령이고, MCP 툴은 없습니다. MCP 클라이언트가 게이트웨이를 돌리고 있으면 `LOCK_TIMEOUT`으로 멈추니 Claude Code를 닫고 실행합니다. `snapshot prune`의 미리 보기는 실 VM에서 확인했습니다. 실제 삭제(`--yes`)와 `snapshot refresh`는 단위 테스트로만 검증했습니다.
 
 ```bash
 x64dbg-vm-gateway snapshot refresh --name MCP_CLEAN_2 --set-clean   # 지금 게스트 상태로 새 클린 스냅샷
@@ -1018,18 +1018,22 @@ flowchart TD
 
 이 절이 검증 현황의 기준입니다. 다른 문서는 여기를 가리킵니다. 실 VM 기록은 [`docs/PHASE0_RESULTS.md`](docs/PHASE0_RESULTS.md)에 있습니다.
 
-환경은 Linux host, VMware Workstation 17.6, Windows 10 Pro 19045(한국어판, PowerShell 5.1) 게스트입니다. 사용자의 분석 VM을 하드 클론한 VM에서 확인했습니다. 날짜는 2026-11-23~24입니다.
+환경은 Linux host, VMware Workstation 17.6, Windows 10 Pro 19045(한국어판, PowerShell 5.1) 게스트입니다. 사용자의 분석 VM을 하드 클론한 VM에서 확인했습니다. 날짜는 2026-11-23~26입니다.
 
 **실 VM·실제 도구에서 확인한 것**
 
-- 실 VM 테스트 10건 통과(E2E 5건, 게스트 동작 점검 5건)
+- 실 VM 테스트 10건 통과(E2E 5건, 게스트 동작 점검 5건). 이번 라운드 기능을 모두 합친 코드로 2026-11-26에 다시 돌려 10건 통과(3분 21초)했습니다.
   - `doctor`, `install-plugin`(17~25초), `provision`(재부팅 감지부터 스냅샷까지 3분 14초)
   - x64·x32 전체 루프. 분석 명령을 뺀 한 바퀴가 약 48초입니다.
   - x64dbg 강제 종료 → `BACKEND_RESTARTED` → 재기동 → 분석 재개
   - MCP stdio
 - 원스톱 설치: `build-release.sh`로 만든 wheel(플러그인과 정적 스크립트 포함)을 격리 설치했습니다. 그 설치본의 `setup`이 실 VM에서 사전 점검, 플러그인 배포, 프로비저닝, 클린 스냅샷, 재점검, 등록 명령 출력까지 248초에 끝냈습니다. 이때는 값을 플래그로 줬습니다(대화식 질문과 암호 파일 저장은 그 뒤에 들어간 기능입니다).
+- `demo`: wheel 설치본으로 x64·x32 둘 다 통과했습니다(92초). 각 아키텍처가 `analysis_start` → `kernel32.Sleep` BP → `run` → `GetCallStack` → 회수 → 복원을 거쳤습니다.
+- `jobs report`: demo가 남긴 실제 job으로 Markdown 보고서를 만들었습니다. 게스트에서 온 값은 `untrusted_guest_output` 블록 안에 들어갔습니다.
+- `snapshot prune --keep 1`(기본값인 미리 보기만): 보호 스냅샷과 현재 클린 스냅샷을 모두 "삭제 안 함"으로 표시했고, 실제로 지운 것은 없습니다.
 - 실제 Claude Code 클라이언트
-  - 툴 104개가 보였습니다(게이트웨이 21 + 플러그인 83, `analysis_report`가 들어가기 전).
+  - 툴 105개가 보였습니다(게이트웨이 22 + 플러그인 83, 2026-11-26).
+  - MCP 프롬프트 5개가 슬래시 명령 `/mcp__x64dbg-vm__analyze-sample` 등으로 보였습니다. `/mcp__x64dbg-vm__report <job>`을 실행하자 `analysis_report`와 `jobs_show`를 불러 한국어 보고서를 썼습니다.
   - BP → `run` → 스택 → 덤프 → 회수 → 복원까지 분석 루프 전체가 68초에 끝났습니다.
 - 클린 스냅샷 복원 후 x64dbg가 응답하기까지 11~14초가 걸렸습니다.
 - 원격 HTTPS
@@ -1057,11 +1061,9 @@ flowchart TD
 **단위 테스트로만 확인한 것(실 VM·실제 클라이언트에서는 아직)**
 
 - `setup`의 대화식 질문(VM 목록, 계정, 암호, 게스트에서 x64dbg 찾기)과 `--save-password-file`
-- `demo`
-- MCP 프롬프트 5개(`prompts/list`, `prompts/get`). Claude Code 슬래시 명령으로 보이는지는 확인하지 않았습니다.
-- `analysis_report` 툴과 `jobs report` 명령(그래서 지금 툴 수 105개도 실제 클라이언트로는 확인 전)
-- `mcp-config --permissions`(strict/lab), `--apply`, `--client json`, `--tool`, `--set`
-- `snapshot refresh`, `snapshot prune`
+- 프롬프트 4개(`analyze-sample`, `trace-api`, `find-oep`, `static-dynamic`)를 끝까지 실행한 결과. 실제 Claude Code에서는 목록에 보이는 것과 `report`만 실행해 봤습니다.
+- `mcp-config --permissions`(strict/lab)가 Claude Code 권한 평가에서 의도대로 동작하는지, `--apply`, `--client json`, `--tool`, `--set`
+- `snapshot refresh`, `snapshot prune --yes`(실제 삭제)
 - 게이트웨이 하나로 VM 여러 대(프로필별 대상, `debugger_select(profile=...)`, `TARGET_AMBIGUOUS`)
 - Windows host용 PowerShell 출력과 이 문서의 Windows host 명령
 

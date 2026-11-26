@@ -360,3 +360,14 @@ def test_aliases_validate_like_their_targets_and_accept_the_old_arguments():
     assert kw == old_args
     with pytest.raises(tool_defs.InvalidArguments):
         tool_defs.check_arguments(tool_defs.CALLABLE_TOOLS["ida_import_annotations"], {"items": [1]})
+
+
+def test_analysis_collect_extract_description_matches_the_host_default():
+    # The collection path never encrypts the archive (app.analysis_collect keeps raw/out.zip as copied),
+    # so the description must not promise an encrypted zip.
+    from x64dbg_vm_gateway.frontends import tool_defs
+
+    tool = next(t for t in tool_defs.GATEWAY_TOOLS if t.name == "analysis_collect")
+    text = tool.input_schema["properties"]["extract"]["description"]
+    assert "encrypt" not in text.replace("not encrypted", "")
+    assert "Windows" in text and "raw/out.zip" in text

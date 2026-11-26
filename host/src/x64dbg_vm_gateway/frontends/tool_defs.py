@@ -430,8 +430,9 @@ GATEWAY_TOOLS: tuple[GatewayToolDef, ...] = (
         _obj({"job_id": _JOB_ID,
               "extra_guest_paths": {"type": "array", "items": {"type": "string", "minLength": 1},
                                     "description": "Additional guest files or directories to include."},
-              "extract": _bool("Extract the archive on the host. Omit for the host default (Windows hosts "
-                               "keep an encrypted zip only).")}),
+              "extract": _bool("Extract the archive on the host. Omit for the host default: Linux and "
+                               "macOS hosts extract; Windows hosts keep only the zip (raw/out.zip, "
+                               "not encrypted) so no loose guest executables land on the host.")}),
     ),
     _def(
         "analysis_finish", "Finish analysis job",
