@@ -35,7 +35,7 @@ analysis_start ──► 분석 (x64dbg 툴 83개 + 정적 도구) ──► ana
  디버거에 로드(정지 상태)
 ```
 
-게이트웨이가 AI에게 보여 주는 툴은 게이트웨이 툴 21개와 플러그인 툴 83개, 합계 104개입니다.
+게이트웨이가 AI에게 보여 주는 툴은 게이트웨이 툴 21개와 플러그인 툴 83개, 합계 104개입니다. 구성 요소, 시퀀스, 상태 전이를 그림으로 보려면 [동작 구조](#동작-구조)를 보세요.
 
 ## 왜 만들었나
 
@@ -292,6 +292,327 @@ AI는 대략 다음 순서로 툴을 호출합니다.
 - 클라이언트 허용 목록과 요청 속도 제한이 있고, 모든 호출은 `<jobs_root>/_audit/`에 감사 로그로 남습니다.
 
 설정은 [`docs/QUICKSTART_KO.md`](docs/QUICKSTART_KO.md) §8과 [`host/README.md`](host/README.md#remote-access-m3)에 있습니다.
+
+## 동작 구조
+
+아래 그림은 GitHub에서 Mermaid로 그려집니다. 이름은 코드에 쓰인 그대로입니다(툴, 단계, 상태).
+
+### 구성 요소와 연결
+
+```mermaid
+flowchart LR
+    subgraph HOST["host (Linux에서 실검증)"]
+        CC["MCP 클라이언트<br/>Claude Code 등"]
+        subgraph GW["x64dbg-vm-gateway"]
+            MCP["MCP 서버<br/>stdio / HTTPS"]
+            PROXY["proxy<br/>툴 중계, 재시도 규칙,<br/>untrusted 래핑"]
+            SUP["supervisor<br/>health L1/L2, 재기동, epoch"]
+            OPS["ops runner<br/>오래 걸리는 작업"]
+            JOBS[("job store<br/>state.json, 감사 로그")]
+        end
+        SMCP["정적 도구 MCP 서버<br/>ida-multi-mcp / pyghidra-mcp / r2mcp"]
+        STATIC["정적 분석 도구<br/>IDA / Ghidra / radare2 / Cutter"]
+        ART[("jobs root<br/>artifacts, manifest")]
+    end
+    subgraph VMW["VMware Workstation"]
+        VMRUN["vmrun / VIX"]
+        subgraph GUEST["Windows 게스트 VM (host-only, 공유 폴더 끔)"]
+            TOOLS["VMware Tools"]
+            X64["x64dbg + 플러그인<br/>:9094"]
+            X32["x32dbg + 플러그인<br/>:9095"]
+            TASK["예약 작업<br/>MCP-x64dbg / MCP-x32dbg"]
+            JDIR["C:\mcp\jobs\job_id\in, out"]
+        end
+    end
+    REMOTE["다른 PC의 MCP 클라이언트"]
+
+    CC -- "MCP" --> MCP
+    REMOTE -- "HTTPS + Bearer 토큰" --> MCP
+    CC -- "MCP" --> SMCP
+    SMCP --> STATIC
+    MCP --> PROXY
+    MCP --> OPS
+    PROXY -- "HTTP + Bearer 토큰" --> X64
+    PROXY -- "HTTP + Bearer 토큰" --> X32
+    SUP -- "health L1/L2" --> X64
+    SUP -- "health L1/L2" --> X32
+    OPS --> VMRUN
+    SUP -- "재기동" --> VMRUN
+    VMRUN -- "전원, 스냅샷" --> GUEST
+    VMRUN -- "파일 복사, 프로그램 실행" --> TOOLS
+    TOOLS --> JDIR
+    TOOLS -- "schtasks /run" --> TASK
+    TASK --> X64
+    TASK --> X32
+    OPS --> JOBS
+    OPS -- "회수" --> ART
+```
+
+| 구성 요소 | 하는 일 |
+|---|---|
+| MCP 서버 | 게이트웨이 툴 21개와 플러그인 툴 83개를 한 목록으로 내놓습니다. 원격 접속은 TLS, 범위별 토큰, 허용 목록, 감사 로그를 거칩니다. |
+| proxy | 플러그인 툴을 원래 이름으로 중계합니다. 읽기 호출만 한 번 재시도합니다. 게스트 출력은 `<untrusted_guest_output>`으로 감쌉니다. |
+| supervisor | 플러그인 상태를 분류합니다(L1: `GET /`, L2: `GetDebugState`, 게스트 프로세스 목록). 죽거나 멈춘 디버거를 재기동하고 epoch를 올립니다. |
+| ops runner | 복원, 전원, 시작·회수·종료처럼 오래 걸리는 작업을 백그라운드로 돌립니다. 호출 한도를 넘으면 `in_progress`를 먼저 돌려줍니다. |
+| job store | job 상태와 이력을 `<jobs_root>/<job_id>/state.json`에 남깁니다. 게이트웨이가 재시작돼도 이어서 진행합니다. |
+| VMware Tools | host와 게스트 사이의 통로입니다. 샘플·결과물 복사, PowerShell 실행, 디버거 재기동(예약 작업)에 씁니다. 공유 폴더는 쓰지 않습니다. |
+| 플러그인 | x64dbg/x32dbg 안의 MCP 서버(v1.10)입니다. 게이트웨이가 Bearer 토큰으로 호출합니다. |
+| 정적 도구 MCP 서버 | 각 정적 도구의 MCP 서버입니다. 게이트웨이와 나란히 등록하고, 주소 변환과 주석 교환은 게이트웨이가 맡습니다. |
+
+### 분석 한 바퀴
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 사용자
+    participant AI as AI (MCP 클라이언트)
+    participant GW as 게이트웨이
+    participant VM as VMware (vmrun/VIX)
+    participant DBG as 게스트 x64dbg 플러그인
+
+    U->>AI: "a.exe 분석해: BP, 실행, 덤프, 회수, 복원"
+    AI->>GW: analysis_start(sample_path)
+    GW->>GW: check_job, isolation (.vmx: host-only, 공유 폴더 끔)
+    GW->>GW: create_job, copy_sample (host 보관 + SHA-256)
+    GW->>VM: prepare_vm: 클린 스냅샷 복원, 시작, 준비 확인
+    GW->>VM: upload: C:\mcp\jobs\job\in 으로 복사, 해시 확인
+    GW->>DBG: debugger: PE 아키텍처로 x64/x32 선택, 살아 있는지 확인
+    GW->>DBG: load: LoadBinary (시스템 BP에서 정지, 자동 실행 안 함)
+    GW-->>AI: state ANALYZING, job_id, epoch
+
+    loop 분석
+        AI->>GW: SetBreakpoint, run, GetArguments, DumpMemory ...
+        GW->>DBG: 같은 이름으로 중계 (Bearer 토큰)
+        DBG-->>GW: 결과
+        GW-->>AI: untrusted_guest_output 으로 감싼 결과 + epoch
+    end
+
+    AI->>GW: analysis_collect
+    GW->>DBG: save_database (SaveDatabase를 out 폴더로)
+    GW->>DBG: module_map (ListModules)
+    GW->>VM: screenshot
+    GW->>VM: collect: out 폴더 압축, host로 복사
+    GW->>GW: 안전한 압축 해제, manifest.json (sha256)
+    GW-->>AI: COLLECTED (결과물 목록, host 경로)
+
+    AI->>GW: analysis_finish(revert=true)
+    GW->>GW: COLLECTED 또는 DISCARDED 인지 확인 (아니면 거부)
+    GW->>VM: revert: 클린 스냅샷으로 복원
+    GW-->>AI: DONE
+```
+
+- 상대 경로로 지정한 덤프(`DumpMemory`, `DumpModule`, `SaveDatabase`)는 job의 게스트 `out` 폴더에 쌓입니다. 회수는 이 폴더를 통째로 가져옵니다.
+- 회수가 일부만 됐으면(`COLLECTED_PARTIAL`) 복원이 막힙니다. 원인을 고쳐 다시 회수하거나, 사람이 CLI로 job을 버려야(`discard`) 합니다.
+
+### 오래 걸리는 작업 (`in_progress`)
+
+MCP 클라이언트에는 호출 한도가 있습니다(`max_call_s`, 기본 110초). 복원·시작처럼 오래 걸리는 작업은 한도보다 10초 짧은 시점(최대 100초)에 먼저 답하고, 백그라운드에서 계속합니다.
+
+```mermaid
+sequenceDiagram
+    participant AI as AI
+    participant GW as 게이트웨이
+    participant OPS as ops runner
+    participant VM as VMware
+
+    AI->>GW: analysis_start / analysis_collect / analysis_finish / vm_snapshot_revert / vm_power
+    GW->>OPS: 작업 시작 (op_id)
+    OPS->>VM: 복원, 시작, 복사 ...
+    alt 대기 한도 안에 끝남
+        OPS-->>GW: 결과
+        GW-->>AI: 결과
+    else 대기 한도를 넘김
+        GW-->>AI: state in_progress, op_id
+        loop 끝날 때까지
+            AI->>GW: session_status
+            GW-->>AI: operation.state = running
+        end
+        OPS-->>GW: 결과
+        AI->>GW: session_status
+        GW-->>AI: operation.state = done, result
+    end
+```
+
+### 디버거가 죽었을 때
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AI as AI
+    participant PX as proxy
+    participant SUP as supervisor
+    participant VM as VMware Tools
+    participant DBG as x64dbg 플러그인
+
+    Note over DBG: 샘플이 디버거를 죽이거나 x64dbg가 크래시
+    AI->>PX: SetBreakpoint (상태 변경 호출)
+    PX->>DBG: 연결 시도
+    DBG--xPX: 연결 거부, 또는 응답 없음 (연결 단계 한도 10초)
+    Note over PX: 상태 변경 호출은 자동 재시도하지 않음
+    PX->>SUP: check (L1 GET /, L2 GetDebugState, 게스트 프로세스 목록)
+    SUP-->>PX: DEAD 또는 HUNG
+    PX->>SUP: ensure_alive
+    SUP->>VM: 남은 프로세스 정리, schtasks /run MCP-x64dbg
+    VM->>DBG: 예약 작업이 x64dbg를 최고 권한으로 다시 실행
+    SUP->>DBG: 응답할 때까지 대기
+    SUP->>SUP: epoch + 1 (이전 세션의 주소, BP, 로드 상태는 사라진 것으로 취급)
+    PX-->>AI: BACKEND_RESTARTED (요청이 보내지지 않았는지, 결과를 알 수 없는지 포함)
+    AI->>PX: session_status (새 epoch 확인)
+    opt analysis_start(reload_on_restart=true)
+        SUP->>DBG: 샘플을 다시 LoadBinary
+    end
+    AI->>PX: 주소를 다시 확인하고 분석 계속
+```
+
+- 재기동이 짧은 시간에 반복되면 `CRASH_LOOP`로 멈춥니다. 디버거를 계속 죽이는 샘플이 무한 재기동을 일으키지 않게 하기 위해서입니다.
+- 플러그인이 인증 실패로 host를 잠갔으면(HTTP 429) `THROTTLED`로 보고합니다. 이때는 재기동하지 않습니다.
+
+### job 상태
+
+`jobs.py`의 `TRANSITIONS`가 허용하는 전이를 그렸습니다. 두 가지는 그림에서 생략했습니다.
+
+- 종료 상태(`DONE`, `FAILED`)를 뺀 모든 상태에서 `FAILED`로 갈 수 있습니다.
+- 사람의 `discard`는 종료 상태, `REVERTING`, `DISCARDED`를 뺀 모든 상태에서 할 수 있습니다. 게이트웨이가 죽으면서 남긴 job도 이것으로 정리합니다. 그림에는 대표적인 두 경우만 그렸습니다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATED: analysis_start
+    CREATED --> PREPARING_VM
+    PREPARING_VM --> VM_READY: 클린 스냅샷 복원, 시작
+    VM_READY --> UPLOADING
+    UPLOADING --> UPLOADING: 해시 불일치 재시도 (3회)
+    UPLOADING --> UPLOADED
+    UPLOADED --> LOADING
+    LOADING --> ANALYZING: LoadBinary 정지
+    ANALYZING --> ANALYZING: 툴 호출, 디버거 재기동 (epoch + 1)
+    ANALYZING --> COLLECTING: analysis_collect
+    ANALYZING --> DISCARDED: discard (사람, CLI)
+    COLLECTING --> COLLECTED
+    COLLECTING --> COLLECTED_PARTIAL
+    COLLECTED_PARTIAL --> COLLECTING: 다시 회수
+    COLLECTED_PARTIAL --> DISCARDED: discard (사람, CLI)
+    COLLECTED --> ANALYZING: 중간 회수 뒤 분석 계속
+    COLLECTED --> REVERTING: analysis_finish(revert=true)
+    COLLECTED --> DONE: analysis_finish(revert=false)
+    DISCARDED --> REVERTING
+    DISCARDED --> DONE
+    REVERTING --> REVERTING: 게이트웨이 재시작 뒤 다시 복원
+    REVERTING --> DONE
+    DONE --> [*]
+    FAILED --> [*]
+```
+
+### 정적·동적 왕복
+
+정적 도구는 바이너리를 PE 이미지 베이스(예: `0x140000000`)에 놓고 봅니다. 디버거에서는 ASLR 때문에 실행마다 모듈 베이스가 바뀝니다. 두 쪽은 **모듈 + RVA**로 맞춥니다.
+
+```
+런타임 주소 = 런타임 모듈 베이스 (x64dbg ListModules) + RVA
+정적 주소   = 정적 도구의 이미지 베이스 (IDA, Ghidra, radare2 baddr) + RVA
+```
+
+```mermaid
+sequenceDiagram
+    participant AI as AI
+    participant S as 정적 도구 MCP (예: r2mcp)
+    participant GW as 게이트웨이
+    participant DBG as x64dbg 플러그인
+
+    AI->>S: open_file, analyze, decompile, xrefs
+    S-->>AI: 관심 함수의 정적 주소 (예: 0x14000102C), 이미지 베이스
+    AI->>GW: analysis_start (같은 샘플)
+    AI->>GW: static_rebase(static_to_runtime, address, imagebase, module)
+    GW->>DBG: ListModules (런타임 모듈 베이스)
+    GW-->>AI: 런타임 주소 (예: 0x7FF6...102C), RVA
+    AI->>GW: SetBreakpoint, run, ReadMemory, GetArguments
+    GW->>DBG: 중계
+    GW-->>AI: 런타임 값 (복호화된 문자열, 인자 ...)
+    AI->>GW: static_rebase(runtime_to_static, 런타임 주소)
+    GW-->>AI: 정적 주소
+    AI->>S: rename_function, set_comment (정적 주소에)
+    opt x64dbg에 단 이름과 주석을 한꺼번에 넘길 때
+        AI->>GW: static_export_annotations
+        GW->>DBG: SaveDatabase (x64dbg DB)
+        GW-->>AI: artifacts/static_sync.json (모듈 + RVA 기준)
+        Note over S: 정적 도구의 동기화 스크립트로 적용<br/>static/ida, static/ghidra, static/radare2
+    end
+    opt 정적 도구의 이름과 주석을 x64dbg에 넘길 때
+        AI->>GW: static_import_annotations(items, module, imagebase)
+        GW->>DBG: CommentOrLabelAtAddress (런타임 주소로 바꿔서)
+    end
+```
+
+이 흐름은 실제 Claude Code에서 r2mcp와 게이트웨이를 나란히 등록해 끝까지 확인했습니다([검증 현황](#검증-현황)).
+
+### `setup`이 하는 일
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 사용자
+    participant CLI as x64dbg-vm-gateway setup
+    participant VM as VMware (vmrun/VIX)
+    participant G as 게스트 Windows
+
+    U->>CLI: setup --vmx ... --guest-user ... --x64dbg-root ... --snapshot MCP_CLEAN
+    opt 설정 파일이 없을 때
+        CLI->>CLI: init (config.toml 0600, 비밀값은 변수 이름만)
+    end
+    CLI->>VM: precheck doctor (vmrun, VM, Tools, 계정, 격리, VM 인스턴스 1개)
+    alt 고칠 수 없는 문제
+        CLI-->>U: 멈춤 + 힌트 (게스트는 바꾸지 않음)
+    end
+    CLI->>G: install-plugin: 디버거 종료, plugins_backup 에 백업, wheel의 플러그인 복사
+    CLI->>G: provision.ps1: 자동 로그온, 예약 작업, 플러그인 설정과 토큰, C:\mcp\jobs, DB 압축 끔
+    CLI->>G: 재부팅
+    CLI->>G: 부팅 시각(LastBootUpTime)으로 재부팅 확인, 두 플러그인 응답 대기
+    CLI->>G: 남은 PowerShell 임시 파일 정리
+    CLI->>VM: 메모리 포함 클린 스냅샷
+    CLI->>VM: doctor 다시
+    CLI-->>U: MCP 등록 명령 (게이트웨이 + 설정한 정적 도구)
+```
+
+### 원격 접속의 요청 처리
+
+`serve --transport http`일 때 다른 PC의 요청은 다음 순서로 걸러집니다.
+
+```mermaid
+flowchart TD
+    REQ["HTTPS 요청 /mcp"] --> ALLOW{"클라이언트 IP가<br/>allow_clients 안인가"}
+    ALLOW -- "아니오" --> E403["403"]
+    ALLOW -- "예" --> RATE{"속도 제한 안인가<br/>(IP별, IPv6는 /64)"}
+    RATE -- "아니오" --> E429["429"]
+    RATE -- "예" --> TOKEN{"Bearer 토큰이<br/>read / analyze / admin 중 하나인가"}
+    TOKEN -- "아니오" --> E401["401"]
+    TOKEN -- "예" --> SESSION{"세션이 같은 범위의 것인가"}
+    SESSION -- "아니오" --> E404["404"]
+    SESSION -- "예" --> TIER{"툴 등급이 범위 안인가<br/>read: 관찰 / analyze: + 게스트 변경 / admin: 전체"}
+    TIER -- "아니오" --> EFORB["FORBIDDEN"]
+    TIER -- "예" --> CALL["게이트웨이 툴 실행"]
+    E403 & E429 & E401 & EFORB & CALL --> AUDIT[("감사 로그<br/>_audit/http-날짜.jsonl<br/>토큰과 인자는 남기지 않음")]
+```
+
+### host에 남는 것
+
+```
+~/.config/x64dbg-vm-gateway/
+├── config.toml            # 0600, 비밀값은 환경 변수 이름만
+└── lab.env                # 0600, 게스트 암호 등 (env_file)
+<jobs_root>/               # 기본 ~/mcp-lab/jobs
+├── _audit/                # 원격 접속 감사 로그
+└── <job_id>/
+    ├── state.json         # job 상태와 이력
+    ├── intent.log         # 상태를 바꾸기 전에 남기는 의도 기록 (재시작 복구용)
+    ├── input/sample.bin   # 원본 샘플 사본 (해시 확인용)
+    ├── logs/, screens/    # 단계별 로그, 회수 시점 화면
+    └── artifacts/
+        ├── manifest.json  # 회수한 파일 목록, sha256, 모듈 맵
+        ├── files/         # 회수한 파일 (이름은 해시 기반)
+        ├── raw/out.zip    # 게스트 out 폴더 원본 압축
+        └── static_sync.json / static_sync.dd64   # static_export_annotations 결과
+```
+
+회수한 파일은 공격자가 만든 데이터로 다룹니다. host에서 실행하지 않습니다.
 
 ## 안전 수칙
 
