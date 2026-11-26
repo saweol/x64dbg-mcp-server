@@ -72,7 +72,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1130,10 +1129,11 @@ def resolve_gateway_program(*, argv0: str | None = None, which: Callable[[str], 
     """(program to put in the register line, how it was found: "argv0", "PATH" or None).
 
     The running console script (``sys.argv[0]`` named x64dbg-vm-gateway[.exe]) first, then the
-    one on PATH; both as absolute paths (a symlink such as ~/.local/bin/x64dbg-vm-gateway is kept:
-    it survives upgrades). The bare name when neither is found."""
+    one on PATH (``search_path``: never the current directory); both as absolute paths (a
+    symlink such as ~/.local/bin/x64dbg-vm-gateway is kept: it survives upgrades). The bare name
+    when neither is found."""
     argv0 = (sys.argv[0] if sys.argv else "") if argv0 is None else argv0
-    which = which or shutil.which
+    which = which or search_path  # never the current directory (see search_path)
     is_file = is_file or os.path.isfile
     if argv0:
         windows_style = "\\" in argv0 or PureWindowsPath(argv0).drive != ""
@@ -1870,8 +1870,40 @@ def mcp_servers_document(entries: Sequence[Mapping[str, Any]]) -> tuple[dict[str
     return {"mcpServers": servers}, notes
 
 
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+_ALREADY_REGISTERED_RE = re.compile(r"\balready exists\b", re.IGNORECASE)
+
+
+def search_path(name: str, *, path_env: str | None = None, pathext: str | None = None,
+                windows: bool | None = None) -> str | None:
+    """The program ``name`` from the absolute PATH entries only: never the current directory (on
+    Windows ``shutil.which`` and CreateProcess look there first, so a planted ``claude.exe`` in the
+    working directory would run), never a relative or empty entry. Windows tries the PATHEXT
+    extensions; elsewhere the file must be executable."""
+    windows = _windows_host() if windows is None else windows
+    raw = os.environ.get("PATH", "") if path_env is None else path_env
+    entries = raw.split(";" if windows else ":")
+    if windows:
+        exts = [e for e in (pathext if pathext is not None else os.environ.get("PATHEXT", _DEFAULT_PATHEXT))
+                .split(";") if e]
+        names = [name] if any(name.lower().endswith(e.lower()) for e in exts) else [name + e for e in exts]
+    else:
+        names = [name]
+    for entry in entries:
+        entry = entry.strip().strip('"')
+        # a drive path on Windows (or, for a test on another host, that host's absolute path)
+        absolute = os.path.isabs(entry) or (windows and PureWindowsPath(entry).is_absolute())
+        if not entry or not absolute:
+            continue
+        for candidate in names:
+            path = os.path.join(entry, candidate)
+            if os.path.isfile(path) and (windows or os.access(path, os.X_OK)):
+                return path
+    return None
+
+
 def _find_claude() -> str | None:
-    return shutil.which("claude")
+    return search_path("claude")
 
 
 def _stdin_is_tty() -> bool:
@@ -1882,8 +1914,9 @@ def _stdin_is_tty() -> bool:
 
 
 def _run_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=APPLY_TIMEOUT_S, check=False,
-                          **gw_platform.subprocess_kwargs())
+    """Run ``argv`` (a list: every value one argument, never through a shell)."""
+    return subprocess.run(list(argv), shell=False, capture_output=True, text=True,  # noqa: S603
+                          timeout=APPLY_TIMEOUT_S, check=False, **gw_platform.subprocess_kwargs())
 
 
 def _apply_plan(entries: Sequence[Mapping[str, Any]], claude: str
@@ -1939,7 +1972,11 @@ def _apply(entries: Sequence[Mapping[str, Any]], args: argparse.Namespace, out: 
             code, output = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except (OSError, subprocess.SubprocessError) as e:
             code, output = -1, f"could not run claude: {type(e).__name__}"
-        applied.append({"name": name, "command": shell_join(argv), "returncode": code, "ok": code == 0,
+        # claude mcp add refuses a name it knows ("MCP server NAME already exists in local config"):
+        # the server is registered, which is what --apply is for; replacing it is the user's call
+        already = code != 0 and bool(_ALREADY_REGISTERED_RE.search(output))
+        applied.append({"name": name, "command": shell_join(argv), "returncode": code,
+                        "ok": code == 0 or already, "already_registered": already,
                         "output": _safe(output.strip())[:2000]})
     return {"applied": applied, "skipped": skipped, "aborted": False}
 
@@ -1947,6 +1984,10 @@ def _apply(entries: Sequence[Mapping[str, Any]], args: argparse.Namespace, out: 
 def _format_apply(result: Mapping[str, Any]) -> str:
     lines: list[str] = []
     for a in result["applied"]:
+        if a.get("already_registered"):
+            lines.append(f"already registered: {_safe(a['name'])} (to replace it, run `claude mcp remove "
+                         f"{_safe(a['name'])}` and --apply again)")
+            continue
         status = "ok" if a["ok"] else f"failed, exit {a['returncode']}"
         lines.append(f"ran: {_safe_command(a['command'])} ({status})")
         lines.extend(f"  {line}" for line in a["output"].splitlines() if line.strip())
@@ -2003,7 +2044,7 @@ def cmd_mcp_config(args: argparse.Namespace, out: _Output) -> int:
         return EXIT_OK
     if args.apply:
         result = _apply(entries, args, out)
-        ok = not result["aborted"] and all(a["ok"] for a in result["applied"])
+        ok = all(a["ok"] for a in result["applied"])  # answering no registers nothing: no failure
         out.data({**base, "ok": ok, **result}, _format_apply)
         return EXIT_OK if ok else EXIT_FAILURE
     out.data(base, _format_mcp_config_result)
