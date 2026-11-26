@@ -173,6 +173,13 @@ this directory was checked against. All are stdio servers. Replace `<...>` with 
 the gateway config's `[static] tools`, with the `<...>` placeholders still to fill in, the
 tool's sync script inside the installation and these notes. Values from
 `[static.servers.<id>]` (`command`, `args`, `env`, `url`, `name`) replace the defaults below.
+`--tool ID` prints one tool, `--set NAME=VALUE` fills a placeholder and `--apply` runs the
+commands that have nothing left to fill in. radare2 is the quickest start (its command has no
+placeholder: `x64dbg-vm-gateway mcp-config --tool radare2 --apply`). pyghidra-mcp takes the binary
+on its command line, so Ghidra is registered per binary: `mcp-config --tool ghidra --set
+binary=/path/a.exe --set project-dir=... --set project-name=... --set ghidra-install-dir=... --set
+jdk25-home=... --apply`, and `claude mcp remove ghidra` before registering the next binary under
+the same name.
 
 | Tool | MCP server | Register (Claude Code) | rename | comment | decompile |
 |---|---|---|---|---|---|
