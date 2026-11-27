@@ -633,6 +633,26 @@ def test_a_new_config_gets_env_file_only_once_the_password_file_is_written(
 
 
 @pytest.mark.usefixtures("bundle")
+def test_the_register_notes_name_the_password_file_setup_just_added(
+        tmp_path, environment, wiring, provision, vm_file, monkeypatch, capsys):
+    """Real first run (2026-11-27): the password file was written and gateway.env_file added, yet
+    the registration notes still said to export the variable where Claude Code starts. The notes
+    were built from the config as loaded before env_file was added."""
+    monkeypatch.setenv(PW_ENV, PASSWORD)
+    rc = run(["--config", str(tmp_path / "config.toml"), "setup", *new_config_flags(vm_file),
+              "--save-password-file", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    data = json.loads(out)
+    pw_file = str(environment / "win10.env")
+    notes = [data["register"]["note"]] + [n for e in data["mcp_config"] for n in e.get("notes", [])
+                                          if "password" in n]
+    assert notes and all(pw_file in n for n in notes), notes
+    assert not any("start Claude Code where it is exported" in n for n in notes), notes
+    assert PASSWORD not in out
+
+
+@pytest.mark.usefixtures("bundle")
 def test_a_failing_password_file_write_leaves_no_file_and_setup_goes_on(
         tmp_path, environment, wiring, provision, vm_file, monkeypatch, capsys):
     """Review finding: an OSError while writing (a volume without chmod, a full disk) is reported

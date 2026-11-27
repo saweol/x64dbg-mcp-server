@@ -1728,6 +1728,8 @@ class _SetupSession:
     password_file: _PasswordFile | None = None
     #: a config this run created without gateway.env_file: (path, its text, the text with it)
     new_config: tuple[Path, str, str] | None = None
+    #: the password file this run wrote into that config's gateway.env_file
+    env_file_added: Path | None = None
 
     def pending(self, config: gw_config.GatewayConfig) -> bool:
         """gateway.env_file is the password file this run has not written (yet, or at all)."""
@@ -2220,14 +2222,14 @@ def _save_password_file_after_precheck(session: _SetupSession, precheck: Any, ar
     pf.status = "written"
     report.data["password_file"] = pf.public()
     out.note(f"setup: wrote {pf.path}")
-    if session.new_config is not None:
-        _add_env_file_to_new_config(session.new_config, pf, report, out)
+    if session.new_config is not None and _add_env_file_to_new_config(session.new_config, pf, report, out):
+        session.env_file_added = pf.path
 
 
 def _add_env_file_to_new_config(new_config: tuple[Path, str, str], pf: _PasswordFile, report: _SetupReport,
-                                out: _Output) -> None:
+                                out: _Output) -> bool:
     """Give the config this run created its gateway.env_file line (only while it is exactly what
-    this run wrote; otherwise the line is printed)."""
+    this run wrote; otherwise the line is printed). True when the line was added."""
     path, written, full = new_config
     line = f"env_file = {_toml_str(str(pf.path))}"
     try:
@@ -2237,8 +2239,9 @@ def _add_env_file_to_new_config(new_config: tuple[Path, str, str], pf: _Password
     except OSError:
         report.note(f"add this line to the [gateway] table of {path} so serve finds the password file: "
                     f"{line}")
-        return
+        return False
     out.note(f"setup: added gateway.env_file to {path}")
+    return True
 
 
 def _refused_password_note(precheck: Any, session: _SetupSession, config: gw_config.GatewayConfig,
@@ -2353,6 +2356,8 @@ def cmd_setup(args: argparse.Namespace, out: _Output) -> int:
         if pf is not None and pf.status == "planned":
             _record_not_saved(pf, "setup stopped before the guest checked the password", report)
     report.data["ok"] = ok
+    if session.env_file_added is not None:  # the notes below describe the config as it is now on disk
+        config = dataclasses.replace(config, env_file=str(session.env_file_added))
     if ok or args.dry_run:
         argv = _register_argv(args, path)
         report.data["register"] = {"command": shell_join(argv), "argv": argv}

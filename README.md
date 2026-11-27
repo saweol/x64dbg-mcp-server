@@ -1027,7 +1027,10 @@ flowchart TD
   - x64·x32 전체 루프. 분석 명령을 뺀 한 바퀴가 약 48초입니다.
   - x64dbg 강제 종료 → `BACKEND_RESTARTED` → 재기동 → 분석 재개
   - MCP stdio
-- 원스톱 설치: `build-release.sh`로 만든 wheel(플러그인과 정적 스크립트 포함)을 격리 설치했습니다. 그 설치본의 `setup`이 실 VM에서 사전 점검, 플러그인 배포, 프로비저닝, 클린 스냅샷, 재점검, 등록 명령 출력까지 248초에 끝냈습니다. 이때는 값을 플래그로 줬습니다(대화식 질문과 암호 파일 저장은 그 뒤에 들어간 기능입니다).
+- 원스톱 설치: `build-release.sh`로 만든 wheel(플러그인과 정적 스크립트 포함)을 격리 설치했습니다. 그 설치본의 `setup`이 실 VM에서 사전 점검, 플러그인 배포, 프로비저닝, 클린 스냅샷, 재점검, 등록 명령 출력까지 248초에 끝냈습니다. 이때는 값을 플래그로 줬습니다.
+- `setup`의 대화식 첫 실행(2026-11-27): 설정이 없는 상태에서 실제 터미널(pty)로 질문 6개에 답했습니다. VM 목록에서 고르기, 게스트 계정, 암호(화면에 안 보임), 게스트에서 x64dbg 찾기(2개 발견), 암호 파일 저장 순서입니다. 43초에 끝났습니다. 프로비저닝은 위에서 확인한 경로라 `--skip-provision`으로 뺐습니다.
+  - 터미널 출력, 설정 파일, job 폴더 어디에도 암호가 나오지 않았습니다. 설정과 암호 파일은 둘 다 0600이고, `gateway.env_file`은 게스트가 암호를 받아들인 뒤에 들어갔습니다.
+  - 암호 환경 변수 없이 이 설정과 암호 파일만으로 `demo`가 통과했습니다.
 - `demo`: wheel 설치본으로 x64·x32 둘 다 통과했습니다(92초). 각 아키텍처가 `analysis_start` → `kernel32.Sleep` BP → `run` → `GetCallStack` → 회수 → 복원을 거쳤습니다.
 - `jobs report`: demo가 남긴 실제 job으로 Markdown 보고서를 만들었습니다. 게스트에서 온 값은 `untrusted_guest_output` 블록 안에 들어갔습니다.
 - `snapshot prune --keep 1`(기본값인 미리 보기만): 보호 스냅샷과 현재 클린 스냅샷을 모두 "삭제 안 함"으로 표시했고, 실제로 지운 것은 없습니다.
@@ -1060,7 +1063,7 @@ flowchart TD
 
 **단위 테스트로만 확인한 것(실 VM·실제 클라이언트에서는 아직)**
 
-- `setup`의 대화식 질문(VM 목록, 계정, 암호, 게스트에서 x64dbg 찾기)과 `--save-password-file`
+- `setup`이 게스트가 암호를 거부할 때 남기는 상태, 기존 설정에 `--save-password-file --force`로 암호 파일을 갱신하는 경로
 - 프롬프트 4개(`analyze-sample`, `trace-api`, `find-oep`, `static-dynamic`)를 끝까지 실행한 결과. 실제 Claude Code에서는 목록에 보이는 것과 `report`만 실행해 봤습니다.
 - `mcp-config --permissions`(strict/lab)가 Claude Code 권한 평가에서 의도대로 동작하는지, `--apply`, `--client json`, `--tool`, `--set`
 - `snapshot refresh`, `snapshot prune --yes`(실제 삭제)
